@@ -10,6 +10,13 @@
     Compile (default), Expression, Inspect or Capability.
 .PARAMETER SourcePath
     Source file containing typed PowerShell classes.
+.PARAMETER SourceAst
+    Retained ScriptBlockAst to compile directly, as an alternative to SourcePath.
+.PARAMETER ClassNames
+    Optional explicit set of classes to emit from the source, including ClassName.
+.PARAMETER StaticData
+    Typed primitive, string or array values keyed by Class.Field. Emits static initialization IL;
+    does not generate PowerShell source or preserve mutable runtime fields.
 .PARAMETER ClassName
     Class whose exported methods are reported; defaults to the first class.
 .PARAMETER MethodNames
@@ -41,7 +48,10 @@ param(
     [ValidateSet('Compile', 'Expression', 'Inspect', 'Capability')]
     [string] $Mode = 'Compile',
     [string] $SourcePath,
+    [System.Management.Automation.Language.ScriptBlockAst] $SourceAst,
+    [Collections.IDictionary] $StaticData,
     [string] $ClassName,
+    [string[]] $ClassNames,
     [string[]] $MethodNames,
     [string] $OutputPath,
     [string] $EntryPoint,
@@ -60,7 +70,7 @@ $ErrorActionPreference = 'Stop'
 if (-not $Help) {
     switch ($Mode) {
         'Compile' {
-            if ([string]::IsNullOrEmpty($SourcePath)) { throw 'Compile requires -SourcePath.' }
+            if ([string]::IsNullOrEmpty($SourcePath) -and $null -eq $SourceAst) { throw 'Compile requires -SourcePath or -SourceAst.' }
             if ([string]::IsNullOrEmpty($OutputPath)) { throw 'Compile requires -OutputPath.' }
         }
         'Inspect' {
@@ -171,6 +181,14 @@ function Resolve-AstType {
         $found = $asm.GetType($nameString, $false, $true)
         if ($null -ne $found) {
             return $found
+        }
+    }
+
+    # PowerShell also resolves abbreviated System namespaces, including open generic definitions.
+    if (-not $nameString.StartsWith('System.', [StringComparison]::OrdinalIgnoreCase)) {
+        foreach ($asm in [AppDomain]::CurrentDomain.GetAssemblies()) {
+            $found = $asm.GetType('System.' + $nameString, $false, $true)
+            if ($null -ne $found) { return $found }
         }
     }
 
@@ -498,11 +516,13 @@ function New-ClassMirror {
             if ($p.IsStatic) { $attributes = $attributes -bor [Reflection.FieldAttributes]::Static }
             $null = $tb.DefineField($p.Name, (Resolve-AstType $p.PropertyType.TypeName), $attributes)
         }
-        $constructors = if ($c.Constructors.Count) { $c.Constructors } else { @($null) }
+        $constructors = @($null)
+        if ($c.Constructors.Count) { $constructors = @($c.Constructors) }
         foreach ($ctorAst in $constructors) {
-            $types = if ($ctorAst) { Get-ParameterTypes $ctorAst } else { [Type[]]@() }
+            [Type[]]$constructorParameterTypes = @()
+            if ($ctorAst) { $constructorParameterTypes = Get-ParameterTypes $ctorAst }
             $cb = $tb.DefineConstructor([Reflection.MethodAttributes]'Public,HideBySig,SpecialName,RTSpecialName',
-                [Reflection.CallingConventions]::Standard, $types)
+                [Reflection.CallingConventions]::Standard, $constructorParameterTypes)
             $il = $cb.GetILGenerator()
             $il.Emit([Reflection.Emit.OpCodes]::Ldarg_0)
             $il.Emit([Reflection.Emit.OpCodes]::Call, $objectCtor)
@@ -588,6 +608,10 @@ function ConvertTo-PowerShellType {
     )
     $from = $Expression.Type
     if ($from -eq $Type) { return $Expression }
+    if ($Type -eq [void]) { return [Linq.Expressions.Expression]::Block($Expression, [Linq.Expressions.Expression]::Empty()) }
+    if ($from -in $script:IntegralTypes -and $Type -eq [char]) {
+        return [Linq.Expressions.Expression]::ConvertChecked($Expression, $Type)
+    }
     if ($from -in $script:FloatingTypes -and $Type -in $script:IntegralTypes) {
         $convert = [Convert].GetMethod("To$($Type.Name)", [Type[]]@($from))
         return [Linq.Expressions.Expression]::Call($convert, $Expression)
@@ -698,8 +722,12 @@ function New-PowerShellArrayIndex {
     )
     $setup = [System.Collections.Generic.List[Linq.Expressions.Expression]]::new()
     if ($Index.Type -ne [int]) { $Index = ConvertTo-PowerShellType -Expression $Index -Type ([int]) }
+    # A list (any type with an Int32 indexer and a Count) follows the same rule as an array: PowerShell counts a
+    # negative index from the end of an IList too.
+    $indexer = if ($Array.Type.IsArray) { $null } else { Get-IntIndexer $Array.Type }
+    $access = { param($target, $at) if ($indexer) { [Linq.Expressions.Expression]::MakeIndex($target, $indexer, [Linq.Expressions.Expression[]]@($at)) } else { [Linq.Expressions.Expression]::ArrayAccess($target, $at) } }
     if ($Index -is [Linq.Expressions.ConstantExpression] -and [int]$Index.Value -ge 0) {
-        return [pscustomobject]@{ Setup = $setup; Access = [Linq.Expressions.Expression]::ArrayAccess($Array, $Index) }
+        return [pscustomobject]@{ Setup = $setup; Access = (& $access $Array $Index) }
     }
     $id = $Scope.DeclaredLocals.Count
     if ($Array -isnot [Linq.Expressions.ParameterExpression]) {
@@ -714,11 +742,23 @@ function New-PowerShellArrayIndex {
         $setup.Add([Linq.Expressions.Expression]::Assign($indexTemp, $Index))
         $Index = $indexTemp
     }
+    $length = if ($indexer) { [Linq.Expressions.Expression]::Property($Array, 'Count') } else { [Linq.Expressions.Expression]::ArrayLength($Array) }
     $adjusted = [Linq.Expressions.Expression]::Condition(
         [Linq.Expressions.Expression]::LessThan($Index, [Linq.Expressions.Expression]::Constant(0)),
-        [Linq.Expressions.Expression]::Add($Index, [Linq.Expressions.Expression]::ArrayLength($Array)),
+        [Linq.Expressions.Expression]::Add($Index, $length),
         $Index)
-    [pscustomobject]@{ Setup = $setup; Access = [Linq.Expressions.Expression]::ArrayAccess($Array, $adjusted) }
+    [pscustomobject]@{ Setup = $setup; Access = (& $access $Array $adjusted) }
+}
+
+function Get-IntIndexer([Type] $Type) {
+    # The default indexer taking one Int32, on a type that also exposes an Int32 Count (List[T], IList[T]).
+    $count = $Type.GetProperty('Count', [Type[]]@())
+    if ($null -eq $count -or $count.PropertyType -ne [int]) { return $null }
+    foreach ($property in $Type.GetProperties()) {
+        $parameters = $property.GetIndexParameters()
+        if ($property.Name -eq 'Item' -and $parameters.Count -eq 1 -and $parameters[0].ParameterType -eq [int]) { return $property }
+    }
+    $null
 }
 
 function Convert-AstExpressionAs {
@@ -1095,9 +1135,10 @@ function Convert-AstExpression {
     if ($Node -is [System.Management.Automation.Language.IndexExpressionAst]) {
         $targetExpr = Convert-AstExpression -Node $Node.Target -Scope $Scope
         $idxExpr = Convert-AstExpression -Node $Node.Index -Scope $Scope
-        if ($targetExpr.Type.IsArray -and $targetExpr.Type.GetArrayRank() -eq 1) {
+        $isList = -not $targetExpr.Type.IsArray -and $null -ne (Get-IntIndexer $targetExpr.Type)
+        if (($targetExpr.Type.IsArray -and $targetExpr.Type.GetArrayRank() -eq 1) -or $isList) {
             $element = New-PowerShellArrayIndex -Array $targetExpr -Index $idxExpr -Scope $Scope
-            $read = [Linq.Expressions.Expression]::ArrayIndex($element.Access.Object, $element.Access.Arguments[0])
+            $read = if ($isList) { $element.Access } else { [Linq.Expressions.Expression]::ArrayIndex($element.Access.Object, $element.Access.Arguments[0]) }
             if ($element.Setup.Count -eq 0) { return $read }
             $element.Setup.Add($read)
             return [Linq.Expressions.Expression]::Block($read.Type, [Linq.Expressions.Expression[]]$element.Setup.ToArray())
@@ -1243,7 +1284,7 @@ function Convert-AstStatement {
                 # The array and index are evaluated once, then the element is read,
                 # combined and stored back.
                 $arrayExpr = Convert-AstExpression -Node $leftNode.Target -Scope $Scope
-                if (-not $arrayExpr.Type.IsArray -or $arrayExpr.Type.GetArrayRank() -ne 1) {
+                if (-not ($arrayExpr.Type.IsArray -and $arrayExpr.Type.GetArrayRank() -eq 1) -and $null -eq (Get-IntIndexer $arrayExpr.Type)) {
                     throw "[{0}:{1}] Compound assignment into non-array type '{2}' is not supported." -f $Statement.Extent.StartLineNumber, $Statement.Extent.StartColumnNumber, $arrayExpr.Type.FullName
                 }
                 $element = New-PowerShellArrayIndex -Array $arrayExpr -Index (Convert-AstExpression -Node $leftNode.Index -Scope $Scope) -Scope $Scope
@@ -1277,11 +1318,12 @@ function Convert-AstStatement {
         if ($leftNode -is [System.Management.Automation.Language.IndexExpressionAst]) {
             $targetExpr = Convert-AstExpression -Node $leftNode.Target -Scope $Scope
             $idxExpr = Convert-AstExpression -Node $leftNode.Index -Scope $Scope
-            if (-not $targetExpr.Type.IsArray) {
+            $indexer = if ($targetExpr.Type.IsArray) { $null } else { Get-IntIndexer $targetExpr.Type }
+            if (-not $targetExpr.Type.IsArray -and $null -eq $indexer) {
                 throw "[{0}:{1}] Cannot assign into non-array type '{2}'." -f `
                     $Statement.Extent.StartLineNumber, $Statement.Extent.StartColumnNumber, $targetExpr.Type.FullName
             }
-            $elemType = $targetExpr.Type.GetElementType()
+            $elemType = if ($indexer) { $indexer.PropertyType } else { $targetExpr.Type.GetElementType() }
             $element = New-PowerShellArrayIndex -Array $targetExpr -Index $idxExpr -Scope $Scope
             $valExpr = Convert-AstExpressionAs -Node $Statement.Right -Type $elemType -Scope $Scope
             $store = [Linq.Expressions.Expression]::Assign($element.Access, $valExpr)
@@ -1990,6 +2032,14 @@ function Get-IlType([Type] $Type) {
 
 function Get-IlMember([Reflection.MemberInfo] $Member) {
     if ($script:IlMap.Members.ContainsKey($Member)) { return $script:IlMap.Members[$Member] }
+    if ($script:IlMap.ContainsKey('ImplicitConstructors') -and $script:IlMap.ImplicitConstructors.ContainsKey($Member)) {
+        # Reflection.Emit normally adds this constructor when the type is completed. Materialize it only when
+        # an authored call needs its token; untouched historical outputs retain their original metadata order.
+        $builder = $script:IlMap.ImplicitConstructors[$Member].DefineDefaultConstructor([Reflection.MethodAttributes]::Public)
+        $script:IlMap.Members[$Member] = $builder
+        $null = $script:IlMap.ImplicitConstructors.Remove($Member)
+        return $builder
+    }
     if ($Member.DeclaringType -and $Member.DeclaringType.Assembly.GetName().Name -like 'PSLoweringMirror*') {
         throw "'$($Member.DeclaringType.Name).$($Member.Name)' is used but not compiled; was it left out with -MethodNames?"
     }
@@ -2200,9 +2250,10 @@ function Write-IlConversion {
         throw "Unsupported conversion from '$($FromType.FullName)' to '$($ToType.FullName)'."
     }
 
-    if ($Checked -and $ToType.IsPrimitive -and $ToType -notin [double], [single], [bool], [char]) {
-        $un = if ($FromType -in [byte], [ushort], [uint], [ulong]) { '_Un' } else { '' }
-        $suffix = @{ [int] = 'I4'; [long] = 'I8'; [short] = 'I2'; [sbyte] = 'I1'; [byte] = 'U1'; [ushort] = 'U2'; [uint] = 'U4'; [ulong] = 'U8' }[$ToType]
+    # Char is an unsigned 16-bit integer: [char]10 is U+000A, and [char]70000 throws as it does in PowerShell.
+    if ($Checked -and $ToType.IsPrimitive -and $ToType -notin [double], [single], [bool]) {
+        $un = if ($FromType -in [byte], [ushort], [uint], [ulong], [char]) { '_Un' } else { '' }
+        $suffix = @{ [int] = 'I4'; [long] = 'I8'; [short] = 'I2'; [sbyte] = 'I1'; [byte] = 'U1'; [ushort] = 'U2'; [uint] = 'U4'; [ulong] = 'U8'; [char] = 'U2' }[$ToType]
         if ($suffix) {
             $IL.Emit([Reflection.Emit.OpCodes].GetField("Conv_Ovf_$suffix$un").GetValue($null))
             return
@@ -2222,8 +2273,33 @@ function Write-IlConversion {
     if ($ToType -eq [uint])   { $IL.Emit([Reflection.Emit.OpCodes]::Conv_U4); return }
     if ($ToType -eq [ulong])  { $IL.Emit([Reflection.Emit.OpCodes]::Conv_U8); return }
     if ($ToType -eq [ushort]) { $IL.Emit([Reflection.Emit.OpCodes]::Conv_U2); return }
+    if ($ToType -eq [char])   { $IL.Emit([Reflection.Emit.OpCodes]::Conv_U2); return }
 
     throw "Unsupported conversion from '$($FromType.FullName)' to '$($ToType.FullName)'."
+}
+
+function Write-IlValueAddress([Reflection.Emit.ILGenerator] $IL, [Linq.Expressions.Expression] $Expr, [hashtable] $Context) {
+    if ($Expr -is [Linq.Expressions.ParameterExpression]) {
+        if ($Context.Locals.ContainsKey($Expr)) { $IL.Emit([Reflection.Emit.OpCodes]::Ldloca, $Context.Locals[$Expr]); return }
+        if ($Context.Parameters.ContainsKey($Expr)) { $IL.Emit([Reflection.Emit.OpCodes]::Ldarga, [short]$Context.Parameters[$Expr]); return }
+        throw "No storage for value-type receiver '$($Expr.Name)'."
+    }
+    if ($Expr -is [Linq.Expressions.MemberExpression] -and $Expr.Member -is [Reflection.FieldInfo] -and -not $Expr.Member.IsLiteral -and -not $Expr.Member.IsInitOnly) {
+        $field = Get-IlMember $Expr.Member
+        if ($Expr.Member.IsStatic) { $IL.Emit([Reflection.Emit.OpCodes]::Ldsflda, $field); return }
+        if ($Expr.Expression.Type.IsValueType) { Write-IlValueAddress $IL $Expr.Expression $Context }
+        else { Write-IlExpression -IL $IL -Expr $Expr.Expression -Context $Context }
+        $IL.Emit([Reflection.Emit.OpCodes]::Ldflda, $field); return
+    }
+    if ($Expr -is [Linq.Expressions.BinaryExpression] -and $Expr.NodeType -eq [Linq.Expressions.ExpressionType]::ArrayIndex) {
+        Write-IlExpression -IL $IL -Expr $Expr.Left -Context $Context
+        Write-IlExpression -IL $IL -Expr $Expr.Right -Context $Context
+        $IL.Emit([Reflection.Emit.OpCodes]::Ldelema, (Get-IlType $Expr.Type)); return
+    }
+    $temporary = $IL.DeclareLocal((Get-IlType $Expr.Type))
+    Write-IlExpression -IL $IL -Expr $Expr -Context $Context
+    $IL.Emit([Reflection.Emit.OpCodes]::Stloc, $temporary)
+    $IL.Emit([Reflection.Emit.OpCodes]::Ldloca, $temporary)
 }
 
 function Write-IlExpression {
@@ -2442,16 +2518,31 @@ function Write-IlExpression {
     # 9.4 Method call (MethodCallExpression)
     if ($Expr -is [Linq.Expressions.MethodCallExpression]) {
         if ($Expr.Object) {
-            Write-IlExpression -IL $IL -Expr $Expr.Object -Context $Context
+            if ($Expr.Object.Type.IsValueType) { Write-IlValueAddress $IL $Expr.Object $Context }
+            else { Write-IlExpression -IL $IL -Expr $Expr.Object -Context $Context }
         }
         foreach ($arg in $Expr.Arguments) {
             Write-IlExpression -IL $IL -Expr $arg -Context $Context
         }
-        if ($Expr.Method.IsVirtual -and -not $Expr.Method.DeclaringType.IsValueType) {
+        if ($Expr.Object -and $Expr.Object.Type.IsValueType -and -not $Expr.Method.DeclaringType.IsValueType) {
+            $IL.Emit([Reflection.Emit.OpCodes]::Constrained, (Get-IlType $Expr.Object.Type))
+            $IL.Emit([Reflection.Emit.OpCodes]::Callvirt, (Get-IlMember $Expr.Method))
+        } elseif ($Expr.Method.IsVirtual -and -not $Expr.Method.DeclaringType.IsValueType) {
             $IL.Emit([Reflection.Emit.OpCodes]::Callvirt, (Get-IlMember $Expr.Method))
         } else {
             $IL.Emit([Reflection.Emit.OpCodes]::Call, (Get-IlMember $Expr.Method))
         }
+        return
+    }
+
+    # 9.3 List element read through an indexer property (List[T].Item)
+    if ($Expr -is [Linq.Expressions.IndexExpression] -and $null -ne $Expr.Indexer -and $Expr.Arguments.Count -eq 1) {
+        if ($Expr.Object.Type.IsValueType) { Write-IlValueAddress $IL $Expr.Object $Context }
+        else { Write-IlExpression -IL $IL -Expr $Expr.Object -Context $Context }
+        Write-IlExpression -IL $IL -Expr $Expr.Arguments[0] -Context $Context
+        $getter = $Expr.Indexer.GetGetMethod()
+        $op = if ($getter.IsVirtual -and -not $getter.DeclaringType.IsValueType) { [Reflection.Emit.OpCodes]::Callvirt } else { [Reflection.Emit.OpCodes]::Call }
+        $IL.Emit($op, (Get-IlMember $getter))
         return
     }
 
@@ -2468,7 +2559,8 @@ function Write-IlExpression {
         if ($Expr.Member -is [Reflection.PropertyInfo]) {
             $getter = $Expr.Member.GetGetMethod()
             if ($Expr.Expression) {
-                Write-IlExpression -IL $IL -Expr $Expr.Expression -Context $Context
+                if ($Expr.Expression.Type.IsValueType) { Write-IlValueAddress $IL $Expr.Expression $Context }
+                else { Write-IlExpression -IL $IL -Expr $Expr.Expression -Context $Context }
             }
             if ($getter.IsVirtual -and -not $getter.DeclaringType.IsValueType) {
                 $IL.Emit([Reflection.Emit.OpCodes]::Callvirt, (Get-IlMember $getter))
@@ -2592,6 +2684,16 @@ function Write-IlExpression {
                     return
                 }
             }
+            if ($Expr.Left -is [Linq.Expressions.IndexExpression] -and $null -ne $Expr.Left.Indexer) {
+                if ($Expr.Left.Object.Type.IsValueType) { Write-IlValueAddress $IL $Expr.Left.Object $Context }
+                else { Write-IlExpression -IL $IL -Expr $Expr.Left.Object -Context $Context }
+                Write-IlExpression -IL $IL -Expr $Expr.Left.Arguments[0] -Context $Context
+                Write-IlExpression -IL $IL -Expr $Expr.Right -Context $Context
+                $setter = $Expr.Left.Indexer.GetSetMethod()
+                $op = if ($setter.IsVirtual -and -not $setter.DeclaringType.IsValueType) { [Reflection.Emit.OpCodes]::Callvirt } else { [Reflection.Emit.OpCodes]::Call }
+                $IL.Emit($op, (Get-IlMember $setter))
+                return
+            }
             if ($Expr.Left -is [Linq.Expressions.IndexExpression]) {
                 Write-IlExpression -IL $IL -Expr $Expr.Left.Object -Context $Context
                 Write-IlExpression -IL $IL -Expr $Expr.Left.Arguments[0] -Context $Context
@@ -2601,7 +2703,10 @@ function Write-IlExpression {
             }
             if ($Expr.Left -is [Linq.Expressions.MemberExpression]) {
                 $member = $Expr.Left.Member
-                if ($Expr.Left.Expression) { Write-IlExpression -IL $IL -Expr $Expr.Left.Expression -Context $Context }
+                if ($Expr.Left.Expression) {
+                    if ($Expr.Left.Expression.Type.IsValueType) { Write-IlValueAddress $IL $Expr.Left.Expression $Context }
+                    else { Write-IlExpression -IL $IL -Expr $Expr.Left.Expression -Context $Context }
+                }
                 Write-IlExpression -IL $IL -Expr $Expr.Right -Context $Context
                 if ($member -is [Reflection.FieldInfo]) {
                     $op = if ($member.IsStatic) { [Reflection.Emit.OpCodes]::Stsfld } else { [Reflection.Emit.OpCodes]::Stfld }
@@ -2772,6 +2877,10 @@ function Get-LoweringCapability {
     param()
 
     [pscustomobject]@{
+        Compiler                = 'PSC'
+        SourcePath              = $PSCommandPath
+        SourceSha256            = (Get-FileHash -LiteralPath $PSCommandPath).Hash
+        CompileInputs           = @('SourcePath','SourceAst','ClassNames','StaticData')
         Product                 = 'Dev.MansfieldPlumbing.PowerShell.Lowering'
         PowerShellVersion       = $PSVersionTable.PSVersion.ToString()
         RuntimeVersion          = [Runtime.InteropServices.RuntimeInformation]::FrameworkDescription
@@ -2797,6 +2906,23 @@ function ConvertTo-TypedExpression {
     Convert-MethodAstToLambda -MethodAst $MethodAst
 }
 
+function ConvertTo-StaticDataExpression($Value, [Type] $Type) {
+    if ($Type -in [IntPtr],[UIntPtr]) { throw 'Native addresses are not durable static data.' }
+    if ($null -eq $Value) {
+        if ($Type.IsValueType) { throw "Null is not valid for static data of type $Type." }
+        return [Linq.Expressions.Expression]::Constant($null, $Type)
+    }
+    if ($Type.IsArray -and $Type.GetArrayRank() -eq 1) {
+        if ($Value -isnot [Array]) { throw "Static data requires an array of $($Type.GetElementType())." }
+        $items = [Collections.Generic.List[Linq.Expressions.Expression]]::new()
+        foreach ($item in $Value) { $items.Add((ConvertTo-StaticDataExpression $item $Type.GetElementType())) }
+        return [Linq.Expressions.Expression]::NewArrayInit($Type.GetElementType(), $items)
+    }
+    if ($Type -ne [string] -and -not $Type.IsPrimitive) { throw "Static data supports primitive values, strings and their arrays, not $Type." }
+    if ($Value.GetType() -ne $Type) { throw "Static data type mismatch: expected $Type, received $($Value.GetType())." }
+    return [Linq.Expressions.Expression]::Constant($Value, $Type)
+}
+
 function Export-LoweredAssembly {
     <#
     .SYNOPSIS
@@ -2811,8 +2937,11 @@ function Export-LoweredAssembly {
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string] $SourcePath,
+        [Parameter()][string] $SourcePath,
+        [Parameter()][System.Management.Automation.Language.ScriptBlockAst] $SourceAst,
+        [Parameter()][Collections.IDictionary] $StaticData,
         [Parameter()][string] $ClassName,
+        [Parameter()][string[]] $ClassNames,
         # Emit only these methods of -ClassName. A body that uses an omitted
         # method fails with an error naming it.
         [Parameter()][string[]] $MethodNames,
@@ -2826,6 +2955,15 @@ function Export-LoweredAssembly {
         [Parameter()][string] $EntryPoint
     )
 
+    if ($null -ne $SourceAst) {
+        if ($SourcePath) { throw 'Supply SourcePath or SourceAst, not both.' }
+        $classes = @($SourceAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true))
+        $target = @(if ($ClassName) { $classes | Where-Object Name -eq $ClassName } else { $classes | Select-Object -First 1 })
+        if ($target.Count -ne 1) { throw 'SourceAst must contain exactly one target class.' }
+        # The caller may compose class copies from independently parsed sources. Extent.Text is provenance,
+        # not a serialization of that composed tree. Get-ClassModel and body admission validate the live nodes.
+        $parsed = [pscustomobject]@{ Ast = $SourceAst; ClassAst = $target[0] }
+    } else {
     $fullSourcePath = if ([IO.Path]::IsPathFullyQualified($SourcePath)) {
         [IO.Path]::GetFullPath($SourcePath)
     }
@@ -2838,16 +2976,30 @@ function Export-LoweredAssembly {
 
     $source = [IO.File]::ReadAllText($fullSourcePath)
     $parsed = Read-PowerShellClass -Source $source -ClassName $ClassName
+    }
     $targetClass = $parsed.ClassAst
     $classAsts = @($parsed.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true))
+    if ($ClassNames) {
+        $classAsts = @($classAsts | Where-Object Name -in $ClassNames)
+        if ($classAsts.Count -ne @($ClassNames | Sort-Object -Unique).Count -or $targetClass.Name -notin $ClassNames) { throw 'ClassNames must identify existing classes and include ClassName.' }
+    }
     $model = @(Get-ClassModel -ClassAsts $classAsts)
     Use-ClassMirror -Ast $parsed.Ast
     $mirror = @{} + $script:LoweringClassTypes
+    $dataFields = @{}
+    if ($null -eq $StaticData) { $StaticData = @{} }
+    foreach ($key in $StaticData.Keys) {
+        $parts = ([string]$key).Split('.')
+        if ($parts.Count -ne 2 -or $parts[0] -notin @($model.Name)) { throw "Unknown or unselected static data field '$key'." }
+        $field = $mirror[$parts[0]].GetField($parts[1], [Reflection.BindingFlags]'Public,Static,DeclaredOnly')
+        if ($null -eq $field) { throw "Unknown static data field '$key'." }
+        $dataFields[$key] = [pscustomobject]@{ Field = $field; Expression = (ConvertTo-StaticDataExpression $StaticData[$key] $field.FieldType) }
+    }
 
     $assemblyName = [IO.Path]::GetFileNameWithoutExtension($OutputPath)
     $session = New-PersistedAssemblySession -AssemblyName $assemblyName
     $declared = [Reflection.BindingFlags]'Public,Static,Instance,DeclaredOnly'
-    $script:IlMap = @{ Types = @{}; Members = @{} }
+    $script:IlMap = @{ Types = @{}; Members = @{}; ImplicitConstructors = @{} }
     try {
         # 1. Output types, so every signature can name any of them.
         foreach ($c in $model) {
@@ -2864,9 +3016,9 @@ function Export-LoweredAssembly {
                 $mf = $mirrorType.GetField($p.Name, $declared)
                 $script:IlMap.Members[$mf] = $tb.DefineField($mf.Name, (Get-IlType $mf.FieldType), $mf.Attributes)
             }
-            $constructors = if ($c.Constructors.Count) { $c.Constructors } else { @($null) }
-            $ctorPlans = foreach ($ctorAst in $constructors) {
-                $types = if ($ctorAst) { Get-ParameterTypes $ctorAst } else { [Type[]]@() }
+            $ctorPlans = @(foreach ($ctorAst in $c.Constructors) {
+                [Type[]]$types = @()
+                if ($ctorAst) { $types = Get-ParameterTypes $ctorAst }
                 $mc = $mirrorType.GetConstructor($declared, $null, $types, $null)
                 $cb = $tb.DefineConstructor($mc.Attributes, [Reflection.CallingConventions]::Standard, [Type[]]@($types | ForEach-Object { Get-IlType $_ }))
                 if ($ctorAst) {
@@ -2874,7 +3026,7 @@ function Export-LoweredAssembly {
                 }
                 $script:IlMap.Members[$mc] = $cb
                 [pscustomobject]@{ Ast = $ctorAst; Builder = $cb }
-            }
+            })
             foreach ($n in $c.NativeImports) {
                 $types = Get-ParameterTypes $n.Ast
                 $mm = $mirrorType.GetMethod($n.Ast.Name, $declared, $null, $types, $null)
@@ -2893,6 +3045,14 @@ function Export-LoweredAssembly {
                 $script:IlMap.Members[$mm] = $mb
                 [pscustomobject]@{ Ast = $m; Builder = $mb }
             }
+            if (-not $c.Constructors.Count) {
+                $mc = $mirrorType.GetConstructor($declared, $null, [Type[]]@(), $null)
+                if (@($c.Properties | Where-Object { -not $_.IsStatic -and $_.InitialValue }).Count) {
+                    $cb = $tb.DefineConstructor($mc.Attributes, [Reflection.CallingConventions]::Standard, [Type[]]@())
+                    $script:IlMap.Members[$mc] = $cb
+                    $ctorPlans += [pscustomobject]@{ Ast = $null; Builder = $cb }
+                } else { $script:IlMap.ImplicitConstructors[$mc] = $tb }
+            }
             [pscustomobject]@{ Class = $c; Constructors = @($ctorPlans); Methods = @($methodPlans) }
         }
 
@@ -2903,9 +3063,18 @@ function Export-LoweredAssembly {
             $c = $plan.Class
             $staticInits = @($c.Properties | Where-Object { $_.IsStatic -and $_.InitialValue })
             $instanceInits = @($c.Properties | Where-Object { -not $_.IsStatic -and $_.InitialValue })
-            if ($staticInits.Count) {
+            $fieldInputs = @($dataFields.Values | Where-Object { $_.Field.DeclaringType -eq $mirror[$c.Name] })
+            if ($staticInits.Count -or $fieldInputs.Count) {
                 $lowered = Convert-InitializersToLambda -ClassAst $c.Ast -Initializers $staticInits -Static
-                Write-IlMethodBody -Lambda $lowered.Lambda -MethodBuilder $session.Types[$c.Name].DefineTypeInitializer() -IsStatic
+                $initializer = $lowered.Lambda
+                if ($fieldInputs.Count) {
+                $body = [Collections.Generic.List[Linq.Expressions.Expression]]::new()
+                $body.Add($lowered.Lambda.Body)
+                foreach ($inputField in $fieldInputs) { $body.Add([Linq.Expressions.Expression]::Assign([Linq.Expressions.Expression]::Field($null, $inputField.Field), $inputField.Expression)) }
+                $body.Add([Linq.Expressions.Expression]::Empty())
+                $initializer = [Linq.Expressions.Expression]::Lambda([Linq.Expressions.Expression]::Block($body), [Linq.Expressions.ParameterExpression[]]@())
+                }
+                Write-IlMethodBody -Lambda $initializer -MethodBuilder $session.Types[$c.Name].DefineTypeInitializer() -IsStatic
             }
             foreach ($ctor in $plan.Constructors) {
                 $lowered = if ($ctor.Ast) { Convert-MethodAstToLambda -MethodAst $ctor.Ast -Initializers $instanceInits }
@@ -3020,7 +3189,7 @@ process {
     switch ($Mode) {
         'Compile' {
             $compileParameters = @{}
-            foreach ($name in 'SourcePath', 'ClassName', 'MethodNames', 'OutputPath', 'EntryPoint', 'Deterministic') {
+            foreach ($name in 'SourcePath', 'SourceAst', 'StaticData', 'ClassName', 'ClassNames', 'MethodNames', 'OutputPath', 'EntryPoint', 'Deterministic') {
                 if ($PSBoundParameters.ContainsKey($name)) { $compileParameters[$name] = $PSBoundParameters[$name] }
             }
             Export-LoweredAssembly @compileParameters

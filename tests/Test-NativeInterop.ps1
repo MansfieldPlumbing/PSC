@@ -1,6 +1,14 @@
-param()
+param([string]$DataAssemblyPath, [string]$ExpectedDataText, [string]$ExpectedDataHash)
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
+if($DataAssemblyPath) {
+    if((Get-FileHash -LiteralPath $DataAssemblyPath).Hash -cne $ExpectedDataHash) { throw 'Fresh typed-data assembly identity changed.' }
+    $assembly=[Reflection.Assembly]::LoadFile($DataAssemblyPath)
+    $dataType=$assembly.GetType('NativeInteropFixture',$true)
+    if($dataType.GetMethod('ReadData').Invoke($null,@()) -cne $ExpectedDataText -or $dataType.GetMethod('DataAt').Invoke($null,@(-1)) -ne -3 -or $assembly.GetTypes().Length -ne 1) { throw 'Fresh typed-data reconstruction failed.' }
+    'FRESH_TYPED_DATA=PASS'
+    return
+}
 if(-not $IsWindows -or [IntPtr]::Size -ne 8) { throw 'Native ABI gates require Windows x64.' }
 $root=Split-Path $PSScriptRoot -Parent
 $compiler=Join-Path $root 'Export-LoweredAssembly.ps1'
@@ -17,6 +25,52 @@ foreach($reference in (Read-LegacyAssembly $dll).References) {
     if($reference.Name -cne 'System.Private.CoreLib') { throw 'Native output contains an external assembly reference.' }
 }
 function Check($ObservedValue,$ExpectedValue,[string]$GateName) { if(-not [object]::Equals($ObservedValue,$ExpectedValue)) { throw "Native ABI gate failed: $GateName" } }
+
+# Independent CLR answers cover value receivers on computed values, arguments,
+# static storage and local copies. These checks precede the external host gate.
+$guidText='48eba18e-f8c9-4687-bf11-0a74c9f96a8f'
+Check ([Convert]::ToHexString($type.GetMethod('GuidBytes').Invoke($null,@($guidText)))) ([Convert]::ToHexString([Guid]::new($guidText).ToByteArray())) 'computed struct receiver'
+Check ($type.GetMethod('NumberText').Invoke($null,@(1234))) '000004D2' 'value argument receiver'
+Check ($type.GetMethod('DateTicks').Invoke($null,@())) ([long]123456) 'struct property receiver'
+Check ($type.GetMethod('ValueTypeName').Invoke($null,@(7))) 'System.Int32' 'constrained Object method'
+Check ($type.GetMethod('MutateStaticValue').Invoke($null,@())) 1 'mutable static struct receiver'
+Check ($type.GetMethod('MutateLocalValue').Invoke($null,@())) 2 'mutable local struct receiver'
+Check ($type.GetField('Spinner').GetValue($null).Count) 1 'local mutation preserves copied source'
+Check ($type.GetMethod('WriteStructField').Invoke($null,@())) 123 'field assignment through a struct receiver'
+Check ($type.GetMethod('MakeInstance').Invoke($null,@()).GetType()) $type 'implicit constructor'
+Check ($type.Assembly.GetType('DefaultInitializerFixture',$true).GetMethod('Read').Invoke($null,@())) 7 'implicit constructor runs instance initializers'
+Check ($type.GetMethod('ListWork').Invoke($null,@())) 18 'list index read write and compound assignment'
+foreach($value in 0,10,65535) { Check ($type.GetMethod('Character').Invoke($null,@($value))) ([char]$value) 'integer to char' }
+foreach($value in -1,65536,70000) {
+    $rejected=$false
+    try { $null=$type.GetMethod('Character').Invoke($null,@($value)) } catch { $rejected=$true }
+    if(-not $rejected) { throw "Out-of-range char conversion admitted: $value" }
+}
+$tokens=$null;$errors=$null
+$sourceAst=[Management.Automation.Language.Parser]::ParseFile($fixture,[ref]$tokens,[ref]$errors)
+if($errors.Count) { throw 'Native fixture has parse failures.' }
+$dataDll=Join-Path $dir 'NativeTypedData.dll'
+$textData="quote ' and newline`nΩ"
+$null=& $compiler -SourceAst $sourceAst -ClassName NativeInteropFixture -ClassNames @('NativeInteropFixture') -StaticData @{'NativeInteropFixture.DataText'=$textData;'NativeInteropFixture.DataNumbers'=[int[]]@(7,19,-3)} -OutputPath $dataDll
+$dataAssembly=[Reflection.Assembly]::LoadFile($dataDll)
+$dataType=$dataAssembly.GetType('NativeInteropFixture',$true)
+Check ($dataType.GetMethod('ReadData').Invoke($null,@())) $textData 'typed string data without source substitution'
+Check ($dataType.GetMethod('DataAt').Invoke($null,@(1))) 19 'typed array data'
+Check ($dataAssembly.GetTypes().Length) 1 'explicit class selection'
+$dataType.GetField('DataText').SetValue($null,'resident mutation must not become durable data')
+$start=[Diagnostics.ProcessStartInfo]::new([Environment]::ProcessPath)
+$start.UseShellExecute=$false;$start.RedirectStandardOutput=$true;$start.RedirectStandardError=$true
+foreach($argument in @('-NoProfile','-File',$PSCommandPath,'-DataAssemblyPath',$dataDll,'-ExpectedDataText',$textData,'-ExpectedDataHash',(Get-FileHash -LiteralPath $dataDll).Hash)) { $start.ArgumentList.Add($argument) }
+$process=[Diagnostics.Process]::Start($start)
+$stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync();$process.WaitForExit()
+if($process.ExitCode -ne 0 -or -not $stdout.Result.Contains('FRESH_TYPED_DATA=PASS')) { throw ('Fresh typed-data verification failed: '+$stdout.Result+$stderr.Result) }
+foreach($invalidData in @(@{'NativeInteropFixture.Unknown'='x'},@{'NativeInteropFixture.DataText'=1},@{'NativeInteropFixture.DataPointer'=[IntPtr]::Zero},@{'UnselectedNativeFixture.Data'=7})) {
+    $invalidPath=Join-Path $dir ([guid]::NewGuid().ToString('N')+'.dll')
+    $rejected=$false
+    try { $null=& $compiler -SourceAst $sourceAst -ClassName NativeInteropFixture -ClassNames @('NativeInteropFixture') -StaticData $invalidData -OutputPath $invalidPath } catch { $rejected=$true }
+    if(-not $rejected -or (Test-Path -LiteralPath $invalidPath)) { throw 'Invalid static data emitted an assembly.' }
+}
+Write-Host 'AST input, typed data, class selection, value receivers, implicit constructors, list indexing and char boundaries: PASS.'
 
 # Independent unmanaged ABI oracle: public Reflection.Emit defines delegate
 # metadata, not compiler expressions or compiler IL. NativeLibrary supplies
