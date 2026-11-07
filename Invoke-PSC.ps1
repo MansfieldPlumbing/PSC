@@ -236,6 +236,8 @@ function Get-UnitProfile($project, [string] $file, $node) {
 }
 
 function Invoke-SmaProfile {
+    [PscImplements('ProjectProfile')]
+    param()
     $builtin = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($c in Get-Command -CommandType Cmdlet, Function, Alias -ErrorAction SilentlyContinue) { $null = $builtin.Add($c.Name) }
     $projects = @(Get-Projects)
@@ -332,7 +334,9 @@ function Get-SmaCheckOnly($profiled) {
     }
 }
 
-function Get-SmaReport($units, $profiled) {
+function Get-SmaReport {
+    [PscImplements('ProfileReport')]
+    param($units, $profiled)
     '=== projects'
     $units | Group-Object Project | Sort-Object Count -Descending | ForEach-Object { '{0,-28} {1,5} units  {2,4} pure  {3}' -f $_.Name, $_.Count, @($_.Group | Where-Object Pure).Count, $_.Group[0].Remote }
     '=== copies of one remote: identical, diverged, not in every copy'
@@ -384,7 +388,9 @@ function Get-SmaReport($units, $profiled) {
 #                       the comma binds first, so the operator receives an array.
 #   CaselessSymbol      a case-insensitive comparison against a literal containing letters, in a file that also
 #                       uses case-sensitive operators, so case matters to its author there.
-function Get-SmaLint([string] $file) {
+function Get-SmaLint {
+    [PscImplements('ProjectLint')]
+    param([string] $file)
     $tokens = $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$tokens, [ref]$errors)
     $finding = { param([string] $rule, $node, [string] $detail) [pscustomobject]@{ File = $file; Line = $node.Extent.StartLineNumber; Rule = $rule; Detail = $detail } }
@@ -841,7 +847,9 @@ function Get-SmaEncodedSourceOrigins($Ast, [string]$SourceIdentity) {
         }
     }
 }
-function Get-SmaDescription([string] $root) {
+function Get-SmaDescription {
+    [PscImplements('ProjectDescription')]
+    param([string] $root)
     $root = [IO.Path]::GetFullPath($root)
     $project = [SmaProject]::new(); $project.Root = $root; $project.DescribedUtc = [DateTime]::UtcNow
     if ([IO.Directory]::Exists((Join-Path $root '.git'))) { $project.Commit = (git -C $root rev-parse HEAD 2>$null) }
@@ -958,6 +966,8 @@ function Invoke-SmaObservedOperation($Project, [string] $Name, [scriptblock] $Op
 }
 
 function Test-SmaDescription {
+    [PscImplements('DescriptionFixture')]
+    param()
     # The fixture is an independent Git repository that exists only for this check; its evidence is the live
     # description returned with each result.
     $directory = Join-Path ([IO.Path]::GetTempPath()) ('PSC-Verify-' + [guid]::NewGuid().ToString('N'))
@@ -1071,7 +1081,9 @@ function Test-AttributeClass([System.Management.Automation.Language.TypeDefiniti
 # class in the same source. The method's name is the keyword; its first parameter, a [string], receives the
 # statement's name; its further typed parameters are the statement's properties. A keyword with properties
 # takes a property table, 'register A { Bits = 8 }'; one without takes a script body, 'lower A { ... }'.
-function Get-LoweringKeywords([System.Management.Automation.Language.Ast] $Root) {
+function Get-LoweringKeywords {
+    [PscImplements('StatementKeywords')]
+    param([System.Management.Automation.Language.Ast] $Root)
     $markers = @($Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass -and $n.Name -eq 'Keyword' }, $true) | Where-Object { Test-AttributeClass $_ })
     if ($markers.Count -eq 0) { return }
     $marked = $Root.FindAll({
@@ -1390,6 +1402,7 @@ function Add-NativeImportMethod {
     # (System.Reflection.Emit MethodBuilderImpl.SetCustomAttributeCore,
     # runtime ab19415702aa8139d5369e47c73edb47343c34ad). The mirror's imports
     # are only call targets during lowering, so they never carry it.
+    [PscImplements('NativeImports')]
     param([Reflection.Emit.TypeBuilder] $TypeBuilder, [string] $Name, $Import, [Type] $ReturnType, [Type[]] $ParameterTypes, [string[]] $ParameterNames, [switch] $Persisted)
     $charSet = if ($Import.StringMarshalling -eq 'Utf16') { [Runtime.InteropServices.CharSet]::Unicode } else { [Runtime.InteropServices.CharSet]::Ansi }
     $method = $TypeBuilder.DefinePInvokeMethod($Name, $Import.Library, $Import.EntryPoint,
@@ -2026,6 +2039,7 @@ function Add-GenericInference([Type] $Pattern, [Type] $Actual, [hashtable] $Bind
 }
 
 function Resolve-MatchingMethod {
+    [PscImplements('ReflectedCallBinding')]
     param(
         [Parameter(Mandatory)][Type] $TargetType,
         [Parameter(Mandatory)][string] $MethodName,
@@ -2663,6 +2677,7 @@ function New-PredicateTruth {
 }
 
 function Convert-PredicateSwitch {
+    [PscImplements('PredicateSwitch')]
     param([System.Management.Automation.Language.SwitchStatementAst] $Statement, [hashtable] $Scope)
     $et = [Linq.Expressions.Expression]
     $flags = [int]$Statement.Flags
@@ -3698,7 +3713,9 @@ function Get-IlMember([Reflection.MemberInfo] $Member) {
 
 # A call's receiver: a reference is loaded; a value type is addressed in its own storage (local, argument,
 # field, array element), so mutations reach it, or else copied once to a temporary.
-function Write-IlReceiver([Reflection.Emit.ILGenerator] $IL, [Linq.Expressions.Expression] $Expr, [hashtable] $Context) {
+function Write-IlReceiver {
+    [PscImplements('ValueTypeReceivers')]
+    param([Reflection.Emit.ILGenerator] $IL, [Linq.Expressions.Expression] $Expr, [hashtable] $Context)
     if (-not $Expr.Type.IsValueType) {
         Write-IlExpression -IL $IL -Expr $Expr -Context $Context
         return
@@ -4589,6 +4606,7 @@ function Get-PinnedPowerShell {
         GitHub publishes for the release asset before it is extracted.
     #>
     [CmdletBinding()]
+    [PscImplements('PinnedPowerShell')]
     param([string] $ArchivePath)
     $version = '7.7.0-preview.5'
     $asset = "PowerShell-$version-win-x64.zip"
@@ -4611,16 +4629,120 @@ function Get-PinnedPowerShell {
     $pwsh
 }
 
+# Every capability PSC has or is to have. A capability is implemented when a function in this script declares
+# [PscImplements('<member>')] for it; the API reports each one's implementing definitions, read from the
+# script's own AST. Attribute arguments must be constants, so a member is named; the attribute's constructor and
+# Get-PscCapabilities convert it to PscCapability, which rejects any name that is not a member.
+enum PscCapability {
+    # The compiler
+    IlAssembly
+    TypedExpression
+    AssemblyInspection
+    CompilerCapability
+    NativeAotExecutable
+    CoffLinker
+    NativeImports
+    StatementKeywords
+    StaticData
+    ReflectedCallBinding
+    PredicateSwitch
+    ValueTypeReceivers
+    SelfDescribingApi
+    PinnedPowerShell
+    ProjectDescription
+    ProjectLint
+    ProjectProfile
+    ProfileReport
+    DescriptionFixture
+    SingleFileJitExecutable
+    # Kernel building: patterns
+    MapPattern
+    ReducePattern
+    ScanPattern
+    BroadcastPattern
+    ContractionPattern
+    QuantizedContraction
+    StencilPattern
+    LayoutChange
+    GatherScatter
+    # Kernel building: data
+    NumberFormats
+    MemorySpaces
+    DmaTransfer
+    ProducerConsumerPipeline
+    # Kernel building: composition
+    Fusion
+    LaneSplitTiling
+    # Kernel building: machine layer
+    InstructionTables
+    RegisterAllocation
+    Scheduling
+    HexagonV73Hvx
+    HexagonV73Hmx
+    A64Backend
+    X64Backend
+    A32Backend
+    # Kernel building: containers and harness
+    ElfSharedObject
+    FastRpcSkeleton
+    KernelGold
+    DeviceMeasures
+}
+
+# Declares that the function whose param block carries it implements a PscCapability.
+class PscImplementsAttribute : System.Attribute {
+    [PscCapability[]] $Capability
+    PscImplementsAttribute([PscCapability[]] $capability) { $this.Capability = $capability }
+}
+
+function Get-PscCapabilities {
+    <#
+    .SYNOPSIS
+        Every PscCapability with the function definitions that declare [PscImplements()] for it. A capability with
+        no implementing definition is planned.
+    #>
+    [CmdletBinding()]
+    [PscImplements('SelfDescribingApi')]
+    param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Ast)
+    $implementers = [System.Collections.Generic.Dictionary[PscCapability, System.Collections.Generic.List[System.Management.Automation.Language.FunctionDefinitionAst]]]::new()
+    foreach ($function in $Ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+        if (-not $function.Body.ParamBlock) { continue }
+        foreach ($attribute in $function.Body.ParamBlock.Attributes) {
+            if ($attribute.TypeName.GetReflectionAttributeType() -ne [PscImplementsAttribute]) { continue }
+            foreach ($argument in $attribute.PositionalArguments) {
+                foreach ($capability in @($argument.SafeGetValue())) {
+                    $value = [PscCapability]$capability
+                    if (-not $implementers.ContainsKey($value)) { $implementers[$value] = [System.Collections.Generic.List[System.Management.Automation.Language.FunctionDefinitionAst]]::new() }
+                    $implementers[$value].Add($function)
+                }
+            }
+        }
+    }
+    foreach ($capability in [Enum]::GetValues([PscCapability])) {
+        [System.Management.Automation.Language.FunctionDefinitionAst[]] $definitions = @()
+        if ($implementers.ContainsKey($capability)) { $definitions = $implementers[$capability].ToArray() }
+        [pscustomobject]@{
+            PSTypeName     = 'PSC.Capability'
+            Capability     = $capability
+            Implemented    = $definitions.Count -gt 0
+            Implementation = @($definitions | ForEach-Object Name)
+            Definitions    = $definitions
+        }
+    }
+}
+
 function Get-PscApi {
     <#
     .SYNOPSIS
         Describes this script's API from its own AST: each mode, the script parameters its operation reads and
-        the functions it calls, with types, defaults and help.
+        the functions it calls, with types, defaults and help; and every capability with its implementing
+        definitions.
     .DESCRIPTION
         A mode's parameters are the script parameters referenced in its clause of the process block's mode
         switch, together with the script parameters a splatted call in that clause can bind by name.
     #>
     [CmdletBinding()]
+    [PscImplements('SelfDescribingApi')]
     param()
     $tokens = $null; $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$tokens, [ref]$errors)
@@ -4676,6 +4798,7 @@ function Get-PscApi {
         Synopsis     = $help.Synopsis
         DefaultMode  = $modeParameter.DefaultValue.SafeGetValue()
         Modes        = @($modes)
+        Capabilities = @(Get-PscCapabilities -Ast $ast)
         Parameters   = @(foreach ($parameter in $ast.ParamBlock.Parameters) { Get-PscApiParameter $parameter $parameterHelp })
         Ast          = $ast
     }
@@ -4720,6 +4843,7 @@ function Get-LoweringCapability {
         Reports compiler capabilities, runtime versions, and supported contracts.
     #>
     [CmdletBinding()]
+    [PscImplements('CompilerCapability')]
     param()
 
     [pscustomobject]@{
@@ -4744,6 +4868,7 @@ function ConvertTo-TypedExpression {
         Lowers a PowerShell class method AST into a validated System.Linq.Expressions.LambdaExpression.
     #>
     [CmdletBinding()]
+    [PscImplements('TypedExpression')]
     param(
         [Parameter(Mandatory, ValueFromPipeline)]
         [System.Management.Automation.Language.FunctionMemberAst] $MethodAst
@@ -4752,7 +4877,9 @@ function ConvertTo-TypedExpression {
     Convert-MethodAstToLambda -MethodAst $MethodAst
 }
 
-function ConvertTo-StaticDataExpression($Value, [Type] $Type) {
+function ConvertTo-StaticDataExpression {
+    [PscImplements('StaticData')]
+    param($Value, [Type] $Type)
     if ($Type -in [IntPtr],[UIntPtr]) { throw 'Native addresses are not durable static data.' }
     if ($null -eq $Value) {
         if ($Type.IsValueType) { throw "Null is not valid for static data of type $Type." }
@@ -4782,6 +4909,7 @@ function Export-LoweredAssembly {
         the -EntryPoint; it defaults to the first class.
     #>
     [CmdletBinding()]
+    [PscImplements('IlAssembly')]
     param(
         [Parameter()][string] $SourcePath,
         [Parameter()][System.Management.Automation.Language.ScriptBlockAst] $SourceAst,
@@ -5048,6 +5176,7 @@ $script:NativeFeatureSwitches = [ordered]@{
 }
 
 function Export-NativeImage {
+    [PscImplements('NativeAotExecutable')]
     param(
         [Parameter(Mandatory)][string] $AssemblyPath,
         [Parameter(Mandatory)][string] $OutputPath,
@@ -5102,6 +5231,7 @@ function Test-LoweredAssembly {
         Inspects an emitted assembly, validates zero SMA dependencies, and generates a receipt.
     #>
     [CmdletBinding()]
+    [PscImplements('AssemblyInspection')]
     param(
         [Parameter(Mandatory)][string] $AssemblyPath
     )
@@ -5308,6 +5438,7 @@ function Find-CoffLibrary([string] $Name, [string[]] $Directories) {
 }
 
 function Resolve-CoffLink {
+    [PscImplements('CoffLinker')]
     param([string[]] $Inputs, [string[]] $LibraryDirectories = @(), [string[]] $DefaultLibraries = @(), [string[]] $IgnoredDefaultLibraries = @(), [string] $Entry)
     $ignoreAll = $IgnoredDefaultLibraries -contains '*'
     $ignored = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -5433,6 +5564,7 @@ function Write-CoffImage {
     # output sections by name before '$' with the suffix as the sort key, builds the import table and jump thunks,
     # applies AMD64 relocations, sorts the function table and writes base relocations. Reference: PE/COFF
     # specification sections 3, 4, 5 and 6.
+    [PscImplements('CoffLinker')]
     param($Resolution, [string] $Path, [string[]] $Merges = @(), [int] $Subsystem = 3, [long] $StackReserve = 0x100000)
     $imageBase = [long]0x140000000
     $fileAlignment = 0x200; $sectionAlignment = 0x1000
