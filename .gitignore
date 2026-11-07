@@ -9,3 +9,4 @@ Thumbs.db
 /tools/*/
 # Pinned Native AOT toolchain (ILC, its build files, the Native AOT runtime, MSVC and Windows SDK libraries): never committed.
 /NativeAOT/*/
+/conformance/
