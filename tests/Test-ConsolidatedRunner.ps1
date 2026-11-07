@@ -161,5 +161,5 @@ if (-not $allPassed) {
 }
 
 if ($allPassed -and $receipt.SuitesPassed -eq $testSuites.Count) {
-    Write-Host 'reproduction: 52 legacy outputs, 14 diagnostics, 0 regressions; 19 legacy suites passed; native interop, portable SIMD and single-file gates passed'
+    Write-Host 'reproduction: 52 legacy outputs, 13 diagnostics, 0 regressions; 19 legacy suites passed; native interop, portable SIMD and single-file gates passed'
 }

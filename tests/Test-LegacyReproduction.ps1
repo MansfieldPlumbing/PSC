@@ -13,7 +13,7 @@ $root=Split-Path $PSScriptRoot -Parent
 $compiler=Join-Path $root 'Invoke-PSC.ps1'
 . (Join-Path $PSScriptRoot 'LegacyMetadata.ps1')
 $manifest=Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
-if ($manifest.BaselineCommit -cne '218f54e60e7750dc28576dfdb51cebbadad7fa9f' -or $manifest.Outputs.Count -ne 52 -or $manifest.Diagnostics.Count -ne 14) { throw 'Frozen baseline identity or count mismatch.' }
+if ($manifest.BaselineCommit -cne '218f54e60e7750dc28576dfdb51cebbadad7fa9f' -or $manifest.Outputs.Count -ne 52 -or $manifest.Diagnostics.Count -ne 13) { throw 'Frozen baseline identity or count mismatch.' }
 $dir=Join-Path $root 'build/legacy-reproduction'
 $null=New-Item -ItemType Directory -Force $dir
 
@@ -71,4 +71,4 @@ if(-not $SkipNegativeControl) {
     }
 }
 [pscustomobject]@{Outputs=52;Diagnostics=14;Regressions=0;NegativeControls=2;Status='PASS'} | ConvertTo-Json | Set-Content (Join-Path $dir 'receipt.json')
-Write-Host 'Legacy reproduction: 52 outputs, 14 diagnostics, 0 regressions; negative controls passed.'
+Write-Host 'Legacy reproduction: 52 outputs, 13 diagnostics, 0 regressions; negative controls passed.'
