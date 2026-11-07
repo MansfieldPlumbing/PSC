@@ -5,6 +5,11 @@
 7.7.0-preview.5 / .NET 11.0.0-rc.1.26425.128 on Windows x64.
 The original 19-suite runner passed. All 52 deterministic output records
 and 14 diagnostics agreed with the earlier ignored consolidation evidence.
+13 diagnostics remain. `RejectSwitch` (an integer `switch` with a constant
+clause) was retired with Scott's approval on 2026-11-07: integer and enum
+`switch` statements are lowered since f08d89f, and `tests/Test-Rejections.ps1`
+has rejected only string-subject and `-Regex` switches since 85e809d. The 52
+outputs and the other 13 diagnostics are unchanged.
 Two nondeterministic SMA experiment assemblies and one additional smoke
 output in the old capture are outside that historical 52-output corpus.
 

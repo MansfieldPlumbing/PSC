@@ -1008,11 +1008,6 @@
       "Message": "AST admission failed:\n[3:28] Multi-element pipelines are not allowed in compiled methods. (near '$a | Out-Null')\n[3:33] Commands and cmdlets are not allowed in compiled methods. (near 'Out-Null')"
     },
     {
-      "Case": "RejectSwitch",
-      "Source": "class RejectSwitch {\n    static [int] M() {\n        [int] $i = 1; switch ($i) { 1 { $i = 2 } }; return $i\n    }\n}\r\n",
-      "Message": "[3:23] Unsupported AST statement 'switch ($i) { 1 { $i = 2 } }' (SwitchStatementAst)."
-    },
-    {
       "Case": "RejectUntypedParameter",
       "Source": "class RejectUntypedParameter {\n    static [int] M($x) { return 0 }\n}\r\n",
       "Message": "[2:20] Parameter $x needs a type."

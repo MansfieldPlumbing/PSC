@@ -50,7 +50,7 @@ rejects implementation loaders and additional implementation files, and runs
 all four modes and help in a fresh process from an unrelated directory.
 `tests/Test-LegacyReproduction.ps1` rebuilds 52 historical outputs and compares
 exact SHA-256, MVID and full assembly references with the frozen
-[`218f54e` baseline](tests/baseline/README.md), plus 14 exact diagnostics.
+[`218f54e` baseline](tests/baseline/README.md), plus 13 exact diagnostics.
 Altered expected artifacts and diagnostics must fail the verifier process.
 
 Native indirect calls and callbacks are described in

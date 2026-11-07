@@ -1236,12 +1236,42 @@ function Test-AstAdmitted {
 
     $violations = [System.Collections.Generic.List[pscustomobject]]::new()
 
+    # A lowered unit consists of its compiled classes, not the surrounding
+    # PowerShell host script. String throws intentionally lose SMA identity;
+    # catches in that unit must not depend on SMA exception inspection.
+    $unit = $Ast
+    while ($unit.Parent) { $unit = $unit.Parent }
+    foreach ($typeAst in $unit.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] }, $true)) {
+        foreach ($catchAst in $typeAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CatchClauseAst] }, $true)) {
+            foreach ($catchType in $catchAst.CatchTypes) {
+                $resolved = Resolve-AstType $catchType.TypeName
+                if ($resolved.Assembly.GetName().Name -eq 'System.Management.Automation' -and [Exception].IsAssignableFrom($resolved)) {
+                    throw "[$($catchType.Extent.File):$($catchType.Extent.StartLineNumber)] ClrOnly catch cannot filter on an SMA exception type."
+                }
+            }
+            foreach ($read in $catchAst.Body.FindAll({ param($n)
+                ($n -is [System.Management.Automation.Language.MemberExpressionAst] -and $n.Member -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $n.Member.Value -eq 'ErrorRecord') -or
+                ($n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.UserPath -in '_', 'PSItem', 'Error', 'ErrorRecord')
+            }, $true)) {
+                $target = $read
+                if ($target.Parent -is [System.Management.Automation.Language.ConvertExpressionAst]) { $target = $target.Parent }
+                if ($target.Parent -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                    $target.Parent.Operator -eq [System.Management.Automation.Language.TokenKind]::Equals -and
+                    [object]::ReferenceEquals($target.Parent.Left, $target)) { continue }
+                throw "[$($read.Extent.File):$($read.Extent.StartLineNumber)] ClrOnly catch cannot read ErrorRecord, `$_, `$PSItem or `$Error."
+            }
+        }
+    }
+
     # Disallowed AST node types in compiled methods
     $disallowed = $Ast.FindAll({
         param($node)
         $node -is [System.Management.Automation.Language.CommandAst] -or
         ($node -is [System.Management.Automation.Language.PipelineAst] -and $node.PipelineElements.Count -gt 1) -or
-        ($node -is [System.Management.Automation.Language.ScriptBlockExpressionAst] -and $node.Parent -isnot [System.Management.Automation.Language.DynamicKeywordStatementAst]) -or
+        ($node -is [System.Management.Automation.Language.ScriptBlockExpressionAst] -and
+            $node.Parent -isnot [System.Management.Automation.Language.DynamicKeywordStatementAst] -and
+            -not ($node.Parent -is [System.Management.Automation.Language.SwitchStatementAst] -and
+                @($node.Parent.Clauses | Where-Object { [object]::ReferenceEquals($_.Item1, $node) }).Count -eq 1)) -or
         $node -is [System.Management.Automation.Language.ExpandableStringExpressionAst]
     }, $true)
 
@@ -1662,7 +1692,10 @@ function ConvertTo-PowerShellType {
     if ($from -eq $Type) { return $Expression }
     if ($Type -eq [void]) { return [Linq.Expressions.Expression]::Block($Expression, [Linq.Expressions.Expression]::Empty()) }
     if ($from -in $script:IntegralTypes -and $Type -eq [char]) {
-        return [Linq.Expressions.Expression]::ConvertChecked($Expression, $Type)
+        # PowerShell's integral-to-Char cast checks the UTF-16 code-unit range.
+        # A plain conv.u2 would silently truncate negative or oversized values.
+        $convert = [Convert].GetMethod('ToChar', [Type[]]@($from))
+        return [Linq.Expressions.Expression]::Call($convert, $Expression)
     }
     if ($from -in $script:FloatingTypes -and $Type -in $script:IntegralTypes) {
         $convert = [Convert].GetMethod("To$($Type.Name)", [Type[]]@($from))
@@ -1916,13 +1949,15 @@ function Read-PowerShellClass {
     #>
     param(
         [Parameter(Mandatory)][string] $Source,
-        [Parameter()][string] $ClassName
+        [Parameter()][string] $ClassName,
+        [Parameter()][string] $SourceFile = ''
     )
 
     $tokens = $null
     $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseInput(
         $Source,
+        $SourceFile,
         [ref]$tokens,
         [ref]$errors
     )
@@ -1966,12 +2001,37 @@ function Read-PowerShellClass {
     }
 }
 
+function Add-GenericInference([Type] $Pattern, [Type] $Actual, [hashtable] $Bindings) {
+    # Structural inference only: do not guess a common type for conflicting
+    # occurrences of T or infer a type parameter solely from a return type.
+    if ($Pattern.IsGenericParameter) {
+        if ($Bindings.ContainsKey($Pattern)) { return $Bindings[$Pattern] -eq $Actual }
+        $Bindings[$Pattern] = $Actual
+        return $true
+    }
+    if ($Pattern.IsArray) {
+        if (-not $Actual.IsArray -or $Pattern.GetArrayRank() -ne $Actual.GetArrayRank() -or $Pattern.IsSZArray -ne $Actual.IsSZArray) { return $false }
+        return Add-GenericInference $Pattern.GetElementType() $Actual.GetElementType() $Bindings
+    }
+    if ($Pattern.IsGenericType) {
+        if (-not $Actual.IsGenericType -or $Pattern.GetGenericTypeDefinition() -ne $Actual.GetGenericTypeDefinition()) { return $false }
+        $patterns = $Pattern.GetGenericArguments()
+        $actuals = $Actual.GetGenericArguments()
+        for ($i = 0; $i -lt $patterns.Length; $i++) {
+            if (-not (Add-GenericInference $patterns[$i] $actuals[$i] $Bindings)) { return $false }
+        }
+        return $true
+    }
+    return $Pattern.IsAssignableFrom($Actual)
+}
+
 function Resolve-MatchingMethod {
     param(
         [Parameter(Mandatory)][Type] $TargetType,
         [Parameter(Mandatory)][string] $MethodName,
         [Parameter(Mandatory)][AllowEmptyCollection()][Type[]] $ArgumentTypes,
-        [switch] $IsStatic
+        [switch] $IsStatic,
+        [System.Management.Automation.Language.IScriptExtent] $SourceExtent
     )
 
     $flags = [Reflection.BindingFlags]'Public'
@@ -1983,7 +2043,7 @@ function Resolve-MatchingMethod {
 
     # 1. Exact match
     $exact = $TargetType.GetMethod($MethodName, $flags, $null, $ArgumentTypes, $null)
-    if ($null -ne $exact) { return $exact }
+    if ($null -ne $exact -and -not $exact.ContainsGenericParameters) { return $exact }
 
     # 2. Compatible match
     $all = @($TargetType.GetMethods($flags) | Where-Object {
@@ -1991,6 +2051,7 @@ function Resolve-MatchingMethod {
     })
 
     foreach ($candidate in $all) {
+        if ($candidate.ContainsGenericParameters) { continue }
         $params = $candidate.GetParameters()
         $match = $true
         for ($i = 0; $i -lt $params.Length; $i++) {
@@ -2003,7 +2064,9 @@ function Resolve-MatchingMethod {
     }
 
     # 3. The one overload reachable by integer conversion; the call site converts each argument, checked.
+    # An open generic definition is never callable as it stands; step 4 closes it or rejects it.
     $reachable = @($all | Where-Object {
+        if ($_.ContainsGenericParameters) { return $false }
         $params = $_.GetParameters()
         for ($i = 0; $i -lt $params.Length; $i++) {
             $wanted = $params[$i].ParameterType
@@ -2013,7 +2076,43 @@ function Resolve-MatchingMethod {
     })
     if ($reachable.Count -eq 1) { return $reachable[0] }
 
-    throw "Could not resolve method '$MethodName' with argument types ($($ArgumentTypes -join ', ')) on '$($TargetType.FullName)'."
+    $failure = "Could not resolve method '$MethodName' with argument types ($($ArgumentTypes -join ', ')) on '$($TargetType.FullName)'."
+    # 4. Static generic method definitions, closed by structural inference from the argument types. The
+    # non-generic binder above and its diagnostics are unchanged; this runs only when it found nothing.
+    $genericCandidates = @($all | Where-Object { $IsStatic -and $_.IsGenericMethodDefinition })
+    if ($genericCandidates.Count -eq 0) { throw $failure }
+    $tried = [Collections.Generic.List[string]]::new()
+    $applicable = [Collections.Generic.List[object]]::new()
+    foreach ($candidate in $genericCandidates) {
+        $bindings = @{}
+        $parameters = $candidate.GetParameters()
+        $inferred = $true
+        for ($i = 0; $i -lt $parameters.Length; $i++) {
+            if (-not (Add-GenericInference $parameters[$i].ParameterType $ArgumentTypes[$i] $bindings)) { $inferred = $false; break }
+        }
+        $typeArguments = [Type[]]@($candidate.GetGenericArguments() | ForEach-Object { $bindings[$_] })
+        if (-not $inferred -or $typeArguments -contains $null) {
+            $tried.Add("${candidate}: conflicting or uninferred type parameters")
+            continue
+        }
+        try { $closed = $candidate.MakeGenericMethod($typeArguments) }
+        catch [ArgumentException] { $tried.Add("${candidate}: inferred arguments violate generic constraints"); continue }
+        $closedParameters = $closed.GetParameters()
+        $matchesArguments = $true
+        $isExact = $true
+        for ($i = 0; $i -lt $closedParameters.Length; $i++) {
+            if (-not $closedParameters[$i].ParameterType.IsAssignableFrom($ArgumentTypes[$i])) { $matchesArguments = $false; break }
+            if ($closedParameters[$i].ParameterType -ne $ArgumentTypes[$i]) { $isExact = $false }
+        }
+        if ($matchesArguments) { $applicable.Add([pscustomobject]@{ Method = $closed; Exact = $isExact }) }
+        $tried.Add("${candidate}: closed as $closed")
+    }
+    $best = @($applicable | Where-Object Exact)
+    if ($best.Count -eq 0) { $best = @($applicable) }
+    if ($best.Count -eq 1) { return $best[0].Method }
+    if ($best.Count -gt 1) { $failure = "Ambiguous generic method '$MethodName' on '$($TargetType.FullName)'." }
+    if ($SourceExtent) { $failure = '[{0}:{1}] {2}' -f $SourceExtent.StartLineNumber, $SourceExtent.StartColumnNumber, $failure }
+    throw ($failure + ' Candidates tried: ' + ($tried -join '; '))
 }
 
 function Resolve-MatchingConstructor {
@@ -2140,6 +2239,9 @@ function Convert-AstExpression {
                 throw "[{0}:{1}] `$this is not available in a static method." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber
             }
             return $Scope.This
+        }
+        if (($varName -in '_', 'PSItem') -and $Scope.ContainsKey('SwitchItem')) {
+            return $Scope.SwitchItem
         }
         if ($Scope.Parameters.ContainsKey($varName)) {
             return $Scope.Parameters[$varName]
@@ -2285,6 +2387,30 @@ function Convert-AstExpression {
     # 8. Binary arithmetic and comparison expressions
     if ($Node -is [System.Management.Automation.Language.BinaryExpressionAst]) {
         $left = Convert-AstExpression -Node $Node.Left -Scope $Scope
+        if ($Node.Operator -in 'Iin', 'Inotin', 'Cin', 'Cnotin') {
+            $right = Convert-AstExpressionAs -Node $Node.Right -Type ([string[]]) -Scope $Scope
+            if ($left.Type -ne [string]) {
+                throw "[$($Node.Extent.StartLineNumber):$($Node.Extent.StartColumnNumber)] Membership requires a string value and string[] collection."
+            }
+            $et = [Linq.Expressions.Expression]
+            $id = $Scope.DeclaredLocals.Count
+            $value = $et::Variable([string], "membershipValue$id")
+            $array = $et::Variable([string[]], "membershipArray$id")
+            $index = $et::Variable([int], "membershipIndex$id")
+            $found = $et::Variable([bool], "membershipFound$id")
+            foreach ($local in @($value, $array, $index, $found)) { $Scope.DeclaredLocals.Add($local) }
+            $done = $et::Label("membershipDone$id")
+            $compare = New-PowerShellStringComparison -Left ($et::ArrayIndex($array, $index)) -Right $value -CaseSensitive ([string]$Node.Operator).StartsWith('C', [StringComparison]::Ordinal)
+            $loop = $et::Loop($et::IfThenElse($et::LessThan($index, $et::ArrayLength($array)),
+                $et::Block($et::IfThen($et::Equal($compare, $et::Constant(0)),
+                    $et::Block($et::Assign($found, $et::Constant($true)), $et::Break($done))),
+                    $et::Assign($index, $et::Add($index, $et::Constant(1))), $et::Empty()),
+                $et::Break($done)), $done)
+            $result = if ($Node.Operator -in 'Inotin', 'Cnotin') { $et::Not($found) } else { $found }
+            return $et::Block($et::Assign($value, $left), $et::Assign($array, $right),
+                $et::Assign($index, $et::Constant(0)), $et::Assign($found, $et::Constant($false)),
+                $et::IfThen($et::NotEqual($array, $et::Constant($null, [string[]])), $loop), $result)
+        }
         $right = Convert-AstExpression -Node $Node.Right -Scope $Scope
 
         if ($Node.Operator -in 'Shl', 'Shr') {
@@ -2434,7 +2560,7 @@ function Convert-AstExpression {
             }
 
             # Static method call: [T]::Method(...)
-            $method = Resolve-MatchingMethod -TargetType $targetType -MethodName $memberName -ArgumentTypes $argTypes -IsStatic
+            $method = Resolve-MatchingMethod -TargetType $targetType -MethodName $memberName -ArgumentTypes $argTypes -IsStatic -SourceExtent $Node.Extent
             if ($method.IsDefined([Runtime.InteropServices.UnmanagedCallersOnlyAttribute],$false)) {
                 throw ('[{0}:{1}] UnmanagedCallersOnly method cannot be called from managed code.' -f $Node.Extent.StartLineNumber,$Node.Extent.StartColumnNumber)
             }
@@ -2508,6 +2634,110 @@ function Convert-AstExpression {
         $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $Node.Extent.Text, $Node.GetType().Name
 }
 
+function New-PredicateTruth {
+    param([Linq.Expressions.Expression] $Value)
+    $et = [Linq.Expressions.Expression]
+    if ($Value.Type -eq [bool]) { return $Value }
+    if ($Value.Type -eq [string]) {
+        return $et::Not($et::Call([string].GetMethod('IsNullOrEmpty', [type[]]@([string])), $Value))
+    }
+    if ($Value.Type -in ($script:IntegralTypes + @([single], [double], [decimal]))) {
+        return $et::NotEqual($Value, $et::Default($Value.Type))
+    }
+    if ($Value.Type.IsArray -and $Value.Type.GetArrayRank() -eq 1) {
+        $item = $et::ArrayIndex($Value, $et::Constant(0))
+        # PowerShell treats a nested singleton list by the nested list's
+        # count, rather than recursively testing its first element.
+        $one = if ($item.Type.IsArray) {
+            $et::AndAlso($et::NotEqual($item, $et::Constant($null, $item.Type)),
+                $et::GreaterThan($et::ArrayLength($item), $et::Constant(0)))
+        } else { New-PredicateTruth $item }
+        return $et::AndAlso($et::NotEqual($Value, $et::Constant($null, $Value.Type)),
+            $et::AndAlso($et::GreaterThan($et::ArrayLength($Value), $et::Constant(0)),
+                $et::OrElse($et::GreaterThan($et::ArrayLength($Value), $et::Constant(1)), $one)))
+    }
+    if ($Value -is [Linq.Expressions.ConstantExpression] -and $null -eq $Value.Value) {
+        return $et::Constant($false)
+    }
+    throw "Predicate truthiness requires a statically typed Boolean, string, number or one-dimensional array; got '$($Value.Type.FullName)'."
+}
+
+function Convert-PredicateSwitch {
+    param([System.Management.Automation.Language.SwitchStatementAst] $Statement, [hashtable] $Scope)
+    $et = [Linq.Expressions.Expression]
+    $flags = [int]$Statement.Flags
+    $caseSensitive = [int][System.Management.Automation.Language.SwitchFlags]::CaseSensitive
+    if ($flags -band (-bnot $caseSensitive)) {
+        throw "[$($Statement.Extent.StartLineNumber):$($Statement.Extent.StartColumnNumber)] Predicate switch admits exact matching only."
+    }
+    $inputValue = Convert-AstExpression -Node $Statement.Condition -Scope $Scope
+    if ($inputValue.Type -ne [string] -and $inputValue.Type -ne [string[]]) {
+        throw "[$($Statement.Extent.StartLineNumber):$($Statement.Extent.StartColumnNumber)] Predicate switch input must be string or string[]."
+    }
+    $id = $Scope.DeclaredLocals.Count
+    $values = $et::Variable([string[]], "switchValues$id")
+    $item = $et::Variable([string], "switchItem$id")
+    $index = $et::Variable([int], "switchIndex$id")
+    $matched = $et::Variable([bool], "switchMatched$id")
+    foreach ($local in @($values, $item, $index, $matched)) { $Scope.DeclaredLocals.Add($local) }
+    $breakLabel = $et::Label("switchBreak$id")
+    $continueLabel = $et::Label("switchContinue$id")
+    $hadItem = $Scope.ContainsKey('SwitchItem')
+    $oldItem = if ($hadItem) { $Scope.SwitchItem } else { $null }
+    $Scope.SwitchItem = $item
+    $Scope.Loops.Push(@{ Break = $breakLabel; Continue = $continueLabel })
+    $chain = [Collections.Generic.List[Linq.Expressions.Expression]]::new()
+    $chain.Add($et::Assign($item, $et::ArrayIndex($values, $index)))
+    $chain.Add($et::Assign($matched, $et::Constant($false)))
+    try {
+        foreach ($clause in $Statement.Clauses) {
+            if ($clause.Item1 -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) {
+                $predicate = $clause.Item1.ScriptBlock
+                if ($predicate.ParamBlock -or $predicate.BeginBlock -or $predicate.ProcessBlock -or
+                    -not $predicate.EndBlock -or $predicate.EndBlock.Statements.Count -ne 1 -or
+                    $predicate.EndBlock.Statements[0] -isnot [System.Management.Automation.Language.PipelineAst]) {
+                    throw "[$($predicate.Extent.StartLineNumber):$($predicate.Extent.StartColumnNumber)] Predicate must contain one typed expression."
+                }
+                if ($predicate.Find({ param($n) $n -is [System.Management.Automation.Language.UnaryExpressionAst] -and
+                    $n.TokenKind -in 'PostfixPlusPlus','PrefixPlusPlus','PostfixMinusMinus','PrefixMinusMinus' }, $true)) {
+                    throw "[$($predicate.Extent.StartLineNumber):$($predicate.Extent.StartColumnNumber)] Predicate local variable mutation is not admitted."
+                }
+                $value = Convert-AstExpression -Node $predicate.EndBlock.Statements[0] -Scope $Scope
+                # Capture the expression once before testing its truthiness.
+                $result = $et::Variable($value.Type, "switchPredicate$($Scope.DeclaredLocals.Count)")
+                $Scope.DeclaredLocals.Add($result)
+                $condition = $et::Block($et::Assign($result, $value), (New-PredicateTruth $result))
+            } else {
+                $constant = Convert-AstExpression -Node $clause.Item1 -Scope $Scope
+                if ($constant.Type -ne [string]) { throw 'Mixed predicate switch clauses must be string constants.' }
+                # Switch exact matching treats null as the empty string.
+                $text = $et::Condition($et::Equal($item, $et::Constant($null, [string])), $et::Constant(''), $item)
+                $comparison = New-PowerShellStringComparison -Left $text -Right $constant -CaseSensitive ([bool]($flags -band $caseSensitive))
+                $condition = $et::Equal($comparison, $et::Constant(0))
+            }
+            $body = Convert-AstStatement -Statement $clause.Item2 -Scope $Scope
+            $chain.Add($et::IfThen($condition, $et::Block(
+                $et::Assign($matched, $et::Constant($true)), $body, $et::Empty())))
+        }
+        if ($Statement.Default) {
+            $chain.Add($et::IfThen($et::Not($matched), (Convert-AstStatement -Statement $Statement.Default -Scope $Scope)))
+        }
+    } finally {
+        $null = $Scope.Loops.Pop()
+        if ($hadItem) { $Scope.SwitchItem = $oldItem } else { $Scope.Remove('SwitchItem') }
+    }
+    $chain.Add($et::Label($continueLabel))
+    $chain.Add($et::Assign($index, $et::Add($index, $et::Constant(1))))
+    $chain.Add($et::Empty())
+    $loop = $et::Loop($et::IfThenElse($et::LessThan($index, $et::ArrayLength($values)),
+        $et::Block([Linq.Expressions.Expression[]]$chain.ToArray()), $et::Break($breakLabel)), $breakLabel)
+    $arrayValue = if ($inputValue.Type -eq [string]) { $et::NewArrayInit([string], [Linq.Expressions.Expression[]]@($inputValue)) } else { $inputValue }
+    return $et::Block($et::Assign($values, $arrayValue),
+        $et::IfThen($et::Equal($values, $et::Constant($null, [string[]])),
+            $et::Block($et::Assign($values, $et::NewArrayInit([string], [Linq.Expressions.Expression[]]@($et::Constant($null, [string])))), $et::Empty())),
+        $et::Assign($index, $et::Constant(0)), $loop, $et::Empty())
+}
+
 function Convert-AstStatement {
     <#
     .SYNOPSIS
@@ -2520,6 +2750,13 @@ function Convert-AstStatement {
         [Parameter(Mandatory)]
         [hashtable] $Scope
     )
+
+    # A predicate switch is an ordered chain, with a lexically bound current
+    # string. No delegate or nested lambda is emitted for its predicates.
+    if ($Statement -is [System.Management.Automation.Language.SwitchStatementAst] -and
+        @($Statement.Clauses | Where-Object { $_.Item1 -is [System.Management.Automation.Language.ScriptBlockExpressionAst] }).Count -gt 0) {
+        return Convert-PredicateSwitch -Statement $Statement -Scope $Scope
+    }
 
     # 1. Assignment statement: $x = <expr>, [int]$x = <expr>, or $arr[$i] = <expr>
     if ($Statement -is [System.Management.Automation.Language.AssignmentStatementAst]) {
@@ -2636,6 +2873,11 @@ function Convert-AstStatement {
         else {
             throw "[{0}:{1}] Unsupported assignment target '{2}'." -f `
                 $Statement.Extent.StartLineNumber, $Statement.Extent.StartColumnNumber, $leftNode.Extent.Text
+        }
+
+        if (($varName -in '_', 'PSItem') -and $Scope.ContainsKey('SwitchItem')) {
+            $value = Convert-AstExpressionAs -Node $Statement.Right -Type $Scope.SwitchItem.Type -Scope $Scope
+            return [Linq.Expressions.Expression]::Assign($Scope.SwitchItem, $value)
         }
 
         $knownType = if ($explicitType) { $explicitType }
@@ -2792,13 +3034,33 @@ function Convert-AstStatement {
     if ($Statement -is [System.Management.Automation.Language.ThrowStatementAst]) {
         if ($Statement.Pipeline) {
             $exExpr = Convert-AstExpression -Node $Statement.Pipeline -Scope $Scope
-            # PowerShell throws a message as an exception carrying it; CoreLib's Exception carries it here.
+            # ClrOnly string-throw contract: preserve the supplied message in
+            # InvalidOperationException. SMA RuntimeException identity is not
+            # preserved. The admission pass rejects SMA-dependent catches.
             if ($exExpr.Type -eq [string]) {
-                $exExpr = $script:ExpressionNewMethod.Invoke($null, @([Exception].GetConstructor([Type[]]@([string])), [Linq.Expressions.Expression[]]@($exExpr)))
+                $ctor = [InvalidOperationException].GetConstructor([type[]]@([string]))
+                $exception = $script:ExpressionNewMethod.Invoke($null, [object[]]@($ctor, [Linq.Expressions.Expression[]]@($exExpr)))
+                return [Linq.Expressions.Expression]::Throw($exception, [void])
+            }
+            # Explicit CoreLib exception construction retains the previously
+            # admitted structured-exception contract (Slice8Fixture). This
+            # does not admit exception variables or ErrorRecord operands.
+            $operand = $Statement.Pipeline
+            while ($operand -is [System.Management.Automation.Language.PipelineAst] -or
+                   $operand -is [System.Management.Automation.Language.CommandExpressionAst] -or
+                   $operand -is [System.Management.Automation.Language.ParenExpressionAst]) {
+                if ($operand -is [System.Management.Automation.Language.PipelineAst]) { $operand = $operand.PipelineElements[0] }
+                elseif ($operand -is [System.Management.Automation.Language.CommandExpressionAst]) { $operand = $operand.Expression }
+                else { $operand = $operand.Pipeline }
+            }
+            if ($operand -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst] -or
+                -not $operand.Static -or $operand.Member.Value -ne 'new' -or
+                -not [Exception].IsAssignableFrom($exExpr.Type) -or $exExpr.Type.Assembly -ne [object].Assembly) {
+                throw "[$($Statement.Extent.File):$($Statement.Extent.StartLineNumber)] Non-string throw operand requires a separate admission decision."
             }
             return [Linq.Expressions.Expression]::Throw($exExpr, [void])
         } else {
-            return [Linq.Expressions.Expression]::Rethrow([void])
+            throw "[$($Statement.Extent.File):$($Statement.Extent.StartLineNumber)] Rethrow requires a separate admission decision."
         }
     }
 
@@ -3407,6 +3669,15 @@ function Get-IlMember([Reflection.MemberInfo] $Member) {
         throw "'$($Member.DeclaringType.Name).$($Member.Name)' is used but not compiled; was it left out with -MethodNames?"
     }
     $declaring = $Member.DeclaringType
+    if ($Member -is [Reflection.MethodInfo] -and $Member.IsConstructedGenericMethod -and -not $declaring.IsConstructedGenericType) {
+        $originalArguments = $Member.GetGenericArguments()
+        $mappedArguments = [Type[]]@($originalArguments | ForEach-Object { Get-IlType $_ })
+        for ($i = 0; $i -lt $originalArguments.Length; $i++) {
+            if ($originalArguments[$i] -ne $mappedArguments[$i]) {
+                return $Member.GetGenericMethodDefinition().MakeGenericMethod($mappedArguments)
+            }
+        }
+    }
     if ($declaring -and $declaring.IsConstructedGenericType) {
         $mapped = Get-IlType $declaring
         if ($mapped -ne $declaring) {
@@ -3423,6 +3694,76 @@ function Get-IlMember([Reflection.MemberInfo] $Member) {
         }
     }
     $Member
+}
+
+# A call's receiver: a reference is loaded; a value type is addressed in its own storage (local, argument,
+# field, array element), so mutations reach it, or else copied once to a temporary.
+function Write-IlReceiver([Reflection.Emit.ILGenerator] $IL, [Linq.Expressions.Expression] $Expr, [hashtable] $Context) {
+    if (-not $Expr.Type.IsValueType) {
+        Write-IlExpression -IL $IL -Expr $Expr -Context $Context
+        return
+    }
+    if ($Expr -is [Linq.Expressions.ParameterExpression]) {
+        if ($Context.Locals.ContainsKey($Expr)) {
+            $IL.Emit([Reflection.Emit.OpCodes]::Ldloca, $Context.Locals[$Expr])
+            return
+        }
+        if ($Context.Parameters.ContainsKey($Expr)) {
+            $IL.Emit([Reflection.Emit.OpCodes]::Ldarga, [int16]$Context.Parameters[$Expr])
+            return
+        }
+        throw "No storage for value-type receiver '$($Expr.Name)'."
+    }
+    if ($Expr -is [Linq.Expressions.MemberExpression] -and $Expr.Member -is [Reflection.FieldInfo] -and
+        -not $Expr.Member.IsInitOnly -and -not $Expr.Member.IsLiteral) {
+        if ($Expr.Expression) {
+            Write-IlReceiver -IL $IL -Expr $Expr.Expression -Context $Context
+            $IL.Emit([Reflection.Emit.OpCodes]::Ldflda, (Get-IlMember $Expr.Member))
+        } else {
+            $IL.Emit([Reflection.Emit.OpCodes]::Ldsflda, (Get-IlMember $Expr.Member))
+        }
+        return
+    }
+    if ($Expr -is [Linq.Expressions.BinaryExpression] -and $Expr.NodeType -eq [Linq.Expressions.ExpressionType]::ArrayIndex) {
+        Write-IlExpression -IL $IL -Expr $Expr.Left -Context $Context
+        Write-IlExpression -IL $IL -Expr $Expr.Right -Context $Context
+        $IL.Emit([Reflection.Emit.OpCodes]::Ldelema, (Get-IlType $Expr.Type))
+        return
+    }
+    if ($Expr -is [Linq.Expressions.IndexExpression] -and $null -eq $Expr.Indexer -and $Expr.Object.Type.IsArray -and $Expr.Arguments.Count -eq 1) {
+        Write-IlExpression -IL $IL -Expr $Expr.Object -Context $Context
+        Write-IlExpression -IL $IL -Expr $Expr.Arguments[0] -Context $Context
+        $IL.Emit([Reflection.Emit.OpCodes]::Ldelema, (Get-IlType $Expr.Type))
+        return
+    }
+    if ($Expr -is [Linq.Expressions.BlockExpression]) {
+        # Array normalization can wrap a storage location in a setup block.
+        foreach ($variable in $Expr.Variables) {
+            if (-not $Context.Locals.ContainsKey($variable)) { $Context.Locals[$variable] = $IL.DeclareLocal((Get-IlType $variable.Type)) }
+        }
+        for ($i = 0; $i -lt $Expr.Expressions.Count - 1; $i++) {
+            Write-IlDiscarded -IL $IL -Expr $Expr.Expressions[$i] -Context $Context
+        }
+        Write-IlReceiver -IL $IL -Expr $Expr.Expressions[$Expr.Expressions.Count - 1] -Context $Context
+        return
+    }
+    # Computed values, properties and readonly fields have no writable storage.
+    # Evaluate exactly once and call on a defensive temporary.
+    $temporary = $IL.DeclareLocal((Get-IlType $Expr.Type))
+    Write-IlExpression -IL $IL -Expr $Expr -Context $Context
+    Write-IlLocalStore -IL $IL -Loc $temporary
+    $IL.Emit([Reflection.Emit.OpCodes]::Ldloca, $temporary)
+}
+
+function Write-IlInstanceCall([Reflection.Emit.ILGenerator] $IL, [Reflection.MethodInfo] $Method, [Type] $ReceiverType) {
+    if ($ReceiverType -and $ReceiverType.IsValueType -and ($Method.IsVirtual -or -not $Method.DeclaringType.IsValueType)) {
+        $IL.Emit([Reflection.Emit.OpCodes]::Constrained, (Get-IlType $ReceiverType))
+        $IL.Emit([Reflection.Emit.OpCodes]::Callvirt, (Get-IlMember $Method))
+    } elseif ($Method.IsVirtual -and -not $Method.DeclaringType.IsValueType) {
+        $IL.Emit([Reflection.Emit.OpCodes]::Callvirt, (Get-IlMember $Method))
+    } else {
+        $IL.Emit([Reflection.Emit.OpCodes]::Call, (Get-IlMember $Method))
+    }
 }
 
 function Write-IlArgumentLoad([Reflection.Emit.ILGenerator]$IL, [int]$Index) {
@@ -3641,29 +3982,6 @@ function Write-IlConversion {
     throw "Unsupported conversion from '$($FromType.FullName)' to '$($ToType.FullName)'."
 }
 
-function Write-IlValueAddress([Reflection.Emit.ILGenerator] $IL, [Linq.Expressions.Expression] $Expr, [hashtable] $Context) {
-    if ($Expr -is [Linq.Expressions.ParameterExpression]) {
-        if ($Context.Locals.ContainsKey($Expr)) { $IL.Emit([Reflection.Emit.OpCodes]::Ldloca, $Context.Locals[$Expr]); return }
-        if ($Context.Parameters.ContainsKey($Expr)) { $IL.Emit([Reflection.Emit.OpCodes]::Ldarga, [short]$Context.Parameters[$Expr]); return }
-        throw "No storage for value-type receiver '$($Expr.Name)'."
-    }
-    if ($Expr -is [Linq.Expressions.MemberExpression] -and $Expr.Member -is [Reflection.FieldInfo] -and -not $Expr.Member.IsLiteral -and -not $Expr.Member.IsInitOnly) {
-        $field = Get-IlMember $Expr.Member
-        if ($Expr.Member.IsStatic) { $IL.Emit([Reflection.Emit.OpCodes]::Ldsflda, $field); return }
-        if ($Expr.Expression.Type.IsValueType) { Write-IlValueAddress $IL $Expr.Expression $Context }
-        else { Write-IlExpression -IL $IL -Expr $Expr.Expression -Context $Context }
-        $IL.Emit([Reflection.Emit.OpCodes]::Ldflda, $field); return
-    }
-    if ($Expr -is [Linq.Expressions.BinaryExpression] -and $Expr.NodeType -eq [Linq.Expressions.ExpressionType]::ArrayIndex) {
-        Write-IlExpression -IL $IL -Expr $Expr.Left -Context $Context
-        Write-IlExpression -IL $IL -Expr $Expr.Right -Context $Context
-        $IL.Emit([Reflection.Emit.OpCodes]::Ldelema, (Get-IlType $Expr.Type)); return
-    }
-    $temporary = $IL.DeclareLocal((Get-IlType $Expr.Type))
-    Write-IlExpression -IL $IL -Expr $Expr -Context $Context
-    $IL.Emit([Reflection.Emit.OpCodes]::Stloc, $temporary)
-    $IL.Emit([Reflection.Emit.OpCodes]::Ldloca, $temporary)
-}
 
 # Every expression leaves its value on the stack. Where a consumer does not want that value (a statement in a
 # block, a void branch, a loop or try body), it emits the expression through this, which drops the value.
@@ -3673,8 +3991,65 @@ function Write-IlDiscarded {
         [Parameter(Mandatory)][Linq.Expressions.Expression] $Expr,
         [Parameter(Mandatory)][hashtable] $Context
     )
+    # A discarded assignment stores without keeping its value: no dup, temporary or pop.
+    if ($Expr.NodeType -eq [Linq.Expressions.ExpressionType]::Assign) {
+        Write-IlAssign -IL $IL -Expr $Expr -Context $Context -Discard
+        return
+    }
     Write-IlExpression -IL $IL -Expr $Expr -Context $Context
     if ($Expr.Type -ne [void]) { $IL.Emit([Reflection.Emit.OpCodes]::Pop) }
+}
+
+function Write-IlAssign {
+    <#
+    .SYNOPSIS
+        Emits an assignment. By default its value, the value stored, is left on the stack; a store that
+        consumes the stack keeps it in a temporary. With -Discard nothing is left and no copy is made.
+    #>
+    param(
+        [Parameter(Mandatory)][Reflection.Emit.ILGenerator] $IL,
+        [Parameter(Mandatory)][Linq.Expressions.BinaryExpression] $Expr,
+        [Parameter(Mandatory)][hashtable] $Context,
+        [switch] $Discard
+    )
+    $left = $Expr.Left
+    if ($left -is [Linq.Expressions.ParameterExpression]) {
+        Write-IlExpression -IL $IL -Expr $Expr.Right -Context $Context
+        if (-not $Discard) { $IL.Emit([Reflection.Emit.OpCodes]::Dup) }
+        if ($Context.Locals.ContainsKey($left)) { Write-IlLocalStore -IL $IL -Loc $Context.Locals[$left]; return }
+        if ($Context.Parameters.ContainsKey($left)) { Write-IlArgumentStore -IL $IL -Index $Context.Parameters[$left]; return }
+        throw "No storage for assignment target '$($left.Name)'."
+    }
+    if ($left -is [Linq.Expressions.MemberExpression] -and $left.Member -is [Reflection.FieldInfo] -and $left.Member.IsStatic) {
+        Write-IlExpression -IL $IL -Expr $Expr.Right -Context $Context
+        if (-not $Discard) { $IL.Emit([Reflection.Emit.OpCodes]::Dup) }
+        $IL.Emit([Reflection.Emit.OpCodes]::Stsfld, (Get-IlMember $left.Member))
+        return
+    }
+    # The remaining targets consume a receiver (and an index) beneath the value.
+    if ($left -is [Linq.Expressions.IndexExpression]) {
+        if ($null -ne $left.Indexer) { Write-IlReceiver -IL $IL -Expr $left.Object -Context $Context }
+        else { Write-IlExpression -IL $IL -Expr $left.Object -Context $Context }
+        Write-IlExpression -IL $IL -Expr $left.Arguments[0] -Context $Context
+    } elseif ($left -is [Linq.Expressions.MemberExpression]) {
+        if ($left.Expression) { Write-IlReceiver -IL $IL -Expr $left.Expression -Context $Context }
+    } else {
+        throw "Assignment to unsupported target expression '$($left.GetType().FullName)'."
+    }
+    $value = $null
+    if ($Discard) { Write-IlExpression -IL $IL -Expr $Expr.Right -Context $Context }
+    else { $value = Write-IlStoredValue -IL $IL -Expr $Expr.Right -Context $Context }
+    if ($left -is [Linq.Expressions.IndexExpression] -and $null -ne $left.Indexer) {
+        Write-IlInstanceCall -IL $IL -Method $left.Indexer.GetSetMethod() -ReceiverType $left.Object.Type
+    } elseif ($left -is [Linq.Expressions.IndexExpression]) {
+        Write-IlArrayStore -IL $IL -ElementType $left.Type
+    } elseif ($left.Member -is [Reflection.FieldInfo]) {
+        $IL.Emit([Reflection.Emit.OpCodes]::Stfld, (Get-IlMember $left.Member))
+    } else {
+        $receiverType = if ($left.Expression) { $left.Expression.Type } else { $null }
+        Write-IlInstanceCall -IL $IL -Method $left.Member.GetSetMethod() -ReceiverType $receiverType
+    }
+    if (-not $Discard) { Write-IlLocalLoad -IL $IL -Loc $value }
 }
 
 # Emits a value about to be stored by an instruction that consumes it, keeping a copy in a temporary of its
@@ -3907,31 +4282,21 @@ function Write-IlExpression {
     # 9.4 Method call (MethodCallExpression)
     if ($Expr -is [Linq.Expressions.MethodCallExpression]) {
         if ($Expr.Object) {
-            if ($Expr.Object.Type.IsValueType) { Write-IlValueAddress $IL $Expr.Object $Context }
-            else { Write-IlExpression -IL $IL -Expr $Expr.Object -Context $Context }
+            Write-IlReceiver -IL $IL -Expr $Expr.Object -Context $Context
         }
         foreach ($arg in $Expr.Arguments) {
             Write-IlExpression -IL $IL -Expr $arg -Context $Context
         }
-        if ($Expr.Object -and $Expr.Object.Type.IsValueType -and -not $Expr.Method.DeclaringType.IsValueType) {
-            $IL.Emit([Reflection.Emit.OpCodes]::Constrained, (Get-IlType $Expr.Object.Type))
-            $IL.Emit([Reflection.Emit.OpCodes]::Callvirt, (Get-IlMember $Expr.Method))
-        } elseif ($Expr.Method.IsVirtual -and -not $Expr.Method.DeclaringType.IsValueType) {
-            $IL.Emit([Reflection.Emit.OpCodes]::Callvirt, (Get-IlMember $Expr.Method))
-        } else {
-            $IL.Emit([Reflection.Emit.OpCodes]::Call, (Get-IlMember $Expr.Method))
-        }
+        $receiverType = if ($Expr.Object) { $Expr.Object.Type } else { $null }
+        Write-IlInstanceCall -IL $IL -Method $Expr.Method -ReceiverType $receiverType
         return
     }
 
     # 9.3 List element read through an indexer property (List[T].Item)
     if ($Expr -is [Linq.Expressions.IndexExpression] -and $null -ne $Expr.Indexer -and $Expr.Arguments.Count -eq 1) {
-        if ($Expr.Object.Type.IsValueType) { Write-IlValueAddress $IL $Expr.Object $Context }
-        else { Write-IlExpression -IL $IL -Expr $Expr.Object -Context $Context }
+        Write-IlReceiver -IL $IL -Expr $Expr.Object -Context $Context
         Write-IlExpression -IL $IL -Expr $Expr.Arguments[0] -Context $Context
-        $getter = $Expr.Indexer.GetGetMethod()
-        $op = if ($getter.IsVirtual -and -not $getter.DeclaringType.IsValueType) { [Reflection.Emit.OpCodes]::Callvirt } else { [Reflection.Emit.OpCodes]::Call }
-        $IL.Emit($op, (Get-IlMember $getter))
+        Write-IlInstanceCall -IL $IL -Method $Expr.Indexer.GetGetMethod() -ReceiverType $Expr.Object.Type
         return
     }
 
@@ -3948,14 +4313,10 @@ function Write-IlExpression {
         if ($Expr.Member -is [Reflection.PropertyInfo]) {
             $getter = $Expr.Member.GetGetMethod()
             if ($Expr.Expression) {
-                if ($Expr.Expression.Type.IsValueType) { Write-IlValueAddress $IL $Expr.Expression $Context }
-                else { Write-IlExpression -IL $IL -Expr $Expr.Expression -Context $Context }
+                Write-IlReceiver -IL $IL -Expr $Expr.Expression -Context $Context
             }
-            if ($getter.IsVirtual -and -not $getter.DeclaringType.IsValueType) {
-                $IL.Emit([Reflection.Emit.OpCodes]::Callvirt, (Get-IlMember $getter))
-            } else {
-                $IL.Emit([Reflection.Emit.OpCodes]::Call, (Get-IlMember $getter))
-            }
+            $receiverType = if ($Expr.Expression) { $Expr.Expression.Type } else { $null }
+            Write-IlInstanceCall -IL $IL -Method $getter -ReceiverType $receiverType
             return
         }
         if ($Expr.Member -is [Reflection.FieldInfo]) {
@@ -3967,7 +4328,7 @@ function Write-IlExpression {
                 return
             }
             if ($Expr.Expression) {
-                Write-IlExpression -IL $IL -Expr $Expr.Expression -Context $Context
+                Write-IlReceiver -IL $IL -Expr $Expr.Expression -Context $Context
                 $IL.Emit([Reflection.Emit.OpCodes]::Ldfld, (Get-IlMember $Expr.Member))
             } else {
                 $IL.Emit([Reflection.Emit.OpCodes]::Ldsfld, (Get-IlMember $Expr.Member))
@@ -4066,64 +4427,10 @@ function Write-IlExpression {
 
     # 12. Binary Expressions (Arithmetic, Assignment, Logic, Comparisons, Index)
     if ($Expr -is [Linq.Expressions.BinaryExpression]) {
-        # An assignment is an expression whose value is the value stored, as in PowerShell and LINQ: every
-        # form leaves it on the stack. A store that consumes the stack keeps the value in a temporary.
+        # An assignment is an expression whose value is the value stored, as in PowerShell and LINQ.
         if ($Expr.NodeType -eq [Linq.Expressions.ExpressionType]::Assign) {
-            if ($Expr.Left -is [Linq.Expressions.ParameterExpression]) {
-                Write-IlExpression -IL $IL -Expr $Expr.Right -Context $Context
-                $IL.Emit([Reflection.Emit.OpCodes]::Dup)
-                if ($Context.Locals.ContainsKey($Expr.Left)) {
-                    Write-IlLocalStore -IL $IL -Loc $Context.Locals[$Expr.Left]
-                    return
-                }
-                if ($Context.Parameters.ContainsKey($Expr.Left)) {
-                    Write-IlArgumentStore -IL $IL -Index $Context.Parameters[$Expr.Left]
-                    return
-                }
-            }
-            if ($Expr.Left -is [Linq.Expressions.IndexExpression] -and $null -ne $Expr.Left.Indexer) {
-                if ($Expr.Left.Object.Type.IsValueType) { Write-IlValueAddress $IL $Expr.Left.Object $Context }
-                else { Write-IlExpression -IL $IL -Expr $Expr.Left.Object -Context $Context }
-                Write-IlExpression -IL $IL -Expr $Expr.Left.Arguments[0] -Context $Context
-                $value = Write-IlStoredValue -IL $IL -Expr $Expr.Right -Context $Context
-                $setter = $Expr.Left.Indexer.GetSetMethod()
-                $op = if ($setter.IsVirtual -and -not $setter.DeclaringType.IsValueType) { [Reflection.Emit.OpCodes]::Callvirt } else { [Reflection.Emit.OpCodes]::Call }
-                $IL.Emit($op, (Get-IlMember $setter))
-                Write-IlLocalLoad -IL $IL -Loc $value
-                return
-            }
-            if ($Expr.Left -is [Linq.Expressions.IndexExpression]) {
-                Write-IlExpression -IL $IL -Expr $Expr.Left.Object -Context $Context
-                Write-IlExpression -IL $IL -Expr $Expr.Left.Arguments[0] -Context $Context
-                $value = Write-IlStoredValue -IL $IL -Expr $Expr.Right -Context $Context
-                Write-IlArrayStore -IL $IL -ElementType $Expr.Left.Type
-                Write-IlLocalLoad -IL $IL -Loc $value
-                return
-            }
-            if ($Expr.Left -is [Linq.Expressions.MemberExpression]) {
-                $member = $Expr.Left.Member
-                if ($member -is [Reflection.FieldInfo] -and $member.IsStatic) {
-                    Write-IlExpression -IL $IL -Expr $Expr.Right -Context $Context
-                    $IL.Emit([Reflection.Emit.OpCodes]::Dup)
-                    $IL.Emit([Reflection.Emit.OpCodes]::Stsfld, (Get-IlMember $member))
-                    return
-                }
-                if ($Expr.Left.Expression) {
-                    if ($Expr.Left.Expression.Type.IsValueType) { Write-IlValueAddress $IL $Expr.Left.Expression $Context }
-                    else { Write-IlExpression -IL $IL -Expr $Expr.Left.Expression -Context $Context }
-                }
-                $value = Write-IlStoredValue -IL $IL -Expr $Expr.Right -Context $Context
-                if ($member -is [Reflection.FieldInfo]) {
-                    $IL.Emit([Reflection.Emit.OpCodes]::Stfld, (Get-IlMember $member))
-                } else {
-                    $setter = $member.GetSetMethod()
-                    $op = if ($setter.IsVirtual -and -not $setter.DeclaringType.IsValueType) { [Reflection.Emit.OpCodes]::Callvirt } else { [Reflection.Emit.OpCodes]::Call }
-                    $IL.Emit($op, (Get-IlMember $setter))
-                }
-                Write-IlLocalLoad -IL $IL -Loc $value
-                return
-            }
-            throw "Assignment to unsupported target expression '$($Expr.Left.GetType().FullName)'."
+            Write-IlAssign -IL $IL -Expr $Expr -Context $Context
+            return
         }
 
         # Array Index Read
@@ -4514,7 +4821,7 @@ function Export-LoweredAssembly {
     }
 
     $source = [IO.File]::ReadAllText($fullSourcePath)
-    $parsed = Read-PowerShellClass -Source $source -ClassName $ClassName
+    $parsed = Read-PowerShellClass -Source $source -ClassName $ClassName -SourceFile $fullSourcePath
     }
     $targetClass = $parsed.ClassAst
     $classAsts = @($parsed.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true) | Where-Object { -not (Test-AttributeClass $_) })
