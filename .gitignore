@@ -5,3 +5,7 @@
 *.log
 .DS_Store
 Thumbs.db
+# Pinned tools: references, not oracles or dependencies; never committed.
+/tools/*/
+# Pinned Native AOT toolchain (ILC, its build files, the Native AOT runtime, MSVC and Windows SDK libraries): never committed.
+/NativeAOT/*/

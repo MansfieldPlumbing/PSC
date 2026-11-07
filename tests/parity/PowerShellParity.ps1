@@ -17,7 +17,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
-$compilerPath = Join-Path $repoRoot 'Export-LoweredAssembly.ps1'
+$compilerPath = Join-Path $repoRoot 'Invoke-PSC.ps1'
 $fixtureRoot = Join-Path $repoRoot 'tests/fixtures'
 $outDir = Join-Path $repoRoot 'build/powershell-parity'
 $null = New-Item -ItemType Directory -Force -Path $outDir

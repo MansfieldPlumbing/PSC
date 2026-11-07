@@ -1,4 +1,4 @@
-# Independent metadata reader for the frozen historical ratchet.
+# Independent metadata reader for the frozen historical outputs.
 function Read-LegacyAssembly([string]$Path) {
     $stream=[IO.File]::OpenRead($Path)
     $pe=[Reflection.PortableExecutable.PEReader]::new($stream)

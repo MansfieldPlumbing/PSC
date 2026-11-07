@@ -17,7 +17,7 @@ $ErrorActionPreference = 'Stop'
 if (-not $IsWindows) { Write-Host 'Native import test needs kernel32; skipped on this platform.'; return }
 
 $repoRoot = Split-Path $PSScriptRoot -Parent
-$compilerPath = Join-Path $repoRoot 'Export-LoweredAssembly.ps1'
+$compilerPath = Join-Path $repoRoot 'Invoke-PSC.ps1'
 $outDir = Join-Path $repoRoot 'build/native-imports'
 $null = New-Item -ItemType Directory -Force -Path $outDir
 

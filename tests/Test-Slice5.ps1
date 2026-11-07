@@ -5,7 +5,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path $PSScriptRoot -Parent
-$compilerPath = Join-Path $repoRoot 'Export-LoweredAssembly.ps1'
+$compilerPath = Join-Path $repoRoot 'Invoke-PSC.ps1'
 
 $fixturePath = Join-Path $PSScriptRoot 'fixtures/Slice5Fixture.ps1'
 $outDir = Join-Path $repoRoot 'build/slice5'

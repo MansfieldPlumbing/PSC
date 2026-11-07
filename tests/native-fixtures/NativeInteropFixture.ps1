@@ -1,4 +1,25 @@
 class NativeInteropFixture {
+    static [System.Threading.SpinWait] $Spinner
+    static [System.Runtime.InteropServices.ComTypes.FILETIME] $Time
+    static [string] $DataText
+    static [int[]] $DataNumbers
+    static [IntPtr] $DataPointer
+    static [byte[]] GuidBytes([string] $text) { return [Guid]::new($text).ToByteArray() }
+    static [string] NumberText([int] $value) { return $value.ToString('X8') }
+    static [long] DateTicks() { return [DateTime]::new([long]123456).Ticks }
+    static [string] ValueTypeName([int] $value) { return $value.GetType().FullName }
+    static [int] MutateStaticValue() { [NativeInteropFixture]::Spinner.SpinOnce(); return [NativeInteropFixture]::Spinner.Count }
+    static [int] MutateLocalValue() { [System.Threading.SpinWait] $local = [NativeInteropFixture]::Spinner; $local.SpinOnce(); return $local.Count }
+    static [int] WriteStructField() { [NativeInteropFixture]::Time.dwLowDateTime = 123; return [NativeInteropFixture]::Time.dwLowDateTime }
+    static [NativeInteropFixture] MakeInstance() { return [NativeInteropFixture]::new() }
+    static [string] ReadData() { return [NativeInteropFixture]::DataText }
+    static [int] DataAt([int] $index) { return [NativeInteropFixture]::DataNumbers[$index] }
+    static [char] Character([int] $value) { return [char]$value }
+    static [int] ListWork() {
+        [System.Collections.Generic.List[int]] $items = [System.Collections.Generic.List[int]]::new()
+        $items.Add(3); $items.Add(5); $items[-1] += 2; $items[0] = 11
+        return $items[-1] + $items[0]
+    }
     [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
     static [uint] ProcessId([IntPtr] $functionPointer) { throw [NotSupportedException]::new() }
     [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvCdecl])]
@@ -62,4 +83,14 @@ class NativeInteropFixture {
             [Runtime.InteropServices.NativeLibrary]::Free($kernel)
         }
     }}
+
+class UnselectedNativeFixture {
+    static [int] $Data
+    static [int] Value() { return 29 }
+}
+
+class DefaultInitializerFixture {
+    [int] $Value = 7
+    static [int] Read() { return [DefaultInitializerFixture]::new().Value }
+}
 

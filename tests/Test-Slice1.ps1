@@ -5,7 +5,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path $PSScriptRoot -Parent
-$compilerPath = Join-Path $repoRoot 'Export-LoweredAssembly.ps1'
+$compilerPath = Join-Path $repoRoot 'Invoke-PSC.ps1'
 
 $fixturePath = Join-Path $PSScriptRoot 'fixtures/Slice1Fixture.ps1'
 $outDir = Join-Path $repoRoot 'build/slice1'
@@ -101,7 +101,7 @@ $loaders = @($compilerAst.FindAll({
 if ($loaders.Count) { throw 'Compiler requires an external implementation loader.' }
 $isolatedDir = Join-Path $repoRoot 'build/single-script'
 $null = New-Item -ItemType Directory -Force -Path $isolatedDir
-$isolatedCompiler = Join-Path $isolatedDir 'Export-LoweredAssembly.ps1'
+$isolatedCompiler = Join-Path $isolatedDir 'Invoke-PSC.ps1'
 Copy-Item -LiteralPath $compilerPath -Destination $isolatedCompiler -Force
 Push-Location ([IO.Path]::GetTempPath())
 try {

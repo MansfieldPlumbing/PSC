@@ -41,7 +41,7 @@ $testSuites = @(
     @{ Name = 'Semantics: Conversion Boundary';              Path = 'tests/Test-ConversionBoundary.ps1';       Args = @() }
     @{ Name = 'Architecture: Single Compiler File';          Path = 'tests/Test-SingleFileArchitecture.ps1'; Args = @() }
     @{ Name = 'Interop: Typed Calls and Native Callbacks';    Path = 'tests/Test-NativeInterop.ps1'; Args = @() }
-    @{ Name = 'Ratchet: Frozen Legacy Outputs';               Path = 'tests/Test-LegacyRatchet.ps1'; Args = @() }
+    @{ Name = 'Reproduction: Frozen Legacy Outputs';               Path = 'tests/Test-LegacyReproduction.ps1'; Args = @() }
 )
 
 Write-Host "================================================================================" -ForegroundColor Cyan
@@ -160,5 +160,5 @@ if (-not $allPassed) {
 }
 
 if ($allPassed -and $receipt.SuitesPassed -eq 22) {
-    Write-Host 'ratchet: 52 legacy outputs, 14 diagnostics, 0 regressions; 19 legacy suites passed; native interop and single-file gates passed'
+    Write-Host 'reproduction: 52 legacy outputs, 14 diagnostics, 0 regressions; 19 legacy suites passed; native interop and single-file gates passed'
 }
