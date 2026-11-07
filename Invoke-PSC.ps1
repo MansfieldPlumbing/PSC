@@ -7548,29 +7548,83 @@ class PscConsolidationState {
     [System.Collections.Generic.HashSet[string]] $Taken = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 }
 
-# The script a command runs with &, when its path is fixed in the source (a literal, or $PSScriptRoot joined with
-# literals); $null otherwise.
-function Resolve-PscScriptInvocation {
-    param([Parameter(Mandatory)][System.Management.Automation.Language.CommandAst] $Command, [Parameter(Mandatory)][string] $Directory)
-    if ($Command.InvocationOperator -ne [System.Management.Automation.Language.TokenKind]::Ampersand) { return $null }
-    $target = $Command.CommandElements[0]
-    $text = if ($target -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $target.Value }
-        elseif ($target -is [System.Management.Automation.Language.ExpandableStringExpressionAst] -and
-            @($target.NestedExpressions | Where-Object { $_ -isnot [System.Management.Automation.Language.VariableExpressionAst] -or $_.VariablePath.UserPath -ne 'PSScriptRoot' }).Count -eq 0) {
-            $target.Value.Replace('$PSScriptRoot', $Directory).Replace('${PSScriptRoot}', $Directory)
+# A path expression's value when everything in it is fixed in the source: a literal, $PSScriptRoot (the source's
+# directory), a variable in -Fixed, a string expanding only those, and Split-Path (the parent) or Join-Path over them;
+# $null when any part is not fixed.
+function Get-PscFixedPath {
+    param([System.Management.Automation.Language.Ast] $Node, [Parameter(Mandatory)][string] $Directory, [hashtable] $Fixed = @{})
+    while ($Node -is [System.Management.Automation.Language.PipelineAst] -and $Node.PipelineElements.Count -eq 1) { $Node = $Node.PipelineElements[0] }
+    while ($Node -is [System.Management.Automation.Language.CommandExpressionAst] -or $Node -is [System.Management.Automation.Language.ParenExpressionAst]) {
+        $Node = if ($Node -is [System.Management.Automation.Language.CommandExpressionAst]) { $Node.Expression } else { $Node.Pipeline }
+        while ($Node -is [System.Management.Automation.Language.PipelineAst] -and $Node.PipelineElements.Count -eq 1) { $Node = $Node.PipelineElements[0] }
+    }
+    if ($Node -is [System.Management.Automation.Language.StringConstantExpressionAst]) { return $Node.Value }
+    if ($Node -is [System.Management.Automation.Language.VariableExpressionAst]) {
+        if ($Node.VariablePath.UserPath -eq 'PSScriptRoot') { return $Directory }
+        if ($Fixed.ContainsKey($Node.VariablePath.UserPath)) { return $Fixed[$Node.VariablePath.UserPath] }
+        return $null
+    }
+    if ($Node -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
+        $text = $Node.Value
+        foreach ($nested in $Node.NestedExpressions) {
+            if ($nested -isnot [System.Management.Automation.Language.VariableExpressionAst]) { return $null }
+            $value = Get-PscFixedPath -Node $nested -Directory $Directory -Fixed $Fixed
+            if ($null -eq $value) { return $null }
+            $text = $text.Replace('${' + $nested.VariablePath.UserPath + '}', $value).Replace('$' + $nested.VariablePath.UserPath, $value)
         }
-        else { return $null }
-    if (-not $text.EndsWith('.ps1', [StringComparison]::OrdinalIgnoreCase)) { return $null }
+        return $text
+    }
+    if ($Node -is [System.Management.Automation.Language.CommandAst] -and $Node.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Unknown) {
+        $arguments = @($Node.CommandElements | Select-Object -Skip 1)
+        $name = $Node.GetCommandName()
+        if ($name -eq 'Split-Path' -and $arguments.Count -eq 1) {
+            $value = Get-PscFixedPath -Node $arguments[0] -Directory $Directory -Fixed $Fixed
+            if ($null -ne $value) { return [IO.Path]::GetDirectoryName($value) }
+        }
+        if ($name -eq 'Join-Path' -and $arguments.Count -eq 2) {
+            $parent = Get-PscFixedPath -Node $arguments[0] -Directory $Directory -Fixed $Fixed
+            $child = Get-PscFixedPath -Node $arguments[1] -Directory $Directory -Fixed $Fixed
+            if ($null -ne $parent -and $null -ne $child) { return [IO.Path]::Combine($parent, $child) }
+        }
+    }
+    $null
+}
+
+# A source's fixed path variables: each assigned exactly once, at top level, from a fixed path expression.
+function Get-PscFixedVariable {
+    param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Ast, [Parameter(Mandatory)][string] $Directory)
+    $counts = @{}
+    foreach ($assignment in $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] }, $true)) {
+        $counts[$assignment.Left.VariablePath.UserPath] = 1 + [int]$counts[$assignment.Left.VariablePath.UserPath]
+    }
+    $fixed = @{}
+    foreach ($statement in @($Ast.EndBlock.Statements)) {
+        if ($statement -isnot [System.Management.Automation.Language.AssignmentStatementAst] -or $statement.Left -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+        $name = $statement.Left.VariablePath.UserPath
+        if ($counts[$name] -ne 1) { continue }
+        $value = Get-PscFixedPath -Node $statement.Right -Directory $Directory -Fixed $fixed
+        if ($null -ne $value) { $fixed[$name] = $value }
+    }
+    $fixed
+}
+
+# The script a command runs with &, when its path is fixed in the source (Get-PscFixedPath); $null otherwise.
+function Resolve-PscScriptInvocation {
+    param([Parameter(Mandatory)][System.Management.Automation.Language.CommandAst] $Command, [Parameter(Mandatory)][string] $Directory, [hashtable] $Fixed = @{})
+    if ($Command.InvocationOperator -ne [System.Management.Automation.Language.TokenKind]::Ampersand) { return $null }
+    $text = Get-PscFixedPath -Node $Command.CommandElements[0] -Directory $Directory -Fixed $Fixed
+    if ($null -eq $text -or -not $text.EndsWith('.ps1', [StringComparison]::OrdinalIgnoreCase)) { return $null }
     if (-not [IO.Path]::IsPathFullyQualified($text)) { $text = [IO.Path]::Combine($Directory, $text) }
     [IO.Path]::GetFullPath($text)
 }
 
-# What a function cannot keep of running a script: exit ends the whole program from a function, $PSScriptRoot and
-# $PSCommandPath name the entry script, and $MyInvocation (beyond .InvocationName) describes the function.
+# What a function cannot keep of running a script: exit ends the whole program from a function, $PSCommandPath names
+# the entry script, and $MyInvocation (beyond .InvocationName) describes the function. ($PSScriptRoot is kept: the
+# fold rewrites it to the script's own directory.)
 function Get-PscScriptDifference {
     param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Ast)
     foreach ($node in $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.ExitStatementAst] }, $true)) { 'L{0} exit ends the whole program from a function' -f $node.Extent.StartLineNumber }
-    foreach ($node in $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.UserPath -in 'PSScriptRoot', 'PSCommandPath' }, $true)) { 'L{0} ${1} names the entry script' -f $node.Extent.StartLineNumber, $node.VariablePath.UserPath }
+    foreach ($node in $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.UserPath -eq 'PSCommandPath' }, $true)) { 'L{0} $PSCommandPath names the entry script' -f $node.Extent.StartLineNumber }
     foreach ($node in $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.UserPath -eq 'MyInvocation' }, $true)) {
         if ($node.Parent -isnot [System.Management.Automation.Language.MemberExpressionAst] -or $node.Parent.Member.Extent.Text -ne 'InvocationName') { 'L{0} $MyInvocation describes the function' -f $node.Extent.StartLineNumber }
     }
@@ -7584,8 +7638,9 @@ function Add-PscFoldedScript {
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($File, [ref]$tokens, [ref]$errors)
     $text = [IO.File]::ReadAllText($File)
     $edits = [System.Collections.Generic.List[object]]::new()
+    $fixed = Get-PscFixedVariable -Ast $ast -Directory ([IO.Path]::GetDirectoryName($File))
     foreach ($command in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
-        $script = Resolve-PscScriptInvocation -Command $command -Directory ([IO.Path]::GetDirectoryName($File))
+        $script = Resolve-PscScriptInvocation -Command $command -Directory ([IO.Path]::GetDirectoryName($File)) -Fixed $fixed
         if ($null -eq $script) {
             # A script named by a string whose path is not fixed in the source stays as it is, and is reported.
             $target = $command.CommandElements[0]
@@ -7608,6 +7663,15 @@ function Add-PscFoldedScript {
         }
         $State.Included[$script].CalledFrom += ('{0}:{1}' -f $File, $command.Extent.StartLineNumber)
         $edits.Add([pscustomobject]@{ Start = $command.Extent.StartOffset; End = $command.CommandElements[0].Extent.EndOffset; Text = $State.Included[$script].Function })
+    }
+    # A folded script's $PSScriptRoot still names its own directory: the entry's, joined with the relative path to it.
+    $relative = [IO.Path]::GetRelativePath([IO.Path]::GetDirectoryName($State.Entry), [IO.Path]::GetDirectoryName($File))
+    if (-not [string]::Equals($File, $State.Entry, [StringComparison]::OrdinalIgnoreCase) -and $relative -ne '.') {
+        $covered = @($edits)
+        foreach ($root in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.UserPath -eq 'PSScriptRoot' }, $true)) {
+            if (@($covered | Where-Object { $root.Extent.StartOffset -ge $_.Start -and $root.Extent.EndOffset -le $_.End }).Count) { continue }
+            $edits.Add([pscustomobject]@{ Start = $root.Extent.StartOffset; End = $root.Extent.EndOffset; Text = '$(Join-Path $PSScriptRoot ''' + $relative.Replace("'", "''") + ''')' })
+        }
     }
     foreach ($edit in @($edits | Sort-Object Start -Descending)) { $text = $text.Substring(0, $edit.Start) + $edit.Text + $text.Substring($edit.End) }
     $text
