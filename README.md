@@ -202,13 +202,10 @@ asset, and extracts it beneath `build/cache`. The pin moves to preview.6 or
 to the 7.7 release when either is published. Generated assemblies are
 written beneath `build/`, which Git ignores.
 
-Use `-Sanitized` on the existing runner for CI: it reports suite names,
-pass/fail results and aggregate metrics. Complete child output and failure
-details stay under ignored `build/verification-diagnostics/`; receipts
-stay under ignored `build/`. No verification artifacts are uploaded.
-GitHub Actions runs the complete suite on hosted Windows runners for
-pushes and pull requests, using integrity-verified pinned PowerShell and
-standalone .NET runtime archives. Local dotnet-host verification also needs
+`-Sanitized` reports only suite names, pass/fail results and aggregate
+measures. Complete child output and failure details stay under ignored
+`build/verification-diagnostics/`. The repository has no CI workflow; the
+suite runs locally. Dotnet-host verification also needs
 standalone runtime 11.0.0-rc.1.26425.128 available through `PATH`; the runtime
 bundled with PowerShell does not install that standalone host.
 
