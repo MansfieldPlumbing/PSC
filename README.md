@@ -39,6 +39,61 @@ Not yet complete: a single-file JIT executable. `-EntryPoint` without `-Native`
 writes an assembly and its `runtimeconfig.json`, which run with
 `dotnet exec <name>.dll`.
 
+## Kernel building (planned; not implemented)
+
+Nothing in this section exists in `Invoke-PSC.ps1` yet. It records the planned
+design.
+
+A kernel is typed PowerShell. The front end above (SMA parse, typed expression
+tree) is shared, and kernel building adds backends to it. One kernel source has
+four executions: interpreted PowerShell, which is its gold output; IL with
+`Vector128`, run on a CPU through the JIT or Native AOT; Hexagon HVX and HMX;
+and A64, x64 and A32 machine code. Each run's output is compared with the gold
+output.
+
+Primitives, with no application or model knowledge:
+
+| Kind | Members |
+|---|---|
+| Patterns | map and zip; reduce; scan; broadcast; contraction (dense, convolutional, quantized int8 and int4); stencil; layout change; gather and scatter |
+| Number formats | fp32, fp16, signed and unsigned integers from int4 to int64, fixed point with explicit rounding and saturation, biased integers; conversions between them are type-checked |
+| Memory and movement | memory spaces (DDR, Hexagon VTCM, matrix unit); tiles and layouts; DMA transfers; producer/consumer queues across threads and units |
+| Composition | sequence, fuse, tile (including independent lane splitting) and pipeline, each checked for matching formats, memory spaces and resources |
+| Machine layer | one typed operation table per instruction set, each operation with an encoder, a decoder, slots, resources and latency; register allocation; scheduling and packetizing; calling conventions |
+| Containers | ELF shared objects, PE/COFF images and a FastRPC skeleton entry point |
+| Harness | host gold output, device runs (cold and warm, counterbalanced), hardware tick counts, and comparison with a compiler-built baseline, returned as measures |
+
+Verification is planned at three levels:
+
+1. Encoding: every operation round-trips through its own decoder, and a pinned
+   assembler confirms the bytes of each emitted listing. The assembler is a
+   reference for encodings only.
+2. Semantics: every compiled kernel's output equals its gold output, exactly or
+   within a tolerance recorded for that kernel.
+3. Performance: each kernel is timed on the device against a build of the same
+   computation by the platform's compiler, which is the baseline to exceed.
+
+PSC's own earlier kernel outputs are to form a reproduction baseline, as the
+`218f54e` outputs do for IL.
+
+Existing work outside this repository is to be integrated: Hexagon V73 HVX and
+HMX encoders and kernels measured on SM8550 and SM8635 devices, including one
+kernel measured at 2.2 times the speed of the Hexagon Clang 19.0.04 build of the
+same computation; an ELF writer; and A64, x64 and A32 encoders, decoders and
+calling-convention checks. In that work each instruction is a hashtable with a
+string-named operation and literal register numbers. PSC parses that source with
+SMA's AST and re-expresses it as typed operations; each re-expressed kernel must
+produce the same bytes as the original before the original is retired.
+
+A downstream project moves its kernels onto PSC one at a time. Its existing
+kernel stays in use until the replacement's output matches the gold output and
+the existing kernel's output, its device measures are no worse, and the result
+is recorded. Order of work: the ELF container; the typed Hexagon V73 operation
+table; the primitives one complete kernel needs (an input stream, element-wise
+arithmetic, lane-split tiling, an output stream, the HVX backend and the
+ELF/FastRPC container); then the remaining primitives, the A64, x64 and A32
+backends, DMA and producer/consumer pipelines.
+
 ## Invocation
 
 `& ./Invoke-PSC.ps1` with no arguments returns a `PSC.Api` object read from the
