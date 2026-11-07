@@ -1,7 +1,6 @@
 # PSC
 
-PSC compiles typed PowerShell classes to .NET assemblies and to Windows x64
-Native AOT executables. The compiler is one PowerShell script, `Invoke-PSC.ps1`.
+A Pwsh script designed to amortize.
 
 ## How PSC lowers
 
