@@ -1,5 +1,4 @@
 param(
-    [switch] $FailFast = $true,
     [string] $PwshPath,
     # CI emits only suite names, outcomes and aggregate metrics.
     [switch] $Sanitized
@@ -120,11 +119,6 @@ foreach ($suite in $testSuites) {
     $results.Add($res)
 
     Write-Host "$($suite.Name): $status (ExitCode=$exitCode, Duration=$($res.DurationMs)ms)" -ForegroundColor $(if ($status -eq 'PASS') { 'Green' } else { 'Red' })
-
-    if ($status -eq 'FAIL' -and $FailFast) {
-        Write-Host "`n[FATAL] Suite failed with FailFast enabled. Halting runner." -ForegroundColor Red
-        break
-    }
 }
 
 $swTotal.Stop()
