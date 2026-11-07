@@ -1768,6 +1768,37 @@ function Get-ScriptFunctionClass {
 }
 
 # A value a script function's statement yields, written to its output; a statement with no value writes nothing.
+# Statements whose output is collected, as $( ), @( ) and a statement used as a value collect it: each statement
+# writes to a list of its own, a collection element by element (PowerShellSemantics.Write); the result is the list as
+# an object[]. A return inside would leave the enclosing method, not the block, and is refused.
+function New-OutputBlock {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][System.Management.Automation.Language.StatementAst[]] $Statements, [Parameter(Mandatory)][hashtable] $Scope)
+    foreach ($statement in $Statements) {
+        $return = $statement.Find({ param($n) $n -is [System.Management.Automation.Language.ReturnStatementAst] }, $false)
+        if ($null -ne $return) { throw "[{0}:{1}] A return inside a block whose output is collected leaves the method, not the block." -f $return.Extent.StartLineNumber, $return.Extent.StartColumnNumber }
+    }
+    $et = [Linq.Expressions.Expression]
+    $list = $et::Variable([System.Collections.Generic.List[object]], 'output' + $Scope.DeclaredLocals.Count)
+    $Scope.DeclaredLocals.Add($list)
+    $parts = [System.Collections.Generic.List[Linq.Expressions.Expression]]::new()
+    $created = $script:ExpressionNewMethod.Invoke($null, [object[]]@([System.Collections.Generic.List[object]].GetConstructor([type[]]@()), [Linq.Expressions.Expression[]]@()))
+    $parts.Add($et::Assign($list, $created))
+    $outer = $Scope['Output']
+    $Scope['Output'] = $list
+    try { foreach ($statement in $Statements) { $parts.Add((Convert-AstStatement -Statement $statement -Scope $Scope)) } }
+    finally { $Scope['Output'] = $outer }
+    $parts.Add($et::Call($list, [System.Collections.Generic.List[object]].GetMethod('ToArray')))
+    $et::Block([object[]], [Linq.Expressions.Expression[]]$parts.ToArray())
+}
+
+# Whether a value of a static type is written to output as itself: a string, a dictionary, or a type no instance of
+# which is enumerable (a value type, or a sealed type, that is not IEnumerable).
+function Test-PscWrittenWhole([Type] $Type) {
+    if ($Type -eq [string] -or [System.Collections.IDictionary].IsAssignableFrom($Type)) { return $true }
+    if ([System.Collections.IEnumerable].IsAssignableFrom($Type)) { return $false }
+    $Type.IsValueType -or $Type.IsSealed
+}
+
 function New-OutputWrite {
     param([Parameter(Mandatory)][Linq.Expressions.Expression] $Value, [Parameter(Mandatory)][hashtable] $Scope)
     if ($Value.Type -eq [void]) { return $Value }
@@ -2394,25 +2425,28 @@ class PscDifferential {
     }
 }
 
-function Get-AstArrayElements($node) {
-    if ($node -is [System.Management.Automation.Language.ArrayLiteralAst]) {
-        return @($node.Elements)
-    }
-    if ($node -is [System.Management.Automation.Language.ArrayExpressionAst]) {
-        if ($node.SubExpression -and $node.SubExpression.Statements.Count -gt 0) {
-            $first = $node.SubExpression.Statements[0]
-            if ($first -is [System.Management.Automation.Language.PipelineAst] -and
-                $first.PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst] -and
-                $first.PipelineElements[0].Expression -is [System.Management.Automation.Language.ArrayLiteralAst]) {
-                return @($first.PipelineElements[0].Expression.Elements)
-            }
-            if ($first -is [System.Management.Automation.Language.PipelineAst] -and
-                $first.PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst]) {
-                return @($first.PipelineElements[0].Expression)
-            }
+# An array of a stated element type built element by element from $a, $b or @( ... ), when that is exactly the array
+# PowerShell builds: an array literal's elements; @() empty; @( one array literal ) its elements; @( one expression )
+# that expression when its type is written whole. Each element converts to the element type. $null otherwise (several
+# statements, or one value that may be enumerated), for the caller to convert the collected output.
+function New-TypedArrayLiteral {
+    param([Parameter(Mandatory)][System.Management.Automation.Language.Ast] $Node, [Parameter(Mandatory)][Type] $ElementType, [Parameter(Mandatory)][hashtable] $Scope)
+    $elements = $null
+    if ($Node -is [System.Management.Automation.Language.ArrayLiteralAst]) { $elements = @($Node.Elements) }
+    elseif ($Node -is [System.Management.Automation.Language.ArrayExpressionAst] -and $null -eq $Node.SubExpression.Traps) {
+        $statements = @($Node.SubExpression.Statements)
+        if ($statements.Count -eq 0) { $elements = @() }
+        elseif ($statements.Count -eq 1 -and $statements[0] -is [System.Management.Automation.Language.PipelineAst] -and $statements[0].PipelineElements.Count -eq 1 -and
+                $statements[0].PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst]) {
+            $only = $statements[0].PipelineElements[0].Expression
+            if ($only -is [System.Management.Automation.Language.ArrayLiteralAst]) { $elements = @($only.Elements) }
+            elseif (Test-PscWrittenWhole (Convert-AstExpression -Node $only -Scope $Scope).Type) { $elements = @($only) }
         }
     }
-    return @($node)
+    if ($null -eq $elements) { return $null }
+    $items = [System.Collections.Generic.List[Linq.Expressions.Expression]]::new()
+    foreach ($element in $elements) { $items.Add((Convert-AstExpressionAs -Node $element -Type $ElementType -Scope $Scope)) }
+    [Linq.Expressions.Expression]::NewArrayInit($ElementType, [Linq.Expressions.Expression[]]$items.ToArray())
 }
 
 function New-PowerShellArrayIndex {
@@ -2492,14 +2526,9 @@ function Convert-AstExpressionAs {
            $inner.PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst]) {
         $inner = $inner.PipelineElements[0].Expression
     }
-    if ($Type.IsArray -and ($inner -is [System.Management.Automation.Language.ArrayExpressionAst] -or
-                            $inner -is [System.Management.Automation.Language.ArrayLiteralAst])) {
-        $elementType = $Type.GetElementType()
-        $items = [System.Collections.Generic.List[Linq.Expressions.Expression]]::new()
-        foreach ($element in Get-AstArrayElements $inner) {
-            $items.Add((Convert-AstExpressionAs -Node $element -Type $elementType -Scope $Scope))
-        }
-        return [Linq.Expressions.Expression]::NewArrayInit($elementType, [Linq.Expressions.Expression[]]$items.ToArray())
+    if ($Type.IsArray -and $Type.GetArrayRank() -eq 1) {
+        $built = New-TypedArrayLiteral -Node $inner -ElementType $Type.GetElementType() -Scope $Scope
+        if ($null -ne $built) { return $built }
     }
     $quotient = ConvertTo-IntegralQuotient -Node $Node -Type $Type -Scope $Scope
     if ($null -ne $quotient) { return $quotient }
@@ -3173,30 +3202,24 @@ function Convert-AstExpression {
         return Convert-AstStatement -Statement $Node -Scope $Scope
     }
 
-    # if as a value: $x = if ($c) { $a } elseif ($d) { $b } else { $e }, each branch one expression.
+    # if as a value: $x = if ($c) { $a } elseif ($d) { $b } else { $e }. With an else, one expression per branch, and
+    # branches of one type, it is that type's conditional; otherwise its output as one value, as $( ) gives it.
     if ($Node -is [System.Management.Automation.Language.IfStatementAst]) {
-        $branchValue = {
-            param($block)
-            if ($block.Statements.Count -ne 1) {
-                throw "[{0}:{1}] Each branch of an if used as a value must be one expression." -f $block.Extent.StartLineNumber, $block.Extent.StartColumnNumber
-            }
-            Convert-AstExpression -Node $block.Statements[0] -Scope $Scope
-        }
-        if (-not $Node.ElseClause) {
-            throw "[{0}:{1}] An if used as a value needs an else branch." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber
-        }
-        $result = & $branchValue $Node.ElseClause
+        $collected = { [Linq.Expressions.Expression]::Call((Get-PscSemanticsMethod -Name Collapse -ParameterTypes ([object[]])), (New-OutputBlock -Statements @($Node) -Scope $Scope)) }
+        $blocks = @(@($Node.Clauses | ForEach-Object { $_.Item2 }) + @($Node.ElseClause))
+        if ($null -eq $Node.ElseClause -or @($blocks | Where-Object { $_.Statements.Count -ne 1 -or $_.Statements[0] -isnot [System.Management.Automation.Language.PipelineAst] }).Count) { return & $collected }
+        $result = Convert-AstExpression -Node $Node.ElseClause.Statements[0] -Scope $Scope
         $clauses = @($Node.Clauses)
         for ($i = $clauses.Count - 1; $i -ge 0; $i--) {
             $test = New-PredicateTruth (Convert-AstExpression -Node $clauses[$i].Item1 -Scope $Scope)
-            $whenTrue = & $branchValue $clauses[$i].Item2
+            $whenTrue = Convert-AstExpression -Node $clauses[$i].Item2.Statements[0] -Scope $Scope
             $widened = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Conditional, $whenTrue, $result)
             if ($widened) { $whenTrue = $widened.Left; $result = $widened.Right }
-            if ($whenTrue.Type -ne $result.Type) {
-                throw "[{0}:{1}] Branches of an if used as a value require identical types, got '{2}' and '{3}'." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $whenTrue.Type.FullName, $result.Type.FullName
-            }
+            if ($whenTrue.Type -ne $result.Type) { return & $collected }
             $result = [Linq.Expressions.Expression]::Condition($test, $whenTrue, $result)
         }
+        # A branch value that is enumerable is written element by element, and collected as $( ) collects it.
+        if (-not (Test-PscWrittenWhole $result.Type)) { return & $collected }
         return $result
     }
 
@@ -3221,6 +3244,66 @@ function Convert-AstExpression {
         return [Linq.Expressions.Expression]::NewArrayInit([object], [Linq.Expressions.Expression[]]$items.ToArray())
     }
 
+    # @( ... ): the output of its statements as an object[]. One array literal is its elements; one expression whose
+    # type is written whole is the one element.
+    if ($Node -is [System.Management.Automation.Language.ArrayExpressionAst]) {
+        $statements = @($Node.SubExpression.Statements)
+        if ($statements.Count -eq 1 -and $null -eq $Node.SubExpression.Traps -and $statements[0] -is [System.Management.Automation.Language.PipelineAst] -and
+            $statements[0].PipelineElements.Count -eq 1 -and $statements[0].PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst]) {
+            $only = $statements[0].PipelineElements[0].Expression
+            if ($only -is [System.Management.Automation.Language.ArrayLiteralAst]) { return Convert-AstExpression -Node $only -Scope $Scope }
+            $value = Convert-AstExpression -Node $only -Scope $Scope
+            if (Test-PscWrittenWhole $value.Type) { return [Linq.Expressions.Expression]::NewArrayInit([object], [Linq.Expressions.Expression[]]@([Linq.Expressions.Expression]::Convert($value, [object]))) }
+        }
+        if ($null -ne $Node.SubExpression.Traps -and $Node.SubExpression.Traps.Count) { throw "[{0}:{1}] trap is not supported." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber }
+        return New-OutputBlock -Statements $statements -Scope $Scope
+    }
+
+    # $( ... ): the output of its statements as one value: $null for none, the value for one, all of them for several.
+    # One expression, or one if with an else and one expression per branch, whose type is written whole is that value.
+    if ($Node -is [System.Management.Automation.Language.SubExpressionAst]) {
+        $statements = @($Node.SubExpression.Statements)
+        if ($null -ne $Node.SubExpression.Traps -and $Node.SubExpression.Traps.Count) { throw "[{0}:{1}] trap is not supported." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber }
+        if ($statements.Count -eq 1) {
+            $only = $statements[0]
+            $single = ($only -is [System.Management.Automation.Language.PipelineAst] -and $only.PipelineElements.Count -eq 1 -and $only.PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst]) -or
+                ($only -is [System.Management.Automation.Language.IfStatementAst] -and $null -ne $only.ElseClause -and
+                 @(@($only.Clauses | ForEach-Object { $_.Item2 }) + @($only.ElseClause) | Where-Object { $_.Statements.Count -ne 1 -or $_.Statements[0] -isnot [System.Management.Automation.Language.PipelineAst] }).Count -eq 0)
+            if ($single) {
+                $value = Convert-AstExpression -Node $only -Scope $Scope
+                if (Test-PscWrittenWhole $value.Type) { return $value }
+            }
+        }
+        return [Linq.Expressions.Expression]::Call((Get-PscSemanticsMethod -Name Collapse -ParameterTypes ([object[]])), (New-OutputBlock -Statements $statements -Scope $Scope))
+    }
+
+    # A switch, foreach, for, while or try used as a value: its output as one value, as $( ) gives it.
+    if ($Node -is [System.Management.Automation.Language.SwitchStatementAst] -or $Node -is [System.Management.Automation.Language.ForEachStatementAst] -or
+        $Node -is [System.Management.Automation.Language.ForStatementAst] -or $Node -is [System.Management.Automation.Language.WhileStatementAst] -or
+        $Node -is [System.Management.Automation.Language.TryStatementAst]) {
+        return [Linq.Expressions.Expression]::Call((Get-PscSemanticsMethod -Name Collapse -ParameterTypes ([object[]])), (New-OutputBlock -Statements @($Node) -Scope $Scope))
+    }
+
+    # @{ key = value; ... }: a Hashtable comparing keys by ordinal, ignoring case, as PowerShell creates it, each entry
+    # added in order.
+    if ($Node -is [System.Management.Automation.Language.HashtableAst]) {
+        $et = [Linq.Expressions.Expression]
+        $table = $et::Variable([hashtable], 'hashtable' + $Scope.DeclaredLocals.Count)
+        $Scope.DeclaredLocals.Add($table)
+        $parts = [System.Collections.Generic.List[Linq.Expressions.Expression]]::new()
+        $comparer = $et::Convert($et::Property($null, [StringComparer].GetProperty('OrdinalIgnoreCase')), [System.Collections.IEqualityComparer])
+        $created = $script:ExpressionNewMethod.Invoke($null, [object[]]@([hashtable].GetConstructor([type[]]@([System.Collections.IEqualityComparer])), [Linq.Expressions.Expression[]]@($comparer)))
+        $parts.Add($et::Assign($table, $created))
+        $add = [hashtable].GetMethod('Add', [type[]]@([object], [object]))
+        foreach ($pair in $Node.KeyValuePairs) {
+            $key = $et::Convert((Convert-AstExpression -Node $pair.Item1 -Scope $Scope), [object])
+            $value = $et::Convert((Convert-AstExpression -Node $pair.Item2 -Scope $Scope), [object])
+            $parts.Add($et::Call($table, $add, $key, $value))
+        }
+        $parts.Add($table)
+        return $et::Block([hashtable], [Linq.Expressions.Expression[]]$parts.ToArray())
+    }
+
     # 5. Paren expressions: ( $expr )
     if ($Node -is [System.Management.Automation.Language.ParenExpressionAst]) {
         return Convert-AstExpression -Node $Node.Pipeline -Scope $Scope
@@ -3237,19 +3320,9 @@ function Convert-AstExpression {
         }
         if ($targetType.IsArray) {
             $childNode = $Node.Child
-            if ($childNode -is [System.Management.Automation.Language.ArrayExpressionAst] -or
-                $childNode -is [System.Management.Automation.Language.ArrayLiteralAst]) {
-                $elements = Get-AstArrayElements $childNode
-                $elemType = $targetType.GetElementType()
-                $elemExprList = [System.Collections.Generic.List[Linq.Expressions.Expression]]::new()
-                foreach ($el in $elements) {
-                    $itemExpr = Convert-AstExpression -Node $el -Scope $Scope
-                    if ($itemExpr.Type -ne $elemType) {
-                        $itemExpr = (ConvertTo-PowerShellType -Expression $itemExpr -Type ($elemType))
-                    }
-                    $elemExprList.Add($itemExpr)
-                }
-                return [Linq.Expressions.Expression]::NewArrayInit($elemType, [Linq.Expressions.Expression[]]$elemExprList.ToArray())
+            if ($targetType.GetArrayRank() -eq 1) {
+                $built = New-TypedArrayLiteral -Node $childNode -ElementType $targetType.GetElementType() -Scope $Scope
+                if ($null -ne $built) { return $built }
             }
         }
         $quotient = ConvertTo-IntegralQuotient -Node $Node.Child -Type $targetType -Scope $Scope
@@ -4234,8 +4307,8 @@ function Convert-AstStatement {
             throw "[{0}:{1}] switch options are not supported." -f $Statement.Extent.StartLineNumber, $Statement.Extent.StartColumnNumber
         }
         $subject = Convert-AstExpression -Node $Statement.Condition -Scope $Scope
-        if ($subject.Type -notin $script:IntegralTypes -and -not $subject.Type.IsEnum) {
-            throw "[{0}:{1}] switch requires an integer or enum value, got '{2}'." -f $Statement.Extent.StartLineNumber, $Statement.Extent.StartColumnNumber, $subject.Type.FullName
+        if ($subject.Type -notin $script:IntegralTypes -and -not $subject.Type.IsEnum -and $subject.Type -ne [string]) {
+            throw "[{0}:{1}] switch requires an integer, enum or string value, got '{2}'." -f $Statement.Extent.StartLineNumber, $Statement.Extent.StartColumnNumber, $subject.Type.FullName
         }
         $id = $Scope.DeclaredLocals.Count
         $value = [Linq.Expressions.Expression]::Variable($subject.Type, "switchValue$id")
@@ -4258,8 +4331,11 @@ function Convert-AstStatement {
                 if ($left.Type -ne $right.Type) {
                     throw "[{0}:{1}] switch clause type '{2}' does not match the value's type '{3}'." -f $clause.Item1.Extent.StartLineNumber, $clause.Item1.Extent.StartColumnNumber, $right.Type.FullName, $value.Type.FullName
                 }
+                # A string value matches a clause as -eq compares strings: ignoring case.
+                $test = if ($left.Type -eq [string]) { [Linq.Expressions.Expression]::Equal((New-PowerShellStringComparison -Left $left -Right $right -CaseSensitive:$false), [Linq.Expressions.Expression]::Constant(0)) }
+                    else { [Linq.Expressions.Expression]::Equal($left, $right) }
                 $body = Convert-AstStatement -Statement $clause.Item2 -Scope $Scope
-                $parts.Add([Linq.Expressions.Expression]::IfThen([Linq.Expressions.Expression]::Equal($left, $right),
+                $parts.Add([Linq.Expressions.Expression]::IfThen($test,
                     [Linq.Expressions.Expression]::Block([Linq.Expressions.Expression]::Assign($matched, [Linq.Expressions.Expression]::Constant($true)), $body, [Linq.Expressions.Expression]::Empty())))
             }
             if ($Statement.Default) {
