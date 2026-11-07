@@ -72,7 +72,7 @@
 .EXAMPLE
     & ./Invoke-PSC.ps1
 .EXAMPLE
-    & ./Invoke-PSC.ps1 -SourcePath ./tests/fixtures/Slice1Fixture.ps1 -ClassName Slice1Fixture -OutputPath ./build/Example.dll -Deterministic
+    & ./Invoke-PSC.ps1 -SourcePath ./Program.ps1 -ClassName Program -OutputPath ./build/Program.dll -Deterministic
 .EXAMPLE
     & ./Invoke-PSC.ps1 -Mode Expression -MethodAst $method
 .EXAMPLE
@@ -1728,9 +1728,8 @@ $script:ExpressionNewMethod = [Linq.Expressions.Expression].GetMethod(
     [Type[]]@([Reflection.ConstructorInfo], [System.Collections.Generic.IEnumerable[Linq.Expressions.Expression]])
 )
 
-# PowerShell's numeric semantics, expressed with CLR operations only. The
-# PowerShell parity check (tests/parity/PowerShellParity.ps1) checks
-# every rule here against PowerShell itself.
+# PowerShell's numeric semantics, expressed with CLR operations only. Investigate compares each lowered method with
+# SMA running the same class, and Compare-PscOperandBinding checks operand binding by mutating SMA's own AST.
 $script:IntegralTypes = [Type[]]@([int], [long], [short], [sbyte], [byte], [ushort], [uint], [ulong])
 $script:FloatingTypes = [Type[]]@([double], [single])
 

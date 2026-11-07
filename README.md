@@ -2,7 +2,7 @@
 
 | Synopsis | Script | SourceSha512 | DefaultMode | Environment |
 |---|---|---|---|---|
-| A Pwsh script designed to amortize. | C:\dev\psc\Invoke-PSC.ps1 | 052C9AB3E7E5E4060C9A76A982E8F6378FAA12A4B0A1E47D84A7BA299822C6FA43E32B115D1DABE6CC0327CA28583515E7A36B1ED67A2EAA1CBCB81296A58238 | Compile | PscEnvironment |
+| A Pwsh script designed to amortize. | C:\dev\psc\Invoke-PSC.ps1 | 496E68239BA121CF3539D70ACEB8CE6C3C612B82E782801FD3D5767C6BC72CA1EC257F0F9DD348CE93EDCD73C03A33AB5C55DA2324372DD934E9A995C89372DD | Compile | PscEnvironment |
 
 ## Modes
 
@@ -65,21 +65,21 @@
 | C:\dev\psc\Invoke-PSC.ps1 | InvokeExpressionCommands | 0 |
 | C:\dev\psc\Invoke-PSC.ps1 | ScriptBlockCreateCalls | 0 |
 | C:\dev\psc\Invoke-PSC.ps1 | HereStrings | 1 |
-| C:\dev\psc\Invoke-PSC.ps1 | ScriptBlockExpressions | 288 |
+| C:\dev\psc\Invoke-PSC.ps1 | ScriptBlockExpressions | 290 |
 | C:\dev\psc\Invoke-PSC.ps1 | CommandsNamedByVariable | 88 |
 | C:\dev\psc\Invoke-PSC.ps1 | ScriptBlockLiteralsInvoked | 0 |
 | C:\dev\psc\Invoke-PSC.ps1 | CommandsNamedByOtherExpression | 1 |
-| C:\dev\psc\Invoke-PSC.ps1 | MemberLookupsByText | 17 |
-| C:\dev\psc\Invoke-PSC.ps1 | HashtableLiterals | 175 |
+| C:\dev\psc\Invoke-PSC.ps1 | MemberLookupsByText | 15 |
+| C:\dev\psc\Invoke-PSC.ps1 | HashtableLiterals | 177 |
 | C:\dev\psc\Invoke-PSC.ps1 | HashtableRecords | 69 |
-| C:\dev\psc\Invoke-PSC.ps1 | QuotedTextConstants | 1326 |
+| C:\dev\psc\Invoke-PSC.ps1 | QuotedTextConstants | 1328 |
 | C:\dev\psc\Invoke-PSC.ps1 | ExpandableTexts | 121 |
 | C:\dev\psc\Invoke-PSC.ps1 | NamespaceUsings | 0 |
 | C:\dev\psc\Invoke-PSC.ps1 | RegexUses | 18 |
 
 ## Functions
 
-Get-ProjectRemote, Get-Projects, Test-DriveRooted, Get-UnitProfile, Invoke-SmaProfile, Get-SmaUnits, Get-SmaCheckOnly, Get-SmaReport, Get-SmaLint, Get-SmaLexicalScope, Get-SmaOwner, Add-SmaDescribedSource, Resolve-SmaEdges, Get-SmaSourceFiles, Get-SmaEncodedSourceOrigins, Get-SmaDescription, Compare-SmaRuntimeGraph, Invoke-SmaObservedOperation, Test-SmaDescription, Test-AttributeClass, Get-LoweringKeywords, Enter-LoweringKeywords, Resolve-AstType, Test-AstAdmitted, Get-AttributeArgumentValue, Get-NativeImport, Add-NativeImportMethod, Get-NativeMethodContract, Set-NativeCallbackAttribute, Convert-NativeAddressExpression, Get-ClassModel, Get-ParameterTypes, New-ClassMirror, Get-EnumUnderlyingType, Get-EnumLiterals, Use-ClassMirror, Get-ClassMirrorType, Get-PscSemanticsClass, ConvertTo-PowerShellType, New-PowerShellStringComparison, New-PowerShellArithmetic, ConvertTo-IntegralQuotient, Copy-UsingStatement, Get-AstArrayElements, New-PowerShellArrayIndex, Get-KeyIndexer, Get-IntIndexer, Convert-AstExpressionAs, New-PowerShellCustomObject, Test-PSObjectView, Get-PowerShellNoteProperty, New-PowerShellNotePropertyRead, New-MemberAccess, Read-PowerShellClass, Add-GenericInference, Resolve-MatchingMethod, Resolve-MatchingConstructor, Resolve-MatchingMember, Convert-AstExpression, New-PredicateTruth, Convert-PredicateSwitch, Convert-AstStatement, Convert-MethodAstToLambda, Convert-InitializersToLambda, New-LoweredBody, Set-DeterministicMvid, New-PersistedAssemblySession, Save-PersistedAssemblySession, Get-IlType, Get-IlMember, Write-IlReceiver, Write-IlInstanceCall, Write-IlArgumentLoad, Write-IlArgumentStore, Write-IlLocalLoad, Write-IlLocalStore, Write-IlArrayLoad, Write-IlArrayStore, Write-IlConstant, Write-IlConversion, Write-IlDiscarded, Write-IlAssign, Write-IlStoredValue, Write-IlExpression, Write-IlMethodBody, Get-PinnedPowerShell, Get-PscApi, Get-PscApiParameter, Get-PscPresentedProperty, ConvertTo-PscMarkdownCell, ConvertTo-PscMarkdownTable, ConvertTo-PscReadme, Get-LoweringCapability, ConvertTo-TypedExpression, ConvertTo-StaticDataExpression, Export-LoweredAssembly, Get-NativeToolset, Export-NativeImage, Test-LoweredAssembly, Read-CoffName, Read-CoffStringAt, Split-CoffDirectives, Read-CoffImportObject, Read-CoffObject, Read-CoffArchive, Get-CoffArchiveMember, Find-CoffLibrary, Resolve-CoffLink, Get-CoffSectionDefinitions, Write-CoffImage, Get-PscInnerExpression, Find-PscAssignment, Get-PscOperand, Get-PscPredicate, Get-PscDerivedCheck, Resolve-PscPathExpression, Invoke-PscInvestigation, Find-PscEffect, Get-PscTypeValue, Get-PscArgumentSet, Invoke-PscMethod, Test-PscSameValue, Compare-PscOutcome, Compare-PscOperandBinding, ConvertTo-PscInterpretedType
+Get-ProjectRemote, Get-Projects, Test-DriveRooted, Get-UnitProfile, Invoke-SmaProfile, Get-SmaUnits, Get-SmaCheckOnly, Get-SmaReport, Get-SmaLint, Get-SmaLexicalScope, Get-SmaOwner, Add-SmaDescribedSource, Resolve-SmaEdges, Get-SmaSourceFiles, Get-SmaEncodedSourceOrigins, Get-SmaDescription, Compare-SmaRuntimeGraph, Invoke-SmaObservedOperation, Test-SmaDescription, Test-AttributeClass, Get-LoweringKeywords, Enter-LoweringKeywords, Resolve-AstType, Test-AstAdmitted, Get-AttributeArgumentValue, Get-NativeImport, Add-NativeImportMethod, Get-NativeMethodContract, Set-NativeCallbackAttribute, Convert-NativeAddressExpression, Get-ClassModel, Get-ParameterTypes, New-ClassMirror, Get-EnumUnderlyingType, Get-EnumLiterals, Use-ClassMirror, Get-ClassMirrorType, Get-PscSemanticsMethod, Add-PscSemanticsToSession, Get-PscSemanticsClass, ConvertTo-PowerShellType, New-PowerShellStringComparison, New-PowerShellArithmetic, ConvertTo-IntegralQuotient, Copy-UsingStatement, Get-AstArrayElements, New-PowerShellArrayIndex, Get-KeyIndexer, Get-IntIndexer, Convert-AstExpressionAs, New-PowerShellCustomObject, Test-PSObjectView, Get-PowerShellNoteProperty, New-PowerShellNotePropertyRead, New-MemberAccess, Read-PowerShellClass, Add-GenericInference, Resolve-MatchingMethod, Resolve-MatchingConstructor, Resolve-MatchingMember, Convert-AstExpression, New-PredicateTruth, Convert-PredicateSwitch, Convert-AstStatement, Convert-MethodAstToLambda, Convert-InitializersToLambda, New-LoweredBody, Set-DeterministicMvid, New-PersistedAssemblySession, Save-PersistedAssemblySession, Get-IlType, Get-IlMember, Write-IlReceiver, Write-IlInstanceCall, Write-IlArgumentLoad, Write-IlArgumentStore, Write-IlLocalLoad, Write-IlLocalStore, Write-IlArrayLoad, Write-IlArrayStore, Write-IlConstant, Write-IlConversion, Write-IlDiscarded, Write-IlAssign, Write-IlStoredValue, Write-IlExpression, Write-IlMethodBody, Get-PinnedPowerShell, Get-PscApi, Get-PscApiParameter, Get-PscPresentedProperty, ConvertTo-PscMarkdownCell, ConvertTo-PscMarkdownTable, ConvertTo-PscReadme, Get-LoweringCapability, ConvertTo-TypedExpression, ConvertTo-StaticDataExpression, Export-LoweredAssembly, Get-NativeToolset, Export-NativeImage, Test-LoweredAssembly, Read-CoffName, Read-CoffStringAt, Split-CoffDirectives, Read-CoffImportObject, Read-CoffObject, Read-CoffArchive, Get-CoffArchiveMember, Find-CoffLibrary, Resolve-CoffLink, Get-CoffSectionDefinitions, Write-CoffImage, Get-PscInnerExpression, Find-PscAssignment, Get-PscOperand, Get-PscPredicate, Get-PscDerivedCheck, Resolve-PscPathExpression, Invoke-PscInvestigation, Find-PscEffect, Get-PscTypeValue, Get-PscArgumentSet, Invoke-PscMethod, Test-PscSameValue, Compare-PscOutcome, Compare-PscOperandBinding, ConvertTo-PscInterpretedType
 
 ## Classes
 
