@@ -84,7 +84,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Compile', 'Api', 'Expression', 'Inspect', 'Capability', 'Link', 'PowerShell', 'Describe', 'Lint', 'Profile', 'Report', 'Verify', 'Readme', 'Investigate')]
+    [ValidateSet('Compile', 'Api', 'Expression', 'Inspect', 'Capability', 'Link', 'PowerShell', 'Describe', 'Lint', 'Profile', 'Report', 'Verify', 'Readme', 'Investigate', 'Consolidate')]
     [string] $Mode = 'Compile',
     [string] $ArchivePath,
     [string] $ProjectPath,
@@ -7484,6 +7484,135 @@ function ConvertTo-PscInterpretedType {
 # One member of a source, lowered on its own to an expression tree: every class's methods and constructors, and the
 # source's functions as their class. A refusal names the member and its line, so a source's whole board is visible at
 # once instead of one refusal at a time.
+# A script one script runs with & at a path fixed in its source, folded into the single script as a function.
+class PscIncludedScript {
+    [string] $Path
+    [string] $Function
+    [string[]] $CalledFrom
+    # What a function cannot keep of running a script, by line: exit, $PSScriptRoot, $PSCommandPath, $MyInvocation.
+    [string[]] $Differences
+}
+
+# A multi-script program made one script: the entry with every script it runs folded in as a function.
+class PscConsolidation {
+    [string] $Entry
+    [string] $OutputPath
+    [PscIncludedScript[]] $Included
+    # Script invocations left as they were: a path not fixed in the source, or a file that does not exist.
+    [string[]] $Unresolved
+    [int] $ParseErrors
+}
+
+# Makes a program that runs other scripts with & one script. Each script run at a path fixed in the source (a literal,
+# or $PSScriptRoot joined with literals) becomes a function whose body is that script's text: its param block binds
+# the same arguments, it runs in a scope of its own and returns its output, as & on the script does. Each such call
+# becomes a call to the function. Included scripts are followed recursively. What a function would change is
+# reported per script, not hidden: exit ends the whole program from a function, $PSScriptRoot and $PSCommandPath name
+# the entry, and $MyInvocation describes the function.
+function ConvertTo-PscSingleScript {
+    [CmdletBinding()]
+    [OutputType([PscConsolidation])]
+    param([Parameter(Mandatory)][string] $Path, [Parameter(Mandatory)][string] $OutputPath)
+    $state = [PscConsolidationState]::new()
+    $state.Entry = [IO.Path]::GetFullPath($Path)
+    $entryTokens = $null; $entryErrors = $null
+    foreach ($existing in ([System.Management.Automation.Language.Parser]::ParseFile($state.Entry, [ref]$entryTokens, [ref]$entryErrors)).FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) { $null = $state.Taken.Add($existing.Name) }
+    $entryText = Add-PscFoldedScript -State $state -File $state.Entry
+    # The functions go after the entry's param block (or at its top), before any statement runs.
+    $folded = [System.Text.StringBuilder]::new()
+    foreach ($script in $state.Order) {
+        $null = $folded.Append("`n# Folded from ").Append([IO.Path]::GetRelativePath([IO.Path]::GetDirectoryName($state.Entry), $script)).Append("`n")
+        $null = $folded.Append('function ').Append($state.Included[$script].Function).Append(" {`n").Append($state.Bodies[$script].TrimEnd()).Append("`n}`n")
+    }
+    $foldedTokens = $null; $foldedErrors = $null
+    $foldedEntry = [System.Management.Automation.Language.Parser]::ParseInput($entryText, [ref]$foldedTokens, [ref]$foldedErrors)
+    $at = if ($foldedEntry.ParamBlock) { $foldedEntry.ParamBlock.Extent.EndOffset } else { 0 }
+    $result = $entryText.Substring(0, $at) + "`n" + $folded.ToString() + $entryText.Substring($at)
+    [IO.File]::WriteAllText([IO.Path]::GetFullPath($OutputPath), $result, [Text.UTF8Encoding]::new($false))
+    $checkTokens = $null; $checkErrors = $null
+    $null = [System.Management.Automation.Language.Parser]::ParseInput($result, [ref]$checkTokens, [ref]$checkErrors)
+    [PscConsolidation]@{
+        Entry = $state.Entry; OutputPath = [IO.Path]::GetFullPath($OutputPath)
+        Included = [PscIncludedScript[]]@($state.Order | ForEach-Object { $state.Included[$_] })
+        Unresolved = $state.Unresolved.ToArray(); ParseErrors = $checkErrors.Count
+    }
+}
+
+# What a consolidation has found so far: each included script's record and folded text, in the order first reached.
+class PscConsolidationState {
+    [string] $Entry
+    [System.Collections.Generic.Dictionary[string, PscIncludedScript]] $Included = [System.Collections.Generic.Dictionary[string, PscIncludedScript]]::new([StringComparer]::OrdinalIgnoreCase)
+    [System.Collections.Generic.Dictionary[string, string]] $Bodies = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+    [System.Collections.Generic.List[string]] $Order = [System.Collections.Generic.List[string]]::new()
+    [System.Collections.Generic.List[string]] $Unresolved = [System.Collections.Generic.List[string]]::new()
+    [System.Collections.Generic.HashSet[string]] $Taken = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+}
+
+# The script a command runs with &, when its path is fixed in the source (a literal, or $PSScriptRoot joined with
+# literals); $null otherwise.
+function Resolve-PscScriptInvocation {
+    param([Parameter(Mandatory)][System.Management.Automation.Language.CommandAst] $Command, [Parameter(Mandatory)][string] $Directory)
+    if ($Command.InvocationOperator -ne [System.Management.Automation.Language.TokenKind]::Ampersand) { return $null }
+    $target = $Command.CommandElements[0]
+    $text = if ($target -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $target.Value }
+        elseif ($target -is [System.Management.Automation.Language.ExpandableStringExpressionAst] -and
+            @($target.NestedExpressions | Where-Object { $_ -isnot [System.Management.Automation.Language.VariableExpressionAst] -or $_.VariablePath.UserPath -ne 'PSScriptRoot' }).Count -eq 0) {
+            $target.Value.Replace('$PSScriptRoot', $Directory).Replace('${PSScriptRoot}', $Directory)
+        }
+        else { return $null }
+    if (-not $text.EndsWith('.ps1', [StringComparison]::OrdinalIgnoreCase)) { return $null }
+    if (-not [IO.Path]::IsPathFullyQualified($text)) { $text = [IO.Path]::Combine($Directory, $text) }
+    [IO.Path]::GetFullPath($text)
+}
+
+# What a function cannot keep of running a script: exit ends the whole program from a function, $PSScriptRoot and
+# $PSCommandPath name the entry script, and $MyInvocation (beyond .InvocationName) describes the function.
+function Get-PscScriptDifference {
+    param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Ast)
+    foreach ($node in $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.ExitStatementAst] }, $true)) { 'L{0} exit ends the whole program from a function' -f $node.Extent.StartLineNumber }
+    foreach ($node in $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.UserPath -in 'PSScriptRoot', 'PSCommandPath' }, $true)) { 'L{0} ${1} names the entry script' -f $node.Extent.StartLineNumber, $node.VariablePath.UserPath }
+    foreach ($node in $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.UserPath -eq 'MyInvocation' }, $true)) {
+        if ($node.Parent -isnot [System.Management.Automation.Language.MemberExpressionAst] -or $node.Parent.Member.Extent.Text -ne 'InvocationName') { 'L{0} $MyInvocation describes the function' -f $node.Extent.StartLineNumber }
+    }
+}
+
+# A source's text with each script it runs at a fixed path folded: the call names the script's function instead, and
+# the script is folded the same way, once, into the state.
+function Add-PscFoldedScript {
+    param([Parameter(Mandatory)][PscConsolidationState] $State, [Parameter(Mandatory)][string] $File)
+    $tokens = $null; $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($File, [ref]$tokens, [ref]$errors)
+    $text = [IO.File]::ReadAllText($File)
+    $edits = [System.Collections.Generic.List[object]]::new()
+    foreach ($command in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+        $script = Resolve-PscScriptInvocation -Command $command -Directory ([IO.Path]::GetDirectoryName($File))
+        if ($null -eq $script) {
+            # A script named by a string whose path is not fixed in the source stays as it is, and is reported.
+            $target = $command.CommandElements[0]
+            if ($command.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Ampersand -and
+                ($target -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $target -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) -and
+                $target.Value.EndsWith('.ps1', [StringComparison]::OrdinalIgnoreCase)) {
+                $State.Unresolved.Add(('{0}:{1} {2}' -f $File, $command.Extent.StartLineNumber, $target.Extent.Text))
+            }
+            continue
+        }
+        if (-not [IO.File]::Exists($script)) { $State.Unresolved.Add(('{0}:{1} {2} (no such file)' -f $File, $command.Extent.StartLineNumber, $script)); continue }
+        if (-not $State.Included.ContainsKey($script)) {
+            $name = 'Invoke-' + [IO.Path]::GetFileNameWithoutExtension($script)
+            while (-not $State.Taken.Add($name)) { $name += 'Script' }
+            $includedTokens = $null; $includedErrors = $null
+            $includedAst = [System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$includedTokens, [ref]$includedErrors)
+            $State.Included[$script] = [PscIncludedScript]@{ Path = $script; Function = $name; CalledFrom = [string[]]@(); Differences = [string[]]@(Get-PscScriptDifference -Ast $includedAst) }
+            $State.Bodies[$script] = Add-PscFoldedScript -State $State -File $script
+            $State.Order.Add($script)
+        }
+        $State.Included[$script].CalledFrom += ('{0}:{1}' -f $File, $command.Extent.StartLineNumber)
+        $edits.Add([pscustomobject]@{ Start = $command.Extent.StartOffset; End = $command.CommandElements[0].Extent.EndOffset; Text = $State.Included[$script].Function })
+    }
+    foreach ($edit in @($edits | Sort-Object Start -Descending)) { $text = $text.Substring(0, $edit.Start) + $edit.Text + $text.Substring($edit.End) }
+    $text
+}
+
 class PscMemberLowering {
     [string] $Class
     [string] $Member
@@ -7669,6 +7798,10 @@ process {
             Get-SmaReport @(Get-SmaUnits $profiled) $profiled
         }
         'Verify' { Test-SmaDescription }
+        'Consolidate' {
+            if (-not $SourcePath -or -not $OutputPath) { throw 'Consolidate requires -SourcePath (the entry script) and -OutputPath (the single script to write).' }
+            ConvertTo-PscSingleScript -Path $SourcePath -OutputPath $OutputPath
+        }
         'Investigate' {
             if (-not $InvestigatePath) { throw 'Investigate requires -InvestigatePath.' }
             Invoke-PscInvestigation -Path $InvestigatePath
