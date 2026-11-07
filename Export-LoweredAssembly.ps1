@@ -2,12 +2,31 @@
 .SYNOPSIS
     Compiles admitted typed PowerShell classes into managed IL.
 .DESCRIPTION
-    Self-contained compiler with four operations. Compile emits an assembly;
+    Self-contained compiler with five operations. Compile emits an assembly;
     Expression returns live AST and expression objects in the calling process;
-    Inspect reads assembly metadata; Capability reports the admitted contract.
-    No module import or external implementation source is required.
+    Inspect reads assembly metadata; Capability reports the admitted contract;
+    Link reads COFF objects and libraries and resolves their symbols into a
+    native image. No module import or external implementation source is required.
 .PARAMETER Mode
-    Compile (default), Expression, Inspect or Capability.
+    Compile (default), Expression, Inspect, Capability or Link.
+.PARAMETER LinkInput
+    Link: COFF object (.obj) and library (.lib) paths, in command-line order.
+.PARAMETER LibraryDirectory
+    Link: directories searched, in order, for libraries named by default-library directives.
+.PARAMETER DefaultLibrary
+    Link: libraries added as if named by a default-library directive.
+.PARAMETER NoDefaultLibrary
+    Link: default libraries to ignore; '*' ignores every default-library directive.
+.PARAMETER ResolveOnly
+    Link: resolve symbols and report members, imports and unresolved symbols without writing an image.
+.PARAMETER EntrySymbol
+    Link: the image's entry point symbol; it is a reference like any other.
+.PARAMETER LinkMerge
+    Link: output-section merges, each From=To, applied after the linker's own and before the objects' directives.
+.PARAMETER Subsystem
+    Link: Console (default) or Windows.
+.PARAMETER StackReserve
+    Link: stack reserve size in bytes.
 .PARAMETER SourcePath
     Source file containing typed PowerShell classes.
 .PARAMETER SourceAst
@@ -45,7 +64,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Compile', 'Expression', 'Inspect', 'Capability')]
+    [ValidateSet('Compile', 'Expression', 'Inspect', 'Capability', 'Link')]
     [string] $Mode = 'Compile',
     [string] $SourcePath,
     [System.Management.Automation.Language.ScriptBlockAst] $SourceAst,
@@ -59,6 +78,16 @@ param(
     [Parameter(ValueFromPipeline)]
     [System.Management.Automation.Language.FunctionMemberAst] $MethodAst,
     [string] $AssemblyPath,
+    [string[]] $LinkInput,
+    [string[]] $LibraryDirectory,
+    [string[]] $DefaultLibrary,
+    [string[]] $NoDefaultLibrary,
+    [switch] $ResolveOnly,
+    [string] $EntrySymbol,
+    [string[]] $LinkMerge,
+    [ValidateSet('Console', 'Windows')]
+    [string] $Subsystem = 'Console',
+    [long] $StackReserve = 0x100000,
     [switch] $Help
 )
 
@@ -75,6 +104,10 @@ if (-not $Help) {
         }
         'Inspect' {
             if ([string]::IsNullOrEmpty($AssemblyPath)) { throw 'Inspect requires -AssemblyPath.' }
+        }
+        'Link' {
+            if ($null -eq $LinkInput -or $LinkInput.Count -eq 0) { throw 'Link requires -LinkInput.' }
+            if (-not $ResolveOnly -and [string]::IsNullOrEmpty($OutputPath)) { throw 'Link requires -OutputPath unless -ResolveOnly.' }
         }
     }
 }
@@ -3179,6 +3212,684 @@ function Test-LoweredAssembly {
     }
 }
 
+# ---------------------------------------------------------------------------------------------------------------
+# Native linking. COFF objects (regular and /bigobj), short import objects and .lib archives are read as typed
+# records; symbols are resolved the way the platform linker resolves them: explicit inputs first, then libraries in
+# the order they are named or found, repeating until nothing new is pulled in. Reference: Microsoft PE/COFF
+# specification (pinned under the shared root as references\pe-coff-spec-*).
+# ---------------------------------------------------------------------------------------------------------------
+
+function Read-CoffName([byte[]] $Bytes, [int] $Offset, [int] $Length) {
+    $end = $Offset
+    while ($end -lt $Offset + $Length -and $end -lt $Bytes.Length -and $Bytes[$end] -ne 0) { $end++ }
+    [Text.Encoding]::UTF8.GetString($Bytes, $Offset, $end - $Offset)
+}
+
+function Read-CoffStringAt([byte[]] $Bytes, [int] $Offset) {
+    $end = $Offset
+    while ($end -lt $Bytes.Length -and $Bytes[$end] -ne 0) { $end++ }
+    [Text.Encoding]::UTF8.GetString($Bytes, $Offset, $end - $Offset)
+}
+
+function Split-CoffDirectives([string] $Text) {
+    # Whitespace-separated options; a double-quoted run keeps its spaces and loses its quotes.
+    $tokens = [Collections.Generic.List[string]]::new()
+    $current = [Text.StringBuilder]::new(); $quoted = $false
+    foreach ($character in $Text.ToCharArray()) {
+        if ($character -eq [char]'"') { $quoted = -not $quoted; continue }
+        if (-not $quoted -and [char]::IsWhiteSpace($character)) {
+            if ($current.Length) { $tokens.Add($current.ToString()); $null = $current.Clear() }
+            continue
+        }
+        $null = $current.Append($character)
+    }
+    if ($current.Length) { $tokens.Add($current.ToString()) }
+    foreach ($token in $tokens) {
+        if ($token.Length -lt 2 -or ($token[0] -ne [char]'/' -and $token[0] -ne [char]'-')) { continue }
+        $colon = $token.IndexOf([char]':')
+        if ($colon -lt 0) { [pscustomobject]@{ Option = $token.Substring(1).ToUpperInvariant(); Value = '' } }
+        else { [pscustomobject]@{ Option = $token.Substring(1, $colon - 1).ToUpperInvariant(); Value = $token.Substring($colon + 1) } }
+    }
+}
+
+function Read-CoffImportObject([byte[]] $Bytes, [string] $Origin) {
+    # IMPORT_OBJECT_HEADER: Sig1 0, Sig2 0xFFFF, Version 0, Machine, TimeDateStamp, SizeOfData, Ordinal/Hint, Type.
+    $typeBits = [BitConverter]::ToUInt16($Bytes, 18)
+    $symbol = Read-CoffStringAt $Bytes 20
+    $dll = Read-CoffStringAt $Bytes (20 + [Text.Encoding]::UTF8.GetByteCount($symbol) + 1)
+    $kind = @('Code', 'Data', 'Const', 'Unknown')[$typeBits -band 3]
+    $nameType = ($typeBits -shr 2) -band 7
+    $importName = $symbol
+    if ($nameType -ge 2) { $importName = $importName.TrimStart([char]'?', [char]'@', [char]'_') }
+    if ($nameType -eq 3) { $at = $importName.IndexOf([char]'@'); if ($at -ge 0) { $importName = $importName.Substring(0, $at) } }
+    $defined = [Collections.Generic.List[string]]::new(); $defined.Add('__imp_' + $symbol); if ($kind -eq 'Code') { $defined.Add($symbol) }
+    [pscustomobject]@{
+        Kind = 'Import'; Origin = $Origin; Machine = [BitConverter]::ToUInt16($Bytes, 6); Symbol = $symbol; Dll = $dll
+        ImportKind = $kind; NameType = $nameType; ImportName = $importName; OrdinalOrHint = [BitConverter]::ToUInt16($Bytes, 16)
+        ByOrdinal = ($nameType -eq 0); Defines = $defined.ToArray()
+    }
+}
+
+function Read-CoffObject([byte[]] $Bytes, [string] $Origin) {
+    if ($Bytes.Length -ge 20 -and [BitConverter]::ToUInt16($Bytes, 0) -eq 0 -and [BitConverter]::ToUInt16($Bytes, 2) -eq 0xFFFF) {
+        $version = [BitConverter]::ToUInt16($Bytes, 4)
+        if ($version -eq 0) { return Read-CoffImportObject $Bytes $Origin }
+        $class = [guid]::new([byte[]]$Bytes[12..27])
+        if ($class -ne [guid]'d1baa1c7-baee-4ba9-af20-faf66aa4dcb8') { throw "$Origin`: unsupported anonymous object (version $version, class $class)." }
+        $big = $true; $machine = [BitConverter]::ToUInt16($Bytes, 6)
+        $sectionCount = [int][BitConverter]::ToUInt32($Bytes, 44); $symbolTable = [int][BitConverter]::ToUInt32($Bytes, 48); $symbolCount = [int][BitConverter]::ToUInt32($Bytes, 52)
+        $sectionTable = 56; $recordSize = 20
+    } else {
+        $big = $false; $machine = [BitConverter]::ToUInt16($Bytes, 0)
+        $sectionCount = [int][BitConverter]::ToUInt16($Bytes, 2); $symbolTable = [int][BitConverter]::ToUInt32($Bytes, 8); $symbolCount = [int][BitConverter]::ToUInt32($Bytes, 12)
+        $sectionTable = 20 + [BitConverter]::ToUInt16($Bytes, 16); $recordSize = 18
+    }
+    $stringTable = $symbolTable + $symbolCount * $recordSize
+    $sections = [Collections.Generic.List[object]]::new()
+    for ($i = 0; $i -lt $sectionCount; $i++) {
+        $h = $sectionTable + 40 * $i
+        $name = Read-CoffName $Bytes $h 8
+        if ($name.StartsWith('/') -and $symbolTable -gt 0) { $name = Read-CoffStringAt $Bytes ($stringTable + [int]::Parse($name.Substring(1))) }
+        $characteristics = [BitConverter]::ToUInt32($Bytes, $h + 36)
+        $relocationCount = [int][BitConverter]::ToUInt16($Bytes, $h + 32); $relocations = [int][BitConverter]::ToUInt32($Bytes, $h + 24)
+        if (($characteristics -band 0x01000000) -ne 0 -and $relocationCount -eq 0xFFFF) { $relocationCount = [int][BitConverter]::ToUInt32($Bytes, $relocations) - 1; $relocations += 10 }
+        $sections.Add([pscustomobject]@{
+            Number = $i + 1; Name = $name; Characteristics = $characteristics
+            RawSize = [int][BitConverter]::ToUInt32($Bytes, $h + 16); RawOffset = [int][BitConverter]::ToUInt32($Bytes, $h + 20)
+            RelocationOffset = $relocations; RelocationCount = $relocationCount
+        })
+    }
+    $symbols = [object[]]::new($symbolCount)
+    for ($i = 0; $i -lt $symbolCount; $i++) {
+        $at = $symbolTable + $i * $recordSize
+        $name = if ([BitConverter]::ToUInt32($Bytes, $at) -eq 0) { Read-CoffStringAt $Bytes ($stringTable + [int][BitConverter]::ToUInt32($Bytes, $at + 4)) } else { Read-CoffName $Bytes $at 8 }
+        $section = if ($big) { [BitConverter]::ToInt32($Bytes, $at + 12) } else { [int][BitConverter]::ToInt16($Bytes, $at + 12) }
+        $typeAt = if ($big) { $at + 16 } else { $at + 14 }
+        $auxCount = [int]$Bytes[$typeAt + 3]
+        $symbols[$i] = [pscustomobject]@{
+            Index = $i; Name = $name; Value = [BitConverter]::ToUInt32($Bytes, $at + 8); Section = $section
+            Type = [BitConverter]::ToUInt16($Bytes, $typeAt); StorageClass = [int]$Bytes[$typeAt + 2]; AuxCount = $auxCount; AuxOffset = $at + $recordSize
+        }
+        $i += $auxCount
+    }
+    $directives = @(foreach ($s in $sections) {
+        if ($s.Name -eq '.drectve' -and $s.RawSize -gt 0) {
+            $text = [Text.Encoding]::UTF8.GetString($Bytes, $s.RawOffset, $s.RawSize)
+            if ($text.Length -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
+            Split-CoffDirectives $text
+        }
+    })
+    [pscustomobject]@{
+        Kind = 'Object'; Origin = $Origin; Bytes = $Bytes; Machine = $machine; BigObject = $big; RecordSize = $recordSize
+        Sections = $sections.ToArray(); Symbols = $symbols; Directives = $directives
+    }
+}
+
+function Read-CoffArchive([string] $Path) {
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -lt 8 -or [Text.Encoding]::ASCII.GetString($bytes, 0, 8) -ne "!<arch>`n") { throw "$Path is not a COFF archive." }
+    $members = [Collections.Generic.List[object]]::new(); $index = $null; $first = $null; $longNames = $null
+    $at = 8; $linkerMembers = 0
+    while ($at + 60 -le $bytes.Length) {
+        $name = [Text.Encoding]::ASCII.GetString($bytes, $at, 16).TrimEnd()
+        $size = [int]::Parse([Text.Encoding]::ASCII.GetString($bytes, $at + 48, 10).Trim())
+        $data = $at + 60
+        if ($name -eq '/') { $linkerMembers++; if ($linkerMembers -eq 1) { $first = @{ Offset = $data; Size = $size } } else { $index = @{ Offset = $data; Size = $size } } }
+        elseif ($name -eq '//') { $longNames = @{ Offset = $data; Size = $size } }
+        else { $members.Add([pscustomobject]@{ HeaderOffset = $at; Name = $name; DataOffset = $data; Size = $size }) }
+        $at = $data + $size; if (($at % 2) -ne 0) { $at++ }
+    }
+    $symbolToMember = [Collections.Generic.Dictionary[string, int]]::new([StringComparer]::Ordinal)
+    if ($null -ne $index) {
+        # Second linker member: little-endian member offsets, then symbol count, 1-based member indices, names.
+        $p = $index.Offset; $memberCount = [int][BitConverter]::ToUInt32($bytes, $p); $p += 4
+        $offsets = [int[]]::new($memberCount); for ($i = 0; $i -lt $memberCount; $i++) { $offsets[$i] = [int][BitConverter]::ToUInt32($bytes, $p); $p += 4 }
+        $symbolCount = [int][BitConverter]::ToUInt32($bytes, $p); $p += 4
+        $indices = [int[]]::new($symbolCount); for ($i = 0; $i -lt $symbolCount; $i++) { $indices[$i] = [int][BitConverter]::ToUInt16($bytes, $p); $p += 2 }
+        for ($i = 0; $i -lt $symbolCount; $i++) { $symbol = Read-CoffStringAt $bytes $p; $p += [Text.Encoding]::UTF8.GetByteCount($symbol) + 1; if (-not $symbolToMember.ContainsKey($symbol)) { $symbolToMember[$symbol] = $offsets[$indices[$i] - 1] } }
+    } elseif ($null -ne $first) {
+        # First linker member only: big-endian count and offsets, then names.
+        $p = $first.Offset; $count = [int](([uint32]$bytes[$p] -shl 24) -bor ([uint32]$bytes[$p + 1] -shl 16) -bor ([uint32]$bytes[$p + 2] -shl 8) -bor [uint32]$bytes[$p + 3]); $p += 4
+        $offsets = [int[]]::new($count); for ($i = 0; $i -lt $count; $i++) { $offsets[$i] = [int](([uint32]$bytes[$p] -shl 24) -bor ([uint32]$bytes[$p + 1] -shl 16) -bor ([uint32]$bytes[$p + 2] -shl 8) -bor [uint32]$bytes[$p + 3]); $p += 4 }
+        for ($i = 0; $i -lt $count; $i++) { $symbol = Read-CoffStringAt $bytes $p; $p += [Text.Encoding]::UTF8.GetByteCount($symbol) + 1; if (-not $symbolToMember.ContainsKey($symbol)) { $symbolToMember[$symbol] = $offsets[$i] } }
+    }
+    $byHeader = @{}; foreach ($m in $members) { $byHeader[$m.HeaderOffset] = $m }
+    [pscustomobject]@{ Kind = 'Archive'; Path = $Path; Bytes = $bytes; Members = $members.ToArray(); MemberAt = $byHeader; SymbolIndex = $symbolToMember; LongNames = $longNames }
+}
+
+function Get-CoffArchiveMember($Archive, [int] $HeaderOffset) {
+    $member = $Archive.MemberAt[$HeaderOffset]
+    if ($null -eq $member) { throw "$($Archive.Path): no member at offset $HeaderOffset." }
+    $name = $member.Name
+    if ($name.StartsWith('/') -and $null -ne $Archive.LongNames) { $name = Read-CoffStringAt $Archive.Bytes ($Archive.LongNames.Offset + [int]::Parse($name.Substring(1))) }
+    $name = $name.TrimEnd([char]'/')
+    $data = [byte[]]::new($member.Size); [Array]::Copy($Archive.Bytes, $member.DataOffset, $data, 0, $member.Size)
+    Read-CoffObject $data ((Split-Path -Leaf $Archive.Path) + '(' + $name + ')')
+}
+
+function Find-CoffLibrary([string] $Name, [string[]] $Directories) {
+    $file = if ([IO.Path]::HasExtension($Name)) { $Name } else { $Name + '.lib' }
+    if ([IO.Path]::IsPathRooted($file) -and [IO.File]::Exists($file)) { return [IO.Path]::GetFullPath($file) }
+    foreach ($directory in $Directories) { $candidate = Join-Path $directory $file; if ([IO.File]::Exists($candidate)) { return [IO.Path]::GetFullPath($candidate) } }
+    $null
+}
+
+function Resolve-CoffLink {
+    param([string[]] $Inputs, [string[]] $LibraryDirectories = @(), [string[]] $DefaultLibraries = @(), [string[]] $IgnoredDefaultLibraries = @(), [string] $Entry)
+    $ignoreAll = $IgnoredDefaultLibraries -contains '*'
+    $ignored = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in $IgnoredDefaultLibraries) { if ($name -ne '*') { $null = $ignored.Add([IO.Path]::GetFileNameWithoutExtension($name)) } }
+    $defined = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $definedSymbol = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $referenced = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $weakDefault = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+    $alternate = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+    $libraries = [Collections.Generic.List[object]]::new(); $libraryPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $loaded = [Collections.Generic.List[object]]::new(); $loadedMembers = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $missingLibraries = [Collections.Generic.List[string]]::new()
+
+    $addLibrary = {
+        param([string] $name, [bool] $fromDirective)
+        $stem = [IO.Path]::GetFileNameWithoutExtension($name)
+        if ($fromDirective -and ($ignoreAll -or $ignored.Contains($stem))) { return }
+        $path = Find-CoffLibrary $name $LibraryDirectories
+        if ($null -eq $path) { if (-not $missingLibraries.Contains($name)) { $missingLibraries.Add($name) }; return }
+        if ($libraryPaths.Add($path)) { $libraries.Add((Read-CoffArchive $path)) }
+    }
+    $addObject = {
+        param($object)
+        $loaded.Add($object)
+        if ($object.Kind -eq 'Import') {
+            foreach ($name in $object.Defines) { if (-not $defined.ContainsKey($name)) { $defined[$name] = $object } }
+            return
+        }
+        foreach ($directive in $object.Directives) {
+            switch ($directive.Option) {
+                'DEFAULTLIB' { & $addLibrary $directive.Value $true }
+                'ALTERNATENAME' { $eq = $directive.Value.IndexOf([char]'='); if ($eq -gt 0) { $from = $directive.Value.Substring(0, $eq); if (-not $alternate.ContainsKey($from)) { $alternate[$from] = $directive.Value.Substring($eq + 1) } } }
+                'INCLUDE' { $null = $referenced.Add($directive.Value) }
+            }
+        }
+        foreach ($symbol in $object.Symbols) {
+            if ($null -eq $symbol -or ($symbol.StorageClass -ne 2 -and $symbol.StorageClass -ne 105)) { continue }
+            if ($symbol.StorageClass -eq 105) {
+                $tag = [int][BitConverter]::ToUInt32($object.Bytes, $symbol.AuxOffset)
+                $weakDefault[$symbol.Name] = $object.Symbols[$tag].Name
+                $null = $referenced.Add($symbol.Name)
+                continue
+            }
+            if ($symbol.Section -ne 0 -or $symbol.Value -ne 0) { if (-not $defined.ContainsKey($symbol.Name)) { $defined[$symbol.Name] = $object; $definedSymbol[$symbol.Name] = $symbol } }
+            else { $null = $referenced.Add($symbol.Name) }
+        }
+    }
+    $isResolved = { param([string] $name) $defined.ContainsKey($name) -or ($alternate.ContainsKey($name) -and $defined.ContainsKey($alternate[$name])) }
+    # Symbols the linker itself defines while writing the image (PE/COFF: image base; load-configuration tables).
+    $linkerDefined = [pscustomobject]@{ Kind = 'Linker'; Origin = '(linker)' }
+    foreach ($name in '__ImageBase', '__guard_flags', '__guard_fids_table', '__guard_fids_count', '__guard_iat_table', '__guard_iat_count',
+        '__guard_longjmp_table', '__guard_longjmp_count', '__guard_eh_cont_table', '__guard_eh_cont_count', '__dynamic_value_reloc_table', '__enclave_config', '__volatile_metadata') {
+        $defined[$name] = $linkerDefined
+    }
+    if ($Entry) { $null = $referenced.Add($Entry) }
+
+    foreach ($inputPath in $Inputs) {
+        $full = [IO.Path]::GetFullPath($inputPath)
+        if ($full.EndsWith('.lib', [StringComparison]::OrdinalIgnoreCase)) { if ($libraryPaths.Add($full)) { $libraries.Add((Read-CoffArchive $full)) } }
+        else { & $addObject (Read-CoffObject ([IO.File]::ReadAllBytes($full)) (Split-Path -Leaf $full)) }
+    }
+    foreach ($name in $DefaultLibraries) { & $addLibrary $name $false }
+
+    # Pull archive members until a full pass over the libraries adds nothing.
+    do {
+        $pulled = $false
+        for ($l = 0; $l -lt $libraries.Count; $l++) {
+            $library = $libraries[$l]
+            foreach ($name in @($referenced)) {
+                if (& $isResolved $name) { continue }
+                foreach ($candidate in @($name, $(if ($alternate.ContainsKey($name)) { $alternate[$name] } else { $null }))) {
+                    if ($null -eq $candidate -or -not $library.SymbolIndex.ContainsKey($candidate)) { continue }
+                    $key = $library.Path + '|' + $library.SymbolIndex[$candidate]
+                    if ($loadedMembers.Add($key)) { & $addObject (Get-CoffArchiveMember $library $library.SymbolIndex[$candidate]); $pulled = $true }
+                    break
+                }
+            }
+        }
+    } while ($pulled)
+
+    $open = @(foreach ($name in $referenced) {
+        if (& $isResolved $name) { continue }
+        if ($weakDefault.ContainsKey($name) -and (& $isResolved $weakDefault[$name])) { continue }
+        $name
+    })
+    $unresolved = @($open | Sort-Object -Unique)
+    $imports = @($loaded | Where-Object { $_.Kind -eq 'Import' } | Where-Object { $referenced.Contains('__imp_' + $_.Symbol) -or $referenced.Contains($_.Symbol) })
+    [pscustomobject]@{
+        Objects = @($loaded | Where-Object { $_.Kind -eq 'Object' } | ForEach-Object { $_.Origin })
+        Libraries = @($libraries | ForEach-Object { $_.Path })
+        MissingLibraries = $missingLibraries.ToArray()
+        Imports = @($imports | Sort-Object Dll, ImportName | ForEach-Object { [pscustomobject]@{ Dll = $_.Dll; Name = $_.ImportName; Symbol = $_.Symbol; Kind = $_.ImportKind; ByOrdinal = $_.ByOrdinal; Hint = $_.OrdinalOrHint } })
+        Unresolved = $unresolved
+        Loaded = $loaded.ToArray()
+        Defined = $defined; DefinedSymbol = $definedSymbol; Alternate = $alternate; WeakDefault = $weakDefault; Entry = $Entry
+    }
+}
+
+function Get-CoffSectionDefinitions($Object) {
+    # Per section number: the section-definition auxiliary record (COMDAT selection, associated section) and, for a
+    # COMDAT, its leader: the first symbol after the section symbol that names the same section (PE/COFF 5.5.6).
+    $definitions = [object[]]::new($Object.Sections.Count + 1)
+    $symbols = $Object.Symbols
+    for ($i = 0; $i -lt $symbols.Count; $i++) {
+        $symbol = $symbols[$i]
+        if ($null -eq $symbol -or $symbol.Section -le 0 -or $symbol.Section -gt $Object.Sections.Count) { continue }
+        $entry = $definitions[$symbol.Section]
+        if ($null -eq $entry) {
+            if ($symbol.StorageClass -eq 3 -and $symbol.Value -eq 0 -and $symbol.AuxCount -gt 0) {
+                $at = $symbol.AuxOffset
+                $number = [int][BitConverter]::ToUInt16($Object.Bytes, $at + 12) -bor ([int][BitConverter]::ToUInt16($Object.Bytes, $at + 16) -shl 16)
+                $definitions[$symbol.Section] = [pscustomobject]@{ Selection = [int]$Object.Bytes[$at + 14]; Associated = $number; Leader = $null }
+            }
+            continue
+        }
+        if ($null -eq $entry.Leader -and $entry.Selection -ne 0 -and $entry.Selection -ne 5) { $entry.Leader = $symbol }
+    }
+    $definitions
+}
+
+function Write-CoffImage {
+    # Writes a PE32+ image from a resolution: keeps the sections link.exe keeps (/OPT:REF over COMDATs), lays out
+    # output sections by name before '$' with the suffix as the sort key, builds the import table and jump thunks,
+    # applies AMD64 relocations, sorts the function table and writes base relocations. Reference: PE/COFF
+    # specification sections 3, 4, 5 and 6.
+    param($Resolution, [string] $Path, [string[]] $Merges = @(), [int] $Subsystem = 3, [long] $StackReserve = 0x100000)
+    $imageBase = [long]0x140000000
+    $fileAlignment = 0x200; $sectionAlignment = 0x1000
+    $alignUp = { param([long] $value, [long] $alignment) [long]([Math]::Ceiling($value / $alignment) * $alignment) }
+    $objects = @($Resolution.Loaded | Where-Object { $_.Kind -eq 'Object' })
+    $id = 0; foreach ($o in $Resolution.Loaded) { $o | Add-Member -NotePropertyName Id -NotePropertyValue $id -Force; $id++ }
+    $errors = [Collections.Generic.List[string]]::new()
+
+    # Output-section names: link.exe's own merges, then the objects' directives, then the command line's.
+    $mergeMap = @{ '.xdata' = '.rdata'; '.00cfg' = '.rdata'; '.idata' = '.rdata'; '.didat' = '.rdata'; '.edata' = '.rdata'; '.bss' = '.data'; '.tls' = '.data' }
+    $mergeValues = [Collections.Generic.List[string]]::new()
+    foreach ($o in $objects) { foreach ($d in $o.Directives) { if ($d.Option -eq 'MERGE') { $mergeValues.Add($d.Value) } } }
+    foreach ($m in $Merges) { $mergeValues.Add($m) }
+    foreach ($m in $mergeValues) { $eq = $m.IndexOf([char]'='); if ($eq -gt 0) { $mergeMap[$m.Substring(0, $eq)] = $m.Substring($eq + 1) } }
+    $outputOf = { param([string] $group) $name = $group; for ($k = 0; $k -lt 16 -and $mergeMap.ContainsKey($name); $k++) { $name = $mergeMap[$name] }; $name }
+    # Sections the linker consumes rather than places (debug records, guard and volatile-access tables, checksums).
+    $consumed = [Collections.Generic.HashSet[string]]::new([string[]]@('.drectve', '.debug', '.gfids', '.giats', '.gljmp', '.gehcont', '.gssep', '.gsspr', '.chks64', '.voltbl'), [StringComparer]::Ordinal)
+
+    # 1. Contributions: one per kept input section.
+    $contributions = [object[]]::new($Resolution.Loaded.Count)
+    $all = [Collections.Generic.List[object]]::new(); $sequence = 0
+    foreach ($o in $objects) {
+        $definitions = Get-CoffSectionDefinitions $o
+        $list = [object[]]::new($o.Sections.Count + 1)
+        foreach ($section in $o.Sections) {
+            $ch = [long]$section.Characteristics
+            $dollar = $section.Name.IndexOf([char]'$'); $group = if ($dollar -ge 0) { $section.Name.Substring(0, $dollar) } else { $section.Name }
+            if (($ch -band 0xA00) -ne 0 -or $consumed.Contains($group)) { continue }
+            if ($group -eq '.idata') { $errors.Add("$($o.Origin): long-format import section $($section.Name) is not supported."); continue }
+            $definition = $definitions[$section.Number]
+            $comdat = ($ch -band 0x1000) -ne 0
+            if ($comdat -and $null -ne $definition -and $definition.Selection -ne 5 -and $null -ne $definition.Leader -and $definition.Leader.StorageClass -eq 2) {
+                $winner = $Resolution.Defined[$definition.Leader.Name]
+                if ($null -eq $winner -or $winner.Kind -ne 'Object' -or $winner.Id -ne $o.Id) { continue }
+            }
+            $alignBits = [int](($ch -shr 20) -band 0xF)
+            $list[$section.Number] = [pscustomobject]@{
+                Sequence = $sequence++; Object = $o; Section = $section; Name = $section.Name; Group = $group; Output = (& $outputOf $group)
+                Comdat = $comdat; Associated = $(if ($comdat -and $null -ne $definition -and $definition.Selection -eq 5) { $definition.Associated } else { 0 })
+                Code = ($ch -band 0x20) -ne 0; Uninitialized = ($ch -band 0x80) -ne 0; Characteristics = $ch
+                Size = [long]$section.RawSize; Align = $(if ($alignBits -gt 0) { 1 -shl ($alignBits - 1) } else { 16 })
+                Live = $false; Rva = [long]-1; Children = [Collections.Generic.List[object]]::new(); Synthetic = $null
+            }
+        }
+        foreach ($c in $list) {
+            if ($null -eq $c -or $c.Associated -eq 0) { continue }
+            $parent = $list[$c.Associated]
+            if ($null -eq $parent) { $list[$c.Section.Number] = $null } else { $parent.Children.Add($c) }
+        }
+        foreach ($c in $list) { if ($null -ne $c) { $all.Add($c) } }
+        $contributions[$o.Id] = $list
+    }
+
+    # 2. Symbol targets: a kept contribution and offset, an absolute value, an import slot or thunk, a common block.
+    $nameTargets = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $symbolTargets = [object[]]::new($Resolution.Loaded.Count)
+    $resolveName = {
+        param([string] $name)
+        if ($nameTargets.ContainsKey($name)) { return $nameTargets[$name] }
+        $n = $name
+        if (-not $Resolution.Defined.ContainsKey($n) -and $Resolution.Alternate.ContainsKey($n)) { $n = $Resolution.Alternate[$n] }
+        $t = $null
+        if ($Resolution.Defined.ContainsKey($n)) {
+            $d = $Resolution.Defined[$n]
+            switch ($d.Kind) {
+                'Linker' { $t = if ($n -eq '__ImageBase') { [pscustomobject]@{ K = 'Base' } } else { [pscustomobject]@{ K = 'Absolute'; V = [long]$(if ($n -eq '__guard_flags') { 0x100 } else { 0 }) } } }
+                'Import' { $t = [pscustomobject]@{ K = $(if ($n.StartsWith('__imp_')) { 'Slot' } else { 'Thunk' }); Import = $d } }
+                'Object' {
+                    $s = $Resolution.DefinedSymbol[$n]
+                    if ($s.Section -gt 0) { $t = [pscustomobject]@{ K = 'Section'; C = $contributions[$d.Id][$s.Section]; Offset = [long]$s.Value; Name = $n } }
+                    elseif ($s.Section -eq -1) { $t = [pscustomobject]@{ K = 'Absolute'; V = [long]$s.Value } }
+                    else { $t = [pscustomobject]@{ K = 'Common'; Name = $n; Size = [long]$s.Value } }
+                }
+            }
+        }
+        $nameTargets[$name] = $t
+        $t
+    }
+    $symbolTarget = {
+        param($o, [int] $index)
+        $cache = $symbolTargets[$o.Id]; if ($null -eq $cache) { $cache = [object[]]::new($o.Symbols.Count); $symbolTargets[$o.Id] = $cache }
+        if ($null -ne $cache[$index]) { return $cache[$index] }
+        $s = $o.Symbols[$index]; $t = $null
+        if ($s.StorageClass -eq 105) {
+            $t = & $resolveName $s.Name
+            if ($null -eq $t) { $t = & $symbolTarget $o ([int][BitConverter]::ToUInt32($o.Bytes, $s.AuxOffset)) }
+        } elseif ($s.StorageClass -eq 2) { $t = & $resolveName $s.Name }
+        elseif ($s.Section -gt 0) { $t = [pscustomobject]@{ K = 'Section'; C = $contributions[$o.Id][$s.Section]; Offset = [long]$s.Value; Name = $s.Name } }
+        elseif ($s.Section -eq -1) { $t = [pscustomobject]@{ K = 'Absolute'; V = [long]$s.Value } }
+        if ($null -eq $t) { $t = [pscustomobject]@{ K = 'Unresolved'; Name = $s.Name } }
+        $cache[$index] = $t
+        $t
+    }
+
+    # 3. Reachability (/OPT:REF): non-COMDAT sections, the entry point, the TLS and load-configuration records and
+    # /INCLUDE names are roots; a live section makes its relocation targets and its associated sections live.
+    $usedImports = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $usedThunks = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $usedCommon = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $work = [Collections.Generic.Stack[object]]::new()
+    $markTarget = {
+        param($t, [string] $where)
+        switch ($t.K) {
+            'Section' { if ($null -eq $t.C) { $errors.Add("$where references $($t.Name) in a discarded section.") } elseif (-not $t.C.Live) { $t.C.Live = $true; $work.Push($t.C) } }
+            'Slot' { $usedImports[$t.Import.Symbol] = $t.Import }
+            'Thunk' { $usedImports[$t.Import.Symbol] = $t.Import; $usedThunks[$t.Import.Symbol] = $t.Import }
+            'Common' { if (-not $usedCommon.ContainsKey($t.Name)) { $usedCommon[$t.Name] = $t } }
+            'Unresolved' { $errors.Add("$where references unresolved $($t.Name).") }
+        }
+    }
+    foreach ($c in $all) { if (-not $c.Comdat) { $c.Live = $true; $work.Push($c) } }
+    $rootNames = [Collections.Generic.List[string]]::new()
+    if ($Resolution.Entry) { $rootNames.Add($Resolution.Entry) }
+    foreach ($name in '_tls_used', '_load_config_used') { if ($Resolution.Defined.ContainsKey($name)) { $rootNames.Add($name) } }
+    foreach ($o in $objects) { foreach ($d in $o.Directives) { if ($d.Option -eq 'INCLUDE') { $rootNames.Add($d.Value) } } }
+    foreach ($name in $rootNames) {
+        $t = & $resolveName $name
+        if ($null -eq $t) { $errors.Add("root $name is unresolved.") } else { & $markTarget $t '(root)' }
+    }
+    while ($work.Count) {
+        $c = $work.Pop(); $o = $c.Object; $bytes = $o.Bytes
+        for ($i = 0; $i -lt $c.Section.RelocationCount; $i++) {
+            $at = $c.Section.RelocationOffset + 10 * $i
+            $t = & $symbolTarget $o ([int][BitConverter]::ToUInt32($bytes, $at + 4))
+            & $markTarget $t "$($o.Origin)($($c.Name))"
+        }
+        foreach ($child in $c.Children) { if (-not $child.Live) { $child.Live = $true; $work.Push($child) } }
+    }
+    if ($errors.Count) { throw ("Link failed:`n" + (($errors | Select-Object -First 40) -join "`n")) }
+
+    # 4. Synthetic contributions: jump thunks, the import address table and the rest of the import data, common
+    # blocks and the debug directory that carries the extended DLL characteristics.
+    $byDll = [ordered]@{}
+    foreach ($import in @($usedImports.Values | Sort-Object { $_.Dll.ToLowerInvariant() }, ImportName)) {
+        $key = $import.Dll.ToLowerInvariant(); if (-not $byDll.Contains($key)) { $byDll[$key] = [Collections.Generic.List[object]]::new() }
+        $byDll[$key].Add($import)
+    }
+    $newSynthetic = {
+        param([string] $kind, [string] $output, [long] $size, [int] $align, [bool] $code, [bool] $uninitialized)
+        $c = [pscustomobject]@{
+            Sequence = $all.Count; Object = $null; Section = $null; Name = $output; Group = $output; Output = $output
+            Comdat = $false; Associated = 0; Code = $code; Uninitialized = $uninitialized; Characteristics = [long]0
+            Size = $size; Align = $align; Live = $true; Rva = [long]-1; Children = $null; Synthetic = $kind
+        }
+        $all.Add($c); $c
+    }
+    $slotOffset = @{}; $iatSize = [long]0
+    foreach ($key in $byDll.Keys) { foreach ($import in $byDll[$key]) { $slotOffset[$import.Symbol] = $iatSize; $iatSize += 8 }; $iatSize += 8 }
+    $iat = & $newSynthetic 'ImportAddressTable' '.rdata' $iatSize 8 $false $false
+    $iat.Sequence = -1   # first in .rdata, as link.exe places it
+    $thunkOffset = @{}; $n = 0; foreach ($symbol in @($usedThunks.Keys | Sort-Object)) { $thunkOffset[$symbol] = [long]8 * $n; $n++ }
+    $thunks = if ($n) { & $newSynthetic 'Thunks' '.text' ([long]8 * $n) 16 $true $false } else { $null }
+    $descriptorSize = [long]20 * ($byDll.Count + 1)
+    $lookupAt = & $alignUp $descriptorSize 8
+    $hintAt = @{}; $p = $lookupAt + $iatSize
+    foreach ($key in $byDll.Keys) { foreach ($import in $byDll[$key]) { if (-not $import.ByOrdinal) { $hintAt[$import.Symbol] = $p; $p += & $alignUp (2 + [Text.Encoding]::ASCII.GetByteCount($import.ImportName) + 1) 2 } } }
+    $dllNameAt = @{}; foreach ($key in $byDll.Keys) { $dllNameAt[$key] = $p; $p += [Text.Encoding]::ASCII.GetByteCount($byDll[$key][0].Dll) + 1 }
+    $importData = & $newSynthetic 'ImportData' '.rdata' $p 8 $false $false
+    $debug = & $newSynthetic 'Debug' '.rdata' 32 4 $false $false
+    $commonContribution = @{}
+    foreach ($entry in @($usedCommon.Values | Sort-Object Name)) {
+        $align = 1; while ($align -lt $entry.Size -and $align -lt 16) { $align *= 2 }
+        $commonContribution[$entry.Name] = & $newSynthetic 'Common' '.data' $entry.Size $align $false $true
+    }
+
+    # 5. Layout: output sections in link.exe's order; within one, initialized before uninitialized, then by input
+    # group (first appearance), full section name (ordinal), and input order.
+    $live = @($all | Where-Object { $_.Live })
+    $groupOrder = @{}; foreach ($c in $live) { if (-not $groupOrder.ContainsKey($c.Group)) { $groupOrder[$c.Group] = $groupOrder.Count } }
+    $outputNames = [Collections.Generic.List[string]]::new()
+    foreach ($name in '.text', '.rdata', '.data', '.pdata') { if (@($live | Where-Object { $_.Output -eq $name }).Count) { $outputNames.Add($name) } }
+    foreach ($c in $live) { if (-not $outputNames.Contains($c.Output)) { $outputNames.Add($c.Output) } }
+    $known = @{ '.text' = 0x60000020; '.rdata' = 0x40000040; '.data' = [int]-1073741760; '.pdata' = 0x40000040 }   # .data: 0xC0000040
+    $outputs = [Collections.Generic.List[object]]::new()
+    $rva = [long]$sectionAlignment
+    foreach ($name in $outputNames) {
+        $memberList = [Collections.Generic.List[object]]::new(); foreach ($c in $live) { if ($c.Output -eq $name) { $memberList.Add($c) } }
+        $memberList.Sort([Comparison[object]] {
+            param($a, $b)
+            $r = $a.Uninitialized.CompareTo($b.Uninitialized); if ($r) { return $r }
+            # The TLS template leads its output section; the import address table leads .rdata.
+            $ga = if ($a.Group -eq '.tls') { -2 } elseif ($a.Sequence -lt 0) { -1 } else { $groupOrder[$a.Group] }
+            $gb = if ($b.Group -eq '.tls') { -2 } elseif ($b.Sequence -lt 0) { -1 } else { $groupOrder[$b.Group] }
+            $r = $ga.CompareTo($gb); if ($r) { return $r }
+            $r = [string]::CompareOrdinal($a.Name, $b.Name); if ($r) { return $r }
+            $a.Sequence.CompareTo($b.Sequence)
+        })
+        $members = $memberList.ToArray()
+        $offset = [long]0; $initializedEnd = [long]0; $code = $false; $flags = [long]0
+        foreach ($c in $members) {
+            $offset = & $alignUp $offset $c.Align
+            $c.Rva = $rva + $offset; $offset += $c.Size
+            if (-not $c.Uninitialized) { $initializedEnd = $offset }
+            if ($c.Code) { $code = $true }
+            $flags = $flags -bor $c.Characteristics
+        }
+        $characteristics = if ($known.ContainsKey($name)) { [int]$known[$name] } else {
+            $f = $flags -band 0xFE0000E0; if ($initializedEnd -gt 0) { $f = $f -band (-bnot 0x80) }; [BitConverter]::ToInt32([BitConverter]::GetBytes([uint32]$f), 0)
+        }
+        $outputs.Add([pscustomobject]@{ Name = $name; Rva = $rva; VirtualSize = $offset; InitializedSize = $initializedEnd; Code = $code; Characteristics = $characteristics; Members = $members; Data = $null; FileOffset = [long]0; RawSize = [long]0 })
+        $rva = & $alignUp ($rva + [Math]::Max($offset, 1)) $sectionAlignment
+    }
+    $outputIndex = @{}; for ($i = 0; $i -lt $outputs.Count; $i++) { $outputIndex[$outputs[$i].Name] = $i }
+    $outputOfRva = { param([long] $r) foreach ($s in $outputs) { if ($r -ge $s.Rva -and $r -lt $s.Rva + [Math]::Max($s.VirtualSize, 1)) { return $s } }; $null }
+    $targetRva = {
+        param($t)
+        switch ($t.K) {
+            'Section' { return $t.C.Rva + $t.Offset }
+            'Slot' { return $iat.Rva + $slotOffset[$t.Import.Symbol] }
+            'Thunk' { return $thunks.Rva + $thunkOffset[$t.Import.Symbol] }
+            'Common' { return $commonContribution[$t.Name].Rva }
+            'Base' { return [long]0 }
+        }
+        throw "no address for target kind $($t.K)."
+    }
+
+    # 6. Section contents and relocations.
+    foreach ($s in $outputs) {
+        $s.Data = [byte[]]::new($s.InitializedSize)
+        if ($s.Code) { [Array]::Fill($s.Data, [byte]0xCC) }
+        foreach ($c in $s.Members) { if ($null -ne $c.Section -and -not $c.Uninitialized -and $c.Size -gt 0) { [Array]::Copy($c.Object.Bytes, $c.Section.RawOffset, $s.Data, $c.Rva - $s.Rva, $c.Size) } }
+    }
+    $baseRelocations = [Collections.Generic.List[long]]::new()
+    $tlsStart = [long]-1
+    foreach ($c in $live) { if ($c.Group -eq '.tls' -and ($tlsStart -lt 0 -or $c.Rva -lt $tlsStart)) { $tlsStart = $c.Rva } }
+    foreach ($s in $outputs) {
+        $data = $s.Data
+        foreach ($c in $s.Members) {
+            if ($null -eq $c.Section) { continue }
+            $o = $c.Object; $bytes = $o.Bytes
+            for ($i = 0; $i -lt $c.Section.RelocationCount; $i++) {
+                $at = $c.Section.RelocationOffset + 10 * $i
+                $offset = [long][BitConverter]::ToUInt32($bytes, $at)
+                $type = [int][BitConverter]::ToUInt16($bytes, $at + 8)
+                if ($type -eq 0) { continue }
+                $t = & $symbolTarget $o ([int][BitConverter]::ToUInt32($bytes, $at + 4))
+                $place = $c.Rva + $offset; $here = [int]($place - $s.Rva)
+                $absolute = $t.K -eq 'Absolute'
+                $targetAddress = if ($absolute) { $t.V } else { & $targetRva $t }
+                switch ($type) {
+                    1 { # ADDR64
+                        $value = [BitConverter]::ToInt64($data, $here) + $(if ($absolute) { $targetAddress } else { $imageBase + $targetAddress })
+                        [BitConverter]::GetBytes([long]$value).CopyTo($data, $here)
+                        if (-not $absolute) { $baseRelocations.Add($place) }
+                    }
+                    3 { # ADDR32NB
+                        $value = [long][BitConverter]::ToInt32($data, $here) + $targetAddress
+                        if ($value -lt 0 -or $value -gt [uint32]::MaxValue) { throw "$($o.Origin)($($c.Name)): ADDR32NB out of range." }
+                        [Array]::Copy([BitConverter]::GetBytes([long]$value), 0, $data, $here, 4)
+                    }
+                    { $_ -ge 4 -and $_ -le 9 } { # REL32 .. REL32_5
+                        if ($absolute) { throw "$($o.Origin)($($c.Name)): relative relocation to an absolute symbol." }
+                        $value = [long][BitConverter]::ToInt32($data, $here) + $targetAddress - ($place + 4 + ($type - 4))
+                        if ($value -lt [int]::MinValue -or $value -gt [int]::MaxValue) { throw "$($o.Origin)($($c.Name)): REL32 out of range." }
+                        [BitConverter]::GetBytes([int]$value).CopyTo($data, $here)
+                    }
+                    10 { # SECTION
+                        $owner = & $outputOfRva $targetAddress
+                        [BitConverter]::GetBytes([uint16]($outputIndex[$owner.Name] + 1)).CopyTo($data, $here)
+                    }
+                    11 { # SECREL: from the TLS template's start for thread-local data, else from the output section's
+                        $origin = if ($t.K -eq 'Section' -and $t.C.Group -eq '.tls') { $tlsStart } else { (& $outputOfRva $targetAddress).Rva }
+                        $value = [long][BitConverter]::ToInt32($data, $here) + $targetAddress - $origin
+                        [Array]::Copy([BitConverter]::GetBytes([long]$value), 0, $data, $here, 4)
+                    }
+                    default { throw "$($o.Origin)($($c.Name)): AMD64 relocation type $type is not supported." }
+                }
+            }
+        }
+    }
+
+    # 7. Synthetic contents: import directory, lookup and address tables, hint/name entries, DLL names; thunks.
+    $rdata = $outputs[$outputIndex['.rdata']]
+    $iatHere = [int]($iat.Rva - $rdata.Rva); $dataHere = [int]($importData.Rva - $rdata.Rva)
+    $slot = 0; $d = 0
+    foreach ($key in $byDll.Keys) {
+        $descriptor = $dataHere + 20 * $d
+        [BitConverter]::GetBytes([uint32]($importData.Rva + $lookupAt + 8 * $slot)).CopyTo($rdata.Data, $descriptor)          # OriginalFirstThunk
+        [BitConverter]::GetBytes([uint32]($importData.Rva + $dllNameAt[$key])).CopyTo($rdata.Data, $descriptor + 12)          # Name
+        [BitConverter]::GetBytes([uint32]($iat.Rva + 8 * $slot)).CopyTo($rdata.Data, $descriptor + 16)                        # FirstThunk
+        [Text.Encoding]::ASCII.GetBytes($byDll[$key][0].Dll).CopyTo($rdata.Data, $dataHere + [int]$dllNameAt[$key])
+        foreach ($import in $byDll[$key]) {
+            $entry = if ($import.ByOrdinal) { [long]::MinValue -bor [long]$import.OrdinalOrHint } else {
+                $h = $dataHere + [int]$hintAt[$import.Symbol]
+                [BitConverter]::GetBytes([uint16]$import.OrdinalOrHint).CopyTo($rdata.Data, $h)
+                [Text.Encoding]::ASCII.GetBytes($import.ImportName).CopyTo($rdata.Data, $h + 2)
+                [long]($importData.Rva + $hintAt[$import.Symbol])
+            }
+            [BitConverter]::GetBytes([long]$entry).CopyTo($rdata.Data, $dataHere + [int]$lookupAt + 8 * $slot)
+            [BitConverter]::GetBytes([long]$entry).CopyTo($rdata.Data, $iatHere + 8 * $slot)
+            $slot++
+        }
+        $slot++; $d++
+    }
+    if ($null -ne $thunks) {
+        $text = $outputs[$outputIndex['.text']]
+        foreach ($symbol in $thunkOffset.Keys) {
+            $at = [int]($thunks.Rva + $thunkOffset[$symbol] - $text.Rva)
+            $text.Data[$at] = 0xFF; $text.Data[$at + 1] = 0x25
+            [BitConverter]::GetBytes([int](($iat.Rva + $slotOffset[$symbol]) - ($thunks.Rva + $thunkOffset[$symbol] + 6))).CopyTo($text.Data, $at + 2)
+        }
+    }
+
+    # 8. Function table sorted by begin address (the unwinder binary-searches it).
+    $exceptionRva = [long]0; $exceptionSize = [long]0
+    if ($outputIndex.ContainsKey('.pdata')) {
+        $pdata = $outputs[$outputIndex['.pdata']]
+        $count = [int]($pdata.InitializedSize / 12)
+        $entries = [Collections.Generic.List[object]]::new()
+        for ($i = 0; $i -lt $count; $i++) { $b = [byte[]]::new(12); [Array]::Copy($pdata.Data, 12 * $i, $b, 0, 12); $entries.Add($b) }
+        $i = 0; foreach ($b in @($entries | Sort-Object { [BitConverter]::ToUInt32($_, 0) })) { [Array]::Copy($b, 0, $pdata.Data, 12 * $i, 12); $i++ }
+        $exceptionRva = $pdata.Rva; $exceptionSize = 12 * $count
+    }
+
+    # 9. Base relocations: one block per 4 KiB page, DIR64 entries, padded to 4 bytes.
+    $relocStream = [IO.MemoryStream]::new(); $relocWriter = [IO.BinaryWriter]::new($relocStream)
+    $sorted = @($baseRelocations | Sort-Object -Unique)
+    $k = 0
+    while ($k -lt $sorted.Count) {
+        $page = $sorted[$k] -band (-bnot [long]0xFFF); $start = $k
+        while ($k -lt $sorted.Count -and ($sorted[$k] -band (-bnot [long]0xFFF)) -eq $page) { $k++ }
+        $entryCount = $k - $start; $padded = $entryCount + ($entryCount % 2)
+        $relocWriter.Write([uint32]$page); $relocWriter.Write([uint32](8 + 2 * $padded))
+        for ($j = $start; $j -lt $k; $j++) { $relocWriter.Write([uint16]((10 -shl 12) -bor ($sorted[$j] -band 0xFFF))) }
+        if ($padded -ne $entryCount) { $relocWriter.Write([uint16]0) }
+    }
+    $relocWriter.Flush()
+    if ($relocStream.Length) {
+        $outputs.Add([pscustomobject]@{ Name = '.reloc'; Rva = $rva; VirtualSize = $relocStream.Length; InitializedSize = $relocStream.Length; Code = $false; Characteristics = 0x42000040; Members = @(); Data = $relocStream.ToArray(); FileOffset = [long]0; RawSize = [long]0 })
+        $rva = & $alignUp ($rva + $relocStream.Length) $sectionAlignment
+    }
+
+    # 10. File layout, debug directory, headers.
+    $headerSize = & $alignUp (0x40 + 4 + 20 + 240 + 40 * $outputs.Count) $fileAlignment
+    $fileOffset = $headerSize
+    foreach ($s in $outputs) { $s.RawSize = & $alignUp $s.InitializedSize $fileAlignment; $s.FileOffset = $(if ($s.RawSize) { $fileOffset } else { 0 }); $fileOffset += $s.RawSize }
+    $debugHere = [int]($debug.Rva - $rdata.Rva)
+    $debugFile = $rdata.FileOffset + $debugHere
+    [BitConverter]::GetBytes([uint32]20).CopyTo($rdata.Data, $debugHere + 12)                 # IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS
+    [BitConverter]::GetBytes([uint32]4).CopyTo($rdata.Data, $debugHere + 16)
+    [BitConverter]::GetBytes([uint32]($debug.Rva + 28)).CopyTo($rdata.Data, $debugHere + 20)
+    [BitConverter]::GetBytes([uint32]($debugFile + 28)).CopyTo($rdata.Data, $debugHere + 24)
+    [BitConverter]::GetBytes([uint32]1).CopyTo($rdata.Data, $debugHere + 28)                  # CET compatible
+
+    $entryTarget = & $resolveName $Resolution.Entry
+    $directoryOf = { param([string] $name) if ($Resolution.Defined.ContainsKey($name)) { & $targetRva (& $resolveName $name) } else { [long]0 } }
+    $tlsRva = & $directoryOf '_tls_used'
+    $loadConfigRva = & $directoryOf '_load_config_used'
+    $loadConfigSize = [long]0
+    if ($loadConfigRva) { $owner = & $outputOfRva $loadConfigRva; $loadConfigSize = [BitConverter]::ToUInt32($owner.Data, [int]($loadConfigRva - $owner.Rva)) }
+    $reloc = if ($outputIndex.Count -lt $outputs.Count) { $outputs[$outputs.Count - 1] } else { $null }
+    $directories = @(
+        @(0, 0), @(($importData.Rva), $descriptorSize), @(0, 0), @($exceptionRva, $exceptionSize), @(0, 0),
+        @($(if ($reloc) { $reloc.Rva } else { 0 }), $(if ($reloc) { $reloc.VirtualSize } else { 0 })),
+        @($debug.Rva, 28), @(0, 0), @(0, 0), @($tlsRva, $(if ($tlsRva) { 0x28 } else { 0 })), @($loadConfigRva, $loadConfigSize),
+        @(0, 0), @($iat.Rva, $iatSize), @(0, 0), @(0, 0), @(0, 0))
+    $codeSize = [long]0; $dataSize = [long]0
+    foreach ($s in $outputs) { if ($s.Code) { $codeSize += $s.RawSize } else { $dataSize += $s.RawSize } }
+
+    $stream = [IO.MemoryStream]::new(); $w = [IO.BinaryWriter]::new($stream)
+    $w.Write([uint16]0x5A4D); $w.Write([byte[]]::new(0x3A)); $w.Write([uint32]0x40)        # MZ, e_lfanew
+    $w.Write([uint32]0x4550)                                                               # PE\0\0
+    $w.Write([uint16]0x8664); $w.Write([uint16]$outputs.Count); $w.Write([uint32]0); $w.Write([uint32]0); $w.Write([uint32]0)
+    $w.Write([uint16]240); $w.Write([uint16]0x22)                                         # executable, large address aware
+    $w.Write([uint16]0x20B); $w.Write([byte]14); $w.Write([byte]0)
+    $w.Write([uint32]$codeSize); $w.Write([uint32]$dataSize); $w.Write([uint32]0)
+    $w.Write([uint32](& $targetRva $entryTarget)); $w.Write([uint32]$outputs[0].Rva)
+    $w.Write([uint64]$imageBase); $w.Write([uint32]$sectionAlignment); $w.Write([uint32]$fileAlignment)
+    $w.Write([uint16]6); $w.Write([uint16]0); $w.Write([uint16]0); $w.Write([uint16]0); $w.Write([uint16]6); $w.Write([uint16]0)
+    $w.Write([uint32]0); $w.Write([uint32]$rva); $w.Write([uint32]$headerSize); $w.Write([uint32]0)
+    $w.Write([uint16]$Subsystem); $w.Write([uint16]0x8160)                               # high entropy VA, dynamic base, NX, terminal server aware
+    $w.Write([uint64]$StackReserve); $w.Write([uint64]0x1000); $w.Write([uint64]0x100000); $w.Write([uint64]0x1000)
+    $w.Write([uint32]0); $w.Write([uint32]16)
+    foreach ($pair in $directories) { $w.Write([uint32]$pair[0]); $w.Write([uint32]$pair[1]) }
+    foreach ($s in $outputs) {
+        $nameBytes = [byte[]]::new(8); [Text.Encoding]::ASCII.GetBytes($s.Name).CopyTo($nameBytes, 0); $w.Write($nameBytes)
+        $w.Write([uint32]$s.VirtualSize); $w.Write([uint32]$s.Rva); $w.Write([uint32]$s.RawSize); $w.Write([uint32]$s.FileOffset)
+        $w.Write([uint32]0); $w.Write([uint32]0); $w.Write([uint16]0); $w.Write([uint16]0); $w.Write([int]$s.Characteristics)
+    }
+    $w.Write([byte[]]::new($headerSize - $stream.Length))
+    foreach ($s in $outputs) { if ($s.RawSize) { $w.Write($s.Data); $w.Write([byte[]]::new($s.RawSize - $s.Data.Length)) } }
+    $w.Flush()
+    [IO.File]::WriteAllBytes($Path, $stream.ToArray())
+    [pscustomobject]@{
+        Path = $Path; Size = $stream.Length; Sections = @($outputs | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Rva = $_.Rva; VirtualSize = $_.VirtualSize; RawSize = $_.RawSize } })
+        Imports = @($usedImports.Values | ForEach-Object { [pscustomobject]@{ Dll = $_.Dll; Name = $_.ImportName; ByOrdinal = $_.ByOrdinal; Hint = $_.OrdinalOrHint } })
+        Kept = $live.Count; Discarded = ($all.Count - $live.Count); BaseRelocations = $sorted.Count
+    }
+}
+
 }
 
 process {
@@ -3200,5 +3911,11 @@ process {
         }
         'Inspect' { Test-LoweredAssembly -AssemblyPath $AssemblyPath }
         'Capability' { Get-LoweringCapability }
+        'Link' {
+            $resolution = Resolve-CoffLink -Inputs $LinkInput -LibraryDirectories @($LibraryDirectory | Where-Object { $_ }) -DefaultLibraries @($DefaultLibrary | Where-Object { $_ }) -IgnoredDefaultLibraries @($NoDefaultLibrary | Where-Object { $_ }) -Entry $EntrySymbol
+            if ($ResolveOnly) { return $resolution }
+            if ($resolution.Unresolved.Count) { throw ("Link: unresolved external symbols:`n" + ($resolution.Unresolved -join "`n")) }
+            Write-CoffImage -Resolution $resolution -Path ([IO.Path]::GetFullPath($OutputPath)) -Merges @($LinkMerge | Where-Object { $_ }) -Subsystem $(if ($Subsystem -eq 'Windows') { 2 } else { 3 }) -StackReserve $StackReserve
+        }
     }
 }
