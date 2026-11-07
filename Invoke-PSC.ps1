@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Compiles admitted typed PowerShell classes into managed IL and native executables.
+    A Pwsh script designed to amortize.
 .DESCRIPTION
     Self-contained compiler. Compile emits an assembly (or, with -Native, an executable);
     Expression returns live AST and expression objects in the calling process;
@@ -84,7 +84,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Compile', 'Api', 'Expression', 'Inspect', 'Capability', 'Link', 'PowerShell', 'Describe', 'Lint', 'Profile', 'Report', 'Verify')]
+    [ValidateSet('Compile', 'Api', 'Expression', 'Inspect', 'Capability', 'Link', 'PowerShell', 'Describe', 'Lint', 'Profile', 'Report', 'Verify', 'Readme')]
     [string] $Mode = 'Compile',
     [string] $ArchivePath,
     [string] $ProjectPath,
@@ -236,7 +236,6 @@ function Get-UnitProfile($project, [string] $file, $node) {
 }
 
 function Invoke-SmaProfile {
-    [PscImplements('ProjectProfile')]
     param()
     $builtin = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($c in Get-Command -CommandType Cmdlet, Function, Alias -ErrorAction SilentlyContinue) { $null = $builtin.Add($c.Name) }
@@ -335,7 +334,6 @@ function Get-SmaCheckOnly($profiled) {
 }
 
 function Get-SmaReport {
-    [PscImplements('ProfileReport')]
     param($units, $profiled)
     '=== projects'
     $units | Group-Object Project | Sort-Object Count -Descending | ForEach-Object { '{0,-28} {1,5} units  {2,4} pure  {3}' -f $_.Name, $_.Count, @($_.Group | Where-Object Pure).Count, $_.Group[0].Remote }
@@ -389,7 +387,6 @@ function Get-SmaReport {
 #   CaselessSymbol      a case-insensitive comparison against a literal containing letters, in a file that also
 #                       uses case-sensitive operators, so case matters to its author there.
 function Get-SmaLint {
-    [PscImplements('ProjectLint')]
     param([string] $file)
     $tokens = $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$tokens, [ref]$errors)
@@ -848,7 +845,6 @@ function Get-SmaEncodedSourceOrigins($Ast, [string]$SourceIdentity) {
     }
 }
 function Get-SmaDescription {
-    [PscImplements('ProjectDescription')]
     param([string] $root)
     $root = [IO.Path]::GetFullPath($root)
     $project = [SmaProject]::new(); $project.Root = $root; $project.DescribedUtc = [DateTime]::UtcNow
@@ -966,7 +962,6 @@ function Invoke-SmaObservedOperation($Project, [string] $Name, [scriptblock] $Op
 }
 
 function Test-SmaDescription {
-    [PscImplements('DescriptionFixture')]
     param()
     # The fixture is an independent Git repository that exists only for this check; its evidence is the live
     # description returned with each result.
@@ -1082,7 +1077,6 @@ function Test-AttributeClass([System.Management.Automation.Language.TypeDefiniti
 # statement's name; its further typed parameters are the statement's properties. A keyword with properties
 # takes a property table, 'register A { Bits = 8 }'; one without takes a script body, 'lower A { ... }'.
 function Get-LoweringKeywords {
-    [PscImplements('StatementKeywords')]
     param([System.Management.Automation.Language.Ast] $Root)
     $markers = @($Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass -and $n.Name -eq 'Keyword' }, $true) | Where-Object { Test-AttributeClass $_ })
     if ($markers.Count -eq 0) { return }
@@ -1402,7 +1396,6 @@ function Add-NativeImportMethod {
     # (System.Reflection.Emit MethodBuilderImpl.SetCustomAttributeCore,
     # runtime ab19415702aa8139d5369e47c73edb47343c34ad). The mirror's imports
     # are only call targets during lowering, so they never carry it.
-    [PscImplements('NativeImports')]
     param([Reflection.Emit.TypeBuilder] $TypeBuilder, [string] $Name, $Import, [Type] $ReturnType, [Type[]] $ParameterTypes, [string[]] $ParameterNames, [switch] $Persisted)
     $charSet = if ($Import.StringMarshalling -eq 'Utf16') { [Runtime.InteropServices.CharSet]::Unicode } else { [Runtime.InteropServices.CharSet]::Ansi }
     $method = $TypeBuilder.DefinePInvokeMethod($Name, $Import.Library, $Import.EntryPoint,
@@ -2039,7 +2032,6 @@ function Add-GenericInference([Type] $Pattern, [Type] $Actual, [hashtable] $Bind
 }
 
 function Resolve-MatchingMethod {
-    [PscImplements('ReflectedCallBinding')]
     param(
         [Parameter(Mandatory)][Type] $TargetType,
         [Parameter(Mandatory)][string] $MethodName,
@@ -2677,7 +2669,6 @@ function New-PredicateTruth {
 }
 
 function Convert-PredicateSwitch {
-    [PscImplements('PredicateSwitch')]
     param([System.Management.Automation.Language.SwitchStatementAst] $Statement, [hashtable] $Scope)
     $et = [Linq.Expressions.Expression]
     $flags = [int]$Statement.Flags
@@ -3714,7 +3705,6 @@ function Get-IlMember([Reflection.MemberInfo] $Member) {
 # A call's receiver: a reference is loaded; a value type is addressed in its own storage (local, argument,
 # field, array element), so mutations reach it, or else copied once to a temporary.
 function Write-IlReceiver {
-    [PscImplements('ValueTypeReceivers')]
     param([Reflection.Emit.ILGenerator] $IL, [Linq.Expressions.Expression] $Expr, [hashtable] $Context)
     if (-not $Expr.Type.IsValueType) {
         Write-IlExpression -IL $IL -Expr $Expr -Context $Context
@@ -4606,7 +4596,6 @@ function Get-PinnedPowerShell {
         GitHub publishes for the release asset before it is extracted.
     #>
     [CmdletBinding()]
-    [PscImplements('PinnedPowerShell')]
     param([string] $ArchivePath)
     $version = '7.7.0-preview.5'
     $asset = "PowerShell-$version-win-x64.zip"
@@ -4629,139 +4618,54 @@ function Get-PinnedPowerShell {
     $pwsh
 }
 
-# Every capability PSC has or is to have. A capability is implemented when a function in this script declares
-# [PscImplements('<member>')] for it; the API reports each one's implementing definitions, read from the
-# script's own AST. Attribute arguments must be constants, so a member is named; the attribute's constructor and
-# Get-PscCapabilities convert it to PscCapability, which rejects any name that is not a member.
-enum PscCapability {
-    # The compiler
-    IlAssembly
-    TypedExpression
-    AssemblyInspection
-    CompilerCapability
-    NativeAotExecutable
-    CoffLinker
-    NativeImports
-    StatementKeywords
-    StaticData
-    ReflectedCallBinding
-    PredicateSwitch
-    ValueTypeReceivers
-    SelfDescribingApi
-    PinnedPowerShell
-    ProjectDescription
-    ProjectLint
-    ProjectProfile
-    ProfileReport
-    DescriptionFixture
-    SingleFileJitExecutable
-    # Kernel building: patterns
-    MapPattern
-    ReducePattern
-    ScanPattern
-    BroadcastPattern
-    ContractionPattern
-    QuantizedContraction
-    StencilPattern
-    LayoutChange
-    GatherScatter
-    # Kernel building: data
-    NumberFormats
-    MemorySpaces
-    DmaTransfer
-    ProducerConsumerPipeline
-    # Kernel building: composition
-    Fusion
-    LaneSplitTiling
-    # Kernel building: machine layer
-    InstructionTables
-    RegisterAllocation
-    Scheduling
-    HexagonV73Hvx
-    HexagonV73Hmx
-    A64Backend
-    X64Backend
-    A32Backend
-    # Kernel building: containers and harness
-    ElfSharedObject
-    FastRpcSkeleton
-    KernelGold
-    DeviceMeasures
+# The API's records. A property marked hidden is kept on the object and left out of its default presentation:
+# console display and the README show exactly the properties that are not hidden.
+class PscParameter {
+    [string] $Name
+    [type] $Type
+    [object] $Default
+    [object[]] $AllowedValues
+    [bool] $Pipeline
+    hidden [System.Management.Automation.Language.ParameterAst] $Ast
+    [string] ToString() { return $this.Name }
 }
 
-# Declares that the function whose param block carries it implements a PscCapability.
-class PscImplementsAttribute : System.Attribute {
-    [PscCapability[]] $Capability
-    PscImplementsAttribute([PscCapability[]] $capability) { $this.Capability = $capability }
+class PscOperation {
+    [string] $Mode
+    [PscParameter[]] $Parameters
+    [string[]] $Calls
+    hidden [System.Management.Automation.Language.FunctionDefinitionAst[]] $Definitions
 }
 
-function Get-PscCapabilities {
-    <#
-    .SYNOPSIS
-        Every PscCapability with the function definitions that declare [PscImplements()] for it. A capability with
-        no implementing definition is planned.
-    #>
-    [CmdletBinding()]
-    [PscImplements('SelfDescribingApi')]
-    param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Ast)
-    $implementers = [System.Collections.Generic.Dictionary[PscCapability, System.Collections.Generic.List[System.Management.Automation.Language.FunctionDefinitionAst]]]::new()
-    foreach ($function in $Ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
-        if (-not $function.Body.ParamBlock) { continue }
-        foreach ($attribute in $function.Body.ParamBlock.Attributes) {
-            if ($attribute.TypeName.GetReflectionAttributeType() -ne [PscImplementsAttribute]) { continue }
-            foreach ($argument in $attribute.PositionalArguments) {
-                foreach ($capability in @($argument.SafeGetValue())) {
-                    $value = [PscCapability]$capability
-                    if (-not $implementers.ContainsKey($value)) { $implementers[$value] = [System.Collections.Generic.List[System.Management.Automation.Language.FunctionDefinitionAst]]::new() }
-                    $implementers[$value].Add($function)
-                }
-            }
-        }
-    }
-    foreach ($capability in [Enum]::GetValues([PscCapability])) {
-        [System.Management.Automation.Language.FunctionDefinitionAst[]] $definitions = @()
-        if ($implementers.ContainsKey($capability)) { $definitions = $implementers[$capability].ToArray() }
-        [pscustomobject]@{
-            PSTypeName     = 'PSC.Capability'
-            Capability     = $capability
-            Implemented    = $definitions.Count -gt 0
-            Implementation = @($definitions | ForEach-Object Name)
-            Definitions    = $definitions
-        }
-    }
+class PscApi {
+    [string] $Synopsis
+    [string] $Script
+    [string] $SourceSha512
+    [string] $DefaultMode
+    [PscOperation[]] $Modes
+    [PscParameter[]] $Parameters
+    [PscMeasure[]] $Measures
+    [string[]] $Functions
+    [string[]] $Classes
+    hidden [System.Management.Automation.Language.ScriptBlockAst] $Ast
 }
 
 function Get-PscApi {
-    <#
-    .SYNOPSIS
-        Describes this script's API from its own AST: each mode, the script parameters its operation reads and
-        the functions it calls, with types, defaults and help; and every capability with its implementing
-        definitions.
-    .DESCRIPTION
-        A mode's parameters are the script parameters referenced in its clause of the process block's mode
-        switch, together with the script parameters a splatted call in that clause can bind by name.
-    #>
     [CmdletBinding()]
-    [PscImplements('SelfDescribingApi')]
+    [OutputType([PscApi])]
     param()
     $tokens = $null; $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$tokens, [ref]$errors)
     if ($errors.Count) { throw 'This script has parse errors; its API cannot be described.' }
-    $help = Get-Help -Name $PSCommandPath -Full
-    $parameterHelp = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($entry in @($help.parameters.parameter)) {
-        $parameterHelp[$entry.name] = (@($entry.description | ForEach-Object Text) -join ' ').Trim()
-    }
     $scriptParameters = [System.Collections.Generic.Dictionary[string, System.Management.Automation.Language.ParameterAst]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($parameter in $ast.ParamBlock.Parameters) { $scriptParameters[$parameter.Name.VariablePath.UserPath] = $parameter }
     $functions = [System.Collections.Generic.Dictionary[string, System.Management.Automation.Language.FunctionDefinitionAst]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($function in $ast.BeginBlock.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
+    foreach ($function in $ast.BeginBlock.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Parent -isnot [System.Management.Automation.Language.FunctionMemberAst] }, $false)) {
         $functions[$function.Name] = $function
     }
-    $modeParameter = $scriptParameters['Mode']
     $switch = $ast.ProcessBlock.Find({ param($node) $node -is [System.Management.Automation.Language.SwitchStatementAst] }, $false)
-    $modes = foreach ($clause in $switch.Clauses) {
-        $mode = $clause.Item1.SafeGetValue()
+    $operations = [System.Collections.Generic.List[PscOperation]]::new()
+    foreach ($clause in $switch.Clauses) {
         $body = $clause.Item2
         $used = [System.Collections.Generic.SortedSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         foreach ($variable in $body.FindAll({ param($node) $node -is [System.Management.Automation.Language.VariableExpressionAst] }, $true)) {
@@ -4782,58 +4686,104 @@ function Get-PscApi {
                 if ($scriptParameters.ContainsKey($parameterName) -and $parameterName -ne 'Mode') { $null = $used.Add($parameterName) }
             }
         }
-        [pscustomobject]@{
-            Mode       = $mode
-            Parameters = @(foreach ($name in $used) { Get-PscApiParameter $scriptParameters[$name] $parameterHelp })
-            Operations = @(foreach ($name in $calls) {
-                $content = $functions[$name].GetHelpContent()
-                [pscustomobject]@{ Function = $name; Synopsis = if ($content -and $content.Synopsis) { $content.Synopsis.Trim() } else { $null }; Definition = $functions[$name] }
-            })
-        }
+        $operation = [PscOperation]::new()
+        $operation.Mode = $clause.Item1.SafeGetValue()
+        $operation.Parameters = [PscParameter[]]@(foreach ($name in $used) { Get-PscApiParameter $scriptParameters[$name] })
+        $operation.Calls = [string[]]@($calls)
+        $operation.Definitions = [System.Management.Automation.Language.FunctionDefinitionAst[]]@(foreach ($name in $calls) { $functions[$name] })
+        $operations.Add($operation)
     }
-    [pscustomobject]@{
-        PSTypeName   = 'PSC.Api'
-        Script       = $PSCommandPath
-        SourceSha256 = (Get-FileHash -LiteralPath $PSCommandPath).Hash
-        Synopsis     = $help.Synopsis
-        DefaultMode  = $modeParameter.DefaultValue.SafeGetValue()
-        Modes        = @($modes)
-        Capabilities = @(Get-PscCapabilities -Ast $ast)
-        Parameters   = @(foreach ($parameter in $ast.ParamBlock.Parameters) { Get-PscApiParameter $parameter $parameterHelp })
-        Ast          = $ast
-    }
+    $help = $ast.GetHelpContent()
+    $api = [PscApi]::new()
+    $api.Synopsis = if ($help) { $help.Synopsis.Trim() } else { $null }
+    $api.Script = $PSCommandPath
+    $api.SourceSha512 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA512).Hash
+    $api.DefaultMode = $scriptParameters['Mode'].DefaultValue.SafeGetValue()
+    $api.Modes = $operations.ToArray()
+    $api.Parameters = [PscParameter[]]@(foreach ($parameter in $ast.ParamBlock.Parameters) { Get-PscApiParameter $parameter })
+    $api.Measures = [PscSource]::new($PSCommandPath).Measures
+    $api.Functions = [string[]]@($functions.Keys)
+    $api.Classes = [string[]]@($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.TypeDefinitionAst] }, $true) | ForEach-Object Name)
+    $api.Ast = $ast
+    $api
 }
 
 function Get-PscApiParameter {
-    <#
-    .SYNOPSIS
-        Describes one script parameter from its ParameterAst: name, type, default, allowed values, pipeline binding
-        and comment-based help.
-    #>
     [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][System.Management.Automation.Language.ParameterAst] $Parameter,
-        [Parameter(Mandatory)][System.Collections.Generic.Dictionary[string, string]] $ParameterHelp
-    )
-    $name = $Parameter.Name.VariablePath.UserPath
-    $attributes = @($Parameter.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.AttributeAst] })
-    $allowed = foreach ($attribute in $attributes) {
-        if ($attribute.TypeName.GetReflectionAttributeType() -eq [System.Management.Automation.ValidateSetAttribute]) {
-            foreach ($argument in $attribute.PositionalArguments) { $argument.SafeGetValue() }
+    [OutputType([PscParameter])]
+    param([Parameter(Mandatory)][System.Management.Automation.Language.ParameterAst] $Parameter)
+    $allowed = [System.Collections.Generic.List[object]]::new()
+    $pipeline = $false
+    foreach ($attribute in $Parameter.Attributes) {
+        if ($attribute -isnot [System.Management.Automation.Language.AttributeAst]) { continue }
+        $attributeType = $attribute.TypeName.GetReflectionAttributeType()
+        if ($attributeType -eq [System.Management.Automation.ValidateSetAttribute]) {
+            foreach ($argument in $attribute.PositionalArguments) { $allowed.Add($argument.SafeGetValue()) }
+        }
+        if ($attributeType -eq [System.Management.Automation.ParameterAttribute]) {
+            foreach ($argument in $attribute.NamedArguments) { if ($argument.ArgumentName -eq 'ValueFromPipeline') { $pipeline = $true } }
         }
     }
-    $pipeline = $false
-    foreach ($attribute in $attributes) {
-        if ($attribute.TypeName.GetReflectionAttributeType() -ne [System.Management.Automation.ParameterAttribute]) { continue }
-        foreach ($argument in $attribute.NamedArguments) { if ($argument.ArgumentName -eq 'ValueFromPipeline') { $pipeline = $true } }
+    $described = [PscParameter]::new()
+    $described.Name = $Parameter.Name.VariablePath.UserPath
+    $described.Type = $Parameter.StaticType
+    $described.Default = if ($Parameter.DefaultValue) { $Parameter.DefaultValue.SafeGetValue() } else { $null }
+    $described.AllowedValues = $allowed.ToArray()
+    $described.Pipeline = $pipeline
+    $described.Ast = $Parameter
+    $described
+}
+
+# The properties a type presents: its public properties that are not hidden, in declaration order.
+function Get-PscPresentedProperty {
+    [CmdletBinding()]
+    [OutputType([System.Reflection.PropertyInfo])]
+    param([Parameter(Mandatory)][type] $Type)
+    foreach ($property in $Type.GetProperties()) {
+        if (-not $property.IsDefined([System.Management.Automation.HiddenAttribute], $false)) { $property }
     }
-    [pscustomobject]@{
-        Name          = $name
-        Type          = $Parameter.StaticType
-        Default       = if ($Parameter.DefaultValue) { $Parameter.DefaultValue.SafeGetValue() } else { $null }
-        AllowedValues = @($allowed)
-        Pipeline      = $pipeline
-        Description   = if ($ParameterHelp.ContainsKey($name)) { $ParameterHelp[$name] } else { $null }
+}
+
+# One Markdown table cell: each element's ToString, joined; cell and row delimiters escaped.
+function ConvertTo-PscMarkdownCell {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([object] $Value)
+    $parts = [System.Collections.Generic.List[string]]::new()
+    foreach ($item in @($Value)) { if ($null -ne $item) { $parts.Add($item.ToString()) } }
+    [string]::Join(', ', $parts).Replace('|', '\|').ReplaceLineEndings(' ')
+}
+
+# The Markdown lines of a table of objects of one type, one column per presented property.
+function ConvertTo-PscMarkdownTable {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)][System.Reflection.PropertyInfo[]] $Columns, [object[]] $Rows)
+    '| ' + [string]::Join(' | ', [string[]]@($Columns | ForEach-Object Name)) + ' |'
+    '|' + [string]::Join('|', [string[]]@(foreach ($column in $Columns) { '---' })) + '|'
+    foreach ($row in @($Rows)) {
+        '| ' + [string]::Join(' | ', [string[]]@(foreach ($column in $Columns) { ConvertTo-PscMarkdownCell $column.GetValue($row) })) + ' |'
+    }
+}
+
+# The README's lines: the API object's presented scalar properties as one table, then each presented sequence
+# property under its own name, as a table when its elements are PSC records and as a list otherwise.
+function ConvertTo-PscReadme {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)][PscApi] $Api)
+    '# PSC'
+    ''
+    $presented = @(Get-PscPresentedProperty -Type ([PscApi]))
+    ConvertTo-PscMarkdownTable -Columns @($presented | Where-Object { -not $_.PropertyType.IsArray }) -Rows @($Api)
+    foreach ($property in $presented | Where-Object { $_.PropertyType.IsArray }) {
+        ''
+        '## ' + $property.Name
+        ''
+        $element = $property.PropertyType.GetElementType()
+        $value = $property.GetValue($Api)
+        if ($element.Assembly -eq [PscApi].Assembly) { ConvertTo-PscMarkdownTable -Columns @(Get-PscPresentedProperty -Type $element) -Rows $value }
+        else { ConvertTo-PscMarkdownCell $value }
     }
 }
 
@@ -4843,7 +4793,6 @@ function Get-LoweringCapability {
         Reports compiler capabilities, runtime versions, and supported contracts.
     #>
     [CmdletBinding()]
-    [PscImplements('CompilerCapability')]
     param()
 
     [pscustomobject]@{
@@ -4868,7 +4817,6 @@ function ConvertTo-TypedExpression {
         Lowers a PowerShell class method AST into a validated System.Linq.Expressions.LambdaExpression.
     #>
     [CmdletBinding()]
-    [PscImplements('TypedExpression')]
     param(
         [Parameter(Mandatory, ValueFromPipeline)]
         [System.Management.Automation.Language.FunctionMemberAst] $MethodAst
@@ -4878,7 +4826,6 @@ function ConvertTo-TypedExpression {
 }
 
 function ConvertTo-StaticDataExpression {
-    [PscImplements('StaticData')]
     param($Value, [Type] $Type)
     if ($Type -in [IntPtr],[UIntPtr]) { throw 'Native addresses are not durable static data.' }
     if ($null -eq $Value) {
@@ -4909,7 +4856,6 @@ function Export-LoweredAssembly {
         the -EntryPoint; it defaults to the first class.
     #>
     [CmdletBinding()]
-    [PscImplements('IlAssembly')]
     param(
         [Parameter()][string] $SourcePath,
         [Parameter()][System.Management.Automation.Language.ScriptBlockAst] $SourceAst,
@@ -5176,7 +5122,6 @@ $script:NativeFeatureSwitches = [ordered]@{
 }
 
 function Export-NativeImage {
-    [PscImplements('NativeAotExecutable')]
     param(
         [Parameter(Mandatory)][string] $AssemblyPath,
         [Parameter(Mandatory)][string] $OutputPath,
@@ -5231,7 +5176,6 @@ function Test-LoweredAssembly {
         Inspects an emitted assembly, validates zero SMA dependencies, and generates a receipt.
     #>
     [CmdletBinding()]
-    [PscImplements('AssemblyInspection')]
     param(
         [Parameter(Mandatory)][string] $AssemblyPath
     )
@@ -5438,7 +5382,6 @@ function Find-CoffLibrary([string] $Name, [string[]] $Directories) {
 }
 
 function Resolve-CoffLink {
-    [PscImplements('CoffLinker')]
     param([string[]] $Inputs, [string[]] $LibraryDirectories = @(), [string[]] $DefaultLibraries = @(), [string[]] $IgnoredDefaultLibraries = @(), [string] $Entry)
     $ignoreAll = $IgnoredDefaultLibraries -contains '*'
     $ignored = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -5564,7 +5507,6 @@ function Write-CoffImage {
     # output sections by name before '$' with the suffix as the sort key, builds the import table and jump thunks,
     # applies AMD64 relocations, sorts the function table and writes base relocations. Reference: PE/COFF
     # specification sections 3, 4, 5 and 6.
-    [PscImplements('CoffLinker')]
     param($Resolution, [string] $Path, [string[]] $Merges = @(), [int] $Subsystem = 3, [long] $StackReserve = 0x100000)
     $imageBase = [long]0x140000000
     $fileAlignment = 0x200; $sectionAlignment = 0x1000
@@ -5955,6 +5897,245 @@ function Write-CoffImage {
     }
 }
 
+# ============================================================================
+# MEASURES
+# Terms are NIST SP 800-55v1's: measurement is "the process of obtaining quantitative values using quantitative
+# methods"; measures are "quantifiable and objective values that result from measurement"; a metric is a measure
+# held to a set target. PSC sets no targets. Each measurement method is a class deriving from PscMeasurementMethod;
+# its Locate method is the method of measurement, and the measure is the number of extents it returns.
+# ============================================================================
+
+class PscMeasure {
+    [string] $Entity
+    [type] $Method
+    [int] $Value
+    hidden [System.Management.Automation.Language.IScriptExtent[]] $Locations
+}
+
+class PscSource {
+    [string] $Path
+    [string] $Sha512
+    [System.Management.Automation.Language.ScriptBlockAst] $Ast
+    [System.Management.Automation.Language.Token[]] $Tokens
+    [System.Management.Automation.Language.ParseError[]] $ParseErrors
+    [PscMeasure[]] $Measures
+
+    PscSource([string] $path) {
+        $this.Path = $path
+        $this.Sha512 = (Get-FileHash -LiteralPath $path -Algorithm SHA512).Hash
+        $parsedTokens = $null; $parsedErrors = $null
+        $this.Ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$parsedTokens, [ref]$parsedErrors)
+        $this.Tokens = $parsedTokens
+        $this.ParseErrors = $parsedErrors
+        $found = [System.Collections.Generic.List[PscMeasure]]::new()
+        foreach ($method in [PscMeasurementMethod]::All()) { $found.Add($method.Measure($this)) }
+        $this.Measures = $found.ToArray()
+    }
+}
+
+class PscMeasurementMethod {
+    static hidden [System.Collections.Generic.Dictionary[string, type]] $Cmdlets = [System.Collections.Generic.Dictionary[string, type]]::new([StringComparer]::OrdinalIgnoreCase)
+
+    [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]] Locate([PscSource] $source) { throw [System.NotImplementedException]::new($this.GetType().Name) }
+
+    [PscMeasure] Measure([PscSource] $source) {
+        $found = $this.Locate($source)
+        $measure = [PscMeasure]::new()
+        $measure.Entity = $source.Path
+        $measure.Method = $this.GetType()
+        $measure.Value = $found.Count
+        $measure.Locations = $found.ToArray()
+        return $measure
+    }
+
+    static [PscMeasurementMethod[]] All() {
+        $methods = [System.Collections.Generic.List[PscMeasurementMethod]]::new()
+        foreach ($type in [PscMeasurementMethod].Assembly.GetTypes()) {
+            if ($type.IsSubclassOf([PscMeasurementMethod])) { $methods.Add([PscMeasurementMethod][Activator]::CreateInstance($type)) }
+        }
+        return $methods.ToArray()
+    }
+
+    static [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]] Nodes([PscSource] $source, [type] $nodeType) {
+        $found = [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]]::new()
+        foreach ($node in $source.Ast.FindAll({ param($n) $nodeType.IsInstanceOfType($n) }, $true)) { $found.Add($node.Extent) }
+        return $found
+    }
+
+    # The cmdlet type a command name resolves to in this session, through aliases; $null for anything else.
+    static [type] ResolveCmdlet([string] $name) {
+        $type = $null
+        if ([PscMeasurementMethod]::Cmdlets.TryGetValue($name, [ref]$type)) { return $type }
+        $info = Get-Command -Name $name -ErrorAction Ignore | Select-Object -First 1
+        if ($info -is [System.Management.Automation.AliasInfo]) { $info = $info.ResolvedCommand }
+        if ($info -is [System.Management.Automation.CmdletInfo]) { $type = $info.ImplementingType }
+        [PscMeasurementMethod]::Cmdlets[$name] = $type
+        return $type
+    }
+
+    static [System.Collections.Generic.List[System.Management.Automation.Language.CommandAst]] Commands([PscSource] $source, [type] $cmdletType) {
+        $found = [System.Collections.Generic.List[System.Management.Automation.Language.CommandAst]]::new()
+        foreach ($command in $source.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+            $name = $command.GetCommandName()
+            if ($name -and [PscMeasurementMethod]::ResolveCmdlet($name) -eq $cmdletType) { $found.Add($command) }
+        }
+        return $found
+    }
+
+    # Commands whose first element is not a name SMA can read, by the kind of node it is.
+    static [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]] CommandsNamedBy([PscSource] $source, [type] $elementType, [type[]] $excluded) {
+        $found = [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]]::new()
+        foreach ($command in $source.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+            $first = $command.CommandElements[0]
+            if ($first -is [System.Management.Automation.Language.StringConstantExpressionAst] -or -not $elementType.IsInstanceOfType($first)) { continue }
+            $skip = $false
+            foreach ($type in $excluded) { if ($type.IsInstanceOfType($first)) { $skip = $true } }
+            if (-not $skip) { $found.Add($command.Extent) }
+        }
+        return $found
+    }
+}
+
+class AddTypeCommands : PscMeasurementMethod {
+    [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]] Locate([PscSource] $source) {
+        $found = [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]]::new()
+        foreach ($command in [PscMeasurementMethod]::Commands($source, [Microsoft.PowerShell.Commands.AddTypeCommand])) { $found.Add($command.Extent) }
+        return $found
+    }
+}
+
+# Add-Type commands that SMA's static binder binds to TypeDefinition or MemberDefinition: source text compiled at run time.
+class AddTypeSourceText : PscMeasurementMethod {
+    [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]] Locate([PscSource] $source) {
+        $found = [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]]::new()
+        foreach ($command in [PscMeasurementMethod]::Commands($source, [Microsoft.PowerShell.Commands.AddTypeCommand])) {
+            $bound = [System.Management.Automation.Language.StaticParameterBinder]::BindCommand($command, $true).BoundParameters
+            if ($bound.ContainsKey('TypeDefinition') -or $bound.ContainsKey('MemberDefinition')) { $found.Add($command.Extent) }
+        }
+        return $found
+    }
+}
+
+class InvokeExpressionCommands : PscMeasurementMethod {
+    [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]] Locate([PscSource] $source) {
+        $found = [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]]::new()
+        foreach ($command in [PscMeasurementMethod]::Commands($source, [Microsoft.PowerShell.Commands.InvokeExpressionCommand])) { $found.Add($command.Extent) }
+        return $found
+    }
+}
+
+# [scriptblock]::Create(...): script text turned into a script block at run time.
+class ScriptBlockCreateCalls : PscMeasurementMethod {
+    [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]] Locate([PscSource] $source) {
+        $found = [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]]::new()
+        foreach ($call in $source.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $n.Static }, $true)) {
+            if ($call.Expression -is [System.Management.Automation.Language.TypeExpressionAst] -and $call.Expression.TypeName.GetReflectionType() -eq [scriptblock] -and
+                $call.Member -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $call.Member.Value -eq 'Create') { $found.Add($call.Extent) }
+        }
+        return $found
+    }
+}
+
+class HereStrings : PscMeasurementMethod {
+    [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]] Locate([PscSource] $source) {
+        $found = [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]]::new()
+        foreach ($token in $source.Tokens) {
+            if ($token.Kind -eq [System.Management.Automation.Language.TokenKind]::HereStringLiteral -or $token.Kind -eq [System.Management.Automation.Language.TokenKind]::HereStringExpandable) { $found.Add($token.Extent) }
+        }
+        return $found
+    }
+}
+
+class ScriptBlockExpressions : PscMeasurementMethod {
+    [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]] Locate([PscSource] $source) { return [PscMeasurementMethod]::Nodes($source, [System.Management.Automation.Language.ScriptBlockExpressionAst]) }
+}
+
+class CommandsNamedByVariable : PscMeasurementMethod {
+    [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]] Locate([PscSource] $source) { return [PscMeasurementMethod]::CommandsNamedBy($source, [System.Management.Automation.Language.VariableExpressionAst], [type[]]@()) }
+}
+
+class ScriptBlockLiteralsInvoked : PscMeasurementMethod {
+    [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]] Locate([PscSource] $source) { return [PscMeasurementMethod]::CommandsNamedBy($source, [System.Management.Automation.Language.ScriptBlockExpressionAst], [type[]]@()) }
+}
+
+class CommandsNamedByOtherExpression : PscMeasurementMethod {
+    [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]] Locate([PscSource] $source) {
+        return [PscMeasurementMethod]::CommandsNamedBy($source, [System.Management.Automation.Language.ExpressionAst], [type[]]@([System.Management.Automation.Language.VariableExpressionAst], [System.Management.Automation.Language.ScriptBlockExpressionAst]))
+    }
+}
+
+# Calls naming a System.Type member whose first parameter is a name (GetMethod, GetProperty, GetType, InvokeMember, ...)
+# with a text constant as that argument. The member set is read from System.Type itself.
+class MemberLookupsByText : PscMeasurementMethod {
+    [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]] Locate([PscSource] $source) {
+        $lookups = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($member in [type].GetMethods()) {
+            $parameters = $member.GetParameters()
+            if ($parameters.Length -gt 0 -and $parameters[0].ParameterType -eq [string] -and $parameters[0].Name -in 'name', 'typeName') { $null = $lookups.Add($member.Name) }
+        }
+        $found = [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]]::new()
+        foreach ($call in $source.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true)) {
+            if ($call.Member -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -or -not $lookups.Contains($call.Member.Value)) { continue }
+            if ($null -eq $call.Arguments -or $call.Arguments.Count -eq 0) { continue }
+            if ($call.Arguments[0] -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $found.Add($call.Extent) }
+        }
+        return $found
+    }
+}
+
+class HashtableLiterals : PscMeasurementMethod {
+    [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]] Locate([PscSource] $source) { return [PscMeasurementMethod]::Nodes($source, [System.Management.Automation.Language.HashtableAst]) }
+}
+
+# Hashtable literals with only constant keys that are not converted to a type ([T]@{...}) and not assigned to a variable
+# that is splatted: records whose field names are text.
+class HashtableRecords : PscMeasurementMethod {
+    [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]] Locate([PscSource] $source) {
+        $splatted = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($variable in $source.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.Splatted }, $true)) { $null = $splatted.Add($variable.VariablePath.UserPath) }
+        $found = [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]]::new()
+        foreach ($table in $source.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.HashtableAst] }, $true)) {
+            if ($table.Parent -is [System.Management.Automation.Language.ConvertExpressionAst]) { continue }
+            $statement = $table.Parent.Parent
+            if ($statement -is [System.Management.Automation.Language.AssignmentStatementAst] -and $statement.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and $splatted.Contains($statement.Left.VariablePath.UserPath)) { continue }
+            $constant = $true
+            foreach ($pair in $table.KeyValuePairs) { if ($pair.Item1 -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { $constant = $false } }
+            if ($constant) { $found.Add($table.Extent) }
+        }
+        return $found
+    }
+}
+
+class QuotedTextConstants : PscMeasurementMethod {
+    [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]] Locate([PscSource] $source) {
+        $found = [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]]::new()
+        foreach ($node in $source.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true)) {
+            if ($node.StringConstantType -ne [System.Management.Automation.Language.StringConstantType]::BareWord) { $found.Add($node.Extent) }
+        }
+        return $found
+    }
+}
+
+class ExpandableTexts : PscMeasurementMethod {
+    [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]] Locate([PscSource] $source) { return [PscMeasurementMethod]::Nodes($source, [System.Management.Automation.Language.ExpandableStringExpressionAst]) }
+}
+
+# -match, -notmatch, -replace and -split in every casing, binary and unary, and [regex] type uses.
+class RegexUses : PscMeasurementMethod {
+    [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]] Locate([PscSource] $source) {
+        $kinds = [System.Management.Automation.Language.TokenKind[]]@('Imatch', 'Cmatch', 'Inotmatch', 'Cnotmatch', 'Ireplace', 'Creplace', 'Isplit', 'Csplit')
+        $found = [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]]::new()
+        foreach ($node in $source.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.BinaryExpressionAst] -or $n -is [System.Management.Automation.Language.UnaryExpressionAst] }, $true)) {
+            $kind = if ($node -is [System.Management.Automation.Language.BinaryExpressionAst]) { $node.Operator } else { $node.TokenKind }
+            if ($kind -in $kinds) { $found.Add($node.Extent) }
+        }
+        foreach ($node in $source.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeExpressionAst] -or $n -is [System.Management.Automation.Language.TypeConstraintAst] }, $true)) {
+            if ($node.TypeName.GetReflectionType() -eq [regex]) { $found.Add($node.Extent) }
+        }
+        return $found
+    }
+}
+
 }
 
 process {
@@ -6000,6 +6181,11 @@ process {
             Get-SmaReport @(Get-SmaUnits $profiled) $profiled
         }
         'Verify' { Test-SmaDescription }
+        'Readme' {
+            $readme = Join-Path $PSScriptRoot 'README.md'
+            [IO.File]::WriteAllLines($readme, [string[]]@(ConvertTo-PscReadme -Api (Get-PscApi)), [Text.UTF8Encoding]::new($false))
+            Get-Item -LiteralPath $readme
+        }
         'Link' {
             $resolution = Resolve-CoffLink -Inputs $LinkInput -LibraryDirectories @($LibraryDirectory | Where-Object { $_ }) -DefaultLibraries @($DefaultLibrary | Where-Object { $_ }) -IgnoredDefaultLibraries @($NoDefaultLibrary | Where-Object { $_ }) -Entry $EntrySymbol
             if ($ResolveOnly) { return $resolution }
