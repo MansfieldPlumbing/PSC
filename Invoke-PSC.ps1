@@ -2062,16 +2062,219 @@ function ConvertTo-IntegralQuotient {
     ConvertTo-PowerShellType -Expression $rounded -Type $Type
 }
 
-# A copy of a using statement. SMA's UsingStatementAst.Copy() reuses its Name child for a statement without an alias
-# (using namespace System.IO), so it always throws there; the public constructor builds the copy from a copied Name.
-function Copy-UsingStatement {
-    param([Parameter(Mandatory)][System.Management.Automation.Language.UsingStatementAst] $Using)
-    if ($null -eq $Using.Alias -and $null -eq $Using.ModuleSpecification -and $null -ne $Using.Name) {
-        return [System.Management.Automation.Language.UsingStatementAst]::new($Using.Extent, $Using.UsingStatementKind, $Using.Name.Copy())
+# The differential primitives, as one class so that they survive the script's run: once & Invoke-PSC.ps1 returns, its
+# functions are gone and its classes remain, so the API and the instruments reach them the same way. Lowering goes
+# through PSC's own Compile operation, which is reachable from anywhere.
+class PscDifferential {
+    # Boundary values of a type: its extremes, zero and its neighbours, and for floating point NaN, infinities and -0.
+    static [System.Collections.Generic.List[object]] Values([type] $type) {
+        $values = [System.Collections.Generic.List[object]]::new()
+        if ($type.IsArray) {
+            $element = $type.GetElementType()
+            $inner = [PscDifferential]::Values($element)
+            $count = [Math]::Min(3, $inner.Count)
+            $values.Add([Array]::CreateInstance($element, 0))
+            $all = [Array]::CreateInstance($element, $count)
+            for ($i = 0; $i -lt $count; $i++) { $all.SetValue($inner[$i], $i) }
+            $values.Add($all)
+            return $values
+        }
+        if ($type.IsEnum) { foreach ($value in [Enum]::GetValues($type)) { $values.Add($value) }; return $values }
+        $listed = $null
+        if ($type -eq [int]) { $listed = [object[]]@([int]::MinValue, [int]-1, [int]0, [int]1, [int]2, [int]7, [int]70000, [int]::MaxValue) }
+        elseif ($type -eq [long]) { $listed = [object[]]@([long]::MinValue, [long]-1, [long]0, [long]1, [long]7, [long]::MaxValue) }
+        elseif ($type -eq [short]) { $listed = [object[]]@([short]::MinValue, [short]-1, [short]0, [short]1, [short]::MaxValue) }
+        elseif ($type -eq [sbyte]) { $listed = [object[]]@([sbyte]::MinValue, [sbyte]-1, [sbyte]0, [sbyte]1, [sbyte]::MaxValue) }
+        elseif ($type -eq [byte]) { $listed = [object[]]@([byte]0, [byte]1, [byte]7, [byte]::MaxValue) }
+        elseif ($type -eq [uint16]) { $listed = [object[]]@([uint16]0, [uint16]1, [uint16]::MaxValue) }
+        elseif ($type -eq [uint32]) { $listed = [object[]]@([uint32]0, [uint32]1, [uint32]::MaxValue) }
+        elseif ($type -eq [uint64]) { $listed = [object[]]@([uint64]0, [uint64]1, [uint64]::MaxValue) }
+        elseif ($type -eq [double]) { $listed = [object[]]@(0.0, -0.0, 1.0, -1.0, 0.5, 2.5, [double]::NaN, [double]::PositiveInfinity, [double]::NegativeInfinity, [double]::MaxValue, [double]::Epsilon) }
+        elseif ($type -eq [float]) { $listed = [object[]]@([float]0, [float]-0.0, [float]1, [float]-1, [float]0.5, [float]2.5, [float]::NaN, [float]::PositiveInfinity, [float]::NegativeInfinity, [float]::MaxValue) }
+        elseif ($type -eq [decimal]) { $listed = [object[]]@([decimal]0, [decimal]1, [decimal]-1, [decimal]0.5) }
+        elseif ($type -eq [bool]) { $listed = [object[]]@($true, $false) }
+        elseif ($type -eq [char]) { $listed = [object[]]@([char]'a', [char]'A', [char]'0', [char]0) }
+        elseif ($type -eq [string]) { $listed = [object[]]@('', 'a', 'A', 'PowerShell', 'ß', ' ') }
+        if ($null -ne $listed) { $values.AddRange($listed) }
+        return $values
     }
-    $Using.Copy()
-}
 
+    # Every combination of each parameter type's values, in order, up to a limit. None when a type has no values.
+    static [System.Collections.Generic.List[object[]]] ArgumentSets([type[]] $types, [int] $limit) {
+        $sets = [System.Collections.Generic.List[object[]]]::new()
+        $lists = [System.Collections.Generic.List[object[]]]::new()
+        foreach ($type in $types) {
+            $values = [PscDifferential]::Values($type)
+            if ($values.Count -eq 0) { return $sets }
+            $lists.Add($values.ToArray())
+        }
+        $indexes = [int[]]::new($lists.Count)
+        while ($sets.Count -lt $limit) {
+            $arguments = [object[]]::new($lists.Count)
+            for ($i = 0; $i -lt $lists.Count; $i++) { $arguments[$i] = $lists[$i][$indexes[$i]] }
+            $sets.Add($arguments)
+            $position = $lists.Count - 1
+            while ($position -ge 0) {
+                $indexes[$position]++
+                if ($indexes[$position] -lt $lists[$position].Length) { break }
+                $indexes[$position] = 0
+                $position--
+            }
+            if ($position -lt 0) { return $sets }
+        }
+        return $sets
+    }
+
+    # Invokes a method into an outcome: its value, or the exception it threw unwrapped from the reflection layers. Array
+    # arguments are copied so a method that mutates them cannot change another invocation's input. With a time limit the
+    # call runs as a compiled delegate on a pool thread; an unfinished call is recorded as unfinished.
+    static [PscOutcome] Invoke([System.Reflection.MethodInfo] $method, [object] $instance, [object[]] $arguments, [int] $timeLimitMilliseconds) {
+        $given = if ($null -eq $arguments) { [object[]]@() } else { $arguments }
+        $copies = [object[]]::new($given.Length)
+        for ($i = 0; $i -lt $copies.Length; $i++) { $copies[$i] = if ($given[$i] -is [Array]) { ([Array]$given[$i]).Clone() } else { $given[$i] } }
+        $outcome = [PscOutcome]::new()
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            if ($timeLimitMilliseconds -gt 0) {
+                $call = [System.Linq.Expressions.Expression]::Call(
+                    [System.Linq.Expressions.Expression]::Constant($method, [System.Reflection.MethodBase]),
+                    [System.Reflection.MethodBase].GetMethod('Invoke', [type[]]@([object], [object[]])),
+                    [System.Linq.Expressions.Expression]::Constant($instance, [object]),
+                    [System.Linq.Expressions.Expression]::Constant($copies, [object[]]))
+                $task = [System.Threading.Tasks.Task[object]]::Run([System.Linq.Expressions.Expression]::Lambda([Func[object]], $call).Compile())
+                if (-not $task.Wait($timeLimitMilliseconds)) { $outcome.Finished = $false }
+                else { $outcome.Value = $task.Result }
+            }
+            else { $outcome.Value = $method.Invoke($instance, $copies) }
+        }
+        catch { $outcome.Exception = [PscDifferential]::Unwrap($_.Exception) }
+        $outcome.Milliseconds = $clock.Elapsed.TotalMilliseconds
+        return $outcome
+    }
+
+    # The exception a call actually threw, beneath the reflection, task and SMA invocation layers that carry it.
+    static [System.Exception] Unwrap([System.Exception] $exception) {
+        $inner = $exception
+        while (($inner -is [System.Management.Automation.MethodInvocationException] -or $inner -is [System.Reflection.TargetInvocationException] -or $inner -is [System.AggregateException]) -and $null -ne $inner.InnerException) { $inner = $inner.InnerException }
+        return $inner
+    }
+
+    # SMA running PowerShell code on arguments: an unbound copy of the code's AST runs in this method's scope, with strict
+    # mode version Latest or off as stated. Its output is collapsed as an expression receives it.
+    static [PscOutcome] Reference([scriptblock] $code, [object[]] $arguments, [bool] $strict) {
+        if ($strict) { Set-StrictMode -Version Latest } else { Set-StrictMode -Off }
+        $unbound = $code.Ast.GetScriptBlock()
+        $given = if ($null -eq $arguments) { [object[]]@() } else { $arguments }
+        $outcome = [PscOutcome]::new()
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            $written = [System.Collections.Generic.List[object]]::new()
+            foreach ($item in $unbound.InvokeReturnAsIs($given)) { $written.Add($item) }
+            $outcome.Value = if ($written.Count -eq 0) { $null } elseif ($written.Count -eq 1) { $written[0] } else { $written.ToArray() }
+        }
+        catch { $outcome.Exception = [PscDifferential]::Unwrap($_.Exception) }
+        $outcome.Milliseconds = $clock.Elapsed.TotalMilliseconds
+        return $outcome
+    }
+
+    # Whether two values are the same: arrays element by element, floating point by bits (NaN equals NaN; -0 differs from
+    # 0), instances of the lowered and interpreted forms of one class by their public instance fields and properties.
+    static [bool] SameValue([object] $first, [object] $second) {
+        if ($null -eq $first -or $null -eq $second) { return ($null -eq $first -and $null -eq $second) }
+        if ($first -is [Array] -and $second -is [Array]) {
+            $left = [Array]$first; $right = [Array]$second
+            if ($left.Length -ne $right.Length) { return $false }
+            for ($i = 0; $i -lt $left.Length; $i++) { if (-not [PscDifferential]::SameValue($left.GetValue($i), $right.GetValue($i))) { return $false } }
+            return $true
+        }
+        if ($first -is [double] -and $second -is [double]) { return [BitConverter]::DoubleToInt64Bits([double]$first) -eq [BitConverter]::DoubleToInt64Bits([double]$second) }
+        if ($first -is [float] -and $second -is [float]) { return [BitConverter]::SingleToInt32Bits([float]$first) -eq [BitConverter]::SingleToInt32Bits([float]$second) }
+        $type = $first.GetType()
+        if ($type.IsPrimitive -or $first -is [string] -or $first -is [decimal] -or $type.IsEnum) { return $type -eq $second.GetType() -and $first.Equals($second) }
+        $firstMembers = [PscDifferential]::PublicState($first)
+        $secondMembers = [PscDifferential]::PublicState($second)
+        if ($firstMembers.Count -ne $secondMembers.Count) { return $false }
+        foreach ($name in $firstMembers.Keys) {
+            if (-not $secondMembers.ContainsKey($name) -or -not [PscDifferential]::SameValue($firstMembers[$name], $secondMembers[$name])) { return $false }
+        }
+        return $true
+    }
+
+    static [System.Collections.Generic.Dictionary[string, object]] PublicState([object] $value) {
+        $members = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
+        $flags = [System.Reflection.BindingFlags]'Public,Instance'
+        foreach ($field in $value.GetType().GetFields($flags)) { $members[$field.Name] = $field.GetValue($value) }
+        foreach ($property in $value.GetType().GetProperties($flags)) { if ($property.GetIndexParameters().Length -eq 0) { $members[$property.Name] = $property.GetValue($value) } }
+        return $members
+    }
+
+    static [PscRelation] Compare([PscOutcome] $lowered, [PscOutcome] $interpreted) {
+        $loweredThrew = $null -ne $lowered.Exception
+        $interpretedThrew = $null -ne $interpreted.Exception
+        if ($loweredThrew -and $interpretedThrew) { return [PscRelation]::BothThrew }
+        if ($loweredThrew) { return [PscRelation]::OnlyLoweredThrew }
+        if ($interpretedThrew) { return [PscRelation]::OnlyInterpretedThrew }
+        if ([PscDifferential]::SameValue($lowered.Value, $interpreted.Value)) { return [PscRelation]::Equal }
+        return [PscRelation]::Different
+    }
+
+    # A using statement copied for a new script block. SMA's UsingStatementAst.Copy() throws on using namespace.
+    static [System.Management.Automation.Language.UsingStatementAst] CopyUsing([System.Management.Automation.Language.UsingStatementAst] $using) {
+        if ($null -eq $using.Alias -and $null -eq $using.ModuleSpecification -and $null -ne $using.Name) {
+            return [System.Management.Automation.Language.UsingStatementAst]::new($using.Extent, $using.UsingStatementKind, $using.Name.Copy())
+        }
+        return [System.Management.Automation.Language.UsingStatementAst]$using.Copy()
+    }
+
+    # The source's classes and enums defined by SMA, interpreted: a new script block holding copies of the source's type
+    # definitions only (no other statement runs) and, after them, one [Name] type expression per definition, so SMA's
+    # own resolution returns each runtime type.
+    static [System.Collections.Generic.Dictionary[string, type]] Interpret([System.Management.Automation.Language.ScriptBlockAst] $source) {
+        $definitions = [System.Collections.Generic.List[System.Management.Automation.Language.StatementAst]]::new()
+        $names = [System.Collections.Generic.List[string]]::new()
+        foreach ($definition in $source.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] }, $false)) {
+            $definitions.Add([System.Management.Automation.Language.StatementAst]$definition.Copy())
+            $names.Add(([System.Management.Automation.Language.TypeDefinitionAst]$definition).Name)
+        }
+        $usings = [System.Collections.Generic.List[System.Management.Automation.Language.UsingStatementAst]]::new()
+        foreach ($using in $source.UsingStatements) { $usings.Add([PscDifferential]::CopyUsing($using)) }
+        foreach ($name in $names) {
+            $expression = [System.Management.Automation.Language.TypeExpressionAst]::new($source.Extent, [System.Management.Automation.Language.TypeName]::new($source.Extent, $name))
+            $definitions.Add([System.Management.Automation.Language.PipelineAst]::new($source.Extent, [System.Management.Automation.Language.CommandExpressionAst]::new($source.Extent, $expression, $null)))
+        }
+        $block = [System.Management.Automation.Language.StatementBlockAst]::new($source.Extent, $definitions, [System.Management.Automation.Language.TrapStatementAst[]]@())
+        $script = [System.Management.Automation.Language.ScriptBlockAst]::new($source.Extent, $usings, $null, $block, $false, $false)
+        $resolved = [System.Collections.Generic.List[object]]::new()
+        foreach ($item in $script.GetScriptBlock().InvokeReturnAsIs()) { $resolved.Add($item) }
+        $types = [System.Collections.Generic.Dictionary[string, type]]::new([StringComparer]::OrdinalIgnoreCase)
+        for ($i = 0; $i -lt $names.Count; $i++) { $types[$names[$i]] = [type]$resolved[$i] }
+        return $types
+    }
+
+    # A source's classes (all of them when no names are given) lowered by PSC's Compile operation and loaded from the
+    # assembly's bytes. The assembly is written under build/api beside PSC, named by the SHA-512 of the source text and
+    # the classes lowered.
+    static [System.Reflection.Assembly] Lower([string] $psc, [System.Management.Automation.Language.ScriptBlockAst] $source, [string[]] $classNames) {
+        $names = [System.Collections.Generic.List[string]]::new()
+        foreach ($name in $classNames) { if (-not [string]::IsNullOrEmpty($name)) { $names.Add($name) } }
+        $identity = [System.Security.Cryptography.SHA512]::HashData([System.Text.Encoding]::UTF8.GetBytes($source.Extent.Text + [char]0 + [string]::Join([char]0, $names)))
+        $directory = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($psc), 'build', 'api', [Convert]::ToHexString($identity, 0, 8))
+        $null = [System.IO.Directory]::CreateDirectory($directory)
+        $output = [System.IO.Path]::Combine($directory, 'Lowered.dll')
+        if ($names.Count) { $null = & $psc -Mode Compile -SourceAst $source -ClassName $names[0] -ClassNames $names.ToArray() -OutputPath $output -Deterministic }
+        else { $null = & $psc -Mode Compile -SourceAst $source -OutputPath $output -Deterministic }
+        return [System.Reflection.Assembly]::Load([System.IO.File]::ReadAllBytes($output))
+    }
+
+    # PSC's PowerShellSemantics definition, alone in a script block of its own, read from PSC's source.
+    static [System.Management.Automation.Language.ScriptBlockAst] SemanticsSource([string] $psc) {
+        $tokens = $null; $errors = $null
+        $own = [System.Management.Automation.Language.Parser]::ParseFile($psc, [ref]$tokens, [ref]$errors)
+        $definition = $own.Find({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.Name -eq 'PowerShellSemantics' }, $true)
+        $block = [System.Management.Automation.Language.StatementBlockAst]::new($definition.Extent, [System.Management.Automation.Language.StatementAst[]]@($definition.Copy()), [System.Management.Automation.Language.TrapStatementAst[]]@())
+        return [System.Management.Automation.Language.ScriptBlockAst]::new($definition.Extent, $null, $block, $false)
+    }
+}
 
 function Get-AstArrayElements($node) {
     if ($node -is [System.Management.Automation.Language.ArrayLiteralAst]) {
@@ -2238,9 +2441,50 @@ function New-PowerShellNotePropertyRead {
             [Linq.Expressions.Expression]::Property($property, 'Value'))))
 }
 
+function Test-PscDynamicMemberTarget([Type] $Type) {
+    # Member access PowerShell binds when the program runs: on a dictionary (its keys win) or on a value typed [object].
+    $Type -eq [object] -or [System.Collections.IDictionary].IsAssignableFrom($Type)
+}
+
+function Test-PscStrictMode {
+    # Whether strict mode (version 2 or later) is in force at a node, as the source states it lexically: the nearest
+    # Set-StrictMode before the node among the statements of the script blocks that enclose it. Strict mode is
+    # dynamically scoped; a caller's setting that the source does not show around the node is not seen here.
+    param([Parameter(Mandatory)][System.Management.Automation.Language.Ast] $Node)
+    $scope = $Node.Parent
+    while ($null -ne $scope) {
+        if ($scope -is [System.Management.Automation.Language.ScriptBlockAst]) {
+            $nearest = $null
+            foreach ($command in $scope.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Set-StrictMode' }, $false)) {
+                if ($command.Extent.EndOffset -le $Node.Extent.StartOffset -and ($null -eq $nearest -or $command.Extent.StartOffset -gt $nearest.Extent.StartOffset)) { $nearest = $command }
+            }
+            if ($null -ne $nearest) {
+                $bound = [System.Management.Automation.Language.StaticParameterBinder]::BindCommand($nearest, $true).BoundParameters
+                if ($bound.ContainsKey('Off')) { return $false }
+                if ($bound.ContainsKey('Version')) {
+                    $version = $bound['Version'].ConstantValue
+                    if ($version -is [string] -and $version -eq 'Latest') { return $true }
+                    return [version]$version -ge [version]'2.0'
+                }
+            }
+        }
+        $scope = $scope.Parent
+    }
+    $false
+}
+
 function New-MemberAccess {
-    # $target.Name or [Type]::Name as a field or property expression.
+    # $target.Name or [Type]::Name as a field or property expression. On a dictionary or an [object] value, PowerShell's
+    # own binding: PowerShellSemantics.Member, given whether strict mode is in force at the node.
     param([Linq.Expressions.Expression] $Target, [Type] $Type, [string] $Name, [System.Management.Automation.Language.Ast] $Node)
+    if ($null -ne $Target -and (Test-PscDynamicMemberTarget $Type)) {
+        $strict = if ($Node) { Test-PscStrictMode -Node $Node } else { $false }
+        return [Linq.Expressions.Expression]::Call(
+            (Get-PscSemanticsMethod -Name 'Member' -ParameterTypes ([Type[]]@([object], [string], [bool]))),
+            [Linq.Expressions.Expression]::Convert($Target, [object]),
+            [Linq.Expressions.Expression]::Constant($Name, [string]),
+            [Linq.Expressions.Expression]::Constant([bool]$strict, [bool]))
+    }
     $member = Resolve-MatchingMember -TargetType $Type -MemberName $Name -IsStatic:($null -eq $Target)
     if ($member -is [Reflection.PropertyInfo]) { return [Linq.Expressions.Expression]::Property($Target, $member) }
     [Linq.Expressions.Expression]::Field($Target, $member)
@@ -2516,6 +2760,43 @@ class PowerShellSemantics {
         }
         $items = ([System.Collections.IEnumerable] $value).GetEnumerator()
         while ($items.MoveNext()) { $output.Add($items.Current) }
+    }
+
+    # $target.Name as PowerShell binds it when the target is a dictionary or its type is known only at run time: a
+    # dictionary's key wins over any member of that name; otherwise the target's public instance property or field,
+    # ignoring case. When there is neither, $null; under strict mode, an exception with PowerShell's message.
+    static [object] Member([object] $target, [string] $name, [bool] $strict) {
+        if ($null -ne $target) {
+            if ($target -is [System.Collections.IDictionary]) {
+                [System.Collections.IDictionary] $dictionary = $target
+                if ($dictionary.Contains($name)) { return $dictionary[$name] }
+            }
+            [System.Reflection.BindingFlags] $flags = [System.Reflection.BindingFlags]::Public -bor [System.Reflection.BindingFlags]::Instance -bor [System.Reflection.BindingFlags]::IgnoreCase
+            [System.Reflection.PropertyInfo] $property = $target.GetType().GetProperty($name, $flags)
+            if ($null -ne $property) { return $property.GetValue($target) }
+            [System.Reflection.FieldInfo] $field = $target.GetType().GetField($name, $flags)
+            if ($null -ne $field) { return $field.GetValue($target) }
+        }
+        if ($strict) { throw [System.InvalidOperationException]::new("The property '" + $name + "' cannot be found on this object. Verify that the property exists.") }
+        return $null
+    }
+
+    # $target.Name = $value as PowerShell binds it for the same targets: a dictionary's key is set (added when absent);
+    # otherwise the public instance property or field of that name, ignoring case. A target with neither throws.
+    static [object] SetMember([object] $target, [string] $name, [object] $value) {
+        if ($target -is [System.Collections.IDictionary]) {
+            [System.Collections.IDictionary] $dictionary = $target
+            $dictionary[$name] = $value
+            return $value
+        }
+        if ($null -ne $target) {
+            [System.Reflection.BindingFlags] $flags = [System.Reflection.BindingFlags]::Public -bor [System.Reflection.BindingFlags]::Instance -bor [System.Reflection.BindingFlags]::IgnoreCase
+            [System.Reflection.PropertyInfo] $property = $target.GetType().GetProperty($name, $flags)
+            if ($null -ne $property) { $property.SetValue($target, $value); return $value }
+            [System.Reflection.FieldInfo] $field = $target.GetType().GetField($name, $flags)
+            if ($null -ne $field) { $field.SetValue($target, $value); return $value }
+        }
+        throw [System.InvalidOperationException]::new("The property '" + $name + "' cannot be found on this object. Verify that the property exists.")
     }
 
     # A function's output as an assignment or an expression receives it: $null when nothing was written, the object
@@ -2915,6 +3196,28 @@ function Convert-AstExpression {
             if ($left -is [Linq.Expressions.ConstantExpression] -and $null -eq $left.Value -and -not $right.Type.IsValueType) { $left = [Linq.Expressions.Expression]::Constant($null, $right.Type) }
             if ($right -is [Linq.Expressions.ConstantExpression] -and $null -eq $right.Value -and -not $left.Type.IsValueType) { $right = [Linq.Expressions.Expression]::Constant($null, $left.Type) }
         }
+        # Bitwise operators on enums, as SMA gives them: computed on the enums' underlying integral types; the result is
+        # the left operand's enum type when the left operand is an enum, and the integral type when it is an integer.
+        if ($Node.Operator -in 'Band', 'Bor', 'Bxor' -and ($left.Type.IsEnum -or $right.Type.IsEnum)) {
+            $resultEnum = if ($left.Type.IsEnum) { $left.Type } else { $null }
+            if ($left.Type.IsEnum) { $left = [Linq.Expressions.Expression]::Convert($left, [Enum]::GetUnderlyingType($left.Type)) }
+            if ($right.Type.IsEnum) { $right = [Linq.Expressions.Expression]::Convert($right, [Enum]::GetUnderlyingType($right.Type)) }
+            $widened = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Bitwise, $left, $right)
+            if ($widened) { $left = $widened.Left; $right = $widened.Right }
+            if ($left.Type -ne $right.Type -or $left.Type -notin $script:IntegralTypes) {
+                throw "[{0}:{1}] -{2} has no common integral type for '{3}' and '{4}'." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $Node.Operator.ToString().ToLowerInvariant(), $left.Type.FullName, $right.Type.FullName
+            }
+            $combined = switch ($Node.Operator) {
+                'Band' { [Linq.Expressions.Expression]::And($left, $right) }
+                'Bor'  { [Linq.Expressions.Expression]::Or($left, $right) }
+                'Bxor' { [Linq.Expressions.Expression]::ExclusiveOr($left, $right) }
+            }
+            if ($null -ne $resultEnum) {
+                if ($combined.Type -ne [Enum]::GetUnderlyingType($resultEnum)) { $combined = [Linq.Expressions.Expression]::Convert($combined, [Enum]::GetUnderlyingType($resultEnum)) }
+                return [Linq.Expressions.Expression]::Convert($combined, $resultEnum)
+            }
+            return $combined
+        }
         if ($Node.Operator -notin 'And', 'Or') {
             # Narrow integers have no CLR arithmetic of their own, even when both sides match.
             $kind = if ($Node.Operator -in 'Band', 'Bor', 'Bxor') { [PscOperatorKind]::Bitwise }
@@ -3299,6 +3602,14 @@ function Convert-AstStatement {
             $idxExpr = Convert-AstExpression -Node $leftNode.Index -Scope $Scope
             $indexer = if ($targetExpr.Type.IsArray) { $null } else { Get-IntIndexer $targetExpr.Type }
             if (-not $targetExpr.Type.IsArray -and $null -eq $indexer) {
+                # A keyed indexer with a setter ($dictionary[$key] = value): the key and value converted to its types.
+                $keyed = Get-KeyIndexer $targetExpr.Type $idxExpr.Type
+                if ($null -ne $keyed -and $keyed.CanWrite) {
+                    $keyType = $keyed.GetIndexParameters()[0].ParameterType
+                    $key = if ($idxExpr.Type -eq $keyType) { $idxExpr } else { ConvertTo-PowerShellType -Expression $idxExpr -Type $keyType }
+                    $valExpr = Convert-AstExpressionAs -Node $Statement.Right -Type $keyed.PropertyType -Scope $Scope
+                    return [Linq.Expressions.Expression]::Assign([Linq.Expressions.Expression]::MakeIndex($targetExpr, $keyed, [Linq.Expressions.Expression[]]@($key)), $valExpr)
+                }
                 throw "[{0}:{1}] Cannot assign into non-array type '{2}'." -f `
                     $Statement.Extent.StartLineNumber, $Statement.Extent.StartColumnNumber, $targetExpr.Type.FullName
             }
@@ -3321,6 +3632,15 @@ function Convert-AstStatement {
                 $value = Convert-AstExpression -Node $Statement.Right -Scope $Scope
                 if ($value.Type -ne [object]) { $value = [Linq.Expressions.Expression]::Convert($value, [object]) }
                 return [Linq.Expressions.Expression]::Assign([Linq.Expressions.Expression]::Property((Get-PowerShellNoteProperty $owner $name), 'Value'), $value)
+            }
+            if (Test-PscDynamicMemberTarget $owner.Type) {
+                $value = Convert-AstExpression -Node $Statement.Right -Scope $Scope
+                if ($value.Type -ne [object]) { $value = [Linq.Expressions.Expression]::Convert($value, [object]) }
+                return [Linq.Expressions.Expression]::Call(
+                    (Get-PscSemanticsMethod -Name 'SetMember' -ParameterTypes ([Type[]]@([object], [string], [object]))),
+                    [Linq.Expressions.Expression]::Convert($owner, [object]),
+                    [Linq.Expressions.Expression]::Constant($name, [string]),
+                    $value)
             }
             $memberTarget = New-MemberAccess -Target $owner -Type $owner.Type -Name $name -Node $leftNode
             if ($memberTarget.Member -is [Reflection.PropertyInfo] -and -not $memberTarget.Member.CanWrite) {
@@ -4489,6 +4809,9 @@ function Write-IlConversion {
     if (-not (& $numeric $FromType) -or -not (& $numeric $ToType)) {
         throw "Unsupported conversion from '$($FromType.FullName)' to '$($ToType.FullName)'."
     }
+    # In IL an enum is its underlying integral type: converting to or from one is converting to or from that type.
+    if ($ToType.IsEnum) { Write-IlConversion -IL $IL -FromType $FromType -ToType ([Enum]::GetUnderlyingType($ToType)) -Checked:$Checked; return }
+    if ($FromType.IsEnum) { Write-IlConversion -IL $IL -FromType ([Enum]::GetUnderlyingType($FromType)) -ToType $ToType -Checked:$Checked; return }
 
     # Char is an unsigned 16-bit integer: [char]10 is U+000A, and [char]70000 throws as it does in PowerShell.
     if ($Checked -and $ToType.IsPrimitive -and $ToType -notin [double], [single], [bool]) {
@@ -5193,6 +5516,39 @@ class PscApi {
 
     # Parses a PowerShell source file and takes every measure of it, with the location of each finding.
     [PscSource] ReadSource([string] $path) { return [PscSource]::new($path) }
+
+    # The classes of a source (all of them when $classNames is empty), lowered by PSC and loaded from the assembly's bytes.
+    [System.Reflection.Assembly] Lower([System.Management.Automation.Language.ScriptBlockAst] $source, [string[]] $classNames) {
+        return [PscDifferential]::Lower($this.Script, $source, $classNames)
+    }
+
+    # PSC's PowerShellSemantics, lowered as every program that needs a helper receives it.
+    [type] Semantics() {
+        return [PscDifferential]::Lower($this.Script, [PscDifferential]::SemanticsSource($this.Script), [string[]]@('PowerShellSemantics')).GetType('PowerShellSemantics')
+    }
+
+    # The same classes defined by SMA, interpreted: the reference implementation of a lowered class.
+    [System.Collections.Generic.Dictionary[string, type]] Interpret([System.Management.Automation.Language.ScriptBlockAst] $source) {
+        return [PscDifferential]::Interpret($source)
+    }
+
+    [PscOutcome] Invoke([System.Reflection.MethodInfo] $method, [object] $instance, [object[]] $arguments) {
+        return [PscDifferential]::Invoke($method, $instance, $arguments, 0)
+    }
+
+    # SMA running PowerShell code on the given arguments, with strict mode version Latest or off: the reference
+    # implementation for any construct PSC lowers.
+    [PscOutcome] Reference([scriptblock] $code, [object[]] $arguments, [bool] $strict) {
+        return [PscDifferential]::Reference($code, $arguments, $strict)
+    }
+
+    [PscRelation] Compare([PscOutcome] $lowered, [PscOutcome] $reference) {
+        return [PscDifferential]::Compare($lowered, $reference)
+    }
+
+    # Boundary values of a type, and every combination of them for a parameter list, up to a limit.
+    [System.Collections.Generic.List[object]] Values([type] $type) { return [PscDifferential]::Values($type) }
+    [System.Collections.Generic.List[object[]]] ArgumentSets([type[]] $types, [int] $limit) { return [PscDifferential]::ArgumentSets($types, $limit) }
 }
 
 function Get-PscApi {
@@ -7240,147 +7596,6 @@ function Find-PscEffect {
     $null
 }
 
-# Boundary values of a type: its extremes, zero and its neighbours, and for floating point NaN, infinities and -0.
-function Get-PscTypeValue {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][type] $Type)
-    if ($Type.IsArray) {
-        $element = $Type.GetElementType()
-        $values = @(Get-PscTypeValue -Type $element | Select-Object -First 3)
-        $empty = [Array]::CreateInstance($element, 0)
-        $all = [Array]::CreateInstance($element, $values.Count)
-        for ($i = 0; $i -lt $values.Count; $i++) { $all.SetValue($values[$i], $i) }
-        , $empty
-        , $all
-        return
-    }
-    if ($Type.IsEnum) { foreach ($value in [Enum]::GetValues($Type)) { $value }; return }
-    if ($Type -eq [int]) { [int]::MinValue, [int]-1, [int]0, [int]1, [int]2, [int]7, [int]70000, [int]::MaxValue; return }
-    if ($Type -eq [long]) { [long]::MinValue, [long]-1, [long]0, [long]1, [long]7, [long]::MaxValue; return }
-    if ($Type -eq [short]) { [short]::MinValue, [short]-1, [short]0, [short]1, [short]::MaxValue; return }
-    if ($Type -eq [sbyte]) { [sbyte]::MinValue, [sbyte]-1, [sbyte]0, [sbyte]1, [sbyte]::MaxValue; return }
-    if ($Type -eq [byte]) { [byte]0, [byte]1, [byte]7, [byte]::MaxValue; return }
-    if ($Type -eq [uint16]) { [uint16]0, [uint16]1, [uint16]::MaxValue; return }
-    if ($Type -eq [uint32]) { [uint32]0, [uint32]1, [uint32]::MaxValue; return }
-    if ($Type -eq [uint64]) { [uint64]0, [uint64]1, [uint64]::MaxValue; return }
-    if ($Type -eq [double]) { 0.0, -0.0, 1.0, -1.0, 0.5, 2.5, [double]::NaN, [double]::PositiveInfinity, [double]::NegativeInfinity, [double]::MaxValue, [double]::Epsilon; return }
-    if ($Type -eq [float]) { [float]0, [float]-0.0, [float]1, [float]-1, [float]0.5, [float]2.5, [float]::NaN, [float]::PositiveInfinity, [float]::NegativeInfinity, [float]::MaxValue; return }
-    if ($Type -eq [decimal]) { [decimal]0, [decimal]1, [decimal]-1, [decimal]0.5; return }
-    if ($Type -eq [bool]) { $true, $false; return }
-    if ($Type -eq [char]) { [char]'a', [char]'A', [char]'0', [char]0; return }
-    if ($Type -eq [string]) { '', 'a', 'A', 'PowerShell', 'ß', ' '; return }
-}
-
-# Every combination of each parameter type's values, in order, up to a limit. Nothing when a type has no values.
-function Get-PscArgumentSet {
-    [CmdletBinding()]
-    param([type[]] $Types, [int] $Limit = 64)
-    $lists = [System.Collections.Generic.List[object[]]]::new()
-    foreach ($type in @($Types)) {
-        $values = [System.Collections.Generic.List[object]]::new()
-        foreach ($value in Get-PscTypeValue -Type $type) { $values.Add($value) }
-        if ($values.Count -eq 0) { return }
-        $lists.Add($values.ToArray())
-    }
-    $indexes = [int[]]::new($lists.Count)
-    $produced = 0
-    while ($produced -lt $Limit) {
-        $arguments = [object[]]::new($lists.Count)
-        for ($i = 0; $i -lt $lists.Count; $i++) { $arguments[$i] = $lists[$i][$indexes[$i]] }
-        , $arguments
-        $produced++
-        $position = $lists.Count - 1
-        while ($position -ge 0) {
-            $indexes[$position]++
-            if ($indexes[$position] -lt $lists[$position].Length) { break }
-            $indexes[$position] = 0
-            $position--
-        }
-        if ($position -lt 0) { return }
-    }
-}
-
-# Invokes a method into an outcome: its value, or the exception it threw unwrapped from the reflection layers. Array
-# arguments are copied so a method that mutates them cannot change another invocation's input. With a time limit the
-# call runs as a compiled delegate on a pool thread; an unfinished call is recorded as unfinished.
-function Invoke-PscMethod {
-    [CmdletBinding()]
-    [OutputType([PscOutcome])]
-    param(
-        [Parameter(Mandatory)][System.Reflection.MethodInfo] $Method,
-        [object] $Instance,
-        [object[]] $Arguments,
-        [int] $TimeLimitMilliseconds = 0
-    )
-    $copies = [object[]]::new(@($Arguments).Count)
-    for ($i = 0; $i -lt $copies.Length; $i++) { $copies[$i] = if ($Arguments[$i] -is [Array]) { $Arguments[$i].Clone() } else { $Arguments[$i] } }
-    $outcome = [PscOutcome]::new()
-    $clock = [System.Diagnostics.Stopwatch]::StartNew()
-    try {
-        if ($TimeLimitMilliseconds -gt 0) {
-            $call = [System.Linq.Expressions.Expression]::Call(
-                [System.Linq.Expressions.Expression]::Constant($Method, [System.Reflection.MethodBase]),
-                [System.Reflection.MethodBase].GetMethod('Invoke', [type[]]@([object], [object[]])),
-                [System.Linq.Expressions.Expression]::Constant($Instance, [object]),
-                [System.Linq.Expressions.Expression]::Constant($copies, [object[]]))
-            $task = [System.Threading.Tasks.Task[object]]::Run([System.Linq.Expressions.Expression]::Lambda([Func[object]], $call).Compile())
-            if (-not $task.Wait($TimeLimitMilliseconds)) { $outcome.Finished = $false }
-            else { $outcome.Value = $task.Result }
-        }
-        else { $outcome.Value = $Method.Invoke($Instance, $copies) }
-    }
-    catch {
-        $exception = $_.Exception
-        while (($exception -is [System.Management.Automation.MethodInvocationException] -or $exception -is [System.Reflection.TargetInvocationException] -or $exception -is [System.AggregateException]) -and $null -ne $exception.InnerException) { $exception = $exception.InnerException }
-        $outcome.Exception = $exception
-    }
-    $outcome.Milliseconds = $clock.Elapsed.TotalMilliseconds
-    $outcome
-}
-
-# Whether two values are the same: arrays element by element, floating point by bits (NaN equals NaN; -0 differs from 0),
-# instances of the lowered and interpreted forms of one class by their public instance fields and properties.
-function Test-PscSameValue {
-    [CmdletBinding()]
-    [OutputType([bool])]
-    param([object] $First, [object] $Second)
-    if ($null -eq $First -or $null -eq $Second) { return ($null -eq $First -and $null -eq $Second) }
-    if ($First -is [Array] -and $Second -is [Array]) {
-        if ($First.Length -ne $Second.Length) { return $false }
-        for ($i = 0; $i -lt $First.Length; $i++) { if (-not (Test-PscSameValue $First[$i] $Second[$i])) { return $false } }
-        return $true
-    }
-    if ($First -is [double] -and $Second -is [double]) { return [BitConverter]::DoubleToInt64Bits($First) -eq [BitConverter]::DoubleToInt64Bits($Second) }
-    if ($First -is [float] -and $Second -is [float]) { return [BitConverter]::SingleToInt32Bits($First) -eq [BitConverter]::SingleToInt32Bits($Second) }
-    if ($First.GetType().IsPrimitive -or $First -is [string] -or $First -is [decimal] -or $First.GetType().IsEnum) {
-        return $First.GetType() -eq $Second.GetType() -and $First.Equals($Second)
-    }
-    $firstMembers = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($field in $First.GetType().GetFields([System.Reflection.BindingFlags]'Public,Instance')) { $firstMembers[$field.Name] = $field.GetValue($First) }
-    foreach ($property in $First.GetType().GetProperties([System.Reflection.BindingFlags]'Public,Instance')) { if ($property.GetIndexParameters().Length -eq 0) { $firstMembers[$property.Name] = $property.GetValue($First) } }
-    $secondMembers = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($field in $Second.GetType().GetFields([System.Reflection.BindingFlags]'Public,Instance')) { $secondMembers[$field.Name] = $field.GetValue($Second) }
-    foreach ($property in $Second.GetType().GetProperties([System.Reflection.BindingFlags]'Public,Instance')) { if ($property.GetIndexParameters().Length -eq 0) { $secondMembers[$property.Name] = $property.GetValue($Second) } }
-    if ($firstMembers.Count -ne $secondMembers.Count) { return $false }
-    foreach ($name in $firstMembers.Keys) {
-        if (-not $secondMembers.ContainsKey($name) -or -not (Test-PscSameValue $firstMembers[$name] $secondMembers[$name])) { return $false }
-    }
-    $true
-}
-
-function Compare-PscOutcome {
-    [CmdletBinding()]
-    [OutputType([PscRelation])]
-    param([Parameter(Mandatory)][PscOutcome] $Lowered, [Parameter(Mandatory)][PscOutcome] $Interpreted)
-    $loweredThrew = $null -ne $Lowered.Exception
-    $interpretedThrew = $null -ne $Interpreted.Exception
-    if ($loweredThrew -and $interpretedThrew) { return [PscRelation]::BothThrew }
-    if ($loweredThrew) { return [PscRelation]::OnlyLoweredThrew }
-    if ($interpretedThrew) { return [PscRelation]::OnlyInterpretedThrew }
-    if (Test-PscSameValue $Lowered.Value $Interpreted.Value) { return [PscRelation]::Equal }
-    [PscRelation]::Different
-}
-
 # One evaluation of an operator in SMA, as written and with an operand binding's type written into each operand.
 # Relation compares type and value; SameNumber says whether the two results are equal numbers whatever their types.
 class PscBindingEvaluation {
@@ -7432,7 +7647,7 @@ function Compare-PscOperandBinding {
                     $paramBlock = [System.Management.Automation.Language.ParamBlockAst]::new($extent, [System.Management.Automation.Language.AttributeAst[]]@(), [System.Management.Automation.Language.ParameterAst[]]@($parameters | ForEach-Object { $_.Copy() }))
                     [System.Management.Automation.Language.ScriptBlockAst]::new($extent, $paramBlock, $body, $false).GetScriptBlock()
                 }
-                foreach ($arguments in Get-PscArgumentSet -Types $leftType, $rightType -Limit 1024) {
+                foreach ($arguments in [PscDifferential]::ArgumentSets([type[]]@($leftType, $rightType), 1024)) {
                     $outcomes = foreach ($evaluator in $evaluators) {
                         $outcome = [PscOutcome]::new()
                         try { $outcome.Value = $evaluator.InvokeReturnAsIs($arguments[0], $arguments[1]) }
@@ -7445,37 +7660,13 @@ function Compare-PscOperandBinding {
                     [PscBindingEvaluation]@{
                         Operator = $token; Left = $leftType; Right = $rightType; Bound = $bound.Left.Type; Arguments = $arguments
                         Reference = $outcomes[0]; Mutated = $outcomes[1]
-                        Relation = Compare-PscOutcome -Lowered $outcomes[1] -Interpreted $outcomes[0]
+                        Relation = [PscDifferential]::Compare($outcomes[1], $outcomes[0])
                         SameNumber = $sameNumber
                     }
                 }
             }
         }
     }
-}
-
-# The source's classes and enums defined by SMA, interpreted: a new script block holding copies of the source's type
-# definitions only (no other statement runs), invoked, with each runtime type read from its definition.
-function ConvertTo-PscInterpretedType {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Ast)
-    $definitions = [System.Collections.Generic.List[System.Management.Automation.Language.StatementAst]]::new()
-    foreach ($definition in $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] }, $false)) { $definitions.Add($definition.Copy()) }
-    $usings = [System.Collections.Generic.List[System.Management.Automation.Language.UsingStatementAst]]::new()
-    foreach ($using in $Ast.UsingStatements) { $usings.Add((Copy-UsingStatement $using)) }
-    # After the definitions, one [Name] type expression per definition: SMA's own resolution returns each runtime type.
-    $names = @($definitions | ForEach-Object Name)
-    foreach ($name in $names) {
-        $typeName = [System.Management.Automation.Language.TypeName]::new($Ast.Extent, $name)
-        $expression = [System.Management.Automation.Language.TypeExpressionAst]::new($Ast.Extent, $typeName)
-        $definitions.Add([System.Management.Automation.Language.PipelineAst]::new($Ast.Extent, [System.Management.Automation.Language.CommandExpressionAst]::new($Ast.Extent, $expression, $null)))
-    }
-    $block = [System.Management.Automation.Language.StatementBlockAst]::new($Ast.Extent, $definitions, [System.Management.Automation.Language.TrapStatementAst[]]@())
-    $script = [System.Management.Automation.Language.ScriptBlockAst]::new($Ast.Extent, $usings, $null, $block, $false, $false)
-    $resolved = @(& $script.GetScriptBlock())
-    $types = [System.Collections.Generic.Dictionary[string, type]]::new([StringComparer]::OrdinalIgnoreCase)
-    for ($i = 0; $i -lt $names.Count; $i++) { $types[$names[$i]] = $resolved[$i] }
-    , $types
 }
 
 # A source's classes, lowered by PSC and loaded from the assembly's bytes. Lowering stops at a class's first refusal;
@@ -7733,7 +7924,7 @@ class LowerInstrument : PscInstrument {
             catch {
                 $investigation.Observe($target, [LowerInstrument], $_)
                 # The refusal's source position exists only in its message text; see the typed-refusal measure.
-                $position = [regex]::Match($_.Exception.Message, '^\[(\d+):(\d+)\]')
+                $position = [regex]::Match($_.Exception.Message, '\[(\d+):(\d+)\]')
                 if (-not $position.Success) { return }
                 $line = [int]$position.Groups[1].Value
                 $refused = @($candidates | Where-Object { $line -ge $_.Extent.StartLineNumber -and $line -le $_.Extent.EndLineNumber })
@@ -7751,7 +7942,7 @@ class InterpretInstrument : PscInstrument {
     [void] Examine([PscInvestigation] $investigation, [string] $target) {
         if (@($investigation.Find($target, [LowerInstrument]) | Where-Object { $_ -is [System.Reflection.Assembly] }).Count -eq 0) { return }
         $source = [PscInstrument]::Source($investigation, $target)
-        $investigation.Observe($target, [InterpretInstrument], (ConvertTo-PscInterpretedType -Ast $source.Ast))
+        $investigation.Observe($target, [InterpretInstrument], [PscDifferential]::Interpret($source.Ast))
     }
 }
 
@@ -7797,18 +7988,18 @@ class CompareInstrument : PscInstrument {
                     catch { $investigation.Observe($target, [CompareInstrument], $_); continue }
                 }
                 $parameterTypes = [type[]]@($loweredMethod.GetParameters() | ForEach-Object ParameterType)
-                $sets = @(Get-PscArgumentSet -Types $parameterTypes)
+                $sets = @([PscDifferential]::ArgumentSets($parameterTypes, 64))
                 if ($parameterTypes.Length -eq 0) { $sets = @(, [object[]]@()) }
                 foreach ($arguments in $sets) {
                     $comparison = [PscComparison]::new()
                     $comparison.Class = $class.Name
                     $comparison.Method = $member.Name
                     $comparison.Arguments = $arguments
-                    $comparison.Lowered = Invoke-PscMethod -Method $loweredMethod -Instance $loweredInstance -Arguments $arguments -TimeLimitMilliseconds 2000
+                    $comparison.Lowered = [PscDifferential]::Invoke($loweredMethod, $loweredInstance, $arguments, 2000)
                     if (-not $comparison.Lowered.Finished -or $comparison.Lowered.Milliseconds -gt 50) { $comparison.Relation = [PscRelation]::NotCompared }
                     else {
-                        $comparison.Interpreted = Invoke-PscMethod -Method $interpretedMethod -Instance $interpretedInstance -Arguments $arguments
-                        $comparison.Relation = Compare-PscOutcome -Lowered $comparison.Lowered -Interpreted $comparison.Interpreted
+                        $comparison.Interpreted = [PscDifferential]::Invoke($interpretedMethod, $interpretedInstance, $arguments, 0)
+                        $comparison.Relation = [PscDifferential]::Compare($comparison.Lowered, $comparison.Interpreted)
                     }
                     $investigation.Observe($target, [CompareInstrument], $comparison)
                 }
