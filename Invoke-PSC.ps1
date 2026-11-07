@@ -2064,7 +2064,9 @@ function Resolve-MatchingMethod {
     }
 
     # 3. The one overload reachable by integer conversion; the call site converts each argument, checked.
+    # An open generic definition is never callable as it stands; step 4 closes it or rejects it.
     $reachable = @($all | Where-Object {
+        if ($_.ContainsGenericParameters) { return $false }
         $params = $_.GetParameters()
         for ($i = 0; $i -lt $params.Length; $i++) {
             $wanted = $params[$i].ParameterType
@@ -3740,8 +3742,7 @@ function Write-IlReceiver([Reflection.Emit.ILGenerator] $IL, [Linq.Expressions.E
             if (-not $Context.Locals.ContainsKey($variable)) { $Context.Locals[$variable] = $IL.DeclareLocal((Get-IlType $variable.Type)) }
         }
         for ($i = 0; $i -lt $Expr.Expressions.Count - 1; $i++) {
-            Write-IlExpression -IL $IL -Expr $Expr.Expressions[$i] -Context $Context
-            if ($Expr.Expressions[$i].Type -ne [void] -and $Expr.Expressions[$i].NodeType -ne [Linq.Expressions.ExpressionType]::Assign) { $IL.Emit([Reflection.Emit.OpCodes]::Pop) }
+            Write-IlDiscarded -IL $IL -Expr $Expr.Expressions[$i] -Context $Context
         }
         Write-IlReceiver -IL $IL -Expr $Expr.Expressions[$Expr.Expressions.Count - 1] -Context $Context
         return
@@ -3990,8 +3991,65 @@ function Write-IlDiscarded {
         [Parameter(Mandatory)][Linq.Expressions.Expression] $Expr,
         [Parameter(Mandatory)][hashtable] $Context
     )
+    # A discarded assignment stores without keeping its value: no dup, temporary or pop.
+    if ($Expr.NodeType -eq [Linq.Expressions.ExpressionType]::Assign) {
+        Write-IlAssign -IL $IL -Expr $Expr -Context $Context -Discard
+        return
+    }
     Write-IlExpression -IL $IL -Expr $Expr -Context $Context
     if ($Expr.Type -ne [void]) { $IL.Emit([Reflection.Emit.OpCodes]::Pop) }
+}
+
+function Write-IlAssign {
+    <#
+    .SYNOPSIS
+        Emits an assignment. By default its value, the value stored, is left on the stack; a store that
+        consumes the stack keeps it in a temporary. With -Discard nothing is left and no copy is made.
+    #>
+    param(
+        [Parameter(Mandatory)][Reflection.Emit.ILGenerator] $IL,
+        [Parameter(Mandatory)][Linq.Expressions.BinaryExpression] $Expr,
+        [Parameter(Mandatory)][hashtable] $Context,
+        [switch] $Discard
+    )
+    $left = $Expr.Left
+    if ($left -is [Linq.Expressions.ParameterExpression]) {
+        Write-IlExpression -IL $IL -Expr $Expr.Right -Context $Context
+        if (-not $Discard) { $IL.Emit([Reflection.Emit.OpCodes]::Dup) }
+        if ($Context.Locals.ContainsKey($left)) { Write-IlLocalStore -IL $IL -Loc $Context.Locals[$left]; return }
+        if ($Context.Parameters.ContainsKey($left)) { Write-IlArgumentStore -IL $IL -Index $Context.Parameters[$left]; return }
+        throw "No storage for assignment target '$($left.Name)'."
+    }
+    if ($left -is [Linq.Expressions.MemberExpression] -and $left.Member -is [Reflection.FieldInfo] -and $left.Member.IsStatic) {
+        Write-IlExpression -IL $IL -Expr $Expr.Right -Context $Context
+        if (-not $Discard) { $IL.Emit([Reflection.Emit.OpCodes]::Dup) }
+        $IL.Emit([Reflection.Emit.OpCodes]::Stsfld, (Get-IlMember $left.Member))
+        return
+    }
+    # The remaining targets consume a receiver (and an index) beneath the value.
+    if ($left -is [Linq.Expressions.IndexExpression]) {
+        if ($null -ne $left.Indexer) { Write-IlReceiver -IL $IL -Expr $left.Object -Context $Context }
+        else { Write-IlExpression -IL $IL -Expr $left.Object -Context $Context }
+        Write-IlExpression -IL $IL -Expr $left.Arguments[0] -Context $Context
+    } elseif ($left -is [Linq.Expressions.MemberExpression]) {
+        if ($left.Expression) { Write-IlReceiver -IL $IL -Expr $left.Expression -Context $Context }
+    } else {
+        throw "Assignment to unsupported target expression '$($left.GetType().FullName)'."
+    }
+    $value = $null
+    if ($Discard) { Write-IlExpression -IL $IL -Expr $Expr.Right -Context $Context }
+    else { $value = Write-IlStoredValue -IL $IL -Expr $Expr.Right -Context $Context }
+    if ($left -is [Linq.Expressions.IndexExpression] -and $null -ne $left.Indexer) {
+        Write-IlInstanceCall -IL $IL -Method $left.Indexer.GetSetMethod() -ReceiverType $left.Object.Type
+    } elseif ($left -is [Linq.Expressions.IndexExpression]) {
+        Write-IlArrayStore -IL $IL -ElementType $left.Type
+    } elseif ($left.Member -is [Reflection.FieldInfo]) {
+        $IL.Emit([Reflection.Emit.OpCodes]::Stfld, (Get-IlMember $left.Member))
+    } else {
+        $receiverType = if ($left.Expression) { $left.Expression.Type } else { $null }
+        Write-IlInstanceCall -IL $IL -Method $left.Member.GetSetMethod() -ReceiverType $receiverType
+    }
+    if (-not $Discard) { Write-IlLocalLoad -IL $IL -Loc $value }
 }
 
 # Emits a value about to be stored by an instruction that consumes it, keeping a copy in a temporary of its
@@ -4369,58 +4427,10 @@ function Write-IlExpression {
 
     # 12. Binary Expressions (Arithmetic, Assignment, Logic, Comparisons, Index)
     if ($Expr -is [Linq.Expressions.BinaryExpression]) {
-        # An assignment is an expression whose value is the value stored, as in PowerShell and LINQ: every
-        # form leaves it on the stack. A store that consumes the stack keeps the value in a temporary.
+        # An assignment is an expression whose value is the value stored, as in PowerShell and LINQ.
         if ($Expr.NodeType -eq [Linq.Expressions.ExpressionType]::Assign) {
-            if ($Expr.Left -is [Linq.Expressions.ParameterExpression]) {
-                Write-IlExpression -IL $IL -Expr $Expr.Right -Context $Context
-                $IL.Emit([Reflection.Emit.OpCodes]::Dup)
-                if ($Context.Locals.ContainsKey($Expr.Left)) {
-                    Write-IlLocalStore -IL $IL -Loc $Context.Locals[$Expr.Left]
-                    return
-                }
-                if ($Context.Parameters.ContainsKey($Expr.Left)) {
-                    Write-IlArgumentStore -IL $IL -Index $Context.Parameters[$Expr.Left]
-                    return
-                }
-            }
-            if ($Expr.Left -is [Linq.Expressions.IndexExpression] -and $null -ne $Expr.Left.Indexer) {
-                Write-IlReceiver -IL $IL -Expr $Expr.Left.Object -Context $Context
-                Write-IlExpression -IL $IL -Expr $Expr.Left.Arguments[0] -Context $Context
-                $value = Write-IlStoredValue -IL $IL -Expr $Expr.Right -Context $Context
-                Write-IlInstanceCall -IL $IL -Method $Expr.Left.Indexer.GetSetMethod() -ReceiverType $Expr.Left.Object.Type
-                Write-IlLocalLoad -IL $IL -Loc $value
-                return
-            }
-            if ($Expr.Left -is [Linq.Expressions.IndexExpression]) {
-                Write-IlExpression -IL $IL -Expr $Expr.Left.Object -Context $Context
-                Write-IlExpression -IL $IL -Expr $Expr.Left.Arguments[0] -Context $Context
-                $value = Write-IlStoredValue -IL $IL -Expr $Expr.Right -Context $Context
-                Write-IlArrayStore -IL $IL -ElementType $Expr.Left.Type
-                Write-IlLocalLoad -IL $IL -Loc $value
-                return
-            }
-            if ($Expr.Left -is [Linq.Expressions.MemberExpression]) {
-                $member = $Expr.Left.Member
-                # An assignment is an expression: the stored value stays on the stack.
-                if ($member -is [Reflection.FieldInfo] -and $member.IsStatic) {
-                    Write-IlExpression -IL $IL -Expr $Expr.Right -Context $Context
-                    $IL.Emit([Reflection.Emit.OpCodes]::Dup)
-                    $IL.Emit([Reflection.Emit.OpCodes]::Stsfld, (Get-IlMember $member))
-                    return
-                }
-                if ($Expr.Left.Expression) { Write-IlReceiver -IL $IL -Expr $Expr.Left.Expression -Context $Context }
-                $value = Write-IlStoredValue -IL $IL -Expr $Expr.Right -Context $Context
-                if ($member -is [Reflection.FieldInfo]) {
-                    $IL.Emit([Reflection.Emit.OpCodes]::Stfld, (Get-IlMember $member))
-                } else {
-                    $receiverType = if ($Expr.Left.Expression) { $Expr.Left.Expression.Type } else { $null }
-                    Write-IlInstanceCall -IL $IL -Method $member.GetSetMethod() -ReceiverType $receiverType
-                }
-                Write-IlLocalLoad -IL $IL -Loc $value
-                return
-            }
-            throw "Assignment to unsupported target expression '$($Expr.Left.GetType().FullName)'."
+            Write-IlAssign -IL $IL -Expr $Expr -Context $Context
+            return
         }
 
         # Array Index Read
