@@ -19,7 +19,9 @@ $null = New-Item -ItemType Directory -Force -Path $outDir
 
 $cases = [ordered]@{
     DoWhile           = @('[int] $i = 0; do { $i++ } while ($i -lt 3); return $i', 'DoWhileStatementAst')
-    Switch            = @('[int] $i = 1; switch ($i) { 1 { $i = 2 } }; return $i', 'SwitchStatementAst')
+    # Integer and enum switch are lowered (Test-LoweringParity); string subjects and options are not.
+    SwitchString      = @('[string] $s = ''a''; [int] $i = 0; switch ($s) { ''a'' { $i = 1 } }; return $i', 'switch requires an integer or enum value')
+    SwitchOptions     = @('[int] $i = 1; switch -Regex ($i) { 1 { $i = 2 } }; return $i', 'switch options are not supported')
     LabeledBreak      = @('[int] $i = 0; :outer while ($true) { break outer }; return $i', 'Labeled break')
     BreakOutsideLoop  = @('[int] $i = 0; break; return $i', 'break outside a loop')
     ContinueOutside   = @('[int] $i = 0; continue; return $i', 'continue outside a loop')
