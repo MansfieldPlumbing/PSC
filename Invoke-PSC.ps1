@@ -84,7 +84,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Compile', 'Api', 'Expression', 'Inspect', 'Capability', 'Link', 'PowerShell', 'Describe', 'Lint', 'Profile', 'Report', 'Verify', 'Readme', 'Investigate', 'Consolidate')]
+    [ValidateSet('Compile', 'Api', 'Expression', 'Inspect', 'Capability', 'Link', 'PowerShell', 'Describe', 'Lint', 'Profile', 'Report', 'Verify', 'Readme', 'Investigate', 'Consolidate', 'Records')]
     [string] $Mode = 'Compile',
     [string] $ArchivePath,
     [string] $ProjectPath,
@@ -1745,7 +1745,7 @@ function Get-ScriptFunctionClass {
     $objectArray = [System.Management.Automation.Language.TypeConstraintAst]::new($Root.Extent, [System.Management.Automation.Language.ReflectionTypeName]::new([object[]]))
     # The source's script variables, as static fields its functions read and its entry point sets.
     $fields = foreach ($variable in Get-ScriptVariable -Root $Root) {
-        $fieldType = [System.Management.Automation.Language.TypeConstraintAst]::new($Root.Extent, [System.Management.Automation.Language.ReflectionTypeName]::new($variable.Type))
+        $fieldType = [System.Management.Automation.Language.TypeConstraintAst]::new($Root.Extent, $variable.TypeName)
         [System.Management.Automation.Language.PropertyMemberAst]::new($Root.Extent, $variable.Name, $fieldType, [System.Management.Automation.Language.AttributeAst[]]@(),
             [System.Management.Automation.Language.PropertyAttributes]'Public,Static', $null)
     }
@@ -1851,6 +1851,106 @@ function Get-SmaVariableName {
     $script:SmaVariableNames
 }
 
+# The type SMA infers for an expression, by its own type inference (the inference behind completion, internal to SMA).
+# Each inferred name that names a loaded type, in order; empty when SMA infers nothing.
+function Get-PscInferredType {
+    param([Parameter(Mandatory)][System.Management.Automation.Language.Ast] $Ast)
+    if ($null -eq $script:PscTypeInference) {
+        $script:PscTypeInference = [System.Management.Automation.PSObject].Assembly.GetType('System.Management.Automation.AstTypeInference').GetMethod('InferTypeOf', [type[]]@([System.Management.Automation.Language.Ast]))
+    }
+    $found = [System.Collections.Generic.List[type]]::new()
+    foreach ($name in $script:PscTypeInference.Invoke($null, [object[]]@($Ast))) {
+        $type = if ($null -ne $name.Type) { $name.Type } else { [object] }
+        if (-not $found.Contains($type)) { $found.Add($type) }
+    }
+    , $found.ToArray()
+}
+
+# A script variable used only as a record: assigned once, at top level, from a hashtable literal whose keys are
+# constants, and otherwise only read or written as $variable.Name with a constant name; no function or method declares
+# a variable of that name. Each name is a slot (names compared ignoring case, as the hashtable compares its keys).
+# A slot's type is the one type SMA infers for every value written to it; $null may be written to a reference type;
+# a value type that the literal does not set, or that is written $null, is read as $null before it is set, so its
+# slot is Nullable. Any other slot is [object]. A variable that is not a record is reported with the use that
+# disqualifies it.
+function Get-PscRecord {
+    [CmdletBinding()]
+    [OutputType([PscRecord])]
+    param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Root)
+    $inCode = { param($n) for ($p = $n.Parent; $null -ne $p; $p = $p.Parent) { if ($p -is [System.Management.Automation.Language.FunctionDefinitionAst] -or $p -is [System.Management.Automation.Language.TypeDefinitionAst] -or $p -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) { return $true } }; $false }
+    $candidates = foreach ($statement in $Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Operator -eq [System.Management.Automation.Language.TokenKind]::Equals -and $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] }, $true)) {
+        if (& $inCode $statement) { continue }
+        if ($statement.Right -isnot [System.Management.Automation.Language.CommandExpressionAst] -or $statement.Right.Expression -isnot [System.Management.Automation.Language.HashtableAst]) { continue }
+        if (@($statement.Right.Expression.KeyValuePairs | Where-Object { $_.Item1 -isnot [System.Management.Automation.Language.StringConstantExpressionAst] }).Count) { continue }
+        $statement
+    }
+    foreach ($assignment in $candidates) {
+        $name = Get-VariableName $assignment.Left.VariablePath
+        $record = [PscRecord]@{ Variable = $name; TypeName = [System.Globalization.CultureInfo]::InvariantCulture.TextInfo.ToTitleCase($name) + 'Record'; Assignment = $assignment; Literal = $assignment.Right.Expression }
+        $values = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[System.Management.Automation.Language.Ast]]]::new([StringComparer]::OrdinalIgnoreCase)
+        $spelling = [System.Collections.Generic.List[string]]::new()
+        $literalNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($pair in $record.Literal.KeyValuePairs) {
+            $key = $pair.Item1.Value
+            $null = $literalNames.Add($key)
+            if (-not $values.ContainsKey($key)) { $values[$key] = [System.Collections.Generic.List[System.Management.Automation.Language.Ast]]::new(); $spelling.Add($key) }
+            $values[$key].Add($pair.Item2)
+        }
+        foreach ($reference in $Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and -not $n.Splatted }, $true)) {
+            if ([object]::ReferenceEquals($reference, $assignment.Left)) { continue }
+            if (-not [string]::Equals((Get-VariableName $reference.VariablePath), $name, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            $use = $reference.Parent
+            if ($use -is [System.Management.Automation.Language.ParameterAst] -or ($use -is [System.Management.Automation.Language.AssignmentStatementAst] -and [object]::ReferenceEquals($use.Left, $reference))) {
+                $record.Disqualified = $reference; break
+            }
+            if ($use -isnot [System.Management.Automation.Language.MemberExpressionAst] -or $use -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -or
+                -not [object]::ReferenceEquals($use.Expression, $reference) -or $use.Member -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -or $use.Static) {
+                $record.Disqualified = $reference; break
+            }
+            $key = $use.Member.Value
+            if (-not $values.ContainsKey($key)) { $values[$key] = [System.Collections.Generic.List[System.Management.Automation.Language.Ast]]::new(); $spelling.Add($key) }
+            if ($use.Parent -is [System.Management.Automation.Language.AssignmentStatementAst] -and [object]::ReferenceEquals($use.Parent.Left, $use)) {
+                if ($use.Parent.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals) { $values[$key].Add($use.Parent) }
+                else { $values[$key].Add($use.Parent.Right) }
+            }
+        }
+        if ($null -eq $record.Disqualified) {
+            $record.Slots = foreach ($key in $spelling) {
+                $slot = [PscRecordSlot]@{ Name = $key; Type = [object] }
+                $types = [System.Collections.Generic.List[type]]::new()
+                [bool] $writesNull = $false
+                [bool] $known = $true
+                foreach ($value in $values[$key]) {
+                    $inner = Get-PscInnerExpression $value
+                    if ($inner -is [System.Management.Automation.Language.VariableExpressionAst] -and $inner.VariablePath.UserPath -eq 'null') { $writesNull = $true; continue }
+                    $inferred = Get-PscInferredType -Ast $value
+                    if ($inferred.Count -ne 1) { $known = $false; continue }
+                    if (-not $types.Contains($inferred[0])) { $types.Add($inferred[0]) }
+                }
+                $slot.Written = $types.ToArray()
+                if ($known -and $types.Count -eq 1 -and $types[0] -ne [object]) {
+                    $slot.Type = $types[0]
+                    if ($types[0].IsValueType -and ($writesNull -or -not $literalNames.Contains($key))) { $slot.Type = [System.Nullable`1].MakeGenericType($types[0]) }
+                }
+                $slot
+            }
+        }
+        $record
+    }
+}
+
+# The source with each record variable given its own class: a class whose public properties are the record's slots,
+# with their types, placed first in the script, and the record's one assignment declaring the variable that type, so
+# PowerShell converts the hashtable literal to it. The source itself when it has no records.
+function ConvertTo-PscRecordSource {
+    [CmdletBinding()]
+    [OutputType([System.Management.Automation.Language.ScriptBlockAst])]
+    param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Root)
+    $records = @(Get-PscRecord -Root $Root | Where-Object { $null -eq $_.Disqualified })
+    if ($records.Count -eq 0) { return $Root }
+    [PscRecordRewrite]::new($Root, $records).Rebuild($Root)
+}
+
 # A source's script variables: each variable its top-level code assigns, and each $script: variable anywhere, except
 # SMA's own. Its type is the one an assignment declares, [hashtable] when every assignment is a hashtable literal,
 # and [object] otherwise, as a PowerShell variable holds whatever is assigned to it.
@@ -1877,10 +1977,11 @@ function Get-ScriptVariable {
     foreach ($name in $assignments.Keys) {
         $all = $assignments[$name]
         $declared = @($all | Where-Object { $null -ne $_.Declared } | Select-Object -First 1)
-        $type = if ($declared.Count) { Resolve-AstType $declared[0].Declared }
-            elseif ($all.Count -and @($all | Where-Object { $_.Value -isnot [System.Management.Automation.Language.CommandExpressionAst] -or $_.Value.Expression -isnot [System.Management.Automation.Language.HashtableAst] }).Count -eq 0) { [hashtable] }
-            else { [object] }
-        [pscustomobject]@{ Name = $name; Type = $type }
+        # A declared type stays a name: it may be one of the source's own classes, which the source's mirror resolves.
+        $typeName = if ($declared.Count) { $declared[0].Declared }
+            elseif ($all.Count -and @($all | Where-Object { $_.Value -isnot [System.Management.Automation.Language.CommandExpressionAst] -or $_.Value.Expression -isnot [System.Management.Automation.Language.HashtableAst] }).Count -eq 0) { [System.Management.Automation.Language.ReflectionTypeName]::new([hashtable]) }
+            else { [System.Management.Automation.Language.ReflectionTypeName]::new([object]) }
+        [pscustomobject]@{ Name = $name; TypeName = $typeName }
     }
 }
 
@@ -2975,6 +3076,8 @@ $script:PscEnvironment = [PscEnvironment]::new()
 [void] $script:PscEnvironment.Set([PowerShellNumericOperands]::new())
 # PowerShellSemantics' definition from this script's AST, read on the first compile.
 $script:PscSemanticsAst = $null
+# SMA's type inference method, found on first use.
+$script:PscTypeInference = $null
 # Each source's function class (or $null when it has none), and each function class's root to its source's root.
 $script:ScriptFunctionClasses = [System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast, System.Management.Automation.Language.TypeDefinitionAst]]::new()
 $script:ScriptFunctionSources = [System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast, System.Management.Automation.Language.Ast]]::new()
@@ -5804,6 +5907,67 @@ class PscOperatorRebinding : PscAstRebuild {
     }
 }
 
+class PscRecordSlot {
+    [string] $Name
+    [type] $Type
+    # Every type SMA inferred for a value written to the slot.
+    [type[]] $Written
+}
+
+class PscRecord {
+    [string] $Variable
+    [string] $TypeName
+    [PscRecordSlot[]] $Slots
+    # The use of the variable that is not a member read or write by constant name, when there is one.
+    [System.Management.Automation.Language.Ast] $Disqualified
+    hidden [System.Management.Automation.Language.AssignmentStatementAst] $Assignment
+    hidden [System.Management.Automation.Language.HashtableAst] $Literal
+}
+
+# Rebuilds a script with each record's class first in its end block and the record's assignment declaring the class.
+class PscRecordRewrite : PscAstRebuild {
+    [System.Management.Automation.Language.ScriptBlockAst] $Root
+    [PscRecord[]] $Records
+
+    PscRecordRewrite([System.Management.Automation.Language.ScriptBlockAst] $root, [PscRecord[]] $records) { $this.Root = $root; $this.Records = $records }
+
+    hidden [System.Management.Automation.Language.TypeDefinitionAst] Definition([PscRecord] $record) {
+        $extent = $record.Literal.Extent
+        $properties = foreach ($slot in $record.Slots) {
+            [System.Management.Automation.Language.PropertyMemberAst]::new($extent, $slot.Name,
+                [System.Management.Automation.Language.TypeConstraintAst]::new($extent, [System.Management.Automation.Language.ReflectionTypeName]::new($slot.Type)),
+                [System.Management.Automation.Language.AttributeAst[]]@(), [System.Management.Automation.Language.PropertyAttributes]::Public, $null)
+        }
+        return [System.Management.Automation.Language.TypeDefinitionAst]::new($extent, $record.TypeName, [System.Management.Automation.Language.AttributeAst[]]@(),
+            [System.Management.Automation.Language.MemberAst[]]@($properties), [System.Management.Automation.Language.TypeAttributes]::Class, [System.Management.Automation.Language.TypeConstraintAst[]]@())
+    }
+
+    [System.Management.Automation.Language.Ast] Edit([System.Management.Automation.Language.Ast] $original, [System.Management.Automation.Language.Ast] $rebuilt) {
+        foreach ($record in $this.Records) {
+            if ([object]::ReferenceEquals($original, $record.Assignment)) {
+                $declared = [System.Management.Automation.Language.ConvertExpressionAst]::new($rebuilt.Left.Extent,
+                    [System.Management.Automation.Language.TypeConstraintAst]::new($rebuilt.Left.Extent, [System.Management.Automation.Language.TypeName]::new($rebuilt.Left.Extent, $record.TypeName)),
+                    $rebuilt.Left.Copy())
+                return [System.Management.Automation.Language.AssignmentStatementAst]::new($rebuilt.Extent, $declared, $rebuilt.Operator, $rebuilt.Right.Copy(), $rebuilt.ErrorPosition)
+            }
+        }
+        return $rebuilt
+    }
+
+    # The script's end block begins with the records' classes. Its statements are rebuilt here rather than copied:
+    # SMA's Copy() of a constructor's base call yields a plain member invocation.
+    [object] VisitNamedBlock([System.Management.Automation.Language.NamedBlockAst] $a) {
+        if (-not [object]::ReferenceEquals($a, $this.Root.EndBlock)) { return ([PscAstRebuild]$this).VisitNamedBlock($a) }
+        $statements = [System.Collections.Generic.List[System.Management.Automation.Language.StatementAst]]::new()
+        foreach ($record in $this.Records) { $statements.Add($this.Definition($record)) }
+        foreach ($statement in $a.Statements) { $statements.Add($this.Rebuild($statement)) }
+        [System.Management.Automation.Language.TrapStatementAst[]] $traps = $null
+        if ($null -ne $a.Traps) { $traps = $this.Each($a.Traps) }
+        $block = [System.Management.Automation.Language.StatementBlockAst]::new($a.Extent, $statements, $traps)
+        return [System.Management.Automation.Language.NamedBlockAst]::new($a.Extent, $a.BlockKind, $block, $a.Unnamed)
+    }
+}
+
 class PscApi {
     [string] $Synopsis
     [string] $Script
@@ -5860,6 +6024,16 @@ class PscApi {
     # this script's functions, so the investigation runs in an invocation of the script.
     [object] Investigate([string[]] $paths) {
         return & $this.Script -Mode Investigate -InvestigatePath $paths
+    }
+
+    # The source's script variables used only as records, each with its slots and their types, or the use that
+    # disqualifies it; and the source with each record given its class, as PSC lowers it. Both run in an invocation of
+    # the script, whose functions they are.
+    [object[]] Records([System.Management.Automation.Language.ScriptBlockAst] $source) { return & $this.Script -Mode Records -SourceAst $source }
+    [System.Management.Automation.Language.ScriptBlockAst] TypeRecords([System.Management.Automation.Language.ScriptBlockAst] $source) {
+        [PscRecord[]] $records = @($this.Records($source) | Where-Object { $null -eq $_.Disqualified })
+        if ($records.Count -eq 0) { return $source }
+        return [PscRecordRewrite]::new($source, $records).Rebuild($source)
     }
 
     # A new tree of the same structure, every node constructed again by SMA.
@@ -6120,6 +6294,12 @@ function Export-LoweredAssembly {
 
     $source = [IO.File]::ReadAllText($fullSourcePath)
     $parsed = Read-PowerShellClass -Source $source -ClassName $ClassName -SourceFile $fullSourcePath
+    }
+    # Script variables used only as records are lowered as their classes.
+    $typedRoot = ConvertTo-PscRecordSource -Root $parsed.Ast
+    if (-not [object]::ReferenceEquals($typedRoot, $parsed.Ast)) {
+        $targetName = $parsed.ClassAst.Name
+        $parsed = [pscustomobject]@{ Ast = $typedRoot; ClassAst = $typedRoot.Find({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.Name -eq $targetName }, $true) }
     }
     $targetClass = $parsed.ClassAst
     $classAsts = @($parsed.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true) | Where-Object { -not (Test-AttributeClass $_) })
@@ -8264,10 +8444,10 @@ class MemberLoweringInstrument : PscInstrument {
     [type[]] Requires() { return [type[]]@([ParseInstrument]) }
     [bool] AppliesTo([string] $target) { return [IO.Path]::GetExtension($target) -in '.ps1', '.psm1' }
     [void] Examine([PscInvestigation] $investigation, [string] $target) {
-        $source = [PscInstrument]::Source($investigation, $target)
+        $root = ConvertTo-PscRecordSource -Root ([PscInstrument]::Source($investigation, $target).Ast)
         $classes = [System.Collections.Generic.List[System.Management.Automation.Language.TypeDefinitionAst]]::new()
-        foreach ($class in $source.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $false)) { if (-not (Test-AttributeClass $class)) { $classes.Add($class) } }
-        $functionClass = Get-ScriptFunctionClass -Root $source.Ast
+        foreach ($class in $root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $false)) { if (-not (Test-AttributeClass $class)) { $classes.Add($class) } }
+        $functionClass = Get-ScriptFunctionClass -Root $root
         if ($null -ne $functionClass) { $classes.Add($functionClass) }
         foreach ($class in $classes) {
             foreach ($member in $class.Members) {
@@ -8442,6 +8622,10 @@ process {
         'Investigate' {
             if (-not $InvestigatePath) { throw 'Investigate requires -InvestigatePath.' }
             Invoke-PscInvestigation -Path $InvestigatePath
+        }
+        'Records' {
+            if ($null -eq $SourceAst) { throw 'Records requires -SourceAst.' }
+            Get-PscRecord -Root $SourceAst
         }
         'Readme' {
             $readme = Join-Path $PSScriptRoot 'README.md'
