@@ -8,7 +8,19 @@
     Link reads COFF objects and libraries and resolves their symbols into a
     native image. No module import or external implementation source is required.
 .PARAMETER Mode
-    Compile (default), Expression, Inspect, Capability or Link.
+    Compile (default), Expression, Inspect, Capability or Link; or, from SMA's own parser over PowerShell
+    projects: Describe (one project as live objects: units, edges, coverage, absence, changes), Lint,
+    Profile (every project's functions and methods), Report (on a historical profile) or Verify (the
+    description's structural fixture).
+.PARAMETER Native
+    Compile: produce a native executable at OutputPath. The lowered assembly is compiled to machine code by the
+    pinned ILC and linked by PSC's own COFF linker with the pinned Native AOT runtime; requires EntryPoint.
+.PARAMETER ProjectPath
+    Describe: the project folder to describe. Call with & to keep the returned live objects.
+.PARAMETER LintFiles
+    Lint: files to check; without it, every PowerShell file of every project beside the SMA root.
+.PARAMETER ProfilePath
+    Report: a historical profile (CLIXML) to report on.
 .PARAMETER LinkInput
     Link: COFF object (.obj) and library (.lib) paths, in command-line order.
 .PARAMETER LibraryDirectory
@@ -64,8 +76,11 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Compile', 'Expression', 'Inspect', 'Capability', 'Link')]
+    [ValidateSet('Compile', 'Expression', 'Inspect', 'Capability', 'Link', 'Describe', 'Lint', 'Profile', 'Report', 'Verify')]
     [string] $Mode = 'Compile',
+    [string] $ProjectPath,
+    [string[]] $LintFiles,
+    [string] $ProfilePath,
     [string] $SourcePath,
     [System.Management.Automation.Language.ScriptBlockAst] $SourceAst,
     [Collections.IDictionary] $StaticData,
@@ -74,6 +89,8 @@ param(
     [string[]] $MethodNames,
     [string] $OutputPath,
     [string] $EntryPoint,
+    # Compile: produce a native executable at OutputPath (lowered, then ILC, then PSC's linker). Needs EntryPoint.
+    [switch] $Native,
     [switch] $Deterministic = $true,
     [Parameter(ValueFromPipeline)]
     [System.Management.Automation.Language.FunctionMemberAst] $MethodAst,
@@ -95,6 +112,913 @@ begin {
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# ============================================================================
+# SMA DESCRIPTION, LINT AND PROFILE
+# From C:\dev\sma\Invoke-Sma.ps1: projects described as live objects from SMA's own parser.
+# ============================================================================
+
+# The shared SMA root (pinned tools, sources, the store), and the projects beside it.
+$SmaRoot = if ($env:DEVDB) { $env:DEVDB } else { 'C:\dev\sma' }
+$ProjectsRoot = Split-Path -Parent $SmaRoot
+$ThirdPartyRemotes = 'microsoft/directml', 'microsoft/edit', 'ggml-org/llama.cpp'
+$WriteCommands = 'Set-Content','Add-Content','Out-File','New-Item','Remove-Item','Copy-Item','Move-Item','Rename-Item','Export-Clixml','Export-Csv','Clear-Content','Set-Item'
+$NetworkCommands = 'Invoke-WebRequest','Invoke-RestMethod','Start-BitsTransfer','New-PSSession','Enter-PSSession'
+$ProcessCommands = 'Start-Process','Stop-Process','Invoke-Command','Start-Job'
+$DynamicCommands = 'Add-Type','Invoke-Expression','iex'
+
+function Get-ProjectRemote([string] $path) {
+    $url = git -C $path remote get-url origin 2>$null
+    if (-not $url) { return $null }
+    $uri = $null
+    if (-not [Uri]::TryCreate($url, [UriKind]::Absolute, [ref]$uri)) { return $url.ToLowerInvariant() }
+    $name = $uri.AbsolutePath.Trim('/')
+    if ($name.EndsWith('.git', [StringComparison]::OrdinalIgnoreCase)) { $name = $name.Substring(0, $name.Length - 4) }
+    $name.ToLowerInvariant()
+}
+
+function Get-Projects {
+    foreach ($d in Get-ChildItem -LiteralPath $ProjectsRoot -Directory -Force) {
+        if ($d.Name.StartsWith('.') -or $d.FullName -eq $SmaRoot) { continue }
+        if (Test-Path -LiteralPath (Join-Path $d.FullName '.git')) {
+            $remote = Get-ProjectRemote $d.FullName
+            if ($remote -and $ThirdPartyRemotes -contains $remote) { continue }
+            if (-not $remote) { $remote = '(local) ' + $d.Name.ToLowerInvariant() }
+            $files = @(git -C $d.FullName ls-files --cached --others --exclude-standard -- '*.ps1' '*.psm1' 2>$null | Sort-Object -Unique)
+        } else {
+            # Project folders outside git: enumerate the file system, leaving out copied upstream references.
+            $remote = '(local) ' + $d.Name.ToLowerInvariant()
+            $files = @(Get-ChildItem -LiteralPath $d.FullName -Recurse -File -Include *.ps1, *.psm1 -ErrorAction SilentlyContinue |
+                Where-Object { -not $_.FullName.Contains('\reference\') -and -not $_.FullName.Contains('\.git\') -and -not $_.FullName.Contains('\node_modules\') } |
+                ForEach-Object { $_.FullName.Substring($d.FullName.Length + 1) })
+        }
+        if ($files.Count) { [pscustomobject]@{ Project = $d.Name; Path = $d.FullName; Remote = $remote; Files = $files } }
+    }
+}
+
+function Test-DriveRooted([string] $value) {
+    if ($value.Length -lt 4 -or $value.Length -gt 259) { return $false }
+    try { if (-not [IO.Path]::IsPathFullyQualified($value)) { return $false }; $root = [IO.Path]::GetPathRoot($value) } catch { return $false }
+    $root.Length -eq 3 -and [char]::IsLetter($root[0]) -and $root[1] -eq ':'
+}
+
+function Get-UnitProfile($project, [string] $file, $node) {
+    if ($node -is [System.Management.Automation.Language.FunctionMemberAst]) {
+        $name = $node.Parent.Name + '.' + $node.Name; $kind = 'method'; $parameters = @($node.Parameters.Name.VariablePath.UserPath); $help = $null
+    } else {
+        $name = $node.Name.Replace('global:', '').Replace('script:', ''); $kind = 'function'
+        $parameters = @($node.Parameters.Name.VariablePath.UserPath + $node.Body.ParamBlock.Parameters.Name.VariablePath.UserPath | Where-Object { $_ }); $help = $node.GetHelpContent()
+    }
+    $calls = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $effects = [Collections.Generic.HashSet[string]]::new()
+    foreach ($command in $node.Body.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+        $commandName = $command.GetCommandName()
+        if ($commandName) { $null = $calls.Add($commandName.Replace('global:', '').Replace('script:', '')) }
+        elseif ($command.InvocationOperator -ne 'Unknown') { $null = $effects.Add('process') }
+    }
+    $types = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($t in $node.Body.FindAll({ $args[0] -is [System.Management.Automation.Language.TypeExpressionAst] -or $args[0] -is [System.Management.Automation.Language.TypeConstraintAst] }, $true)) { $null = $types.Add($t.TypeName.FullName) }
+    foreach ($c in $calls) {
+        if ($WriteCommands -contains $c) { $null = $effects.Add('file-write') }
+        if ($NetworkCommands -contains $c) { $null = $effects.Add('network') }
+        if ($ProcessCommands -contains $c) { $null = $effects.Add('process') }
+        if ($DynamicCommands -contains $c) { $null = $effects.Add('dynamic-code') }
+    }
+    foreach ($m in $node.Body.FindAll({ $args[0] -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $args[0].Static }, $true)) {
+        $typeName = $m.Expression.TypeName.FullName; $member = $m.Member.Extent.Text
+        $fileType = $typeName -in 'IO.File','System.IO.File','IO.Directory','System.IO.Directory'
+        if ($fileType -and ($member.StartsWith('Write') -or $member.StartsWith('Append') -or $member -in 'Delete','Move','Copy','CreateDirectory','Create','Replace')) { $null = $effects.Add('file-write') }
+        if ($typeName -in 'scriptblock','System.Management.Automation.ScriptBlock' -and $member -eq 'Create') { $null = $effects.Add('dynamic-code') }
+        if ($typeName -in 'Diagnostics.Process','System.Diagnostics.Process') { $null = $effects.Add('process') }
+    }
+    foreach ($t in $types) { if ($t.StartsWith('Net.Http') -or $t.StartsWith('System.Net.Http') -or $t.StartsWith('Net.Sockets') -or $t.StartsWith('System.Net.Sockets') -or $t -in 'Net.WebClient','System.Net.WebClient') { $null = $effects.Add('network') } }
+    $rooted = @($node.Body.FindAll({ $args[0] -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | Where-Object { Test-DriveRooted $_.Value } | ForEach-Object Value | Sort-Object -Unique)
+    # Calls the command graph cannot see: instance member invocations ($kernels.Tokenize(...)) and names handed to
+    # reflection (GetMethod('Tokenize')). Both are resolved later against units of the same project, as nominations.
+    $memberCalls = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $reflected = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($m in $node.Body.FindAll({ $args[0] -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true)) {
+        if ($m.Member -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { continue }
+        $memberName = $m.Member.Value
+        if (-not $m.Static) { $null = $memberCalls.Add($memberName) }
+        if ($memberName -in 'GetMethod', 'GetProperty', 'GetField', 'GetMember' -and $m.Arguments.Count -and $m.Arguments[0] -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $null = $reflected.Add($m.Arguments[0].Value) }
+    }
+    # Statement structure: each statement of at least 12 nodes as a preorder of node kinds and operators, with every
+    # name and literal value removed. Equal hashes in different units are shared structure, whatever the spelling.
+    $subtrees = [Collections.Generic.HashSet[string]]::new()
+    foreach ($statement in $node.Body.FindAll({ $args[0] -is [System.Management.Automation.Language.StatementAst] -and $args[0] -isnot [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0] -isnot [System.Management.Automation.Language.TypeDefinitionAst] }, $true)) {
+        $kinds = [Collections.Generic.List[string]]::new()
+        foreach ($n in $statement.FindAll({ $true }, $true)) {
+            $nodeKind = $n.GetType().Name
+            if ($n -is [System.Management.Automation.Language.BinaryExpressionAst]) { $nodeKind += ':' + $n.Operator }
+            elseif ($n -is [System.Management.Automation.Language.UnaryExpressionAst]) { $nodeKind += ':' + $n.TokenKind }
+            elseif ($n -is [System.Management.Automation.Language.AssignmentStatementAst]) { $nodeKind += ':' + $n.Operator }
+            $kinds.Add($nodeKind)
+        }
+        if ($kinds.Count -ge 12) { $null = $subtrees.Add([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($kinds -join ' '))).Substring(0, 16)) }
+    }
+    $tokens = $errors = $null; $null = [System.Management.Automation.Language.Parser]::ParseInput($node.Extent.Text, [ref]$tokens, [ref]$errors)
+    $shape = ($tokens | Where-Object { $_.Kind -notin 'NewLine','Comment','EndOfInput' } | ForEach-Object { if ($_.Kind -eq 'Variable') { 'v' } else { $_.Kind.ToString() + ':' + $_.Text } }) -join ' '
+    [pscustomobject]@{
+        Project = $project.Project; Remote = $project.Remote; File = $file; Name = $name; Kind = $kind; Line = $node.Extent.StartLineNumber
+        Lines = $node.Extent.EndLineNumber - $node.Extent.StartLineNumber + 1; Parameters = $parameters; Calls = @($calls); Types = @($types)
+        Effects = @($effects); RootedPaths = $rooted; Synopsis = $(if ($help) { $help.Synopsis } else { $null })
+        Shape = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($shape))).Substring(0, 16)
+        MemberCalls = @($memberCalls); ReflectedNames = @($reflected); Subtrees = @($subtrees)
+    }
+}
+
+function Invoke-SmaProfile {
+    $builtin = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($c in Get-Command -CommandType Cmdlet, Function, Alias -ErrorAction SilentlyContinue) { $null = $builtin.Add($c.Name) }
+    $projects = @(Get-Projects)
+    $units = [Collections.Generic.List[object]]::new()
+    foreach ($project in $projects) {
+        foreach ($rel in $project.Files) {
+            $path = Join-Path $project.Path $rel; if (-not (Test-Path -LiteralPath $path)) { continue }
+            $tokens = $errors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+            foreach ($node in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionMemberAst] -or ($args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Parent -isnot [System.Management.Automation.Language.FunctionMemberAst]) }, $true)) {
+                $units.Add((Get-UnitProfile $project $rel $node))
+            }
+        }
+    }
+    $byProject = @{}; foreach ($u in $units) { $k = $u.Project + '|' + $u.Name; if (-not $byProject.ContainsKey($k)) { $byProject[$k] = $u } }
+    $byName = $units | Group-Object Name -AsHashTable -AsString
+    # Class methods by project and short name, the targets of member invocations and reflected names.
+    $methods = @{}
+    foreach ($u in $units | Where-Object Kind -eq 'method') { $k = $u.Project + '|' + $u.Name.Split('.')[-1]; if (-not $methods.ContainsKey($k)) { $methods[$k] = [Collections.Generic.List[object]]::new() }; $methods[$k].Add($u) }
+    $incoming = @{}
+    $addIncoming = { param($target, [string] $via, $source) $key = $target.Project + '|' + $target.Name + '|' + $target.Line; if (-not $incoming.ContainsKey($key)) { $incoming[$key] = [Collections.Generic.List[string]]::new() }; $incoming[$key].Add($via + ':' + $source.Name) }
+    foreach ($u in $units) {
+        $internal = [Collections.Generic.List[object]]::new(); $elsewhere = [Collections.Generic.List[string]]::new(); $unresolved = [Collections.Generic.List[string]]::new()
+        foreach ($c in $u.Calls) {
+            if ($byProject.ContainsKey($u.Project + '|' + $c)) { $internal.Add($byProject[$u.Project + '|' + $c]); & $addIncoming $byProject[$u.Project + '|' + $c] 'command' $u }
+            elseif ($byName.ContainsKey($c)) { $elsewhere.Add($c + ' <- ' + ((@($byName[$c].Project | Sort-Object -Unique)) -join ',')) }
+            elseif (-not $builtin.Contains($c)) { $unresolved.Add($c) }
+        }
+        # Member and reflection edges are nominations by name within the project; they are kept apart from command calls.
+        $nominated = [Collections.Generic.List[string]]::new()
+        foreach ($pair in @(@($u.MemberCalls, 'member'), @($u.ReflectedNames, 'reflection'))) {
+            foreach ($n in $pair[0]) {
+                $k = $u.Project + '|' + $n
+                if ($methods.ContainsKey($k)) { foreach ($t in $methods[$k]) { if ($t -ne $u) { $nominated.Add($pair[1] + ':' + $t.Name); & $addIncoming $t $pair[1] $u } } }
+                elseif ($pair[1] -eq 'reflection' -and $byProject.ContainsKey($k)) { $nominated.Add('reflection:' + $n); & $addIncoming $byProject[$k] 'reflection' $u }
+            }
+        }
+        $u | Add-Member Internal $internal; $u | Add-Member NameMatchedElsewhere @($elsewhere); $u | Add-Member Unresolved @($unresolved); $u | Add-Member Nominated @($nominated)
+    }
+    foreach ($u in $units) { $key = $u.Project + '|' + $u.Name + '|' + $u.Line; $u | Add-Member Incoming @($(if ($incoming.ContainsKey($key)) { $incoming[$key] } else { @() })) }
+    $memo = @{}
+    $testPure = {
+        param($u, $seen)
+        $key = $u.Project + '|' + $u.Name + '|' + $u.Line
+        if ($memo.ContainsKey($key)) { return $memo[$key] }
+        if ($seen.Contains($key)) { return $true }
+        $null = $seen.Add($key)
+        $ok = $u.Effects.Count -eq 0 -and $u.RootedPaths.Count -eq 0 -and $u.NameMatchedElsewhere.Count -eq 0 -and $u.Unresolved.Count -eq 0
+        if ($ok) { foreach ($d in $u.Internal) { if (-not (& $testPure $d $seen)) { $ok = $false; break } } }
+        $memo[$key] = $ok; $ok
+    }
+    foreach ($u in $units) { $u | Add-Member PureClosure (& $testPure $u ([Collections.Generic.HashSet[string]]::new())) }
+    @($units | Select-Object Project, Remote, File, Name, Kind, Line, Lines, Parameters, Calls, Types, Effects, RootedPaths, Synopsis, Shape, @{ n = 'Internal'; e = { @($_.Internal.Name) } }, NameMatchedElsewhere, Unresolved, PureClosure, MemberCalls, ReflectedNames, Subtrees, Nominated, Incoming)
+}
+
+function Get-SmaUnits($profiled) {
+    # One unit per function, and one per class with its methods rolled up.
+    foreach ($f in $profiled | Where-Object Kind -eq 'function') { $f | Select-Object *, @{ n = 'Pure'; e = { $_.PureClosure } } }
+    foreach ($g in $profiled | Where-Object Kind -eq 'method' | Group-Object Project, File, { $_.Name.Split('.')[0] }) {
+        $m = $g.Group
+        [pscustomobject]@{ Project = $m[0].Project; Remote = $m[0].Remote; File = $m[0].File; Name = $m[0].Name.Split('.')[0]; Kind = 'class'
+            Line = ($m.Line | Measure-Object -Minimum).Minimum; Lines = ($m.Lines | Measure-Object -Sum).Sum
+            Calls = @($m.Calls | Sort-Object -Unique); Types = @($m.Types | Sort-Object -Unique); Effects = @($m.Effects | Sort-Object -Unique)
+            RootedPaths = @($m.RootedPaths | Sort-Object -Unique); NameMatchedElsewhere = @($m.NameMatchedElsewhere | Sort-Object -Unique)
+            Unresolved = @($m.Unresolved | Sort-Object -Unique); Shape = (($m | Sort-Object Name).Shape -join ''); Pure = -not ($m | Where-Object { -not $_.PureClosure })
+            Subtrees = @($m.Subtrees | Sort-Object -Unique); Nominated = @($m.Nominated | Sort-Object -Unique)
+            Incoming = @($m.Incoming | Where-Object { $_ -and $_.Split(':', 2)[1] -notlike ($m[0].Name.Split('.')[0] + '.*') } | Sort-Object -Unique) }
+    }
+}
+
+# Units that only checks can reach. Roots are units nothing else calls (entry points and script-level dispatch
+# targets). A check is a unit named Test-*, Verify-*, Assert-*, or *Judge*. A unit reachable from a check root and
+# from no other root works only inside its own proofs: green checks, unreachable from the product.
+function Get-SmaCheckOnly($profiled) {
+    $byKey = @{}
+    foreach ($u in $profiled) { $k = $u.Project + '|' + $u.Name; if (-not $byKey.ContainsKey($k)) { $byKey[$k] = [Collections.Generic.List[object]]::new() }; $byKey[$k].Add($u) }
+    $edges = @{}
+    foreach ($u in $profiled) {
+        $targets = [Collections.Generic.List[object]]::new()
+        foreach ($n in $u.Internal) { if ($byKey.ContainsKey($u.Project + '|' + $n)) { $targets.AddRange($byKey[$u.Project + '|' + $n]) } }
+        foreach ($n in $u.Nominated) { $name = $n.Split(':', 2)[1]; if ($byKey.ContainsKey($u.Project + '|' + $name)) { $targets.AddRange($byKey[$u.Project + '|' + $name]) } }
+        $edges[$u] = $targets
+    }
+    $isCheck = { param($u) $short = $u.Name.Split('.')[-1]; $short -match '^(Test|Verify|Assert)-' -or $short -match '(?i)judge' -or $u.File -match '(?i)(^|[\\/])(tests?|.*judges?)[\\/.]' }
+    $reach = { param([object[]] $roots) $seen = [Collections.Generic.HashSet[object]]::new(); $stack = [Collections.Generic.Stack[object]]::new(); foreach ($r in $roots) { if ($seen.Add($r)) { $stack.Push($r) } }
+        while ($stack.Count) { $x = $stack.Pop(); foreach ($t in $edges[$x]) { if ($seen.Add($t)) { $stack.Push($t) } } }; , $seen }
+    $roots = @($profiled | Where-Object { -not $_.Incoming.Count })
+    $fromChecks = & $reach @($roots | Where-Object { & $isCheck $_ })
+    $fromProduct = & $reach @($roots | Where-Object { -not (& $isCheck $_) })
+    foreach ($u in $fromChecks) {
+        if ($fromProduct.Contains($u) -or (& $isCheck $u)) { continue }
+        $callers = @($profiled | Where-Object { $edges[$_] -contains $u } | ForEach-Object Name | Sort-Object -Unique)
+        [pscustomobject]@{ Project = $u.Project; File = $u.File; Line = $u.Line; Name = $u.Name; Lines = $u.Lines; CalledBy = $callers; Status = 'UnverifiedNomination'; ExecutionCoverage = 'Unknown' }
+    }
+}
+
+function Get-SmaReport($units, $profiled) {
+    '=== projects'
+    $units | Group-Object Project | Sort-Object Count -Descending | ForEach-Object { '{0,-28} {1,5} units  {2,4} pure  {3}' -f $_.Name, $_.Count, @($_.Group | Where-Object Pure).Count, $_.Group[0].Remote }
+    '=== copies of one remote: identical, diverged, not in every copy'
+    foreach ($r in $units | Group-Object Remote | Where-Object { @($_.Group.Project | Sort-Object -Unique).Count -gt 1 }) {
+        $copies = @($r.Group.Project | Sort-Object -Unique); $map = @{}
+        foreach ($c in $copies) { $map[$c] = @{}; foreach ($u in $r.Group | Where-Object Project -eq $c) { $map[$c][$u.Kind + ':' + $u.Name] = $u.Shape } }
+        $same = 0; $diff = 0; $one = 0
+        foreach ($n in @($map.Values | ForEach-Object { $_.Keys } | Sort-Object -Unique)) {
+            $present = @($copies | Where-Object { $map[$_].ContainsKey($n) })
+            if ($present.Count -lt $copies.Count) { $one++ } elseif (@($present | ForEach-Object { $map[$_][$n] } | Sort-Object -Unique).Count -eq 1) { $same++ } else { $diff++ }
+        }
+        '{0,-34} {1}: identical {2}, diverged {3}, not in every copy {4}' -f $r.Name, ($copies -join ' / '), $same, $diff, $one
+    }
+    $primary = @{}; foreach ($r in $units | Group-Object Remote) { $primary[$r.Name] = ($r.Group | Group-Object Project | Sort-Object Count -Descending | Select-Object -First 1).Name }
+    $distinct = @($units | Where-Object { $primary[$_.Remote] -eq $_.Project })
+    '=== distinct work (largest copy of each remote)'
+    '{0} units: {1} functions, {2} classes; pure closures {3}' -f $distinct.Count, @($distinct | Where-Object Kind -eq 'function').Count, @($distinct | Where-Object Kind -eq 'class').Count, @($distinct | Where-Object Pure).Count
+    'effects: ' + (($distinct | ForEach-Object { $_.Effects } | Group-Object | Sort-Object Count -Descending | ForEach-Object { "$($_.Name)=$($_.Count)" }) -join '  ')
+    '=== identical structure in more than one remote (at least 5 lines)'
+    $distinct | Where-Object { $_.Lines -ge 5 } | Group-Object Shape | Where-Object { @($_.Group.Remote | Sort-Object -Unique).Count -gt 1 } | Sort-Object { $_.Group[0].Lines } -Descending | ForEach-Object { '{0,4} lines  {1}' -f $_.Group[0].Lines, (($_.Group | ForEach-Object { "$($_.Project):$($_.Name)" }) -join ' = ') }
+    '=== same name, different structure, in more than one remote'
+    $distinct | Group-Object Kind, Name | Where-Object { @($_.Group.Remote | Sort-Object -Unique).Count -gt 1 -and @($_.Group.Shape | Sort-Object -Unique).Count -gt 1 } | Sort-Object Count -Descending | ForEach-Object { '{0,-40} {1}' -f $_.Group[0].Name, (($_.Group | ForEach-Object Project | Sort-Object -Unique) -join ', ') }
+    '=== dynamic code'
+    $distinct | Where-Object { $_.Effects -contains 'dynamic-code' } | Sort-Object Project, File, Line | ForEach-Object { '  {0}:{1}:{2} {3}' -f $_.Project, $_.File, $_.Line, $_.Name }
+    '=== drive-rooted path literals'
+    $distinct | Where-Object { $_.RootedPaths.Count } | Sort-Object Project, File, Line | ForEach-Object { '  {0}:{1}:{2} {3}  {4}' -f $_.Project, $_.File, $_.Line, $_.Name, ($_.RootedPaths -join ' | ') }
+    '=== calls matched by name to another project (nominated, not established)'
+    $distinct | ForEach-Object { $u = $_; $u.NameMatchedElsewhere | ForEach-Object { "$($u.Project) -> " + $_ } } | Group-Object | Sort-Object Count -Descending | ForEach-Object { '  {0,4}  {1}' -f $_.Count, $_.Name }
+    '=== reached only through members or reflection (invisible to the command graph)'
+    $distinct | Where-Object { $_.Incoming.Count -and -not ($_.Incoming | Where-Object { $_ -like 'command:*' }) } | Sort-Object Project, File, Line | ForEach-Object { '  {0}:{1}:{2} {3}  <- {4}' -f $_.Project, $_.File, $_.Line, $_.Name, (($_.Incoming | ForEach-Object { $_ } | Select-Object -First 4) -join ' | ') }
+    '=== no incoming edge from any unit (entry points, script-level dispatch, or unused), by project'
+    $distinct | Where-Object { -not $_.Incoming.Count } | Group-Object Project | Sort-Object Count -Descending | ForEach-Object { '  {0,-28} {1,5} of {2}' -f $_.Name, $_.Count, @($distinct | Where-Object Project -eq $_.Name).Count }
+    '=== experimental check-root nominations; script dispatch, dynamic binding and product reachability are not established'
+    if ($profiled) { Get-SmaCheckOnly $profiled | Sort-Object Project, File, Line | ForEach-Object { '  {0}:{1}:{2} {3} ({4} lines)  <- {5}' -f $_.Project, $_.File, $_.Line, $_.Name, $_.Lines, (($_.CalledBy | Select-Object -First 4) -join ', ') } }
+    '=== statement structure shared by different units (12+ nodes, names and literals removed), widest first'
+    $owners = @{}
+    foreach ($u in $distinct) { foreach ($s in $u.Subtrees) { if (-not $owners.ContainsKey($s)) { $owners[$s] = [Collections.Generic.List[object]]::new() }; $owners[$s].Add($u) } }
+    $owners.GetEnumerator() | Where-Object { @($_.Value | ForEach-Object { $_.Project + '|' + $_.Name } | Sort-Object -Unique).Count -gt 2 } | Sort-Object { @($_.Value).Count } -Descending | Select-Object -First 60 | ForEach-Object {
+        $names = @($_.Value | ForEach-Object { $_.Project + ':' + $_.Name } | Sort-Object -Unique)
+        '  {0} x{1,-4} {2}{3}' -f $_.Key, $names.Count, (($names | Select-Object -First 6) -join ' = '), $(if ($names.Count -gt 6) { ' ...' } else { '' }) }
+}
+
+# Lint: defects PowerShell's own rules make easy to write and hard to see, found from the parser.
+#   CaseSpelledTwoWays  a variable or function name written with different casing (one name to PowerShell).
+#   VariableClobbered   a variable assigned at a function's top level and again inside a loop (loops share the
+#                       function's scope), then read at top level after that loop.
+#   MethodSyntaxCall    a command called as name(a, b): one array argument, not two.
+#   CommaBindsFirst     an arithmetic, comparison or format operator with a bare comma list as an operand:
+#                       the comma binds first, so the operator receives an array.
+#   CaselessSymbol      a case-insensitive comparison against a literal containing letters, in a file that also
+#                       uses case-sensitive operators, so case matters to its author there.
+function Get-SmaLint([string] $file) {
+    $tokens = $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$tokens, [ref]$errors)
+    $finding = { param([string] $rule, $node, [string] $detail) [pscustomobject]@{ File = $file; Line = $node.Extent.StartLineNumber; Rule = $rule; Detail = $detail } }
+    $variables = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.VariableExpressionAst] }, $true))
+    foreach ($group in $variables | Where-Object { -not $_.VariablePath.IsDriveQualified } | Group-Object { $_.VariablePath.UserPath.ToLowerInvariant() }) {
+        $spellings = @($group.Group | ForEach-Object { $_.VariablePath.UserPath } | Sort-Object -Unique -CaseSensitive)
+        if ($spellings.Count -gt 1) { & $finding 'CaseSpelledTwoWays' $group.Group[0] ('$' + ($spellings -join ' $')) }
+    }
+    # In a class method, a local whose name equals a property's name in any casing is the property to PowerShell:
+    # assigning it is a parse error, and reading it is easy to confuse. Every such name is a finding.
+    foreach ($type in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.TypeDefinitionAst] }, $true)) {
+        $properties = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($member in $type.Members) { if ($member -is [System.Management.Automation.Language.PropertyMemberAst]) { $null = $properties.Add($member.Name) } }
+        foreach ($method in $type.Members | Where-Object { $_ -is [System.Management.Automation.Language.FunctionMemberAst] }) {
+            # A parameter with a property's name is the ordinary constructor idiom ($this.Name = $Name). The defects are
+            # assigning a local with a property's name (PowerShell rejects it) and reading one that is neither a
+            # parameter nor assigned in the method, where $this.<Name> was meant.
+            $parameterNames = [Collections.Generic.HashSet[string]]::new([string[]]@($method.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath }), [StringComparer]::OrdinalIgnoreCase)
+            $assigned = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            foreach ($assignment in $method.Body.FindAll({ $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) { $left = $assignment.Left; while ($left -is [System.Management.Automation.Language.ConvertExpressionAst]) { $left = $left.Child }; if ($left -is [System.Management.Automation.Language.VariableExpressionAst]) { $null = $assigned.Add($left.VariablePath.UserPath) } }
+            foreach ($variable in $method.Body.FindAll({ $args[0] -is [System.Management.Automation.Language.VariableExpressionAst] -and -not $args[0].VariablePath.IsDriveQualified }, $true)) {
+                $variableName = $variable.VariablePath.UserPath
+                if ($variableName -eq 'this' -or -not $properties.Contains($variableName) -or $parameterNames.Contains($variableName)) { continue }
+                $how = if ($assigned.Contains($variableName)) { 'assigned as a local' } else { 'read but never assigned or passed in; $this.' + $variableName + ' was probably meant' }
+                & $finding 'LocalShadowsProperty' $variable ("`$$variableName in $($type.Name).$($method.Name) shares property $($type.Name).$variableName's name and is $how"); break
+            }
+        }
+    }
+    # A script's parameters share one case-insensitive namespace with every variable in the file.
+    $scriptParameters = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+    foreach ($parameter in $scriptParameters) {
+        $others = @($variables | Where-Object { $_.VariablePath.UserPath -ieq $parameter -and $_.VariablePath.UserPath -cne $parameter })
+        if ($others.Count) { & $finding 'CaseSpelledTwoWays' $others[0] "script parameter `$$parameter also written `$$($others[0].VariablePath.UserPath)" }
+    }
+    $definitions = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))
+    $commands = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true))
+    $defined = @{}; foreach ($d in $definitions) { $defined[$d.Name.ToLowerInvariant()] = $d.Name }
+    foreach ($group in @($commands | Where-Object { $_.GetCommandName() -and $defined.ContainsKey($_.GetCommandName().ToLowerInvariant()) }) | Group-Object { $_.GetCommandName().ToLowerInvariant() }) {
+        $spellings = @(@($group.Group | ForEach-Object { $_.GetCommandName() }) + $defined[$group.Name] | Sort-Object -Unique -CaseSensitive)
+        if ($spellings.Count -gt 1) { & $finding 'CaseSpelledTwoWays' $group.Group[0] ($spellings -join ' ') }
+    }
+    $isLoop = { param($a) $a -is [System.Management.Automation.Language.LoopStatementAst] }
+    foreach ($fn in $definitions) {
+        $body = $fn.Body
+        $loopOf = { param($n) $found = $null; $p = $n.Parent; while ($null -ne $p -and $p -ne $body) { if ($p -is [System.Management.Automation.Language.FunctionDefinitionAst] -or $p -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) { return 'nested' }; if (& $isLoop $p) { $found = $p }; $p = $p.Parent }; $found }
+        $assigned = @{}
+        foreach ($a in $body.FindAll({ $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) {
+            # Only a direct rebinding counts ($x = ..., [T] $x = ...); $x[i] = ... and $x.P = ... change the object, not the variable.
+            $left = $a.Left; while ($left -is [System.Management.Automation.Language.ConvertExpressionAst]) { $left = $left.Child }
+            foreach ($target in @($left) | Where-Object { $_ -is [System.Management.Automation.Language.VariableExpressionAst] }) {
+                $name = $target.VariablePath.UserPath.ToLowerInvariant(); $loop = & $loopOf $a
+                if ($loop -eq 'nested') { continue }
+                # An accumulator ($t += x, $t = $t + x) carries its own value forward; that is not a clobber.
+                if ($null -ne $loop -and ($a.Operator -ne 'Equals' -or @($a.Right.FindAll({ param($x) $x -is [System.Management.Automation.Language.VariableExpressionAst] -and $x.VariablePath.UserPath -ieq $name }, $true)).Count)) { continue }
+                if (-not $assigned.ContainsKey($name)) { $assigned[$name] = [Collections.Generic.List[object]]::new() }
+                $assigned[$name].Add([pscustomobject]@{ Node = $a; Loop = $loop; Offset = $a.Extent.StartOffset })
+            }
+        }
+        foreach ($loopNode in $body.FindAll({ $args[0] -is [System.Management.Automation.Language.ForEachStatementAst] }, $true)) {
+            if ((& $loopOf $loopNode) -eq 'nested') { continue }
+            $name = $loopNode.Variable.VariablePath.UserPath.ToLowerInvariant()
+            if (-not $assigned.ContainsKey($name)) { $assigned[$name] = [Collections.Generic.List[object]]::new() }
+            $assigned[$name].Add([pscustomobject]@{ Node = $loopNode; Loop = $loopNode; Offset = $loopNode.Extent.StartOffset })
+        }
+        foreach ($name in $assigned.Keys) {
+            $top = @($assigned[$name] | Where-Object { $null -eq $_.Loop }); $inner = @($assigned[$name] | Where-Object { $null -ne $_.Loop })
+            if (-not $top.Count -or -not $inner.Count) { continue }
+            $firstTop = ($top | Measure-Object Offset -Minimum).Minimum
+            foreach ($i in $inner) {
+                if ($i.Offset -lt $firstTop) { continue }
+                # A scanner fills a default when a condition holds (an if or switch between the write and its loop).
+                # A clobber overwrites unconditionally on every pass.
+                $guard = $i.Node.Parent; $guarded = $false
+                while ($null -ne $guard -and $guard -ne $i.Loop) { if ($guard -is [System.Management.Automation.Language.IfStatementAst] -or $guard -is [System.Management.Automation.Language.SwitchStatementAst] -or $guard -is [System.Management.Automation.Language.TryStatementAst]) { $guarded = $true; break }; $guard = $guard.Parent }
+                if ($guarded) { continue }
+                # Searches and refinements read the outer value inside the loop before replacing it. A clobber is a
+                # loop temporary: inside the loop the name is written before it is ever read.
+                $inLoop = @($i.Loop.FindAll({ param($x) $x -is [System.Management.Automation.Language.VariableExpressionAst] -and $x.VariablePath.UserPath -ieq $name }, $true) | Sort-Object { $_.Extent.StartOffset })
+                if ($i.Loop -is [System.Management.Automation.Language.ForEachStatementAst] -and $i.Loop.Variable.VariablePath.UserPath -ieq $name) { $inLoop = @($inLoop | Where-Object { $_ -ne $i.Loop.Variable }) }
+                $firstUse = $inLoop | Select-Object -First 1
+                if ($null -ne $firstUse -and -not ($firstUse.Parent -is [System.Management.Automation.Language.AssignmentStatementAst] -and $firstUse.Parent.Left -eq $firstUse) -and -not ($i.Loop -is [System.Management.Automation.Language.ForEachStatementAst] -and $i.Loop.Variable.VariablePath.UserPath -ieq $name)) { continue }
+                $after = $i.Loop.Extent.EndOffset
+                $reads = @($body.FindAll({ param($x) $x -is [System.Management.Automation.Language.VariableExpressionAst] -and $x.VariablePath.UserPath -ieq $name -and $x.Extent.StartOffset -gt $after -and $x.Parent -isnot [System.Management.Automation.Language.AssignmentStatementAst] }, $true) | Where-Object { $null -eq (& $loopOf $_) })
+                $reassigned = @($top | Where-Object { $_.Offset -gt $after -and $_.Offset -lt $(if ($reads.Count) { $reads[0].Extent.StartOffset } else { 0 }) })
+                if ($reads.Count -and -not $reassigned.Count) { & $finding 'VariableClobbered' $i.Node ("`$$name in $($fn.Name): set at top level, reassigned in the loop at line $($i.Loop.Extent.StartLineNumber), read after it at line $($reads[0].Extent.StartLineNumber)"); break }
+            }
+        }
+    }
+    # A forced reimport inside a function reruns the module body on every call and resets its script-scope state.
+    foreach ($c in $commands | Where-Object { $_.GetCommandName() -eq 'Import-Module' }) {
+        $forced = @($c.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] -and 'Force'.StartsWith($_.ParameterName, [StringComparison]::OrdinalIgnoreCase) })
+        $owner = $c.Parent; while ($null -ne $owner -and $owner -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $owner = $owner.Parent }
+        if ($forced.Count -and $null -ne $owner) {
+            $callCount = @($commands | Where-Object { $_.GetCommandName() -eq $owner.Name }).Count
+            & $finding 'ForcedReimport' $c ("in $($owner.Name), called from $callCount place(s): " + $c.Extent.Text)
+        }
+    }
+    foreach ($c in $commands) {
+        $name = $c.GetCommandName(); if (-not $name -or $c.CommandElements.Count -lt 2) { continue }
+        $second = $c.CommandElements[1]
+        if ($second -is [System.Management.Automation.Language.ParenExpressionAst] -and $second.Extent.StartOffset -eq $c.CommandElements[0].Extent.EndOffset -and $null -ne $second.Pipeline.Find({ $args[0] -is [System.Management.Automation.Language.ArrayLiteralAst] }, $true)) { & $finding 'MethodSyntaxCall' $c $c.Extent.Text.Split("`n")[0] }
+    }
+    foreach ($b in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.BinaryExpressionAst] }, $true)) {
+        if ($b.Operator -in 'Comma') { continue }
+        foreach ($side in $b.Left, $b.Right) {
+            if ($side -is [System.Management.Automation.Language.ArrayLiteralAst] -and $side.Elements.Count -gt 1 -and $b.Operator -notin 'Format', 'Join', 'Iin', 'Cin', 'Inotin', 'Cnotin', 'Icontains', 'Ccontains', 'Inotcontains', 'Cnotcontains', 'Ireplace', 'Creplace') { & $finding 'CommaBindsFirst' $b $b.Extent.Text.Split("`n")[0] }
+        }
+    }
+    # Literals that exist in this file in more than one casing ('A' and 'a'): case distinguishes them here.
+    $literals = @($ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $x.Parent -isnot [System.Management.Automation.Language.MemberExpressionAst] -and $x.Parent -isnot [System.Management.Automation.Language.CommandAst] }, $true))
+    $cased = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($group in $literals | Where-Object { $_.Value -cmatch '\p{L}' } | Group-Object { $_.Value.ToLowerInvariant() }) {
+        if (@($group.Group.Value | Sort-Object -Unique -CaseSensitive).Count -gt 1) { $null = $cased.Add($group.Name) }
+    }
+    if ($cased.Count) {
+        foreach ($b in $ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.BinaryExpressionAst] -and $x.Operator -in 'Ieq', 'Ine', 'Ilike', 'Inotlike', 'Iin', 'Inotin', 'Icontains', 'Inotcontains', 'Imatch', 'Inotmatch', 'Ireplace', 'Isplit' }, $true)) {
+            $operands = @(foreach ($side in $b.Left, $b.Right) { if ($side -is [System.Management.Automation.Language.ArrayLiteralAst]) { $side.Elements } else { $side } })
+            $hits = @($operands | Where-Object { $_ -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $cased.Contains($_.Value) } | ForEach-Object Value)
+            if ($hits.Count) { & $finding 'CaselessSymbol' $b ("'" + ($hits -join "','") + "' exists here in another casing: " + $b.Extent.Text.Split("`n")[0]) }
+        }
+    }
+}
+
+# Describe: one project as live objects, built only from its parsed source. Every fact carries where it was read
+# (file and line). Code held in string literals is parsed and described too, marked Embedded: it is cruft by the AST
+# rule, and it is still part of what the project does. String literals that are not PowerShell are listed as Foreign.
+class SmaUnit {
+    [string] $Identity; [string] $Scope; [string] $BodyScope
+    [string] $Name; [string] $Kind; [string] $File; [int] $Line; [int] $Lines; [string] $Class
+    [bool] $Embedded; [string[]] $Parameters; [string] $Synopsis
+    [object] $Ast
+    [string] ToString() { return "$($this.Name) ($($this.File):$($this.Line))" }
+}
+class SmaEdge {
+    [string] $FromIdentity; [string] $ToIdentity; [string] $Scope
+    [string] $Resolution = 'Unresolved'; [string] $Reason
+    [object] $Ast
+    [string] $From; [string] $To; [string] $Kind; [string] $File; [int] $Line
+    [string] ToString() { return "$($this.From) -$($this.Kind)-> $($this.To) ($($this.File):$($this.Line))" }
+}
+class SmaSource {
+    [string] $Identity; [string] $File; [string] $Sha256; [string] $Provenance
+    [string] $ParentIdentity; [object] $Container; [object] $Ast; [object[]] $ParseErrors
+    [string] $Boundary; [bool] $Embedded
+}
+class SmaCoverage {
+    [string] $Root; [string] $Scope; [int] $Sources; [int] $ParseFailures; [int] $UnresolvedEdges
+    [int] $UnexaminedLiterals; [bool] $DeclarationsComplete; [bool] $ExecutionComplete
+    [string[]] $Limitations
+}
+class SmaAbsence {
+    [string] $Pattern; [string] $Scope; [string] $Status
+    [object[]] $Matches; [SmaCoverage] $Coverage
+}
+class SmaChange {
+    [string] $File; [string] $Before; [string] $After; [string] $Kind
+}
+class SmaProject {
+    [string] $Root; [string] $Commit; [datetime] $DescribedUtc
+    [Collections.Generic.List[SmaUnit]] $Units
+    [Collections.Generic.List[SmaEdge]] $Edges
+    SmaProject() { $this.Units = [Collections.Generic.List[SmaUnit]]::new(); $this.Edges = [Collections.Generic.List[SmaEdge]]::new() }
+    [Collections.Generic.List[object]] $EntryCalls = [Collections.Generic.List[object]]::new()
+    [Collections.Generic.List[object]] $Embedded = [Collections.Generic.List[object]]::new()
+    [Collections.Generic.List[object]] $Foreign = [Collections.Generic.List[object]]::new()
+    [Collections.Generic.List[object]] $Lint = [Collections.Generic.List[object]]::new()
+    [Collections.Generic.List[object]] $Parameters = [Collections.Generic.List[object]]::new()
+    [Collections.Generic.List[object]] $Variables = [Collections.Generic.List[object]]::new()
+    [string[]] $Files
+    [string[]] $Operations = @('Describe','Find','Callers','Callees','Path','Coverage','Absent','Changes')
+    [Collections.Generic.List[SmaSource]] $Sources = [Collections.Generic.List[SmaSource]]::new()
+    [Collections.Generic.List[object]] $Symbols = [Collections.Generic.List[object]]::new()
+    [Collections.Generic.List[object]] $TypeReferences = [Collections.Generic.List[object]]::new()
+    [Collections.Generic.List[object]] $Relationships = [Collections.Generic.List[object]]::new()
+    [Collections.Generic.List[object]] $Diagnostics = [Collections.Generic.List[object]]::new()
+    [Collections.Generic.List[object]] $Observations = [Collections.Generic.List[object]]::new()
+    [Collections.Generic.Dictionary[System.Management.Automation.Language.Ast,SmaUnit]] $NodeOwners = [Collections.Generic.Dictionary[System.Management.Automation.Language.Ast,SmaUnit]]::new()
+    [SmaProject] Describe() { return $this }
+    [SmaCoverage] Coverage() { return $this.Coverage('Execution') }
+    [SmaCoverage] Coverage([string] $Scope) {
+        if ($Scope -notin 'Declarations','Execution') { throw 'Scope must be Declarations or Execution.' }
+        $failures = @($this.Sources | Where-Object { $_.ParseErrors.Count }).Count
+        $unresolved = @($this.Edges | Where-Object Resolution -ne 'Bound').Count
+        return [SmaCoverage]@{ Root = $this.Root; Scope = $Scope; Sources = $this.Sources.Count; ParseFailures = $failures
+            UnresolvedEdges = $unresolved; UnexaminedLiterals = $this.Foreign.Count
+            DeclarationsComplete = ($failures -eq 0 -and $this.Foreign.Count -eq 0); ExecutionComplete = $false
+            Limitations = @('Local nonignored PowerShell files only; imported and external source is not recursively admitted.',
+                'Static lexical binding only; runtime function replacement, aliases, module exports and dynamic dispatch require observations.',
+                'Large multiline literals without an established PowerShell consumer remain unclassified.',
+                'Experimental lint findings are hypotheses, not proof of runtime failure.') }
+    }
+    [SmaChange[]] Changes() {
+        $changes = [Collections.Generic.List[SmaChange]]::new()
+        foreach ($source in $this.Sources | Where-Object { -not $_.Embedded }) {
+            $path = Join-Path $this.Root $source.File
+            $after = if ([IO.File]::Exists($path)) { (Get-FileHash -LiteralPath $path).Hash } else { '' }
+            if ($after -cne $source.Sha256) { $changes.Add([SmaChange]@{ File = $source.File; Before = $source.Sha256; After = $after; Kind = $(if ($after) { 'Modified' } else { 'Missing' }) }) }
+        }
+        foreach ($relative in Get-SmaSourceFiles $this.Root) {
+            if ($relative -notin $this.Files) { $changes.Add([SmaChange]@{ File = $relative; After = (Get-FileHash -LiteralPath (Join-Path $this.Root $relative)).Hash; Kind = 'Added' }) }
+        }
+        return $changes.ToArray()
+    }
+    # Units whose name matches a pattern (regular expression over unit names, which are data, not code).
+    [SmaUnit[]] Find([string] $Pattern) { return @($this.Units | Where-Object { $_.Name -match $Pattern }) }
+    [SmaEdge[]] Callers([string] $name) { return @($this.Edges | Where-Object { $_.To -ieq $name -or $_.To -like "*.$name" }) }
+    [SmaEdge[]] Callees([string] $name) { return @($this.Edges | Where-Object { $_.From -ieq $name }) }
+    # A shortest call path from one unit to another over every edge kind, or nothing when none exists.
+    [string[]] Path([string] $From, [string] $To) {
+        $starts=@($this.Units | Where-Object { $_.Identity -ceq $From -or $_.Name -ieq $From })
+        $ends=@($this.Units | Where-Object { $_.Identity -ceq $To -or $_.Name -ieq $To })
+        if($starts.Count -gt 1 -or $ends.Count -gt 1){throw 'Ambiguous symbol: supply its scope-qualified unit Identity.'}
+        if($starts.Count -eq 0 -or $ends.Count -eq 0){return @()}
+        $startIdentity=$starts[0].Identity;$endIdentity=$ends[0].Identity
+        $labels=@{};foreach($unit in $this.Units){$labels[$unit.Identity]=$unit.Name}
+        $previous = @{}; $queue = [Collections.Generic.Queue[string]]::new(); $queue.Enqueue($startIdentity); $previous[$startIdentity] = $null
+        $next = @{}; foreach ($e in $this.Edges | Where-Object Resolution -eq 'Bound') { $k = $e.FromIdentity; if (-not $next.ContainsKey($k)) { $next[$k] = [Collections.Generic.List[string]]::new() }; $next[$k].Add($e.ToIdentity) }
+        while ($queue.Count) {
+            $n = $queue.Dequeue(); if ($n -ceq $endIdentity) { $path = [Collections.Generic.List[string]]::new(); $c = $n; while ($null -ne $c) { $path.Insert(0, $labels[$c]); $c = $previous[$c] }; return $path.ToArray() }
+            foreach ($m in @($next[$n])) { if ($null -ne $m -and -not $previous.ContainsKey($m)) { $previous[$m] = $n; $queue.Enqueue($m) } }
+        }
+        return @()
+    }
+    # Evidence of absence: every unit name, command, type and member searched, with how many of each were searched.
+    [object] Absent([string] $Pattern) { return $this.Absent($Pattern, 'Execution') }
+    [SmaAbsence] Absent([string] $Pattern, [string] $Scope) {
+        # Absence is claimed only when nothing matches anywhere the parser can see: unit names, call targets, script
+        # and function parameters, environment and script variables, and the holders and contents of string literals
+        # that are source (embedded PowerShell, templates, foreign languages).
+        $matchedUnits = @($this.Units | Where-Object { $_.Name -match $Pattern })
+        $matchedEdges = @($this.Edges | Where-Object { $_.To -match $Pattern })
+        $matchedParameters = @($this.Parameters | Where-Object { $_.Name -match $Pattern })
+        $matchedVariables = @($this.Variables | Where-Object { $_.Name -match $Pattern })
+        $matchedLiterals = @(@($this.Embedded) + @($this.Foreign) | Where-Object { $_.HeldBy -match $Pattern -or $_.Text -match $Pattern })
+        $coverage = $this.Coverage($Scope)
+        $matches = @(if ($Scope -eq 'Declarations') { $matchedUnits } else { @($matchedUnits) + @($matchedEdges) + @($matchedParameters) + @($matchedVariables) + @($matchedLiterals) })
+        $status = if ($matches.Count) { 'Found' } elseif ($Scope -eq 'Declarations' -and $coverage.DeclarationsComplete) { 'NotFoundWithinScope' } else { 'Unknown' }
+        return [SmaAbsence]@{ Pattern = $Pattern; Scope = $Scope; Status = $status; Matches = @($matches); Coverage = $coverage }
+    }
+}
+
+function Get-SmaLexicalScope($node, [string] $sourceIdentity) {
+    $cursor = $node.Parent
+    while ($null -ne $cursor) {
+        if ($cursor -is [System.Management.Automation.Language.ScriptBlockAst]) { return $sourceIdentity + ':' + $cursor.Extent.StartOffset }
+        # Inline function/method parameters precede the body node in the AST, but belong to its lexical scope.
+        if ($cursor -is [System.Management.Automation.Language.FunctionDefinitionAst] -or $cursor -is [System.Management.Automation.Language.FunctionMemberAst]) { return $sourceIdentity + ':' + $cursor.Body.Extent.StartOffset }
+        $cursor = $cursor.Parent
+    }
+    return $sourceIdentity + ':0'
+}
+
+function Get-SmaOwner($node, $project, [string] $sourceIdentity) {
+    $cursor = $node.Parent
+    while ($null -ne $cursor) {
+        if ($project.NodeOwners.ContainsKey($cursor)) { return $project.NodeOwners[$cursor] }
+        $cursor = $cursor.Parent
+    }
+    return $project.Units | Where-Object Identity -eq ($sourceIdentity + ':script') | Select-Object -First 1
+}
+
+function Add-SmaDescribedSource($project, [string] $relative, $ast, [bool] $embedded, [int] $lineOffset, [string] $sourceIdentity) {
+    $scriptName=if($embedded){'<embedded-script>'+$sourceIdentity}else{'<script>'+$relative}
+    $scriptUnit = [SmaUnit]@{ Identity = $sourceIdentity + ':script'; Name = $scriptName; Kind = 'script'; File = $relative
+        Line = 1 + $lineOffset; Lines = $ast.Extent.EndLineNumber; Ast = $ast; Embedded = $embedded
+        Scope = $sourceIdentity + ':0'; BodyScope = $sourceIdentity + ':' + $ast.Extent.StartOffset }
+    $project.Units.Add($scriptUnit)
+    $project.NodeOwners[$ast] = $scriptUnit
+    foreach ($node in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -or $args[0] -is [System.Management.Automation.Language.TypeDefinitionAst] }, $true)) {
+        $className = ''; $kind = 'function'; $name = $node.Name; $bodyScope = ''
+        if ($node -is [System.Management.Automation.Language.TypeDefinitionAst]) { $kind = 'class' }
+        elseif ($node.Parent -is [System.Management.Automation.Language.FunctionMemberAst]) { $className = $node.Parent.Parent.Name; $kind = 'method'; $name = $className + '.' + $name }
+        if ($kind -ne 'class') { $bodyScope = $sourceIdentity + ':' + $node.Body.Extent.StartOffset }
+        $unit = [SmaUnit]@{ Identity = $sourceIdentity + ':' + $node.Extent.StartOffset + ':' + $kind; Name = $name; Kind = $kind; Class = $className
+            File = $relative; Line = $node.Extent.StartLineNumber + $lineOffset; Lines = $node.Extent.EndLineNumber - $node.Extent.StartLineNumber + 1
+            Ast = $node; Embedded = $embedded; Scope = (Get-SmaLexicalScope $node $sourceIdentity); BodyScope = $bodyScope }
+        $project.Units.Add($unit)
+        $project.NodeOwners[$node] = $unit
+    }
+    foreach ($node in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.ScriptBlockExpressionAst] }, $true)) {
+        $unit=[SmaUnit]@{ Identity=$sourceIdentity+':'+$node.Extent.StartOffset+':closure'; Name='<closure>'+$relative+':'+$node.Extent.StartOffset
+            Kind='closure'; File=$relative; Line=$node.Extent.StartLineNumber+$lineOffset; Lines=$node.Extent.EndLineNumber-$node.Extent.StartLineNumber+1
+            Ast=$node; Embedded=$embedded; Scope=(Get-SmaLexicalScope $node $sourceIdentity); BodyScope=$sourceIdentity+':'+$node.ScriptBlock.Extent.StartOffset }
+        $project.Units.Add($unit);$project.NodeOwners[$node]=$unit
+        $project.Relationships.Add([pscustomobject]@{Kind='ScriptBlockValue';Identity=$unit.Identity;Container=$node.Parent;Ast=$node;Resolution='Invocation requires a consumer or runtime observation'})
+    }
+    # An authored ScriptMethod is a closure attached by a command, not a CLR class method. Record the
+    # attachment separately: a matching member spelling never establishes which object receives a call.
+    foreach($command in $ast.FindAll({$args[0] -is [System.Management.Automation.Language.CommandAst]},$true)){
+        if($command.GetCommandName() -ine 'Add-Member'){continue}
+        $arguments=@{}; $elements=$command.CommandElements
+        for($i=1;$i -lt $elements.Count;$i++){
+            if($elements[$i] -isnot [System.Management.Automation.Language.CommandParameterAst]){continue}
+            $parameter=$elements[$i]; $value=$parameter.Argument
+            if($null -eq $value -and $i+1 -lt $elements.Count -and $elements[$i+1] -isnot [System.Management.Automation.Language.CommandParameterAst]){$i++;$value=$elements[$i]}
+            $arguments[$parameter.ParameterName]=$value
+        }
+        $memberType=$arguments['MemberType'];$memberName=$arguments['Name'];$body=$arguments['Value']
+        if($memberType -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -or $memberType.Value -ine 'ScriptMethod' -or
+            $memberName -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -or $body -isnot [System.Management.Automation.Language.ScriptBlockExpressionAst]){continue}
+        $receiver=$arguments['InputObject']
+        if($null -eq $receiver -and $command.Parent -is [System.Management.Automation.Language.PipelineAst]){
+            $pipeline=$command.Parent; $index=[Array]::IndexOf($pipeline.PipelineElements,$command)
+            if($index -gt 0){$receiver=$pipeline.PipelineElements[$index-1]}
+        }
+        $project.Relationships.Add([pscustomobject]@{Kind='ScriptMethodDefinition';Name=$memberName.Value;ValueIdentity=$project.NodeOwners[$body].Identity
+            ReceiverAst=$receiver;Ast=$command;File=$relative;Line=$command.Extent.StartLineNumber+$lineOffset
+            Resolution='Authored attachment; command resolution, receiver identity and later invocation require binding or observation'})
+    }
+    foreach($assignment in $ast.FindAll({$args[0] -is [System.Management.Automation.Language.AssignmentStatementAst]},$true)){
+        if($assignment.Left -isnot [System.Management.Automation.Language.VariableExpressionAst]){continue}
+        $table=$assignment.Right.Find({$args[0] -is [System.Management.Automation.Language.HashtableAst]},$false)
+        if($null -eq $table){continue}
+        foreach($pair in $table.KeyValuePairs){
+            $value=$pair.Item2.Find({$args[0] -is [System.Management.Automation.Language.ScriptBlockExpressionAst]},$false)
+            if($value -and $pair.Item1 -is [System.Management.Automation.Language.StringConstantExpressionAst]){
+                $project.Relationships.Add([pscustomobject]@{Kind='DispatchTableEntry';Table=$assignment.Left.VariablePath.UserPath;Key=$pair.Item1.Value
+                    ValueIdentity=$project.NodeOwners[$value].Identity;Ast=$pair.Item2;File=$relative;Line=$pair.Item1.Extent.StartLineNumber+$lineOffset;Resolution='Declared mapping; selector and invocation remain separate facts'})
+            }
+        }
+    }
+    foreach ($node in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.ParameterAst] -or $args[0] -is [System.Management.Automation.Language.VariableExpressionAst] -or $args[0] -is [System.Management.Automation.Language.TypeExpressionAst] -or $args[0] -is [System.Management.Automation.Language.TypeConstraintAst] }, $true)) {
+        $scope = Get-SmaLexicalScope $node $sourceIdentity
+        $record = [pscustomobject]@{ Name = ''; Kind = $node.GetType().Name; Scope = $scope; File = $relative; Line = $node.Extent.StartLineNumber + $lineOffset; Ast = $node; Type = '' }
+        if ($node -is [System.Management.Automation.Language.ParameterAst]) {
+            $record.Name = $node.Name.VariablePath.UserPath; $record.Type = $node.StaticType.FullName
+            $project.Parameters.Add($record); $project.Symbols.Add($record)
+        } elseif ($node -is [System.Management.Automation.Language.VariableExpressionAst]) {
+            $record.Name = $node.VariablePath.UserPath
+            if ($node.Parent -is [System.Management.Automation.Language.ConvertExpressionAst]) { $record.Type = $node.Parent.Type.TypeName.FullName }
+            $project.Variables.Add($record); $project.Symbols.Add($record)
+        } else { $record.Name = $node.TypeName.FullName; $project.TypeReferences.Add($record) }
+    }
+    foreach ($node in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] -or $args[0] -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -or $args[0] -is [System.Management.Automation.Language.UsingStatementAst] }, $true)) {
+        $owner = Get-SmaOwner $node $project $sourceIdentity
+        $edge = [SmaEdge]@{ From = $owner.Name; FromIdentity = $owner.Identity; Scope = (Get-SmaLexicalScope $node $sourceIdentity)
+            File = $relative; Line = $node.Extent.StartLineNumber + $lineOffset; Ast = $node; Reason = 'Target requires binding or runtime observation.' }
+        if ($node -is [System.Management.Automation.Language.CommandAst]) {
+            $edge.Kind = 'command'; $edge.To = $node.GetCommandName()
+            if (-not $edge.To) { $edge.To = $node.CommandElements[0].Extent.Text; $edge.Kind = 'dynamic-command' }
+            if ($node.InvocationOperator -eq 'Dot') { $edge.Kind = 'dot-source' }
+            if ($edge.To -in 'Import-Module','Add-Type','Invoke-Expression') { $edge.Kind = 'import-or-evaluation' }
+            if ($owner.Kind -eq 'script') { $project.EntryCalls.Add($edge) }
+        } elseif ($node -is [System.Management.Automation.Language.UsingStatementAst]) {
+            $edge.Kind = 'using'; $edge.To = $node.Name.Value
+        } else {
+            $memberName = if ($node.Member -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $node.Member.Value } else { $node.Member.Extent.Text }
+            $edge.To = $memberName; $edge.Kind = 'member'
+            if ($node.Static -and $node.Expression -is [System.Management.Automation.Language.TypeExpressionAst]) {
+                $edge.To = $node.Expression.TypeName.FullName + '.' + $memberName; $edge.Kind = 'static'
+            } elseif ($node.Expression -is [System.Management.Automation.Language.VariableExpressionAst] -and $node.Expression.VariablePath.UserPath -ieq 'this' -and $owner.Class) {
+                $edge.To = $owner.Class + '.' + $memberName; $edge.Kind = 'this-member'
+            }
+            if ($memberName -in 'GetMethod','GetProperty','GetField','GetMember','GetType','CreateDelegate') {
+                $edge.Kind = 'reflection'; $edge.Reason = 'Reflection receiver and overload are not established.'
+                if($node.Arguments.Count -and $node.Arguments[0] -is [System.Management.Automation.Language.StringConstantExpressionAst]){$edge.To=$node.Arguments[0].Value}
+            }
+            if ($memberName -in 'Invoke','DynamicInvoke') { $edge.Kind = 'delegate-or-reflection'; $edge.Reason = 'Callable value is not established.' }
+        }
+        $project.Edges.Add($edge)
+    }
+}
+
+function Resolve-SmaEdges($project) {
+    $functions = @{}; $methods = @{}
+    foreach ($unit in $project.Units) {
+        if ($unit.Kind -eq 'function') { $index = $functions; $key = $unit.Scope + '|' + $unit.Name }
+        elseif ($unit.Kind -eq 'method') { $index = $methods; $key = $unit.File + '|' + $unit.Name }
+        else { continue }
+        if (-not $index.ContainsKey($key)) { $index[$key] = [Collections.Generic.List[SmaUnit]]::new() }
+        $index[$key].Add($unit)
+    }
+    # Never turn a short member spelling into a class method edge. Only explicit local static/this receivers bind here.
+    foreach ($edge in $project.Edges) {
+        $candidates = @()
+        if ($edge.Kind -eq 'command') {
+            $cursor = $edge.Ast.Parent
+            while ($cursor) {
+                if ($cursor -is [System.Management.Automation.Language.ScriptBlockAst]) {
+                    # Scope identities already include the secondary source identity.
+                    $prefix = $edge.Scope.Substring(0, $edge.Scope.LastIndexOf(':'))
+                    $scope = $prefix + ':' + $cursor.Extent.StartOffset
+                    $key = $scope + '|' + $edge.To
+                    $candidates = @(if ($functions.ContainsKey($key)) { $functions[$key] })
+                    if ($candidates.Count) { break }
+                }
+                $cursor = $cursor.Parent
+            }
+        } elseif ($edge.Kind -in 'static','this-member') {
+            $key = $edge.File + '|' + $edge.To
+            $candidates = @(if ($methods.ContainsKey($key)) { $methods[$key] })
+        }
+        if ($candidates.Count -eq 1) { $edge.ToIdentity = $candidates[0].Identity; $edge.To = $candidates[0].Name; $edge.Resolution = 'Bound'; $edge.Reason = 'Unique declaration in lexical scope; static relationship, not an execution observation.' }
+        elseif ($candidates.Count -gt 1) { $edge.Reason = 'Multiple declarations or overloads; binding not established.' }
+    }
+    foreach ($group in $project.Units | Where-Object Kind -in 'function','class' | Group-Object Scope,Name) {
+        if ($group.Count -gt 1) { $project.Diagnostics.Add([pscustomobject]@{ Rule = 'DuplicateDeclaration'; File = $group.Group[0].File; Line = $group.Group[0].Line; Nodes = $group.Group; Detail = 'Case-insensitive declarations share a lexical scope.' }) }
+    }
+    foreach ($group in $project.Symbols | Group-Object Scope,{ $_.Name.ToLowerInvariant() }) {
+        $spellings = @($group.Group.Name | Sort-Object -Unique -CaseSensitive)
+        if ($spellings.Count -gt 1) { $project.Diagnostics.Add([pscustomobject]@{ Rule = 'CaseFoldSymbol'; File = $group.Group[0].File; Line = $group.Group[0].Line; Nodes = $group.Group; Detail = 'One PowerShell variable has multiple authored casings: ' + ($spellings -join ', ') }) }
+        $types = @($group.Group.Type | Where-Object { $_ -and $_ -ne 'System.Object' } | Sort-Object -Unique)
+        if ($types.Count -gt 1) { $project.Diagnostics.Add([pscustomobject]@{ Rule='MultipleVariableTypes'; File=$group.Group[0].File; Line=$group.Group[0].Line; Nodes=$group.Group; Detail='One lexical variable has multiple declared types; inspect conversions: '+($types -join ', ') }) }
+    }
+}
+
+function Get-SmaSourceFiles([string] $root) {
+    if ([IO.Directory]::Exists((Join-Path $root '.git'))) {
+        git -C $root ls-files --cached --others --exclude-standard -- '*.ps1' '*.psm1' 2>$null | Sort-Object -Unique
+    } else {
+        # SMA hosts retained third-party sources and evidence. Its own authored project is the root script.
+        Get-ChildItem -LiteralPath $root -File | Where-Object Extension -in '.ps1','.psm1' | ForEach-Object Name
+    }
+}
+
+function Get-SmaEncodedSourceOrigins($Ast, [string]$SourceIdentity) {
+    $assignments=@($Ast.FindAll({$args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and $args[0].Left -is [System.Management.Automation.Language.VariableExpressionAst]},$true))
+    $unwrap={param($node)
+        while($true){
+            if($node -is [System.Management.Automation.Language.CommandExpressionAst]){$node=$node.Expression;continue}
+            if($node -is [System.Management.Automation.Language.PipelineAst] -and $node.PipelineElements.Count -eq 1 -and $node.PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst]){$node=$node.PipelineElements[0].Expression;continue}
+            if($node -is [System.Management.Automation.Language.ParenExpressionAst]){$node=$node.Pipeline;continue}
+            return $node
+        }
+    }
+    $resolve={param($variable,[int]$before)
+        if($variable -isnot [System.Management.Automation.Language.VariableExpressionAst]){return $null}
+        $scope=Get-SmaLexicalScope $variable $SourceIdentity
+        $matches=@($assignments | Where-Object { $_.Left.VariablePath.UserPath -ieq $variable.VariablePath.UserPath -and $_.Extent.EndOffset -le $before -and (Get-SmaLexicalScope $_.Left $SourceIdentity) -eq $scope })
+        # Require one preceding write in a sequential block enclosing its use. A sibling conditional write does not qualify.
+        if($matches.Count -ne 1){return $null}
+        $cursor=$variable.Parent;$enclosing=$false
+        while($cursor){if([object]::ReferenceEquals($matches[0].Parent,$cursor)){$enclosing=$true;break};$cursor=$cursor.Parent}
+        if(-not $enclosing){return $null}
+        return & $unwrap $matches[0].Right
+    }
+    foreach($command in $Ast.FindAll({$args[0] -is [System.Management.Automation.Language.CommandAst]},$true)){
+        if($command.GetCommandName() -notin 'powershell','powershell.exe','pwsh','pwsh.exe'){continue}
+        for($i=1;$i -lt $command.CommandElements.Count;$i++){
+            $parameter=$command.CommandElements[$i]
+            if($parameter -isnot [System.Management.Automation.Language.CommandParameterAst] -or $parameter.ParameterName -ine 'EncodedCommand'){continue}
+            $argument=$parameter.Argument
+            if($null -eq $argument -and $i+1 -lt $command.CommandElements.Count){$argument=$command.CommandElements[$i+1]}
+            $encoding=& $resolve $argument $command.Extent.StartOffset
+            if($encoding -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst] -or -not $encoding.Static -or $encoding.Expression -isnot [System.Management.Automation.Language.TypeExpressionAst] -or $encoding.Expression.TypeName.GetReflectionType() -ne [Convert] -or $encoding.Member.Value -ine 'ToBase64String' -or $encoding.Arguments.Count -ne 1){continue}
+            $getBytes=$encoding.Arguments[0]
+            if($getBytes -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst] -or $getBytes.Member.Value -ine 'GetBytes' -or $getBytes.Arguments.Count -ne 1){continue}
+            $unicode=$getBytes.Expression
+            if($unicode -isnot [System.Management.Automation.Language.MemberExpressionAst] -or -not $unicode.Static -or $unicode.Expression -isnot [System.Management.Automation.Language.TypeExpressionAst] -or $unicode.Expression.TypeName.GetReflectionType() -ne [Text.Encoding] -or $unicode.Member.Value -ine 'Unicode'){continue}
+            $literal=& $resolve $getBytes.Arguments[0] $encoding.Extent.StartOffset
+            if($literal -is [System.Management.Automation.Language.StringConstantExpressionAst]){
+                [pscustomobject]@{Literal=$literal;Consumer=$command;Transform='UTF-16LE then Base64';Target=$command.GetCommandName();Boundary='PowerShellEncodedCommandSource'}
+            }
+        }
+    }
+}
+function Get-SmaDescription([string] $root) {
+    $root = [IO.Path]::GetFullPath($root)
+    $project = [SmaProject]::new(); $project.Root = $root; $project.DescribedUtc = [DateTime]::UtcNow
+    if ([IO.Directory]::Exists((Join-Path $root '.git'))) { $project.Commit = (git -C $root rev-parse HEAD 2>$null) }
+    # Tracked and untracked-but-not-ignored PowerShell files: a working directory's whole source.
+    $project.Files = @(Get-SmaSourceFiles $root)
+    foreach ($relative in $project.Files) {
+        $path = Join-Path $root $relative; $tokens = $errors = $null
+        if(-not [IO.File]::Exists($path)){
+            $project.Sources.Add([SmaSource]@{Identity=$relative+':missing';File=$relative;Boundary='MissingFile';ParseErrors=@('Tracked source is missing.');Provenance=$project.Commit})
+            $project.Diagnostics.Add([pscustomobject]@{Rule='MissingSource';File=$relative;Line=0;Detail='Tracked source is missing; relevant scope is incomplete.'})
+            continue
+        }
+        try {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+            $hash = (Get-FileHash -LiteralPath $path).Hash
+        } catch {
+            $project.Sources.Add([SmaSource]@{Identity=$relative+':unreadable';File=$relative;Boundary='UnreadableSource';ParseErrors=@($_);Provenance=$project.Commit})
+            $project.Diagnostics.Add([pscustomobject]@{Rule='UnreadableSource';File=$relative;Line=0;Detail=$_.Exception.Message;Error=$_})
+            continue
+        }
+        $identity = $relative + ':' + $hash
+        $project.Sources.Add([SmaSource]@{ Identity = $identity; File = $relative; Sha256 = $hash; Provenance = $project.Commit
+            Ast = $ast; ParseErrors = @($errors); Boundary = 'PowerShellFile' })
+        foreach ($errorRecord in $errors) { $project.Diagnostics.Add([pscustomobject]@{ Rule = 'ParseFailure'; File = $relative; Line = $errorRecord.Extent.StartLineNumber; Column = $errorRecord.Extent.StartColumnNumber; Detail = $errorRecord.Message; Ast = $errorRecord.Extent }) }
+        Add-SmaDescribedSource $project $relative $ast $false 0 $identity
+        $encodedOrigins=@(Get-SmaEncodedSourceOrigins $ast $identity)
+        foreach($origin in $encodedOrigins){$project.Relationships.Add([pscustomobject]@{Kind='ExecutableSourceBoundary';File=$relative;Line=$origin.Literal.Extent.StartLineNumber;Source=$origin.Literal;Consumer=$origin.Consumer;Transform=$origin.Transform;Target=$origin.Target;Resolution='Structurally established source construction; execution not observed'})}
+        # String literals long enough to be source: parse each; PowerShell with definitions is Embedded, the rest Foreign.
+        $literals=@($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $args[0].Value.Length -ge 400 -and $args[0].Value.Contains("`n") }, $true))
+        foreach($origin in $encodedOrigins){if(-not @($literals | Where-Object {[object]::ReferenceEquals($_,$origin.Literal)}).Count){$literals+= $origin.Literal}}
+        foreach ($literal in $literals) {
+            $innerTokens = $innerErrors = $null
+            $inner = [System.Management.Automation.Language.Parser]::ParseInput($literal.Value, [ref]$innerTokens, [ref]$innerErrors)
+            $definitions = @($inner.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -or $args[0] -is [System.Management.Automation.Language.TypeDefinitionAst] }, $true)).Count
+            $holder = $literal.Parent; while ($null -ne $holder -and $holder -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $holder = $holder.Parent }
+            $record = [pscustomobject]@{ File = $relative; Line = $literal.Extent.StartLineNumber; EndLine = $literal.Extent.EndLineNumber; Characters = $literal.Value.Length; Text = $literal.Value
+                HeldBy = $(if ($holder) { $holder.Name } else { '<script>' }); Definitions = $definitions; ParseErrors = $innerErrors.Count
+                Ast = $inner; Container = $literal; Boundary = 'UnclassifiedMultilineLiteral'
+                UnresolvedTypes = @($innerErrors | Where-Object ErrorId -eq 'TypeNotFound' | ForEach-Object { $_.Extent.Text.Trim('[', ']') } | Sort-Object -Unique) }
+            $nonTypeErrors = @($innerErrors | Where-Object ErrorId -ne 'TypeNotFound').Count
+            $encoded=@($encodedOrigins | Where-Object {[object]::ReferenceEquals($_.Literal,$literal)})
+            if (($definitions -gt 0 -and $nonTypeErrors -eq 0) -or $encoded.Count) {
+                $record.Boundary = if($encoded.Count){'PowerShellEncodedCommandSource'}else{'PowerShellSyntaxCandidate'}
+                $project.Embedded.Add($record)
+                $innerHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($literal.Value)))
+                $innerIdentity = $identity + ':literal:' + $literal.Extent.StartOffset
+                $project.Sources.Add([SmaSource]@{ Identity = $innerIdentity; File = $relative; Sha256 = $innerHash; Ast = $inner
+                    ParseErrors = @($innerErrors); Embedded = $true; Container = $literal; ParentIdentity = $identity; Boundary = $record.Boundary })
+                $offset=$literal.Extent.StartLineNumber-1
+                if($literal.StringConstantType -in 'SingleQuotedHereString','DoubleQuotedHereString'){$offset++}
+                Add-SmaDescribedSource $project $relative $inner $true $offset $innerIdentity
+            } else { $project.Foreign.Add($record) }
+        }
+        try { foreach ($finding in @(Get-SmaLint $path)) { $finding.File = $relative; $project.Lint.Add($finding) } }
+        catch { $project.Diagnostics.Add([pscustomobject]@{ Rule='LintFailure'; File=$relative; Line=0; Detail=$_.Exception.Message; Error=$_ }) }
+    }
+    Resolve-SmaEdges $project
+    $project
+}
+
+function Compare-SmaRuntimeGraph($Before, $After) {
+    $leftToRight = [Collections.Generic.Dictionary[object,object]]::new([Collections.Generic.ReferenceEqualityComparer]::Instance)
+    $rightToLeft = [Collections.Generic.Dictionary[object,object]]::new([Collections.Generic.ReferenceEqualityComparer]::Instance)
+    $differences = [Collections.Generic.List[string]]::new()
+    $compare = {
+        param($left, $right, [string] $path)
+        if ($null -eq $left -or $null -eq $right) { if (-not [object]::ReferenceEquals($left,$right)) { $differences.Add($path + ': null mismatch') }; return }
+        $leftType = $left.GetType(); $rightType = $right.GetType()
+        if ($leftType.Name -cne $rightType.Name) { $differences.Add($path + ': type mismatch'); return }
+        if ($leftType.IsPrimitive -or $left -is [string] -or $left -is [decimal] -or $leftType.IsEnum) {
+            if (-not $left.Equals($right)) { $differences.Add($path + ': value mismatch') }; return
+        }
+        if (-not $leftType.IsValueType) {
+            if ($leftToRight.ContainsKey($left)) { if (-not [object]::ReferenceEquals($leftToRight.get_Item($left),$right)) { $differences.Add($path + ': shared reference changed') }; return }
+            if ($rightToLeft.ContainsKey($right)) { $differences.Add($path + ': distinct references merged'); return }
+            $leftToRight.Add($left,$right); $rightToLeft.Add($right,$left)
+        }
+        if ($left -is [Collections.IEnumerable]) {
+            $leftItems = @($left); $rightItems = @($right)
+            if ($leftItems.Count -ne $rightItems.Count) { $differences.Add($path + ': collection length changed'); return }
+            for ($i=0; $i -lt $leftItems.Count; $i++) { & $compare $leftItems[$i] $rightItems[$i] ($path + '[' + $i + ']') }
+            return
+        }
+        $fields = $leftType.GetFields([Reflection.BindingFlags]'Instance,Public')
+        foreach ($field in $fields) {
+            $otherField = $rightType.GetField($field.Name)
+            if ($null -eq $otherField) { $differences.Add($path + ': missing field ' + $field.Name); continue }
+            & $compare ($field.GetValue($left)) ($otherField.GetValue($right)) ($path + '.' + $field.Name)
+        }
+        if (-not $fields.Count) {
+            foreach ($property in $leftType.GetProperties([Reflection.BindingFlags]'Instance,Public') | Where-Object { $_.CanRead -and -not $_.GetIndexParameters().Count }) {
+                $otherProperty = $rightType.GetProperty($property.Name)
+                if ($null -eq $otherProperty) { $differences.Add($path + ': missing property ' + $property.Name); continue }
+                & $compare ($property.GetValue($left)) ($otherProperty.GetValue($right)) ($path + '.' + $property.Name)
+            }
+        }
+    }
+    & $compare $Before $After '$'
+    [pscustomobject]@{ PSTypeName='Sma.RuntimeGraphComparison'; Equal=($differences.Count -eq 0); ReferencePairs=$leftToRight.Count; Differences=$differences.ToArray() }
+}
+
+function Invoke-SmaObservedOperation($Project, [string] $Name, [scriptblock] $Operation, [object[]] $Arguments=@()) {
+    $watch=[Diagnostics.Stopwatch]::StartNew()
+    try {
+        $result=& $Operation @Arguments
+        $Project.Observations.Add([pscustomobject]@{ Name=$Name; Ast=$Operation.Ast; StartedUtc=[DateTime]::UtcNow-$watch.Elapsed
+            WallMilliseconds=$watch.Elapsed.TotalMilliseconds; Succeeded=$true; Result=$result; Error=$null; Boundary='Explicit invocation only; no filesystem enforcement.' })
+        return $result
+    } catch {
+        $Project.Observations.Add([pscustomobject]@{ Name=$Name; Ast=$Operation.Ast; WallMilliseconds=$watch.Elapsed.TotalMilliseconds
+            Succeeded=$false; Result=$null; Error=$_; Boundary='Explicit invocation only; no filesystem enforcement.' })
+        throw
+    }
+}
+
+function Test-SmaDescription {
+    $directory = Join-Path $SmaRoot ('store/evidence/sma-fixtures/' + [guid]::NewGuid().ToString('N'))
+    $null = [IO.Directory]::CreateDirectory($directory)
+    git init --quiet $directory
+    if($LASTEXITCODE){throw 'Could not create an independent Git fixture.'}
+    $fixture = @'
+class Unrelated { [void] Add([int] $value) {} }
+function Entry { $list = [Collections.Generic.List[int]]::new(); $list.Add(1); $target.GetMethod('Ghost').Invoke($null,@()); & $dispatch; Local }
+function Local { $Value = 1; $value += 2 }
+function Duplicate { 'first' }
+function DUPLICATE { 'second' }
+function Outer { function Local { 'nested' }; Local }
+$unused = { Never }
+function Never { 'unused closure target' }
+function Types { [int]$slot=1; [string]$SLOT='other' }
+function ParameterScope([int]$Token) { $token += 1 }
+function OtherParameterScope([string]$TOKEN) { $TOKEN }
+$firstObject | Add-Member -MemberType ScriptMethod -Name Evaluate -Value { FirstMethodTarget }
+Add-Member -InputObject $secondObject -MemberType ScriptMethod -Name Evaluate -Value { SecondMethodTarget }
+$thirdObject | Add-Member -MemberType ScriptMethod -Name $unknownName -Value { UnknownMethodTarget }
+$fourthObject | Add-Member -MemberType NoteProperty -Name Evaluate -Value 7
+$firstObject.Evaluate(); $secondObject.Evaluate(); $unrelatedObject.Evaluate()
+$payloadForFixture = 'Write-Output "inert parser fixture"'
+$transportForFixture = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payloadForFixture))
+powershell.exe -EncodedCommand $transportForFixture
+if ($flag) { $conditionalPayload = 'Write-Output "conditional parser fixture"' }
+$conditionalTransport = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($conditionalPayload))
+powershell.exe -EncodedCommand $conditionalTransport
+Entry
+'@
+    [IO.File]::WriteAllText((Join-Path $directory 'untracked.ps1'), $fixture)
+    $project = Get-SmaDescription $directory
+    $checks = [ordered]@{
+        DuplicateDeclarations = @($project.Diagnostics | Where-Object Rule -eq 'DuplicateDeclaration').Count -eq 1
+        CaseFoldSymbols = @($project.Diagnostics | Where-Object Rule -eq 'CaseFoldSymbol').Count -ge 1
+        ScriptDispatch = $project.Path('<script>untracked.ps1','Entry').Count -eq 2
+        NoInventedMemberEdge = $project.Path('Entry','Unrelated.Add').Count -eq 0
+        ReflectionUnresolved = @($project.Edges | Where-Object { $_.Kind -eq 'reflection' -and $_.Resolution -ne 'Unresolved' }).Count -eq 0
+        DynamicUnresolved = @($project.Edges | Where-Object { $_.Kind -eq 'dynamic-command' -and $_.Resolution -eq 'Unresolved' }).Count -eq 1
+        AbsenceLimited = $project.Absent('UnexaminedTarget','Execution').Status -eq 'Unknown'
+        DeclarationAbsence = $project.Absent('Ghost','Declarations').Status -eq 'NotFoundWithinScope'
+        LiveAstRetained = $project.Sources[0].Ast -is [System.Management.Automation.Language.ScriptBlockAst]
+        LocalSourceIncluded = $project.Files -contains 'untracked.ps1'
+        ClosureNotExecutedByContainment = $project.Path('<script>untracked.ps1','Never').Count -eq 0
+        LexicalBinding = @($project.Edges | Where-Object { $_.From -eq 'Outer' -and $_.To -eq 'Local' -and $_.Resolution -eq 'Bound' -and $_.ToIdentity -eq @($project.Units | Where-Object { $_.Name -eq 'Local' -and $_.Scope -eq @($project.Units | Where-Object Name -eq 'Outer')[0].BodyScope })[0].Identity }).Count -eq 1
+        VariableTypeConflicts = @($project.Diagnostics | Where-Object Rule -eq 'MultipleVariableTypes').Count -ge 1
+        EncodedSourceEstablishedStructurally = @($project.Relationships | Where-Object Kind -eq 'ExecutableSourceBoundary').Count -eq 1
+        ShortExecutableInputRetained = @($project.Sources | Where-Object Boundary -eq 'PowerShellEncodedCommandSource').Count -eq 1
+        InlineParameterScope = @($project.Diagnostics | Where-Object { $_.Rule -eq 'CaseFoldSymbol' -and $_.Nodes[0].Scope -eq @($project.Units | Where-Object Name -eq 'ParameterScope')[0].BodyScope }).Count -eq 1
+        IndependentParameterScopes = @($project.Diagnostics | Where-Object { $_.Rule -eq 'MultipleVariableTypes' -and @($_.Nodes | Where-Object Name -ieq 'Token').Count }).Count -eq 0
+        ScriptMethodAttachments = @($project.Relationships | Where-Object Kind -eq 'ScriptMethodDefinition').Count -eq 2
+        ScriptMethodReceiversRetained = @($project.Relationships | Where-Object { $_.Kind -eq 'ScriptMethodDefinition' -and $null -ne $_.ReceiverAst -and $_.ValueIdentity }).Count -eq 2
+        ScriptMethodCallsRemainUnresolved = @($project.Edges | Where-Object { $_.To -eq 'Evaluate' -and $_.Resolution -eq 'Unresolved' }).Count -eq 3
+    }
+    [IO.File]::AppendAllText((Join-Path $directory 'untracked.ps1'), "`n# source revision")
+    $checks.SourceInvalidation = $project.Changes().Count -eq 1
+    [IO.File]::WriteAllText((Join-Path $directory 'broken.ps1'),'function Broken { 1 + }')
+    $broken=Get-SmaDescription $directory
+    $checks.ParsePositions = @($broken.Diagnostics | Where-Object { $_.Rule -eq 'ParseFailure' -and $_.Line -eq 1 -and $_.Column -gt 0 }).Count -gt 0
+    $checks.ParseFailureLimitsAbsence = $broken.Absent('UnseenDeclaration','Declarations').Status -eq 'Unknown'
+    $shared=[int[]]@(4,5);$copy=[int[]]@(4,5)
+    $checks.GraphSharedReferences = (Compare-SmaRuntimeGraph ([object[]]@($shared,$shared)) ([object[]]@($copy,$copy))).Equal
+    $checks.GraphSplitReferencesRejected = -not (Compare-SmaRuntimeGraph ([object[]]@($shared,$shared)) ([object[]]@([int[]]@(4,5),[int[]]@(4,5)))).Equal
+    foreach ($key in $checks.Keys) {
+        [pscustomobject]@{ Test = $key; Passed = [bool]$checks[$key]; Evidence = $directory }
+    }
+    if ($checks.Values -contains $false) { throw 'SMA independent structural fixture failed.' }
+}
+
+
 # Validate the invocation before parsing source or constructing an assembly.
 if (-not $Help) {
     switch ($Mode) {
@@ -115,6 +1039,56 @@ if (-not $Help) {
 # Class name -> mirror type for the classes being compiled together; set by
 # Export-LoweredAssembly for the duration of one compilation.
 $script:LoweringClassTypes = @{}
+
+# Keyword name -> its declaring method, for one compilation.
+$script:LoweringKeywords = @{}
+
+# A class in the source deriving from System.Attribute is a marker for other members, not code to compile.
+function Test-AttributeClass([System.Management.Automation.Language.TypeDefinitionAst] $Class) {
+    $Class.BaseTypes.Count -eq 1 -and (Resolve-AstType $Class.BaseTypes[0].TypeName) -eq [Attribute]
+}
+
+# The source declares its own keywords: a static method marked [Keyword()], where Keyword is an attribute
+# class in the same source. The method's name is the keyword; its first parameter, a [string], receives the
+# statement's name; its further typed parameters are the statement's properties. A keyword with properties
+# takes a property table, 'register A { Bits = 8 }'; one without takes a script body, 'lower A { ... }'.
+function Get-LoweringKeywords([System.Management.Automation.Language.Ast] $Root) {
+    $markers = @($Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass -and $n.Name -eq 'Keyword' }, $true) | Where-Object { Test-AttributeClass $_ })
+    if ($markers.Count -eq 0) { return }
+    $marked = $Root.FindAll({
+        param($n)
+        $n -is [System.Management.Automation.Language.FunctionMemberAst] -and
+        @($n.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.AttributeAst] -and $_.TypeName.Name -eq 'Keyword' }).Count -gt 0
+    }, $true)
+    foreach ($method in $marked) {
+        $parameters = @($method.Parameters)
+        $first = if ($parameters.Count) { $parameters[0].Attributes | Where-Object { $_ -is [System.Management.Automation.Language.TypeConstraintAst] } | Select-Object -First 1 }
+        if (-not $method.IsStatic -or -not $first -or (Resolve-AstType $first.TypeName) -ne [string]) {
+            throw "[{0}:{1}] Keyword method '{2}' must be static and take the statement's name as its first parameter, a [string]." -f $method.Extent.StartLineNumber, $method.Extent.StartColumnNumber, $method.Name
+        }
+        [pscustomobject]@{ Name = $method.Name; Class = $method.Parent.Name; Method = $method; Properties = @($parameters | Select-Object -Skip 1) }
+    }
+}
+
+# Teaches SMA's own parser the keywords (DynamicKeyword), so the source parses to typed
+# DynamicKeywordStatementAst nodes. The caller pops the keywords after parsing.
+function Enter-LoweringKeywords([object[]] $Definitions) {
+    [System.Management.Automation.Language.DynamicKeyword]::Push()
+    foreach ($definition in $Definitions) {
+        $keyword = [System.Management.Automation.Language.DynamicKeyword]::new()
+        $keyword.Keyword = $definition.Name
+        $keyword.NameMode = [System.Management.Automation.Language.DynamicKeywordNameMode]::NameRequired
+        $keyword.BodyMode = if ($definition.Properties.Count) { [System.Management.Automation.Language.DynamicKeywordBodyMode]::Hashtable } else { [System.Management.Automation.Language.DynamicKeywordBodyMode]::ScriptBlock }
+        foreach ($parameter in $definition.Properties) {
+            $constraint = $parameter.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.TypeConstraintAst] } | Select-Object -First 1
+            $property = [System.Management.Automation.Language.DynamicKeywordProperty]::new()
+            $property.Name = $parameter.Name.VariablePath.UserPath
+            $property.TypeConstraint = $constraint.TypeName.FullName
+            $keyword.Properties.Add($property.Name, $property)
+        }
+        [System.Management.Automation.Language.DynamicKeyword]::AddKeyword($keyword)
+    }
+}
 
 function Resolve-AstType {
     <#
@@ -248,7 +1222,7 @@ function Test-AstAdmitted {
         param($node)
         $node -is [System.Management.Automation.Language.CommandAst] -or
         ($node -is [System.Management.Automation.Language.PipelineAst] -and $node.PipelineElements.Count -gt 1) -or
-        $node -is [System.Management.Automation.Language.ScriptBlockExpressionAst] -or
+        ($node -is [System.Management.Automation.Language.ScriptBlockExpressionAst] -and $node.Parent -isnot [System.Management.Automation.Language.DynamicKeywordStatementAst]) -or
         $node -is [System.Management.Automation.Language.ExpandableStringExpressionAst]
     }, $true)
 
@@ -523,13 +1497,20 @@ function New-ClassMirror {
         maps each mirror member to the output assembly's member.
         Registers the mirror types for Resolve-AstType.
     #>
-    param([Parameter(Mandatory)][object[]] $Model)
+    param([Parameter(Mandatory)][object[]] $Model, [System.Management.Automation.Language.TypeDefinitionAst[]] $Enums = @())
 
     $name = [Reflection.AssemblyName]::new("PSLoweringMirror$([Guid]::NewGuid().ToString('N'))")
     $assembly = [Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly($name, [Reflection.Emit.AssemblyBuilderAccess]::RunAndCollect)
     $module = $assembly.DefineDynamicModule($name.Name)
     $notSupported = [NotSupportedException].GetConstructor([Type[]]@())
     $objectCtor = [object].GetConstructor([Type[]]@())
+
+    # Enums declared in the source are real enums here, before any class names them.
+    foreach ($enumAst in $Enums) {
+        $enumBuilder = $module.DefineEnum($enumAst.Name, [Reflection.TypeAttributes]::Public, (Get-EnumUnderlyingType $enumAst))
+        foreach ($literal in (Get-EnumLiterals $enumAst)) { $null = $enumBuilder.DefineLiteral($literal.Name, $literal.Value) }
+        $script:LoweringClassTypes[$enumAst.Name] = $enumBuilder.CreateType()
+    }
 
     $builders = [ordered]@{}
     foreach ($c in $Model) {
@@ -580,8 +1561,26 @@ function New-ClassMirror {
         $script:LoweringClassTypes[$c.Name] = $builders[$c.Name].CreateType()
     }
     $types = [ordered]@{}
+    foreach ($enumAst in $Enums) { $types[$enumAst.Name] = $script:LoweringClassTypes[$enumAst.Name] }
     foreach ($c in $Model) { $types[$c.Name] = $script:LoweringClassTypes[$c.Name] }
     $types
+}
+
+# An enum's underlying type: its declared base, or Int32.
+function Get-EnumUnderlyingType([System.Management.Automation.Language.TypeDefinitionAst] $EnumAst) {
+    if ($EnumAst.BaseTypes.Count) { return Resolve-AstType $EnumAst.BaseTypes[0].TypeName }
+    [int]
+}
+
+# An enum's members and values, numbered as PowerShell numbers them: a member without a value is the previous one plus one.
+function Get-EnumLiterals([System.Management.Automation.Language.TypeDefinitionAst] $EnumAst) {
+    $underlying = Get-EnumUnderlyingType $EnumAst
+    [long] $next = 0
+    foreach ($member in $EnumAst.Members) {
+        $value = if ($member.InitialValue) { [long]$member.InitialValue.SafeGetValue() } else { $next }
+        $next = $value + 1
+        [pscustomobject]@{ Name = $member.Name; Value = [Convert]::ChangeType($value, $underlying) }
+    }
 }
 
 $script:ClassMirrorCache = [System.Runtime.CompilerServices.ConditionalWeakTable[object, hashtable]]::new()
@@ -597,9 +1596,10 @@ function Use-ClassMirror {
     while ($root.Parent) { $root = $root.Parent }
     $types = $null
     if (-not $script:ClassMirrorCache.TryGetValue($root, [ref]$types)) {
-        $classes = @($root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true))
+        $classes = @($root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true) | Where-Object { -not (Test-AttributeClass $_) })
+        $enums = @($root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsEnum }, $true))
         $script:LoweringClassTypes = @{}
-        $mirror = New-ClassMirror -Model @(Get-ClassModel -ClassAsts $classes)
+        $mirror = New-ClassMirror -Model @(Get-ClassModel -ClassAsts $classes) -Enums $enums
         $types = @{}
         foreach ($name in $mirror.Keys) { $types[$name] = $mirror[$name] }
         $script:ClassMirrorCache.Add($root, $types)
@@ -783,6 +1783,18 @@ function New-PowerShellArrayIndex {
     [pscustomobject]@{ Setup = $setup; Access = (& $access $Array $adjusted) }
 }
 
+# A type's default indexer (Item) taking one key that the index converts to: exact type first, then any
+# integer-to-integer match. $null when the type has none.
+function Get-KeyIndexer([Type] $Type, [Type] $IndexType) {
+    $candidates = @($Type.GetProperties() | Where-Object { $_.Name -eq 'Item' -and $_.GetIndexParameters().Count -eq 1 })
+    foreach ($property in $candidates) { if ($property.GetIndexParameters()[0].ParameterType.IsAssignableFrom($IndexType)) { return $property } }
+    foreach ($property in $candidates) {
+        $parameterType = $property.GetIndexParameters()[0].ParameterType
+        if ($parameterType -in $script:IntegralTypes -and $IndexType -in $script:IntegralTypes) { return $property }
+    }
+    $null
+}
+
 function Get-IntIndexer([Type] $Type) {
     # The default indexer taking one Int32, on a type that also exposes an Int32 Count (List[T], IList[T]).
     $count = $Type.GetProperty('Count', [Type[]]@())
@@ -822,6 +1834,54 @@ function Convert-AstExpressionAs {
     ConvertTo-PowerShellType -Expression $value -Type $Type
 }
 
+# A PowerShell custom object is an SMA PSObject over PSCustomObject whose members are note properties in the
+# order they were written. Compiled code builds and uses it through SMA's own PSObject API, so its Extended Type
+# System behaviour (ordering, type identity, formatting, later Add-Member) is PowerShell's, not an imitation.
+function New-PowerShellCustomObject {
+    param([Parameter(Mandatory)][System.Management.Automation.Language.HashtableAst] $Table, [Parameter(Mandatory)][hashtable] $Scope)
+    $object = [Linq.Expressions.Expression]::Variable([System.Management.Automation.PSObject], "customObject$($Scope.DeclaredLocals.Count)")
+    $Scope.DeclaredLocals.Add($object)
+    $parts = [System.Collections.Generic.List[Linq.Expressions.Expression]]::new()
+    $parts.Add([Linq.Expressions.Expression]::Assign($object, $script:ExpressionNewMethod.Invoke($null, @([System.Management.Automation.PSObject].GetConstructor([Type[]]@()), [Linq.Expressions.Expression[]]@()))))
+    $noteConstructor = [System.Management.Automation.PSNoteProperty].GetConstructor([Type[]]@([string], [object]))
+    $properties = [Linq.Expressions.Expression]::Property($object, 'Properties')
+    $add = $properties.Type.GetMethod('Add', [Type[]]@([System.Management.Automation.PSPropertyInfo]))
+    foreach ($pair in $Table.KeyValuePairs) {
+        $value = Convert-AstExpression -Node $pair.Item2 -Scope $Scope
+        if ($value.Type -ne [object]) { $value = [Linq.Expressions.Expression]::Convert($value, [object]) }
+        $note = $script:ExpressionNewMethod.Invoke($null, @($noteConstructor, [Linq.Expressions.Expression[]]@([Linq.Expressions.Expression]::Constant([string]$pair.Item1.SafeGetValue()), $value)))
+        $parts.Add([Linq.Expressions.Expression]::Call($properties, $add, [Linq.Expressions.Expression]$note))
+    }
+    $parts.Add($object)
+    [Linq.Expressions.Expression]::Block([System.Management.Automation.PSObject], [Linq.Expressions.Expression[]]$parts.ToArray())
+}
+
+# True when an expression is the intrinsic .PSObject member: PowerShell's view of the wrapper as an ordinary object.
+function Test-PSObjectView([System.Management.Automation.Language.Ast] $Node) {
+    $Node -is [System.Management.Automation.Language.MemberExpressionAst] -and
+    $Node -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst] -and -not $Node.Static -and
+    $Node.Member -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $Node.Member.Value -eq 'PSObject'
+}
+
+# The note property of a PSObject by name: the PSPropertyInfo, or $null when it has none.
+function Get-PowerShellNoteProperty([Linq.Expressions.Expression] $Target, [string] $Name) {
+    $properties = [Linq.Expressions.Expression]::Property($Target, 'Properties')
+    [Linq.Expressions.Expression]::Call($properties, $properties.Type.GetMethod('get_Item', [Type[]]@([string])), [Linq.Expressions.Expression]::Constant($Name))
+}
+
+# $object.Name on a PSObject: the property's value, or $null when it has none (PowerShell outside strict mode).
+function New-PowerShellNotePropertyRead {
+    param([Linq.Expressions.Expression] $Target, [string] $Name, [hashtable] $Scope)
+    $property = [Linq.Expressions.Expression]::Variable([System.Management.Automation.PSPropertyInfo], "noteProperty$($Scope.DeclaredLocals.Count)")
+    $Scope.DeclaredLocals.Add($property)
+    [Linq.Expressions.Expression]::Block([object], [Linq.Expressions.Expression[]]@(
+        [Linq.Expressions.Expression]::Assign($property, (Get-PowerShellNoteProperty $Target $Name)),
+        [Linq.Expressions.Expression]::Condition(
+            [Linq.Expressions.Expression]::Equal($property, [Linq.Expressions.Expression]::Constant($null, [System.Management.Automation.PSPropertyInfo])),
+            [Linq.Expressions.Expression]::Constant($null, [object]),
+            [Linq.Expressions.Expression]::Property($property, 'Value'))))
+}
+
 function New-MemberAccess {
     # $target.Name or [Type]::Name as a field or property expression.
     param([Linq.Expressions.Expression] $Target, [Type] $Type, [string] $Name, [System.Management.Automation.Language.Ast] $Node)
@@ -848,6 +1908,14 @@ function Read-PowerShellClass {
         [ref]$errors
     )
 
+    # Keywords the source declares are taught to SMA's parser, and the source is parsed again with them.
+    $keywords = @(Get-LoweringKeywords $ast)
+    if ($keywords.Count) {
+        Enter-LoweringKeywords $keywords
+        try { $ast = [System.Management.Automation.Language.Parser]::ParseInput($Source, [ref]$tokens, [ref]$errors) }
+        finally { [System.Management.Automation.Language.DynamicKeyword]::Pop() }
+    }
+
     if ($errors -and $errors.Count -gt 0) {
         $messages = ($errors | ForEach-Object { $_.Message }) -join "`n"
         throw "PowerShell syntax parse error:`n$messages"
@@ -856,7 +1924,7 @@ function Read-PowerShellClass {
     $classes = @($ast.FindAll({
         param($n)
         $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass
-    }, $true))
+    }, $true) | Where-Object { -not (Test-AttributeClass $_) })
 
     if ($classes.Count -eq 0) {
         throw 'No class definition found in source.'
@@ -915,6 +1983,17 @@ function Resolve-MatchingMethod {
         if ($match) { return $candidate }
     }
 
+    # 3. The one overload reachable by integer conversion; the call site converts each argument, checked.
+    $reachable = @($all | Where-Object {
+        $params = $_.GetParameters()
+        for ($i = 0; $i -lt $params.Length; $i++) {
+            $wanted = $params[$i].ParameterType
+            if (-not $wanted.IsAssignableFrom($ArgumentTypes[$i]) -and -not ($wanted -in $script:IntegralTypes -and $ArgumentTypes[$i] -in $script:IntegralTypes)) { return $false }
+        }
+        $true
+    })
+    if ($reachable.Count -eq 1) { return $reachable[0] }
+
     throw "Could not resolve method '$MethodName' with argument types ($($ArgumentTypes -join ', ')) on '$($TargetType.FullName)'."
 }
 
@@ -969,6 +2048,32 @@ function Resolve-MatchingMember {
     if ($null -ne $field) { return $field }
 
     throw "Could not resolve property or field '$MemberName' on '$($TargetType.FullName)'."
+}
+
+# Integer promotion as C# defines it (binary numeric promotion): types narrower than Int32 meet in
+# Int32; same signedness meets in the wider type; mixed signedness meets in the narrowest signed type
+# that holds both (Int32 with UInt32 is Int64). A signed type with UInt64 has no common integer type
+# and is rejected. Returns $null when no rule applies.
+function ConvertTo-CommonIntegralOperands {
+    param([Linq.Expressions.Expression] $Left, [Linq.Expressions.Expression] $Right)
+    if ($Left.Type -notin $script:IntegralTypes -or $Right.Type -notin $script:IntegralTypes) { return $null }
+    $size = @{ [sbyte] = 1; [byte] = 1; [short] = 2; [ushort] = 2; [int] = 4; [uint] = 4; [long] = 8; [ulong] = 8 }
+    $signed = { param($type) $type -in [sbyte], [short], [int], [long] }
+    $l = $Left.Type; $r = $Right.Type
+    $common = if ($size[$l] -lt 4 -and $size[$r] -lt 4) { [int] }
+        elseif ((& $signed $l) -eq (& $signed $r)) { if ($size[$l] -ge $size[$r]) { $l } else { $r } }
+        else {
+            $signedType = if (& $signed $l) { $l } else { $r }
+            $unsignedType = if (& $signed $l) { $r } else { $l }
+            if ($size[$signedType] -gt $size[$unsignedType]) { $signedType }
+            elseif ($size[$unsignedType] -lt 4) { [int] }
+            elseif ($size[$unsignedType] -eq 4) { [long] }
+            else { $null }
+        }
+    if ($null -eq $common) { return $null }
+    $convertLeft = if ($Left.Type -eq $common) { $Left } else { [Linq.Expressions.Expression]::Convert($Left, $common) }
+    $convertRight = if ($Right.Type -eq $common) { $Right } else { [Linq.Expressions.Expression]::Convert($Right, $common) }
+    [pscustomobject]@{ Left = $convertLeft; Right = $convertRight }
 }
 
 function Convert-AstExpression {
@@ -1040,6 +2145,55 @@ function Convert-AstExpression {
         }
     }
 
+    # An assignment used as a value ($a = $b = $c) is the value stored.
+    if ($Node -is [System.Management.Automation.Language.AssignmentStatementAst]) {
+        return Convert-AstStatement -Statement $Node -Scope $Scope
+    }
+
+    # if as a value: $x = if ($c) { $a } elseif ($d) { $b } else { $e }, each branch one expression.
+    if ($Node -is [System.Management.Automation.Language.IfStatementAst]) {
+        $branchValue = {
+            param($block)
+            if ($block.Statements.Count -ne 1) {
+                throw "[{0}:{1}] Each branch of an if used as a value must be one expression." -f $block.Extent.StartLineNumber, $block.Extent.StartColumnNumber
+            }
+            Convert-AstExpression -Node $block.Statements[0] -Scope $Scope
+        }
+        if (-not $Node.ElseClause) {
+            throw "[{0}:{1}] An if used as a value needs an else branch." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber
+        }
+        $result = & $branchValue $Node.ElseClause
+        $clauses = @($Node.Clauses)
+        for ($i = $clauses.Count - 1; $i -ge 0; $i--) {
+            $test = Convert-AstExpression -Node $clauses[$i].Item1 -Scope $Scope
+            $whenTrue = & $branchValue $clauses[$i].Item2
+            $widened = ConvertTo-CommonIntegralOperands -Left $whenTrue -Right $result
+            if ($widened) { $whenTrue = $widened.Left; $result = $widened.Right }
+            if ($whenTrue.Type -ne $result.Type) {
+                throw "[{0}:{1}] Branches of an if used as a value require identical types, got '{2}' and '{3}'." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $whenTrue.Type.FullName, $result.Type.FullName
+            }
+            $result = [Linq.Expressions.Expression]::Condition($test, $whenTrue, $result)
+        }
+        return $result
+    }
+
+    # Ternary: $test ? $a : $b. An integer test is true when nonzero, as in PowerShell.
+    if ($Node -is [System.Management.Automation.Language.TernaryExpressionAst]) {
+        $test = Convert-AstExpression -Node $Node.Condition -Scope $Scope
+        if ($test.Type -in $script:IntegralTypes) { $test = [Linq.Expressions.Expression]::NotEqual($test, [Linq.Expressions.Expression]::Constant([Convert]::ChangeType(0, $test.Type), $test.Type)) }
+        if ($test.Type -ne [bool]) {
+            throw "[{0}:{1}] A ternary test must be [bool] or an integer, got '{2}'." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $test.Type.FullName
+        }
+        $whenTrue = Convert-AstExpression -Node $Node.IfTrue -Scope $Scope
+        $whenFalse = Convert-AstExpression -Node $Node.IfFalse -Scope $Scope
+        $widened = ConvertTo-CommonIntegralOperands -Left $whenTrue -Right $whenFalse
+        if ($widened) { $whenTrue = $widened.Left; $whenFalse = $widened.Right }
+        if ($whenTrue.Type -ne $whenFalse.Type) {
+            throw "[{0}:{1}] Ternary arms require identical types, got '{2}' and '{3}'." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $whenTrue.Type.FullName, $whenFalse.Type.FullName
+        }
+        return [Linq.Expressions.Expression]::Condition($test, $whenTrue, $whenFalse)
+    }
+
     # 5. Paren expressions: ( $expr )
     if ($Node -is [System.Management.Automation.Language.ParenExpressionAst]) {
         return Convert-AstExpression -Node $Node.Pipeline -Scope $Scope
@@ -1050,6 +2204,10 @@ function Convert-AstExpression {
     # 6. Type casts: [int]$x or [int[]]@(...)
     if ($Node -is [System.Management.Automation.Language.ConvertExpressionAst]) {
         $targetType = Resolve-AstType $Node.Type.TypeName
+        # [pscustomobject]@{ ... }: a PowerShell custom object, built through SMA's PSObject.
+        if ($targetType -eq [System.Management.Automation.PSObject] -and $Node.Child -is [System.Management.Automation.Language.HashtableAst]) {
+            return New-PowerShellCustomObject -Table $Node.Child -Scope $Scope
+        }
         if ($targetType.IsArray) {
             $childNode = $Node.Child
             if ($childNode -is [System.Management.Automation.Language.ArrayExpressionAst] -or
@@ -1075,12 +2233,12 @@ function Convert-AstExpression {
     if ($Node -is [System.Management.Automation.Language.UnaryExpressionAst]) {
         if ($Node.TokenKind -in 'PostfixPlusPlus', 'PrefixPlusPlus', 'PostfixMinusMinus', 'PrefixMinusMinus') {
             $target = Convert-AstExpression -Node $Node.Child -Scope $Scope
-            $one = [Linq.Expressions.Expression]::Constant(1, $target.Type)
-            if ($Node.TokenKind -in 'PostfixPlusPlus', 'PrefixPlusPlus') {
-                return [Linq.Expressions.Expression]::Assign($target, (New-PowerShellArithmetic -Operator Plus -Left $target -Right $one))
-            } else {
-                return [Linq.Expressions.Expression]::Assign($target, (New-PowerShellArithmetic -Operator Minus -Left $target -Right $one))
-            }
+            $one = [Linq.Expressions.Expression]::Constant(1, [int])
+            $operand = $target
+            $widened = ConvertTo-CommonIntegralOperands -Left $target -Right $one
+            if ($widened) { $operand = $widened.Left; $one = $widened.Right } else { $one = [Linq.Expressions.Expression]::Constant([Convert]::ChangeType(1, $target.Type), $target.Type) }
+            $operator = if ($Node.TokenKind -in 'PostfixPlusPlus', 'PrefixPlusPlus') { 'Plus' } else { 'Minus' }
+            return [Linq.Expressions.Expression]::Assign($target, (ConvertTo-PowerShellType -Expression (New-PowerShellArithmetic -Operator $operator -Left $operand -Right $one) -Type $target.Type))
         }
 
         $operand = Convert-AstExpression -Node $Node.Child -Scope $Scope
@@ -1111,6 +2269,15 @@ function Convert-AstExpression {
         $right = Convert-AstExpression -Node $Node.Right -Scope $Scope
 
         if ($Node.Operator -in 'Shl', 'Shr') {
+            # The shift count is an Int32 in PowerShell and the CLR. A narrower left operand keeps its own type in
+            # PowerShell ([byte] -shl 8 loses the high bits), so it shifts as an Int32 and truncates back.
+            if ($right.Type -in $script:IntegralTypes -and $right.Type -ne [int]) { $right = ConvertTo-PowerShellType -Expression $right -Type ([int]) }
+            if ($left.Type -in [sbyte], [byte], [short], [ushort]) {
+                $narrow = $left.Type
+                $wide = [Linq.Expressions.Expression]::Convert($left, [int])
+                $shifted = if ($Node.Operator -eq 'Shl') { [Linq.Expressions.Expression]::LeftShift($wide, $right) } else { [Linq.Expressions.Expression]::RightShift($wide, $right) }
+                return [Linq.Expressions.Expression]::Convert($shifted, $narrow)
+            }
             if ($left.Type -notin $script:IntegralTypes -or $right.Type -ne [int]) {
                 throw "[{0}:{1}] -{2} requires an integral left operand and an [int] shift count, got '{3}' and '{4}'." -f `
                     $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $Node.Operator.ToString().ToLowerInvariant(), $left.Type.FullName, $right.Type.FullName
@@ -1119,6 +2286,16 @@ function Convert-AstExpression {
             return [Linq.Expressions.Expression]::RightShift($left, $right)
         }
 
+        # $null compared with a reference is a null of that reference's type.
+        if ($Node.Operator -in 'Ieq', 'Ine', 'Ceq', 'Cne') {
+            if ($left -is [Linq.Expressions.ConstantExpression] -and $null -eq $left.Value -and -not $right.Type.IsValueType) { $left = [Linq.Expressions.Expression]::Constant($null, $right.Type) }
+            if ($right -is [Linq.Expressions.ConstantExpression] -and $null -eq $right.Value -and -not $left.Type.IsValueType) { $right = [Linq.Expressions.Expression]::Constant($null, $left.Type) }
+        }
+        if ($Node.Operator -notin 'And', 'Or') {
+            # Narrow integers have no CLR arithmetic of their own, even when both sides match.
+            $widened = ConvertTo-CommonIntegralOperands -Left $left -Right $right
+            if ($widened) { $left = $widened.Left; $right = $widened.Right }
+        }
         if ($left.Type -ne $right.Type) {
             throw "[{0}:{1}] Binary operator '{2}' requires identical operand types, got '{3}' and '{4}'." -f `
                 $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $Node.Operator, $left.Type.FullName, $right.Type.FullName
@@ -1175,6 +2352,12 @@ function Convert-AstExpression {
             if ($element.Setup.Count -eq 0) { return $read }
             $element.Setup.Add($read)
             return [Linq.Expressions.Expression]::Block($read.Type, [Linq.Expressions.Expression[]]$element.Setup.ToArray())
+        }
+        # Any other type indexes through its default indexer (Item), by key: a dictionary, a member collection.
+        $keyed = Get-KeyIndexer $targetExpr.Type $idxExpr.Type
+        if ($keyed) {
+            $key = ConvertTo-PowerShellType -Expression $idxExpr -Type $keyed.GetIndexParameters()[0].ParameterType
+            return [Linq.Expressions.Expression]::MakeIndex($targetExpr, $keyed, [Linq.Expressions.Expression[]]@($key))
         }
         throw "[{0}:{1}] Indexing into non-array type '{2}' is not supported." -f `
             $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $targetExpr.Type.FullName
@@ -1247,6 +2430,12 @@ function Convert-AstExpression {
         else {
             # Instance method call: $inst.Method(...)
             $targetExpr = Convert-AstExpression -Node $Node.Expression -Scope $Scope
+            # On a PowerShell object, PowerShell calls methods on the base object: a custom object's base is
+            # PSCustomObject, so GetType() reports PSCustomObject and ToString() returns an empty string.
+            # Through .PSObject, the methods are the PSObject class's own.
+            if ($targetExpr.Type -eq [System.Management.Automation.PSObject] -and -not (Test-PSObjectView $Node.Expression)) {
+                $targetExpr = [Linq.Expressions.Expression]::Property($targetExpr, 'BaseObject')
+            }
             $method = Resolve-MatchingMethod -TargetType $targetExpr.Type -MethodName $memberName -ArgumentTypes $argTypes
             if ($method.IsDefined([Runtime.InteropServices.UnmanagedCallersOnlyAttribute],$false)) {
                 throw ('[{0}:{1}] UnmanagedCallersOnly method cannot be called from managed code.' -f $Node.Extent.StartLineNumber,$Node.Extent.StartColumnNumber)
@@ -1276,12 +2465,21 @@ function Convert-AstExpression {
             } else {
                 Resolve-AstType $Node.Expression.Extent.Text
             }
+            # An enum member is a constant of the enum type; literal fields have no storage to load.
+            if ($targetType.IsEnum) { return [Linq.Expressions.Expression]::Constant([Enum]::Parse($targetType, $memberName, $true), $targetType) }
             return New-MemberAccess -Target $null -Type $targetType -Name $memberName -Node $Node
         }
         else {
             $targetExpr = Convert-AstExpression -Node $Node.Expression -Scope $Scope
             if ($targetExpr.Type.IsArray -and $memberName -eq 'Length') {
                 return [Linq.Expressions.Expression]::ArrayLength($targetExpr)
+            }
+            # On a PowerShell object, a member name is one of its properties. Through .PSObject, PowerShell
+            # shows the wrapper itself as an ordinary object, so $o.PSObject.Name is the PSObject class's member.
+            if ($targetExpr.Type -eq [System.Management.Automation.PSObject]) {
+                if ($memberName -eq 'PSObject') { return $targetExpr }
+                if (Test-PSObjectView $Node.Expression) { return New-MemberAccess -Target $targetExpr -Type $targetExpr.Type -Name $memberName -Node $Node }
+                return New-PowerShellNotePropertyRead -Target $targetExpr -Name $memberName -Scope $Scope
             }
             return New-MemberAccess -Target $targetExpr -Type $targetExpr.Type -Name $memberName -Node $Node
         }
@@ -1322,28 +2520,38 @@ function Convert-AstStatement {
                 }
                 $element = New-PowerShellArrayIndex -Array $arrayExpr -Index (Convert-AstExpression -Node $leftNode.Index -Scope $Scope) -Scope $Scope
                 $right = Convert-AstExpression -Node $Statement.Right -Scope $Scope
-                if ($right.Type -ne $element.Access.Type) {
+                $operandLeft = $element.Access
+                $widened = ConvertTo-CommonIntegralOperands -Left $operandLeft -Right $right
+                if ($widened) { $operandLeft = $widened.Left; $right = $widened.Right }
+                if ($right.Type -ne $operandLeft.Type) {
                     throw "[{0}:{1}] Compound assignment '{2}' requires identical operand types, got '{3}' and '{4}'." -f `
                         $Statement.Extent.StartLineNumber, $Statement.Extent.StartColumnNumber, $Statement.Operator, $element.Access.Type.FullName, $right.Type.FullName
                 }
-                $combined = New-PowerShellArithmetic -Operator $compound -Left $element.Access -Right $right
+                $combined = New-PowerShellArithmetic -Operator $compound -Left $operandLeft -Right $right
                 $element.Setup.Add([Linq.Expressions.Expression]::Assign($element.Access, (ConvertTo-PowerShellType -Expression $combined -Type $element.Access.Type)))
                 $element.Setup.Add([Linq.Expressions.Expression]::Empty())
                 return [Linq.Expressions.Expression]::Block([Linq.Expressions.Expression[]]$element.Setup.ToArray())
             }
-            if ($leftNode -isnot [System.Management.Automation.Language.VariableExpressionAst] -and
-                -not ($leftNode -is [System.Management.Automation.Language.MemberExpressionAst] -and
-                      $leftNode -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
-                      ($leftNode.Static -or $leftNode.Expression -is [System.Management.Automation.Language.VariableExpressionAst]))) {
-                throw "[{0}:{1}] Compound assignment '{2}' is supported only on a variable or a member of a variable or type." -f $Statement.Extent.StartLineNumber, $Statement.Extent.StartColumnNumber, $Statement.Operator
+            # The target is read and then written, so it must be a variable or a chain of field reads off a
+            # variable or type: reading it twice has no effect to repeat.
+            $chain = $leftNode
+            while ($chain -is [System.Management.Automation.Language.MemberExpressionAst] -and
+                   $chain -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst] -and -not $chain.Static) { $chain = $chain.Expression }
+            $plain = $chain -is [System.Management.Automation.Language.VariableExpressionAst] -or
+                     ($chain -is [System.Management.Automation.Language.MemberExpressionAst] -and $chain -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $chain.Static)
+            if (-not $plain) {
+                throw "[{0}:{1}] Compound assignment '{2}' is supported only on a variable or a chain of members of a variable or type." -f $Statement.Extent.StartLineNumber, $Statement.Extent.StartColumnNumber, $Statement.Operator
             }
             $target = Convert-AstExpression -Node $leftNode -Scope $Scope
             $right = Convert-AstExpression -Node $Statement.Right -Scope $Scope
-            if ($right.Type -ne $target.Type) {
+            $operandLeft = $target
+            $widened = ConvertTo-CommonIntegralOperands -Left $operandLeft -Right $right
+            if ($widened) { $operandLeft = $widened.Left; $right = $widened.Right }
+            if ($right.Type -ne $operandLeft.Type) {
                 throw "[{0}:{1}] Compound assignment '{2}' requires identical operand types, got '{3}' and '{4}'." -f `
                     $Statement.Extent.StartLineNumber, $Statement.Extent.StartColumnNumber, $Statement.Operator, $target.Type.FullName, $right.Type.FullName
             }
-            $value = New-PowerShellArithmetic -Operator $compound -Left $target -Right $right
+            $value = New-PowerShellArithmetic -Operator $compound -Left $operandLeft -Right $right
             return [Linq.Expressions.Expression]::Assign($target, (ConvertTo-PowerShellType -Expression $value -Type $target.Type))
         }
 
@@ -1366,6 +2574,22 @@ function Convert-AstStatement {
             return [Linq.Expressions.Expression]::Block([Linq.Expressions.Expression[]]$element.Setup.ToArray())
         }
 
+        if ($leftNode -is [System.Management.Automation.Language.MemberExpressionAst] -and
+            $leftNode -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst] -and -not $leftNode.Static) {
+            # The owner is converted once. On a PowerShell object, $object.Name = value sets that note property.
+            $owner = Convert-AstExpression -Node $leftNode.Expression -Scope $Scope
+            $name = if ($leftNode.Member -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $leftNode.Member.Value } else { $leftNode.Member.Extent.Text }
+            if ($owner.Type -eq [System.Management.Automation.PSObject]) {
+                $value = Convert-AstExpression -Node $Statement.Right -Scope $Scope
+                if ($value.Type -ne [object]) { $value = [Linq.Expressions.Expression]::Convert($value, [object]) }
+                return [Linq.Expressions.Expression]::Assign([Linq.Expressions.Expression]::Property((Get-PowerShellNoteProperty $owner $name), 'Value'), $value)
+            }
+            $memberTarget = New-MemberAccess -Target $owner -Type $owner.Type -Name $name -Node $leftNode
+            if ($memberTarget.Member -is [Reflection.PropertyInfo] -and -not $memberTarget.Member.CanWrite) {
+                throw "[{0}:{1}] Property '{2}' is read-only." -f $Statement.Extent.StartLineNumber, $Statement.Extent.StartColumnNumber, $memberTarget.Member.Name
+            }
+            return [Linq.Expressions.Expression]::Assign($memberTarget, (Convert-AstExpressionAs -Node $Statement.Right -Type $memberTarget.Type -Scope $Scope))
+        }
         if ($leftNode -is [System.Management.Automation.Language.MemberExpressionAst] -and
             $leftNode -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst]) {
             $memberTarget = Convert-AstExpression -Node $leftNode -Scope $Scope
@@ -1549,6 +2773,10 @@ function Convert-AstStatement {
     if ($Statement -is [System.Management.Automation.Language.ThrowStatementAst]) {
         if ($Statement.Pipeline) {
             $exExpr = Convert-AstExpression -Node $Statement.Pipeline -Scope $Scope
+            # PowerShell throws a message as an exception carrying it; CoreLib's Exception carries it here.
+            if ($exExpr.Type -eq [string]) {
+                $exExpr = $script:ExpressionNewMethod.Invoke($null, @([Exception].GetConstructor([Type[]]@([string])), [Linq.Expressions.Expression[]]@($exExpr)))
+            }
             return [Linq.Expressions.Expression]::Throw($exExpr, [void])
         } else {
             return [Linq.Expressions.Expression]::Rethrow([void])
@@ -1666,6 +2894,89 @@ function Convert-AstStatement {
         $loopLabels = $Scope.Loops.Peek()
         if ($keyword -eq 'break') { return [Linq.Expressions.Expression]::Break($loopLabels.Break) }
         return [Linq.Expressions.Expression]::Continue($loopLabels.Continue)
+    }
+
+    # A keyword statement, 'keyword Name { ... }', lowers to a call of the method that declares the keyword
+    # (see Get-LoweringKeywords) with the name and the properties in parameter order; a script body then runs inline.
+    if ($Statement -is [System.Management.Automation.Language.DynamicKeywordStatementAst]) {
+        $elements = $Statement.CommandElements
+        $keywordName = $elements[0].Value
+        if (-not $script:LoweringKeywords.ContainsKey($keywordName)) {
+            throw "[{0}:{1}] Keyword '{2}' is not declared by a [Keyword()] method in this source." -f $Statement.Extent.StartLineNumber, $Statement.Extent.StartColumnNumber, $keywordName
+        }
+        $definition = $script:LoweringKeywords[$keywordName]
+        if ($elements.Count -ne 3 -or $elements[1] -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) {
+            throw "[{0}:{1}] Keyword '{2}' needs a literal name and a body." -f $Statement.Extent.StartLineNumber, $Statement.Extent.StartColumnNumber, $keywordName
+        }
+        $body = $elements[2]
+        $arguments = [System.Collections.Generic.List[Linq.Expressions.Expression]]::new()
+        $arguments.Add([Linq.Expressions.Expression]::Constant($elements[1].Value, [string]))
+        if ($body -is [System.Management.Automation.Language.HashtableAst]) {
+            $values = @{}
+            foreach ($pair in $body.KeyValuePairs) { $values[[string]$pair.Item1.SafeGetValue()] = $pair.Item2 }
+            $declared = @($definition.Properties | ForEach-Object { $_.Name.VariablePath.UserPath })
+            foreach ($key in $values.Keys) {
+                if ($key -notin $declared) { throw "[{0}:{1}] Keyword '{2}' has no property '{3}'." -f $body.Extent.StartLineNumber, $body.Extent.StartColumnNumber, $keywordName, $key }
+            }
+            foreach ($parameter in $definition.Properties) {
+                $propertyName = $parameter.Name.VariablePath.UserPath
+                if (-not $values.ContainsKey($propertyName)) { throw "[{0}:{1}] Keyword '{2}' needs property '{3}'." -f $body.Extent.StartLineNumber, $body.Extent.StartColumnNumber, $keywordName, $propertyName }
+                $constraint = $parameter.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.TypeConstraintAst] } | Select-Object -First 1
+                $arguments.Add((Convert-AstExpressionAs -Node $values[$propertyName] -Type (Resolve-AstType $constraint.TypeName) -Scope $Scope))
+            }
+        }
+        $parts = [System.Collections.Generic.List[Linq.Expressions.Expression]]::new()
+        $method = Resolve-MatchingMethod -TargetType $script:LoweringClassTypes[$definition.Class] -MethodName $definition.Name -ArgumentTypes ([Type[]]@($arguments | ForEach-Object Type)) -IsStatic
+        $parts.Add([Linq.Expressions.Expression]::Call($method, [Linq.Expressions.Expression[]]$arguments.ToArray()))
+        if ($body -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) {
+            foreach ($inner in $body.ScriptBlock.EndBlock.Statements) { $parts.Add((Convert-AstStatement -Statement $inner -Scope $Scope)) }
+        }
+        $parts.Add([Linq.Expressions.Expression]::Empty())
+        return [Linq.Expressions.Expression]::Block([Linq.Expressions.Expression[]]$parts.ToArray())
+    }
+
+    # 12. switch over an integer or enum value with constant clauses. As in PowerShell, every matching
+    # clause runs in order, break or continue leaves the switch, and default runs when nothing matched.
+    if ($Statement -is [System.Management.Automation.Language.SwitchStatementAst]) {
+        if ($Statement.Flags -ne [System.Management.Automation.Language.SwitchFlags]::None) {
+            throw "[{0}:{1}] switch options are not supported." -f $Statement.Extent.StartLineNumber, $Statement.Extent.StartColumnNumber
+        }
+        $subject = Convert-AstExpression -Node $Statement.Condition -Scope $Scope
+        if ($subject.Type -notin $script:IntegralTypes -and -not $subject.Type.IsEnum) {
+            throw "[{0}:{1}] switch requires an integer or enum value, got '{2}'." -f $Statement.Extent.StartLineNumber, $Statement.Extent.StartColumnNumber, $subject.Type.FullName
+        }
+        $id = $Scope.DeclaredLocals.Count
+        $value = [Linq.Expressions.Expression]::Variable($subject.Type, "switchValue$id")
+        $matched = [Linq.Expressions.Expression]::Variable([bool], "switchMatched$id")
+        $Scope.DeclaredLocals.Add($value)
+        $Scope.DeclaredLocals.Add($matched)
+        $endLabel = [Linq.Expressions.Expression]::Label("switchEnd$id")
+        $parts = [System.Collections.Generic.List[Linq.Expressions.Expression]]::new()
+        $parts.Add([Linq.Expressions.Expression]::Assign($value, $subject))
+        $parts.Add([Linq.Expressions.Expression]::Assign($matched, [Linq.Expressions.Expression]::Constant($false)))
+        $Scope.Loops.Push(@{ Break = $endLabel; Continue = $endLabel })
+        try {
+            foreach ($clause in $Statement.Clauses) {
+                $left = [Linq.Expressions.Expression]$value
+                $right = Convert-AstExpression -Node $clause.Item1 -Scope $Scope
+                if ($left.Type.IsEnum -and $right.Type -ne $left.Type) { $left = [Linq.Expressions.Expression]::Convert($left, [Enum]::GetUnderlyingType($left.Type)) }
+                if ($right.Type.IsEnum -and $right.Type -ne $left.Type) { $right = [Linq.Expressions.Expression]::Convert($right, [Enum]::GetUnderlyingType($right.Type)) }
+                $widened = ConvertTo-CommonIntegralOperands -Left $left -Right $right
+                if ($widened) { $left = $widened.Left; $right = $widened.Right }
+                if ($left.Type -ne $right.Type) {
+                    throw "[{0}:{1}] switch clause type '{2}' does not match the value's type '{3}'." -f $clause.Item1.Extent.StartLineNumber, $clause.Item1.Extent.StartColumnNumber, $right.Type.FullName, $value.Type.FullName
+                }
+                $body = Convert-AstStatement -Statement $clause.Item2 -Scope $Scope
+                $parts.Add([Linq.Expressions.Expression]::IfThen([Linq.Expressions.Expression]::Equal($left, $right),
+                    [Linq.Expressions.Expression]::Block([Linq.Expressions.Expression]::Assign($matched, [Linq.Expressions.Expression]::Constant($true)), $body, [Linq.Expressions.Expression]::Empty())))
+            }
+            if ($Statement.Default) {
+                $parts.Add([Linq.Expressions.Expression]::IfThen([Linq.Expressions.Expression]::Not($matched), (Convert-AstStatement -Statement $Statement.Default -Scope $Scope)))
+            }
+        }
+        finally { $null = $Scope.Loops.Pop() }
+        $parts.Add([Linq.Expressions.Expression]::Label($endLabel))
+        return [Linq.Expressions.Expression]::Block([Linq.Expressions.Expression[]]$parts.ToArray())
     }
 
     throw "[{0}:{1}] Unsupported AST statement '{2}' ({3})." -f `
@@ -2335,6 +3646,36 @@ function Write-IlValueAddress([Reflection.Emit.ILGenerator] $IL, [Linq.Expressio
     $IL.Emit([Reflection.Emit.OpCodes]::Ldloca, $temporary)
 }
 
+# Every expression leaves its value on the stack. Where a consumer does not want that value (a statement in a
+# block, a void branch, a loop or try body), it emits the expression through this, which drops the value.
+function Write-IlDiscarded {
+    param(
+        [Parameter(Mandatory)][Reflection.Emit.ILGenerator] $IL,
+        [Parameter(Mandatory)][Linq.Expressions.Expression] $Expr,
+        [Parameter(Mandatory)][hashtable] $Context
+    )
+    Write-IlExpression -IL $IL -Expr $Expr -Context $Context
+    if ($Expr.Type -ne [void]) { $IL.Emit([Reflection.Emit.OpCodes]::Pop) }
+}
+
+# Emits a value about to be stored by an instruction that consumes it, keeping a copy in a temporary of its
+# type (one per type, as nothing is emitted between the store and the reload). Returns that temporary.
+function Write-IlStoredValue {
+    param(
+        [Parameter(Mandatory)][Reflection.Emit.ILGenerator] $IL,
+        [Parameter(Mandatory)][Linq.Expressions.Expression] $Expr,
+        [Parameter(Mandatory)][hashtable] $Context
+    )
+    if (-not $Context.ContainsKey('StoredValues')) { $Context.StoredValues = @{} }
+    $type = Get-IlType $Expr.Type
+    if (-not $Context.StoredValues.ContainsKey($type)) { $Context.StoredValues[$type] = $IL.DeclareLocal($type) }
+    $temporary = $Context.StoredValues[$type]
+    Write-IlExpression -IL $IL -Expr $Expr -Context $Context
+    $IL.Emit([Reflection.Emit.OpCodes]::Dup)
+    Write-IlLocalStore -IL $IL -Loc $temporary
+    $temporary
+}
+
 function Write-IlExpression {
     param(
         [Parameter(Mandatory)][Reflection.Emit.ILGenerator] $IL,
@@ -2393,16 +3734,12 @@ function Write-IlExpression {
             }
         }
 
+        # Every expression but the last is evaluated for its effect; so is the last when the block is void.
         $count = $Expr.Expressions.Count
         for ($i = 0; $i -lt $count; $i++) {
             $child = $Expr.Expressions[$i]
-            $isLast = ($i -eq ($count - 1))
-            Write-IlExpression -IL $IL -Expr $child -Context $Context
-
-            # If not the last expression and pushes value onto stack, pop it
-            if (-not $isLast -and $child.Type -ne [void] -and $child.NodeType -ne [Linq.Expressions.ExpressionType]::Assign) {
-                $IL.Emit([Reflection.Emit.OpCodes]::Pop)
-            }
+            if ($i -eq $count - 1 -and $Expr.Type -ne [void]) { Write-IlExpression -IL $IL -Expr $child -Context $Context }
+            else { Write-IlDiscarded -IL $IL -Expr $child -Context $Context }
         }
         return
     }
@@ -2626,7 +3963,9 @@ function Write-IlExpression {
         $lblEnd = $IL.BeginExceptionBlock()
         $Context.ExceptionDepth++
 
-        Write-IlExpression -IL $IL -Expr $Expr.Body -Context $Context
+        # A try used as a statement evaluates its bodies for effect; a finally body always is.
+        if ($Expr.Type -eq [void]) { Write-IlDiscarded -IL $IL -Expr $Expr.Body -Context $Context }
+        else { Write-IlExpression -IL $IL -Expr $Expr.Body -Context $Context }
 
         foreach ($cb in $Expr.Handlers) {
             $IL.BeginCatchBlock((Get-IlType $cb.Test))
@@ -2639,12 +3978,13 @@ function Write-IlExpression {
             } else {
                 $IL.Emit([Reflection.Emit.OpCodes]::Pop)
             }
-            Write-IlExpression -IL $IL -Expr $cb.Body -Context $Context
+            if ($Expr.Type -eq [void]) { Write-IlDiscarded -IL $IL -Expr $cb.Body -Context $Context }
+            else { Write-IlExpression -IL $IL -Expr $cb.Body -Context $Context }
         }
 
         if ($Expr.Finally) {
             $IL.BeginFinallyBlock()
-            Write-IlExpression -IL $IL -Expr $Expr.Finally -Context $Context
+            Write-IlDiscarded -IL $IL -Expr $Expr.Finally -Context $Context
         }
 
         $IL.EndExceptionBlock()
@@ -2659,7 +3999,9 @@ function Write-IlExpression {
         $lblEnd = $IL.DefineLabel()
 
         $IL.Emit([Reflection.Emit.OpCodes]::Brfalse, $lblFalse)
-        Write-IlExpression -IL $IL -Expr $Expr.IfTrue -Context $Context
+        # A void conditional (an if statement) evaluates its branches for effect.
+        if ($Expr.Type -eq [void]) { Write-IlDiscarded -IL $IL -Expr $Expr.IfTrue -Context $Context }
+        else { Write-IlExpression -IL $IL -Expr $Expr.IfTrue -Context $Context }
 
         $hasFalseBranch = ($Expr.IfFalse -and $Expr.IfFalse.NodeType -ne [Linq.Expressions.ExpressionType]::Default -and $Expr.IfFalse.Type -ne [void]) -or
                           ($Expr.IfFalse -and $Expr.IfFalse.NodeType -ne [Linq.Expressions.ExpressionType]::Default)
@@ -2667,7 +4009,8 @@ function Write-IlExpression {
         if ($hasFalseBranch) {
             $IL.Emit([Reflection.Emit.OpCodes]::Br, $lblEnd)
             $IL.MarkLabel($lblFalse)
-            Write-IlExpression -IL $IL -Expr $Expr.IfFalse -Context $Context
+            if ($Expr.Type -eq [void]) { Write-IlDiscarded -IL $IL -Expr $Expr.IfFalse -Context $Context }
+            else { Write-IlExpression -IL $IL -Expr $Expr.IfFalse -Context $Context }
             $IL.MarkLabel($lblEnd)
         }
         else {
@@ -2696,7 +4039,7 @@ function Write-IlExpression {
         $IL.MarkLabel($lblHead)
         # The continue label is the loop head, as in LambdaCompiler.EmitLoopExpression.
         if ($Expr.ContinueLabel) { $IL.MarkLabel($lblContinue) }
-        Write-IlExpression -IL $IL -Expr $Expr.Body -Context $Context
+        Write-IlDiscarded -IL $IL -Expr $Expr.Body -Context $Context
         $IL.Emit([Reflection.Emit.OpCodes]::Br, $lblHead)
         $IL.MarkLabel($lblBreak)
         return
@@ -2704,10 +4047,12 @@ function Write-IlExpression {
 
     # 12. Binary Expressions (Arithmetic, Assignment, Logic, Comparisons, Index)
     if ($Expr -is [Linq.Expressions.BinaryExpression]) {
+        # An assignment is an expression whose value is the value stored, as in PowerShell and LINQ: every
+        # form leaves it on the stack. A store that consumes the stack keeps the value in a temporary.
         if ($Expr.NodeType -eq [Linq.Expressions.ExpressionType]::Assign) {
             if ($Expr.Left -is [Linq.Expressions.ParameterExpression]) {
-                # Evaluate right hand side
                 Write-IlExpression -IL $IL -Expr $Expr.Right -Context $Context
+                $IL.Emit([Reflection.Emit.OpCodes]::Dup)
                 if ($Context.Locals.ContainsKey($Expr.Left)) {
                     Write-IlLocalStore -IL $IL -Loc $Context.Locals[$Expr.Left]
                     return
@@ -2721,34 +4066,42 @@ function Write-IlExpression {
                 if ($Expr.Left.Object.Type.IsValueType) { Write-IlValueAddress $IL $Expr.Left.Object $Context }
                 else { Write-IlExpression -IL $IL -Expr $Expr.Left.Object -Context $Context }
                 Write-IlExpression -IL $IL -Expr $Expr.Left.Arguments[0] -Context $Context
-                Write-IlExpression -IL $IL -Expr $Expr.Right -Context $Context
+                $value = Write-IlStoredValue -IL $IL -Expr $Expr.Right -Context $Context
                 $setter = $Expr.Left.Indexer.GetSetMethod()
                 $op = if ($setter.IsVirtual -and -not $setter.DeclaringType.IsValueType) { [Reflection.Emit.OpCodes]::Callvirt } else { [Reflection.Emit.OpCodes]::Call }
                 $IL.Emit($op, (Get-IlMember $setter))
+                Write-IlLocalLoad -IL $IL -Loc $value
                 return
             }
             if ($Expr.Left -is [Linq.Expressions.IndexExpression]) {
                 Write-IlExpression -IL $IL -Expr $Expr.Left.Object -Context $Context
                 Write-IlExpression -IL $IL -Expr $Expr.Left.Arguments[0] -Context $Context
-                Write-IlExpression -IL $IL -Expr $Expr.Right -Context $Context
+                $value = Write-IlStoredValue -IL $IL -Expr $Expr.Right -Context $Context
                 Write-IlArrayStore -IL $IL -ElementType $Expr.Left.Type
+                Write-IlLocalLoad -IL $IL -Loc $value
                 return
             }
             if ($Expr.Left -is [Linq.Expressions.MemberExpression]) {
                 $member = $Expr.Left.Member
+                if ($member -is [Reflection.FieldInfo] -and $member.IsStatic) {
+                    Write-IlExpression -IL $IL -Expr $Expr.Right -Context $Context
+                    $IL.Emit([Reflection.Emit.OpCodes]::Dup)
+                    $IL.Emit([Reflection.Emit.OpCodes]::Stsfld, (Get-IlMember $member))
+                    return
+                }
                 if ($Expr.Left.Expression) {
                     if ($Expr.Left.Expression.Type.IsValueType) { Write-IlValueAddress $IL $Expr.Left.Expression $Context }
                     else { Write-IlExpression -IL $IL -Expr $Expr.Left.Expression -Context $Context }
                 }
-                Write-IlExpression -IL $IL -Expr $Expr.Right -Context $Context
+                $value = Write-IlStoredValue -IL $IL -Expr $Expr.Right -Context $Context
                 if ($member -is [Reflection.FieldInfo]) {
-                    $op = if ($member.IsStatic) { [Reflection.Emit.OpCodes]::Stsfld } else { [Reflection.Emit.OpCodes]::Stfld }
-                    $IL.Emit($op, (Get-IlMember $member))
-                    return
+                    $IL.Emit([Reflection.Emit.OpCodes]::Stfld, (Get-IlMember $member))
+                } else {
+                    $setter = $member.GetSetMethod()
+                    $op = if ($setter.IsVirtual -and -not $setter.DeclaringType.IsValueType) { [Reflection.Emit.OpCodes]::Callvirt } else { [Reflection.Emit.OpCodes]::Call }
+                    $IL.Emit($op, (Get-IlMember $setter))
                 }
-                $setter = $member.GetSetMethod()
-                $op = if ($setter.IsVirtual -and -not $setter.DeclaringType.IsValueType) { [Reflection.Emit.OpCodes]::Callvirt } else { [Reflection.Emit.OpCodes]::Call }
-                $IL.Emit($op, (Get-IlMember $setter))
+                Write-IlLocalLoad -IL $IL -Loc $value
                 return
             }
             throw "Assignment to unsupported target expression '$($Expr.Left.GetType().FullName)'."
@@ -3011,7 +4364,9 @@ function Export-LoweredAssembly {
     $parsed = Read-PowerShellClass -Source $source -ClassName $ClassName
     }
     $targetClass = $parsed.ClassAst
-    $classAsts = @($parsed.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true))
+    $classAsts = @($parsed.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true) | Where-Object { -not (Test-AttributeClass $_) })
+    $script:LoweringKeywords = @{}
+    foreach ($definition in @(Get-LoweringKeywords $parsed.Ast)) { $script:LoweringKeywords[$definition.Name] = $definition }
     if ($ClassNames) {
         $classAsts = @($classAsts | Where-Object Name -in $ClassNames)
         if ($classAsts.Count -ne @($ClassNames | Sort-Object -Unique).Count -or $targetClass.Name -notin $ClassNames) { throw 'ClassNames must identify existing classes and include ClassName.' }
@@ -3034,7 +4389,13 @@ function Export-LoweredAssembly {
     $declared = [Reflection.BindingFlags]'Public,Static,Instance,DeclaredOnly'
     $script:IlMap = @{ Types = @{}; Members = @{}; ImplicitConstructors = @{} }
     try {
-        # 1. Output types, so every signature can name any of them.
+        # 1. Output types, so every signature can name any of them. Enums are complete once their literals exist.
+        foreach ($enumAst in @($parsed.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsEnum }, $true))) {
+            $enumBuilder = $session.Module.DefineEnum($enumAst.Name, [Reflection.TypeAttributes]::Public, (Get-EnumUnderlyingType $enumAst))
+            foreach ($literal in (Get-EnumLiterals $enumAst)) { $null = $enumBuilder.DefineLiteral($literal.Name, $literal.Value) }
+            $null = $enumBuilder.CreateType()
+            $script:IlMap.Types[$mirror[$enumAst.Name]] = $enumBuilder
+        }
         foreach ($c in $model) {
             $tb = $session.Module.DefineType($c.Name, [Reflection.TypeAttributes]'Public,Class')
             $session.Types[$c.Name] = $tb
@@ -3148,6 +4509,7 @@ function Export-LoweredAssembly {
     }
     finally {
         $script:IlMap = @{ Types = @{}; Members = @{} }
+        $script:LoweringKeywords = @{}
     }
 
     [pscustomobject]@{
@@ -3161,6 +4523,117 @@ function Export-LoweredAssembly {
         EntryPoint     = $saveResult.EntryPoint
         RuntimeConfig  = $saveResult.RuntimeConfig
     }
+}
+
+# Native AOT: the lowered assembly compiled to machine code by ILC (Microsoft's IL compiler, PSC's backend) and
+# linked by PSC's own COFF linker. No MSBuild and no .NET SDK: every input is pinned under tools and verified by hash.
+
+# Pinned tool folders already verified against their manifests in this process.
+$script:VerifiedPins = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+
+# Pinned tool folders under PSC's tools, found by enumerating the folder for the newest version of each.
+function Get-NativeToolset {
+    $tools = Join-Path $PSScriptRoot 'tools'
+    $find = { param([string] $prefix) $found = @(Get-ChildItem -LiteralPath $tools -Directory -Filter ($prefix + '*') | Sort-Object Name); if (-not $found.Count) { throw "Pinned tool '$prefix*' is missing under $tools." }; $found[-1].FullName }
+    $toolset = [pscustomobject]@{
+        Compiler = & $find 'ilc-1'
+        Build = & $find 'ilc-build-'
+        Runtime = & $find 'nativeaot-win-x64-'
+        Msvc = & $find 'msvc-'
+        Sdk = & $find 'windows-sdk-lib-'
+    }
+    foreach ($folder in $toolset.Compiler, $toolset.Build, $toolset.Runtime, $toolset.Sdk) {
+        if ($script:VerifiedPins.Contains($folder)) { continue }
+        $manifest = Join-Path $folder 'pin.sha256.csv'
+        if (-not [IO.File]::Exists($manifest)) { throw "Pinned tool $folder has no hash manifest." }
+        foreach ($entry in Import-Csv -LiteralPath $manifest) {
+            $path = Join-Path $folder $entry.Path
+            if (-not [IO.File]::Exists($path) -or (Get-FileHash -LiteralPath $path).Hash -cne $entry.Sha256) { throw "Pinned tool file failed verification: $path" }
+        }
+        $null = $script:VerifiedPins.Add($folder)
+    }
+    $toolset
+}
+
+# ILC's settings for a Windows x64 executable. The feature switches are those the .NET SDK's ILCompiler targets pass
+# for PublishAot with InvariantGlobalization and UseSystemResourceKeys (observed from a reference publish); each is
+# both a compile-time feature and a runtime knob, as the SDK passes them.
+$script:NativeFeatureSwitches = [ordered]@{
+    'Microsoft.Extensions.DependencyInjection.VerifyOpenGenericServiceTrimmability' = $true
+    'System.ComponentModel.DefaultValueAttribute.IsSupported' = $false
+    'System.ComponentModel.Design.IDesignerHost.IsSupported' = $false
+    'System.ComponentModel.TypeConverter.EnableUnsafeBinaryFormatterInDesigntimeLicenseContextSerialization' = $false
+    'System.ComponentModel.TypeDescriptor.IsComObjectDescriptorSupported' = $false
+    'System.Data.DataSet.XmlSerializationIsSupported' = $false
+    'System.Diagnostics.Tracing.EventSource.IsSupported' = $false
+    'System.Globalization.Invariant' = $true
+    'System.Globalization.PredefinedCulturesOnly' = $true
+    'System.Linq.Enumerable.IsSizeOptimized' = $true
+    'System.Net.SocketsHttpHandler.Http3Support' = $false
+    'System.Reflection.Metadata.MetadataUpdater.IsSupported' = $false
+    'System.Resources.ResourceManager.AllowCustomResourceTypes' = $false
+    'System.Resources.UseSystemResourceKeys' = $true
+    'System.Runtime.CompilerServices.RuntimeFeature.IsDynamicCodeSupported' = $false
+    'System.Runtime.InteropServices.BuiltInComInterop.IsSupported' = $false
+    'System.Runtime.InteropServices.EnableConsumingManagedCodeFromNativeHosting' = $false
+    'System.Runtime.InteropServices.EnableCppCLIHostActivation' = $false
+    'System.Runtime.InteropServices.Marshalling.EnableGeneratedComInterfaceComImportInterop' = $false
+    'System.Runtime.Serialization.EnableUnsafeBinaryFormatterSerialization' = $false
+    'System.StartupHookProvider.IsSupported' = $false
+    'System.Text.Encoding.EnableUnsafeUTF7Encoding' = $false
+    'System.Text.Json.JsonSerializer.IsReflectionEnabledByDefault' = $false
+    'System.Threading.Thread.EnableAutoreleasePool' = $false
+    'System.Threading.ThreadPool.UseWindowsThreadPool' = $true
+    'System.Linq.Expressions.CanEmitObjectArrayDelegate' = $false
+}
+
+function Export-NativeImage {
+    param(
+        [Parameter(Mandatory)][string] $AssemblyPath,
+        [Parameter(Mandatory)][string] $OutputPath,
+        [ValidateSet('Console', 'Windows')][string] $Subsystem = 'Console'
+    )
+    $toolset = Get-NativeToolset
+    $managed = Join-Path $toolset.Runtime 'runtimes\win-x64\lib\net11.0'
+    $native = Join-Path $toolset.Runtime 'runtimes\win-x64\native'
+    $object = [IO.Path]::ChangeExtension($OutputPath, '.obj')
+    $response = [IO.Path]::ChangeExtension($OutputPath, '.ilc.rsp')
+
+    # 1. ILC: the lowered assembly to one native object.
+    $arguments = [System.Collections.Generic.List[string]]::new()
+    $arguments.Add($AssemblyPath)
+    $arguments.Add('-o:' + $object)
+    foreach ($reference in Get-ChildItem -LiteralPath $managed, $native -File -Filter *.dll | Sort-Object FullName) { $arguments.Add('-r:' + $reference.FullName) }
+    foreach ($option in '--targetos:win', '--targetarch:x64', '-O',
+        '--export-dynamic-symbol:DotNetRuntimeDebugHeader,DATA', '--export-dynamic-symbol:DotNetRuntimeContractDescriptor,DATA',
+        '--initassembly:System.Private.CoreLib', '--initassembly:System.Private.StackTraceMetadata', '--initassembly:System.Private.TypeLoader', '--initassembly:System.Private.Reflection.Execution',
+        '--directpinvoke:System.Globalization.Native', '--directpinvoke:System.IO.Compression.Native',
+        ('--directpinvokelist:' + (Join-Path $toolset.Build 'build\WindowsAPIs.txt')),
+        '--stacktracedata:frames', '--scanreflection', '--methodbodyfolding:generic', '--singlewarn', '--resilient',
+        '--generateunmanagedentrypoints:System.Private.CoreLib,HIDDEN', '--feature:System.Diagnostics.Debugger.IsSupported=false', '--runtimeknob:RUNTIME_IDENTIFIER=win-x64') {
+        $arguments.Add($option)
+    }
+    foreach ($switch in $script:NativeFeatureSwitches.Keys) {
+        $value = $script:NativeFeatureSwitches[$switch].ToString().ToLowerInvariant()
+        $arguments.Add("--feature:$switch=$value"); $arguments.Add("--runtimeknob:$switch=$value")
+    }
+    [IO.File]::WriteAllLines($response, $arguments)
+    $compiler = Join-Path $toolset.Compiler 'tools\ilc.exe'
+    $output = & $compiler "@$response" 2>&1
+    if ($LASTEXITCODE -ne 0) { throw ("ILC failed ($LASTEXITCODE):`n" + ($output -join "`n")) }
+
+    # 2. PSC's COFF linker: the object, the Native AOT runtime, and the Windows import libraries.
+    $inputs = [System.Collections.Generic.List[string]]::new()
+    $inputs.Add($object)
+    foreach ($name in 'bootstrapper.obj', 'Runtime.WorkstationGC.lib', 'eventpipe-disabled.lib', 'Runtime.VxsortDisabled.lib', 'standalonegc-disabled.lib', 'aotminipal.lib',
+        'zlibstatic.lib', 'brotlicommon.lib', 'brotlienc.lib', 'brotlidec.lib', 'zstd_static.lib', 'System.Globalization.Native.Aot.lib', 'System.IO.Compression.Native.Aot.lib') { $inputs.Add((Join-Path $native $name)) }
+    foreach ($name in 'advapi32.lib', 'bcrypt.lib', 'crypt32.lib', 'iphlpapi.lib', 'kernel32.lib', 'mswsock.lib', 'ncrypt.lib', 'normaliz.lib', 'ntdll.lib',
+        'ole32.lib', 'oleaut32.lib', 'secur32.lib', 'Synchronization.lib', 'user32.lib', 'version.lib', 'ws2_32.lib') { $inputs.Add((Join-Path $toolset.Sdk "um\x64\$name")) }
+    $libraries = @((Join-Path $toolset.Msvc 'lib\x64'), (Join-Path $toolset.Sdk 'ucrt\x64'), (Join-Path $toolset.Sdk 'um\x64'))
+    $resolution = Resolve-CoffLink -Inputs $inputs.ToArray() -LibraryDirectories $libraries -DefaultLibraries @('ucrt.lib') -IgnoredDefaultLibraries @('libucrt.lib') -Entry 'wmainCRTStartup'
+    if ($resolution.Unresolved.Count) { throw ("Native link: unresolved external symbols:`n" + ($resolution.Unresolved -join "`n")) }
+    $image = Write-CoffImage -Resolution $resolution -Path ([IO.Path]::GetFullPath($OutputPath)) -Merges @('.managedcode=.text', 'hydrated=.bss') -Subsystem $(if ($Subsystem -eq 'Windows') { 2 } else { 3 }) -StackReserve 1572864
+    [pscustomobject]@{ OutputPath = [IO.Path]::GetFullPath($OutputPath); Object = $object; ObjectLength = (Get-Item -LiteralPath $object).Length; ImageLength = (Get-Item -LiteralPath $OutputPath).Length; Image = $image }
 }
 
 function Test-LoweredAssembly {
@@ -3903,7 +5376,13 @@ process {
             foreach ($name in 'SourcePath', 'SourceAst', 'StaticData', 'ClassName', 'ClassNames', 'MethodNames', 'OutputPath', 'EntryPoint', 'Deterministic') {
                 if ($PSBoundParameters.ContainsKey($name)) { $compileParameters[$name] = $PSBoundParameters[$name] }
             }
-            Export-LoweredAssembly @compileParameters
+            if (-not $Native) { return Export-LoweredAssembly @compileParameters }
+            if (-not $EntryPoint) { throw 'A native executable needs -EntryPoint.' }
+            # The lowered assembly sits beside the executable, named for it; ILC and the linker take it from there.
+            $compileParameters['OutputPath'] = [IO.Path]::ChangeExtension([IO.Path]::GetFullPath($OutputPath), '.dll')
+            $lowered = Export-LoweredAssembly @compileParameters
+            $image = Export-NativeImage -AssemblyPath $lowered.OutputPath -OutputPath $OutputPath -Subsystem $Subsystem
+            [pscustomobject]@{ Assembly = $lowered; Native = $image }
         }
         'Expression' {
             if ($null -eq $MethodAst) { throw 'Expression requires -MethodAst.' }
@@ -3911,6 +5390,20 @@ process {
         }
         'Inspect' { Test-LoweredAssembly -AssemblyPath $AssemblyPath }
         'Capability' { Get-LoweringCapability }
+        'Describe' { Get-SmaDescription $(if ($ProjectPath) { $ProjectPath } else { $PSScriptRoot }) }
+        'Lint' {
+            $targets = if ($LintFiles) { $LintFiles } else { foreach ($project in Get-Projects) { foreach ($relative in $project.Files) { Join-Path $project.Path $relative } } }
+            $findings = @(foreach ($file in $targets) { if (Test-Path -LiteralPath $file) { Get-SmaLint ([IO.Path]::GetFullPath($file)) } })
+            $findings | Group-Object Rule | Sort-Object Count -Descending | ForEach-Object { '{0,-20} {1,5}' -f $_.Name, $_.Count }
+            $findings | Sort-Object Rule, File, Line | ForEach-Object { '{0,-20} {1}:{2}  {3}' -f $_.Rule, $_.File, $_.Line, $_.Detail }
+        }
+        'Profile' { Invoke-SmaProfile }
+        'Report' {
+            if (-not $ProfilePath) { throw 'Report requires a historical -ProfilePath.' }
+            $profiled = Import-Clixml -LiteralPath $ProfilePath
+            Get-SmaReport @(Get-SmaUnits $profiled) $profiled
+        }
+        'Verify' { Test-SmaDescription }
         'Link' {
             $resolution = Resolve-CoffLink -Inputs $LinkInput -LibraryDirectories @($LibraryDirectory | Where-Object { $_ }) -DefaultLibraries @($DefaultLibrary | Where-Object { $_ }) -IgnoredDefaultLibraries @($NoDefaultLibrary | Where-Object { $_ }) -Entry $EntrySymbol
             if ($ResolveOnly) { return $resolution }

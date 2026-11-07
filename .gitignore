@@ -5,3 +5,5 @@
 *.log
 .DS_Store
 Thumbs.db
+# Pinned tools: references, not oracles or dependencies; never committed.
+/tools/*/
