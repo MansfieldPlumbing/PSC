@@ -6821,18 +6821,38 @@ function ConvertTo-PscInterpretedType {
     , $types
 }
 
-# A source's classes, lowered by PSC and loaded from the assembly's bytes.
+# A source's classes, lowered by PSC and loaded from the assembly's bytes. Lowering stops at a class's first refusal;
+# the refusal is recorded, the class it occurs in is set aside, and the remaining classes are lowered again, until what
+# remains lowers or nothing remains. Every class's first refusal is observed, and every class that lowers is lowered.
 class LowerInstrument : PscInstrument {
     [type[]] Requires() { return [type[]]@([ParseInstrument]) }
     [bool] AppliesTo([string] $target) { return [IO.Path]::GetExtension($target) -in '.ps1', '.psm1' }
     [void] Examine([PscInvestigation] $investigation, [string] $target) {
         $source = [PscInstrument]::Source($investigation, $target)
-        if ($null -eq $source.Ast.Find({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $false)) { return }
+        $classes = @($source.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $false) | Where-Object { -not (Test-AttributeClass $_) })
+        if ($classes.Count -eq 0) { return }
         $directory = [IO.Path]::Combine([IO.Path]::GetDirectoryName($PSCommandPath), 'build', 'investigation', $source.Sha512.Substring(0, 16))
         $null = [IO.Directory]::CreateDirectory($directory)
         $output = [IO.Path]::Combine($directory, [IO.Path]::GetFileNameWithoutExtension($target) + '.dll')
-        $null = Export-LoweredAssembly -SourceAst $source.Ast -OutputPath $output -Deterministic
-        $investigation.Observe($target, [LowerInstrument], [System.Reflection.Assembly]::Load([IO.File]::ReadAllBytes($output)))
+        $candidates = [System.Collections.Generic.List[System.Management.Automation.Language.TypeDefinitionAst]]::new()
+        foreach ($class in $classes) { $candidates.Add($class) }
+        while ($candidates.Count) {
+            try {
+                $null = Export-LoweredAssembly -SourceAst $source.Ast -ClassName $candidates[0].Name -ClassNames ([string[]]@($candidates | ForEach-Object Name)) -OutputPath $output -Deterministic
+                $investigation.Observe($target, [LowerInstrument], [System.Reflection.Assembly]::Load([IO.File]::ReadAllBytes($output)))
+                return
+            }
+            catch {
+                $investigation.Observe($target, [LowerInstrument], $_)
+                # The refusal's source position exists only in its message text; see the typed-refusal measure.
+                $position = [regex]::Match($_.Exception.Message, '^\[(\d+):(\d+)\]')
+                if (-not $position.Success) { return }
+                $line = [int]$position.Groups[1].Value
+                $refused = @($candidates | Where-Object { $line -ge $_.Extent.StartLineNumber -and $line -le $_.Extent.EndLineNumber })
+                if ($refused.Count -eq 0) { return }
+                $null = $candidates.Remove($refused[0])
+            }
+        }
     }
 }
 
@@ -6841,7 +6861,7 @@ class InterpretInstrument : PscInstrument {
     [type[]] Requires() { return [type[]]@([LowerInstrument]) }
     [bool] AppliesTo([string] $target) { return [IO.Path]::GetExtension($target) -in '.ps1', '.psm1' }
     [void] Examine([PscInvestigation] $investigation, [string] $target) {
-        if (@($investigation.Find($target, [LowerInstrument])).Count -eq 0) { return }
+        if (@($investigation.Find($target, [LowerInstrument]) | Where-Object { $_ -is [System.Reflection.Assembly] }).Count -eq 0) { return }
         $source = [PscInstrument]::Source($investigation, $target)
         $investigation.Observe($target, [InterpretInstrument], (ConvertTo-PscInterpretedType -Ast $source.Ast))
     }
@@ -6854,7 +6874,7 @@ class CompareInstrument : PscInstrument {
     [type[]] Requires() { return [type[]]@([LowerInstrument], [InterpretInstrument]) }
     [bool] AppliesTo([string] $target) { return [IO.Path]::GetExtension($target) -in '.ps1', '.psm1' }
     [void] Examine([PscInvestigation] $investigation, [string] $target) {
-        $assemblies = @($investigation.Find($target, [LowerInstrument]))
+        $assemblies = @($investigation.Find($target, [LowerInstrument]) | Where-Object { $_ -is [System.Reflection.Assembly] })
         $interpretedSets = @($investigation.Find($target, [InterpretInstrument]))
         if ($assemblies.Count -eq 0 -or $interpretedSets.Count -eq 0) { return }
         $assembly = [System.Reflection.Assembly]$assemblies[0]
