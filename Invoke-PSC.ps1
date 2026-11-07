@@ -1793,14 +1793,11 @@ function New-PowerShellArithmetic {
         'Rem'      { return [Linq.Expressions.Expression]::Modulo($Left, $Right) }
         'Divide' {
             if (-not $integral) { return [Linq.Expressions.Expression]::Divide($Left, $Right) }
-            $zero = [Linq.Expressions.Expression]::Constant([Convert]::ChangeType(0, $Right.Type), $Right.Type)
-            $throw = [Linq.Expressions.Expression]::Throw(
-                $script:ExpressionNewMethod.Invoke($null, [object[]]@([DivideByZeroException].GetConstructor([Type[]]@()), [Linq.Expressions.Expression[]]@())), [double])
-            $quotient = [Linq.Expressions.Expression]::Divide(
-                [Linq.Expressions.Expression]::Convert($Left, [double]),
-                [Linq.Expressions.Expression]::Convert($Right, [double]))
-            return [Linq.Expressions.Expression]::Condition(
-                [Linq.Expressions.Expression]::Equal($Right, $zero), $throw, $quotient)
+            # PowerShellSemantics.Quotient: the integer quotient when exact, the Double quotient otherwise.
+            $operandType = if ($Left.Type -eq [uint64]) { [uint64] } else { [long] }
+            $quotient = $script:LoweringClassTypes['PowerShellSemantics'].GetMethod('Quotient', [Type[]]@($operandType, $operandType))
+            return [Linq.Expressions.Expression]::Call($quotient,
+                [Linq.Expressions.Expression]::Convert($Left, $operandType), [Linq.Expressions.Expression]::Convert($Right, $operandType))
         }
     }
 }
@@ -2269,6 +2266,22 @@ class PowerShellSemantics {
             return $quotient + 1
         }
         return $quotient
+    }
+
+    # $dividend / $divisor for integral operands, as a Double: an exact quotient is the integer quotient, as SMA gives
+    # it (0 / -1 is +0, where IEEE 0.0 / -1.0 is -0); otherwise the Double quotient. -1 divides every integer, and
+    # 0.0 - $dividend is that quotient without Int64.MinValue / -1 overflowing. A zero divisor throws.
+    static [double] Quotient([long] $dividend, [long] $divisor) {
+        if ($divisor -eq -1) { return 0.0 - [double]$dividend }
+        [long] $quotient = [Math]::DivRem($dividend, $divisor).Item1
+        if ($dividend - $quotient * $divisor -eq 0) { return [double]$quotient }
+        return [double]$dividend / [double]$divisor
+    }
+
+    static [double] Quotient([uint64] $dividend, [uint64] $divisor) {
+        [uint64] $quotient = [Math]::DivRem($dividend, $divisor).Item1
+        if ($dividend - $quotient * $divisor -eq [uint64]0) { return [double]$quotient }
+        return [double]$dividend / [double]$divisor
     }
 }
 
@@ -7097,12 +7110,18 @@ function ConvertTo-PscInterpretedType {
     foreach ($definition in $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] }, $false)) { $definitions.Add($definition.Copy()) }
     $usings = [System.Collections.Generic.List[System.Management.Automation.Language.UsingStatementAst]]::new()
     foreach ($using in $Ast.UsingStatements) { $usings.Add((Copy-UsingStatement $using)) }
+    # After the definitions, one [Name] type expression per definition: SMA's own resolution returns each runtime type.
+    $names = @($definitions | ForEach-Object Name)
+    foreach ($name in $names) {
+        $typeName = [System.Management.Automation.Language.TypeName]::new($Ast.Extent, $name)
+        $expression = [System.Management.Automation.Language.TypeExpressionAst]::new($Ast.Extent, $typeName)
+        $definitions.Add([System.Management.Automation.Language.PipelineAst]::new($Ast.Extent, [System.Management.Automation.Language.CommandExpressionAst]::new($Ast.Extent, $expression, $null)))
+    }
     $block = [System.Management.Automation.Language.StatementBlockAst]::new($Ast.Extent, $definitions, [System.Management.Automation.Language.TrapStatementAst[]]@())
     $script = [System.Management.Automation.Language.ScriptBlockAst]::new($Ast.Extent, $usings, $null, $block, $false, $false)
-    $null = & $script.GetScriptBlock()
-    $typeProperty = [System.Management.Automation.Language.TypeDefinitionAst].GetProperty('Type', [System.Reflection.BindingFlags]'NonPublic,Instance')
+    $resolved = @(& $script.GetScriptBlock())
     $types = [System.Collections.Generic.Dictionary[string, type]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($definition in $definitions) { $types[$definition.Name] = $typeProperty.GetValue($definition) }
+    for ($i = 0; $i -lt $names.Count; $i++) { $types[$names[$i]] = $resolved[$i] }
     , $types
 }
 
