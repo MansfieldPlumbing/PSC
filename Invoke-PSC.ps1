@@ -1743,13 +1743,19 @@ function Get-ScriptFunctionClass {
     $taken = @($Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] }, $true) | ForEach-Object Name)
     while ($name -in $taken) { $name += 'Script' }
     $objectArray = [System.Management.Automation.Language.TypeConstraintAst]::new($Root.Extent, [System.Management.Automation.Language.ReflectionTypeName]::new([object[]]))
-    $members = foreach ($function in $functions) {
+    # The source's script variables, as static fields its functions read and its entry point sets.
+    $fields = foreach ($variable in Get-ScriptVariable -Root $Root) {
+        $fieldType = [System.Management.Automation.Language.TypeConstraintAst]::new($Root.Extent, [System.Management.Automation.Language.ReflectionTypeName]::new($variable.Type))
+        [System.Management.Automation.Language.PropertyMemberAst]::new($Root.Extent, $variable.Name, $fieldType, [System.Management.Automation.Language.AttributeAst[]]@(),
+            [System.Management.Automation.Language.PropertyAttributes]'Public,Static', $null)
+    }
+    $members = @($fields) + @(foreach ($function in $functions) {
         $parameters = @(if ($function.Body.ParamBlock) { $function.Body.ParamBlock.Parameters } elseif ($function.Parameters) { $function.Parameters }) | ForEach-Object { $_.Copy() }
         $definition = [System.Management.Automation.Language.FunctionDefinitionAst]::new($function.Extent, $false, $false, $function.Name,
             [System.Management.Automation.Language.ParameterAst[]]@($parameters), $function.Body.Copy())
         [System.Management.Automation.Language.FunctionMemberAst]::new($function.Extent, $definition, $objectArray.Copy(),
             [System.Management.Automation.Language.AttributeAst[]]@(), [System.Management.Automation.Language.MethodAttributes]'Public,Static')
-    }
+    })
     $type = [System.Management.Automation.Language.TypeDefinitionAst]::new($Root.Extent, $name, [System.Management.Automation.Language.AttributeAst[]]@(),
         [System.Management.Automation.Language.MemberAst[]]@($members), [System.Management.Automation.Language.TypeAttributes]::Class,
         [System.Management.Automation.Language.TypeConstraintAst[]]@())
@@ -1821,6 +1827,69 @@ function New-ScriptFunctionCall {
     }
     $method = $script:LoweringClassTypes[$member.Parent.Name].GetMethod($member.Name, [Type[]]$types)
     [Linq.Expressions.Expression]::Call($method, [Linq.Expressions.Expression[]]$bound)
+}
+
+# A variable path's name without its scope qualifier ($script:x is x).
+function Get-VariableName([System.Management.Automation.VariablePath] $Path) {
+    $name = $Path.UserPath
+    if ($Path.IsScript -or $Path.IsGlobal -or $Path.IsLocal -or $Path.IsPrivate) { $name = $name.Substring($name.IndexOf(':') + 1) }
+    $name
+}
+
+# The variables SMA itself defines in a new session (preferences and automatic variables), read once from a fresh
+# runspace's variable provider; a source's own variables are the others.
+function Get-SmaVariableName {
+    if ($null -eq $script:SmaVariableNames) {
+        $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+        try {
+            $runspace.Open()
+            $names = @($runspace.SessionStateProxy.InvokeProvider.ChildItem.Get('Variable:', $false) | ForEach-Object Name) + '_', 'PSItem', 'this', 'input', 'args'
+            $script:SmaVariableNames = [System.Collections.Generic.HashSet[string]]::new([string[]]$names, [StringComparer]::OrdinalIgnoreCase)
+        }
+        finally { $runspace.Dispose() }
+    }
+    $script:SmaVariableNames
+}
+
+# A source's script variables: each variable its top-level code assigns, and each $script: variable anywhere, except
+# SMA's own. Its type is the one an assignment declares, [hashtable] when every assignment is a hashtable literal,
+# and [object] otherwise, as a PowerShell variable holds whatever is assigned to it.
+function Get-ScriptVariable {
+    param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Root)
+    $sma = Get-SmaVariableName
+    $inCode = { param($n) for ($p = $n.Parent; $null -ne $p; $p = $p.Parent) { if ($p -is [System.Management.Automation.Language.FunctionDefinitionAst] -or $p -is [System.Management.Automation.Language.TypeDefinitionAst] -or $p -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) { return $true } }; $false }
+    $assignments = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[object]]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($statement in $Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) {
+        $left = $statement.Left
+        $declared = $null
+        if ($left -is [System.Management.Automation.Language.ConvertExpressionAst]) { $declared = $left.Type.TypeName; $left = $left.Child }
+        if ($left -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+        if (-not $left.VariablePath.IsScript -and (& $inCode $statement)) { continue }
+        $name = Get-VariableName $left.VariablePath
+        if ($sma.Contains($name)) { continue }
+        if (-not $assignments.ContainsKey($name)) { $assignments[$name] = [System.Collections.Generic.List[object]]::new() }
+        $assignments[$name].Add([pscustomobject]@{ Declared = $declared; Value = $statement.Right })
+    }
+    foreach ($reference in $Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.IsScript }, $true)) {
+        $name = Get-VariableName $reference.VariablePath
+        if (-not $sma.Contains($name) -and -not $assignments.ContainsKey($name)) { $assignments[$name] = [System.Collections.Generic.List[object]]::new() }
+    }
+    foreach ($name in $assignments.Keys) {
+        $all = $assignments[$name]
+        $declared = @($all | Where-Object { $null -ne $_.Declared } | Select-Object -First 1)
+        $type = if ($declared.Count) { Resolve-AstType $declared[0].Declared }
+            elseif ($all.Count -and @($all | Where-Object { $_.Value -isnot [System.Management.Automation.Language.CommandExpressionAst] -or $_.Value.Expression -isnot [System.Management.Automation.Language.HashtableAst] }).Count -eq 0) { [hashtable] }
+            else { [object] }
+        [pscustomobject]@{ Name = $name; Type = $type }
+    }
+}
+
+# The script field a variable names, for a member of a source's function class; $null otherwise.
+function Get-ScriptField {
+    param([Parameter(Mandatory)][hashtable] $Scope, [Parameter(Mandatory)][System.Management.Automation.VariablePath] $Path)
+    $class = $Scope['ScriptClass']
+    if ($null -eq $class) { return $null }
+    $class.GetField((Get-VariableName $Path), [Reflection.BindingFlags]'Public,Static,DeclaredOnly,IgnoreCase')
 }
 
 # Whether a member is one of a source's functions, lowered with pipeline output.
@@ -2571,6 +2640,8 @@ $script:PscSemanticsAst = $null
 # Each source's function class (or $null when it has none), and each function class's root to its source's root.
 $script:ScriptFunctionClasses = [System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast, System.Management.Automation.Language.TypeDefinitionAst]]::new()
 $script:ScriptFunctionSources = [System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast, System.Management.Automation.Language.Ast]]::new()
+# The names of the variables SMA defines in a new session, read on first use.
+$script:SmaVariableNames = $null
 
 function Convert-AstExpression {
     <#
@@ -2627,6 +2698,10 @@ function Convert-AstExpression {
         if ($Scope.Locals.ContainsKey($varName)) {
             return $Scope.Locals[$varName]
         }
+        # In a script function, a variable that is neither a parameter nor a local is the script's, as PowerShell's
+        # dynamic scope finds it.
+        $scriptField = Get-ScriptField -Scope $Scope -Path $Node.VariablePath
+        if ($null -ne $scriptField) { return [Linq.Expressions.Expression]::Field($null, $scriptField) }
 
         throw "[{0}:{1}] Unresolved variable `$$varName." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber
     }
@@ -3286,6 +3361,17 @@ function Convert-AstStatement {
             $value = Convert-AstExpressionAs -Node $Statement.Right -Type $Scope.SwitchItem.Type -Scope $Scope
             return [Linq.Expressions.Expression]::Assign($Scope.SwitchItem, $value)
         }
+        # $script:x = value writes the script's variable; an unqualified assignment in a function makes a local, as in
+        # PowerShell.
+        $leftVariable = if ($leftNode -is [System.Management.Automation.Language.VariableExpressionAst]) { $leftNode } else { $leftNode.Child }
+        if ($leftVariable.VariablePath.IsScript) {
+            $scriptField = Get-ScriptField -Scope $Scope -Path $leftVariable.VariablePath
+            if ($null -ne $scriptField) {
+                $value = Convert-AstExpressionAs -Node $Statement.Right -Type $(if ($explicitType) { $explicitType } else { $scriptField.FieldType }) -Scope $Scope
+                if ($value.Type -ne $scriptField.FieldType) { $value = ConvertTo-PowerShellType -Expression $value -Type $scriptField.FieldType }
+                return [Linq.Expressions.Expression]::Assign([Linq.Expressions.Expression]::Field($null, $scriptField), $value)
+            }
+        }
 
         $knownType = if ($explicitType) { $explicitType }
                      elseif ($Scope.Parameters.ContainsKey($varName)) { $Scope.Parameters[$varName].Type }
@@ -3740,7 +3826,8 @@ function Convert-MethodAstToLambda {
     $thisParam = if ($MethodAst.IsStatic) { $null } else { [Linq.Expressions.Expression]::Parameter($classType, 'this') }
     New-LoweredBody -Name $MethodAst.Name -ReturnType $retType -This $thisParam -Parameters $paramExprList -ParameterMap $paramMap `
         -Initializers $Initializers -Statements @($(if ($MethodAst.Body -and $MethodAst.Body.EndBlock) { $MethodAst.Body.EndBlock.Statements })) `
-        -IsStatic ([bool]$MethodAst.IsStatic) -IsConstructor ([bool]$MethodAst.IsConstructor) -Output:$isFunction
+        -IsStatic ([bool]$MethodAst.IsStatic) -IsConstructor ([bool]$MethodAst.IsConstructor) -Output:$isFunction `
+        -ScriptClass $(if ($isFunction) { $classType } else { $null })
 }
 
 function Convert-InitializersToLambda {
@@ -3769,7 +3856,9 @@ function New-LoweredBody {
         [System.Management.Automation.Language.PropertyMemberAst[]] $Initializers, [object[]] $Statements,
         [bool] $IsStatic, [bool] $IsConstructor,
         # A script function: what its statements write is collected and returned as [object[]].
-        [switch] $Output
+        [switch] $Output,
+        # A script function's class, whose static fields are the script's variables.
+        [Type] $ScriptClass
     )
 
     $returnTarget = [Linq.Expressions.Expression]::Label($ReturnType, 'returnTarget')
@@ -3788,6 +3877,7 @@ function New-LoweredBody {
         Loops          = [System.Collections.Generic.Stack[object]]::new()
         This           = $This
         Output         = $outputList
+        ScriptClass    = $ScriptClass
     }
 
     $body = [System.Collections.Generic.List[Linq.Expressions.Expression]]::new()
