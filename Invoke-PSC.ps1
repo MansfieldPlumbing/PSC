@@ -4842,6 +4842,9 @@ class PscApi {
 
     # Sets a binding in this API's environment; the newest binding for its target wins.
     [PscBinding] SetBinding([PscBinding] $binding) { return $this.Environment.Set($binding) }
+
+    # Parses a PowerShell source file and takes every measure of it, with the location of each finding.
+    [PscSource] ReadSource([string] $path) { return [PscSource]::new($path) }
 }
 
 function Get-PscApi {
@@ -6319,6 +6322,18 @@ class ExpandableTexts : PscMeasurementMethod {
 }
 
 # -match, -notmatch, -replace and -split in every casing, binary and unary, and [regex] type uses.
+# using namespace statements: the source's type names then resolve through a namespace search list instead of what
+# they say.
+class NamespaceUsings : PscMeasurementMethod {
+    [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]] Locate([PscSource] $source) {
+        $found = [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]]::new()
+        foreach ($using in $source.Ast.UsingStatements) {
+            if ($using.UsingStatementKind -eq [System.Management.Automation.Language.UsingStatementKind]::Namespace) { $found.Add($using.Extent) }
+        }
+        return $found
+    }
+}
+
 class RegexUses : PscMeasurementMethod {
     [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]] Locate([PscSource] $source) {
         $kinds = [System.Management.Automation.Language.TokenKind[]]@('Imatch', 'Cmatch', 'Inotmatch', 'Cnotmatch', 'Ireplace', 'Creplace', 'Isplit', 'Csplit')
