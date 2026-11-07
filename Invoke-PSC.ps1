@@ -1650,29 +1650,62 @@ function Use-ClassMirror {
     param([Parameter(Mandatory)][System.Management.Automation.Language.Ast] $Ast)
     $root = $Ast
     while ($root.Parent) { $root = $root.Parent }
-    $types = Get-ClassMirrorType -Root $root
-    $semanticsRoot = Get-PscSemanticsClass
-    while ($semanticsRoot.Parent) { $semanticsRoot = $semanticsRoot.Parent }
-    if ($root -ne $semanticsRoot -and -not $types.ContainsKey('PowerShellSemantics')) {
-        $types = $types + (Get-ClassMirrorType -Root $semanticsRoot)
-    }
-    $script:LoweringClassTypes = @{} + $types
+    $script:LoweringClassTypes = @{} + (Get-ClassMirrorType -Root $root)
 }
 
-# The mirror types of the classes and enums under one root, built once per root.
+# The mirror types of the classes and enums under one root, built once per root. Building one leaves the lowering in
+# progress resolving the types it was resolving.
 function Get-ClassMirrorType {
     param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Root)
     $types = $null
     if (-not $script:ClassMirrorCache.TryGetValue($Root, [ref]$types)) {
-        $classes = @($Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true) | Where-Object { -not (Test-AttributeClass $_) })
-        $enums = @($Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsEnum }, $true))
-        $script:LoweringClassTypes = @{}
-        $mirror = New-ClassMirror -Model @(Get-ClassModel -ClassAsts $classes) -Enums $enums
-        $types = @{}
-        foreach ($name in $mirror.Keys) { $types[$name] = $mirror[$name] }
-        $script:ClassMirrorCache.Add($Root, $types)
+        $resolving = $script:LoweringClassTypes
+        try {
+            $classes = @($Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true) | Where-Object { -not (Test-AttributeClass $_) })
+            $enums = @($Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsEnum }, $true))
+            $script:LoweringClassTypes = @{}
+            $mirror = New-ClassMirror -Model @(Get-ClassModel -ClassAsts $classes) -Enums $enums
+            $types = @{}
+            foreach ($name in $mirror.Keys) { $types[$name] = $mirror[$name] }
+            $script:ClassMirrorCache.Add($Root, $types)
+        }
+        finally { $script:LoweringClassTypes = $resolving }
     }
     $types
+}
+
+# A PowerShellSemantics method for lowering to call. The helper class is off until a lowering asks for one: its
+# definition is read and mirrored on the first request, and it enters an output assembly only when an emitted call
+# needs it (Get-IlMember).
+function Get-PscSemanticsMethod {
+    param([Parameter(Mandatory)][string] $Name, [Parameter(Mandatory)][Type[]] $ParameterTypes)
+    $root = Get-PscSemanticsClass
+    while ($root.Parent) { $root = $root.Parent }
+    (Get-ClassMirrorType -Root $root)['PowerShellSemantics'].GetMethod($Name, $ParameterTypes)
+}
+
+# Defines PowerShellSemantics in the assembly being compiled, the first time an emitted call needs one of its methods;
+# Export-LoweredAssembly lowers its bodies after the program's.
+function Add-PscSemanticsToSession {
+    $state = $script:IlMap.Semantics
+    if ($null -ne $state.Methods) { return }
+    $class = Get-PscSemanticsClass
+    $root = $class; while ($root.Parent) { $root = $root.Parent }
+    $mirrorType = (Get-ClassMirrorType -Root $root)['PowerShellSemantics']
+    $declared = [Reflection.BindingFlags]'Public,Static,Instance,DeclaredOnly'
+    $tb = $state.Session.Module.DefineType('PowerShellSemantics', [Reflection.TypeAttributes]'Public,Class')
+    $state.Session.Types['PowerShellSemantics'] = $tb
+    $script:IlMap.Types[$mirrorType] = $tb
+    $state.Methods = @(foreach ($m in @($class.Members | Where-Object { $_ -is [System.Management.Automation.Language.FunctionMemberAst] -and -not $_.IsConstructor })) {
+        $types = Get-ParameterTypes $m
+        $mm = $mirrorType.GetMethod($m.Name, $declared, $null, $types, $null)
+        $mb = $tb.DefineMethod($mm.Name, $mm.Attributes, (Get-IlType $mm.ReturnType), [Type[]]@($types | ForEach-Object { Get-IlType $_ }))
+        for ($i = 0; $i -lt $m.Parameters.Count; $i++) { $null = $mb.DefineParameter($i + 1, [Reflection.ParameterAttributes]::None, $m.Parameters[$i].Name.VariablePath.UserPath) }
+        $script:IlMap.Members[$mm] = $mb
+        [pscustomobject]@{ Ast = $m; Builder = $mb }
+    })
+    $mc = $mirrorType.GetConstructor($declared, $null, [Type[]]@(), $null)
+    if ($null -ne $mc) { $script:IlMap.ImplicitConstructors[$mc] = $tb }
 }
 
 # PowerShellSemantics' definition, read once from this script's AST and copied into a root of its own, so its methods
@@ -1795,7 +1828,7 @@ function New-PowerShellArithmetic {
             if (-not $integral) { return [Linq.Expressions.Expression]::Divide($Left, $Right) }
             # PowerShellSemantics.Quotient: the integer quotient when exact, the Double quotient otherwise.
             $operandType = if ($Left.Type -eq [uint64]) { [uint64] } else { [long] }
-            $quotient = $script:LoweringClassTypes['PowerShellSemantics'].GetMethod('Quotient', [Type[]]@($operandType, $operandType))
+            $quotient = Get-PscSemanticsMethod -Name Quotient -ParameterTypes ($operandType, $operandType)
             return [Linq.Expressions.Expression]::Call($quotient,
                 [Linq.Expressions.Expression]::Convert($Left, $operandType), [Linq.Expressions.Expression]::Convert($Right, $operandType))
         }
@@ -1826,9 +1859,7 @@ function ConvertTo-IntegralQuotient {
     $bound = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Arithmetic,
         (Convert-AstExpression -Node $inner.Left -Scope $Scope), (Convert-AstExpression -Node $inner.Right -Scope $Scope))
     if ($null -eq $bound -or $bound.Left.Type -notin [int], [uint32]) { return $null }
-    $semantics = $script:LoweringClassTypes['PowerShellSemantics']
-    if ($null -eq $semantics) { throw 'PowerShellSemantics is not part of this compile; Export-LoweredAssembly composes it into every one.' }
-    $rounded = [Linq.Expressions.Expression]::Call($semantics.GetMethod('RoundedQuotient'),
+    $rounded = [Linq.Expressions.Expression]::Call((Get-PscSemanticsMethod -Name RoundedQuotient -ParameterTypes ([long], [long])),
         [Linq.Expressions.Expression]::Convert($bound.Left, [long]), [Linq.Expressions.Expression]::Convert($bound.Right, [long]))
     ConvertTo-PowerShellType -Expression $rounded -Type $Type
 }
@@ -2342,7 +2373,7 @@ class PscOperandBinding : PscBinding {
 # Where SMA's result type depends on the value, nothing is chosen here and the binding does not apply: arithmetic on a
 # signed integer and an unsigned one of higher rank ([uint32]1 + [int]-2 is Int64, [uint32]5 + [int]2 is UInt32), and
 # bitwise operators with a Single, Double or Decimal operand (UInt64, or Int64 when negative). The program states the
-# type it means there, as PSNES does.
+# type it means there.
 class PowerShellNumericOperands : PscOperandBinding {
     static [Type[]] $Ranks = @([int], [uint32], [long], [uint64], [double], [decimal])
 
@@ -3865,6 +3896,13 @@ function Get-IlType([Type] $Type) {
 }
 
 function Get-IlMember([Reflection.MemberInfo] $Member) {
+    # A PowerShellSemantics method: the helper class enters this assembly on the first call that needs it, and every
+    # helper a call needs is recorded for the compile's result.
+    if ($Member.DeclaringType -and $Member.DeclaringType.Name -eq 'PowerShellSemantics' -and $script:IlMap.ContainsKey('Semantics') -and
+        $Member.DeclaringType.Assembly.GetName().Name -like 'PSLoweringMirror*') {
+        Add-PscSemanticsToSession
+        $null = $script:IlMap.Semantics.Needed.Add('PowerShellSemantics.' + $Member.Name)
+    }
     if ($script:IlMap.Members.ContainsKey($Member)) { return $script:IlMap.Members[$Member] }
     if ($script:IlMap.ContainsKey('ImplicitConstructors') -and $script:IlMap.ImplicitConstructors.ContainsKey($Member)) {
         # Reflection.Emit normally adds this constructor when the type is completed. Materialize it only when
@@ -5110,14 +5148,11 @@ function Export-LoweredAssembly {
     }
     $targetClass = $parsed.ClassAst
     $classAsts = @($parsed.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true) | Where-Object { -not (Test-AttributeClass $_) })
-    # PSC's semantic helpers are lowered with every program.
-    if ('PowerShellSemantics' -notin @($classAsts.Name)) { $classAsts += Get-PscSemanticsClass }
     $script:LoweringKeywords = @{}
     foreach ($definition in @(Get-LoweringKeywords $parsed.Ast)) { $script:LoweringKeywords[$definition.Name] = $definition }
     if ($ClassNames) {
-        $selected = @(@($ClassNames) + 'PowerShellSemantics' | Sort-Object -Unique)
-        $classAsts = @($classAsts | Where-Object Name -in $selected)
-        if ($classAsts.Count -ne $selected.Count -or $targetClass.Name -notin $ClassNames) { throw 'ClassNames must identify existing classes and include ClassName.' }
+        $classAsts = @($classAsts | Where-Object Name -in $ClassNames)
+        if ($classAsts.Count -ne @($ClassNames | Sort-Object -Unique).Count -or $targetClass.Name -notin $ClassNames) { throw 'ClassNames must identify existing classes and include ClassName.' }
     }
     $model = @(Get-ClassModel -ClassAsts $classAsts)
     Use-ClassMirror -Ast $parsed.Ast
@@ -5135,7 +5170,7 @@ function Export-LoweredAssembly {
     $assemblyName = [IO.Path]::GetFileNameWithoutExtension($OutputPath)
     $session = New-PersistedAssemblySession -AssemblyName $assemblyName
     $declared = [Reflection.BindingFlags]'Public,Static,Instance,DeclaredOnly'
-    $script:IlMap = @{ Types = @{}; Members = @{}; ImplicitConstructors = @{} }
+    $script:IlMap = @{ Types = @{}; Members = @{}; ImplicitConstructors = @{}; Semantics = [pscustomobject]@{ Session = $session; Methods = $null; Needed = [System.Collections.Generic.SortedSet[string]]::new([StringComparer]::Ordinal) } }
     try {
         # 1. Output types, so every signature can name any of them. Enums are complete once their literals exist.
         foreach ($enumAst in @($parsed.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsEnum }, $true))) {
@@ -5245,6 +5280,15 @@ function Export-LoweredAssembly {
                 }
             }
         }
+        # PowerShellSemantics, when an emitted call switched it on: its bodies are lowered after the program's.
+        $helpers = [string[]]@()
+        if ($null -ne $script:IlMap.Semantics.Methods) {
+            foreach ($helper in $script:IlMap.Semantics.Methods) {
+                $lowered = Convert-MethodAstToLambda -MethodAst $helper.Ast
+                Write-IlMethodBody -Lambda $lowered.Lambda -MethodBuilder $helper.Builder -IsStatic:$lowered.IsStatic -HasThis:$lowered.HasThis
+            }
+            $helpers = [string[]]@($script:IlMap.Semantics.Needed)
+        }
         if ($emittedMethods.Count -eq 0 -and $MethodNames) {
             throw "No matching methods found in class '$($targetClass.Name)' to export."
         }
@@ -5266,6 +5310,8 @@ function Export-LoweredAssembly {
         SHA256         = $saveResult.SHA256
         ClassName      = $targetClass.Name
         Classes        = [string[]]@($model | ForEach-Object Name)
+        # The PowerShellSemantics helpers this compile switched on, because lowering needed them.
+        Helpers        = $helpers
         EmittedMethods = $emittedMethods.ToArray()
         Deterministic  = $saveResult.Deterministic
         EntryPoint     = $saveResult.EntryPoint
