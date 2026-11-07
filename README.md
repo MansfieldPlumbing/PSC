@@ -1,230 +1,209 @@
-# PSLowering
+# PSC
 
-PSLowering lets PowerShell be the language you write managed code in. You
-write a typed PowerShell class; PSLowering compiles its methods ahead of time
-into a .NET assembly whose methods run as ordinary IL, with no PowerShell
-engine, no C#, no Roslyn and no `Add-Type`. The compiler is itself written in
-PowerShell.
+PSC compiles typed PowerShell classes to .NET assemblies and to Windows x64
+Native AOT executables. The compiler is one PowerShell script, `Invoke-PSC.ps1`.
 
-The complete compiler is the directly executable `Invoke-PSC.ps1`.
+## How PSC lowers
 
-## Script operations
+1. SMA's parser parses the source. Statement keywords the source declares are
+   registered with the parser first (see [Compiled language](#compiled-language)).
+2. The classes to compile become a class model, and mirror types are defined so
+   member and type references resolve before IL exists.
+3. Each method's AST is lowered to a typed LINQ expression tree. Constructs
+   outside the compiled language are rejected here, with their source position.
+4. PSC's IL emitter writes each expression tree as a method body into a
+   `PersistedAssemblyBuilder` assembly, which is saved deterministically.
+5. With `-Native`, ILC compiles that assembly to one COFF object, and PSC's COFF
+   linker links it with the Native AOT runtime and the Windows import libraries
+   into a PE32+ executable.
 
-Call the script with `&` in the current process to retain live AST and
-expression objects. No module import, dot-sourced implementation, helper
-script or compiler DLL is required.
+Compiled output references no `System.Management.Automation` type. Its assembly
+references are `System.Private.CoreLib` and the BCL assemblies the source calls.
 
-`& ./Invoke-PSC.ps1` with no arguments (or `-Mode Api`) returns the script's
-API, read from its own AST: every mode, the script parameters that mode's
-operation reads (including those a splatted call binds), their types,
-defaults, allowed values and help, and the functions each mode calls.
+The same pipeline serves three uses:
 
-| Mode | Result |
+- **Helpers**: individual typed methods (kernels, contracts, conversions)
+  compiled to an assembly that a PowerShell process loads and calls through
+  reflection or delegates.
+- **Hot loops**: methods that run per frame or per sample, compiled to IL so the
+  loop runs as JIT-compiled code instead of in the PowerShell interpreter, or
+  compiled into a native executable.
+- **Appliances**: a whole PowerShell script whose classes and static entry
+  method form a program, compiled with `-Native -EntryPoint <method>` to a
+  Native AOT executable. The executable contains the Native AOT runtime and the
+  program's code. Its import table names only Windows system DLLs and the
+  Universal C Runtime API sets (`api-ms-win-crt-*`); it imports no .NET host or
+  PowerShell library.
+
+Not yet complete: a single-file JIT executable. `-EntryPoint` without `-Native`
+writes an assembly and its `runtimeconfig.json`, which run with
+`dotnet exec <name>.dll`.
+
+## Invocation
+
+`& ./Invoke-PSC.ps1` with no arguments returns a `PSC.Api` object read from the
+script's own AST: each mode, the script parameters that mode's operation reads
+(including parameters bound through a splatted call), their types, defaults,
+allowed values and help, and the functions each mode calls. `-Mode Api` returns
+the same object. `-Help` returns the comment-based help.
+
+| Mode | Returns |
 |---|---|
-| `Api` | The script's API object (`PSC.Api`) |
-| `Compile` (default with compile inputs) | Compilation receipt; accepts `SourcePath` or `SourceAst`, `ClassName`, `ClassNames`, `MethodNames`, `StaticData`, `OutputPath`, `EntryPoint`, `Deterministic`; with `-Native` and `EntryPoint`, a native executable |
-| `Expression` | Typed-expression object with a live `Lambda`; accepts `MethodAst`, including pipeline input |
-| `Inspect` | Assembly metadata receipt; accepts `AssemblyPath` |
-| `Capability` | Capability object |
-| `Link` | COFF symbol resolution and native image writing |
-| `PowerShell` | Path of the pinned `pwsh.exe`, downloaded and SHA-256-verified beneath `build/cache` on first use; accepts `ArchivePath` |
-| `Describe`, `Lint`, `Profile`, `Report`, `Verify` | Projects described as live objects from SMA's parser; `Lint` and `Profile` cover the projects beside this repository's folder |
+| `Compile` | The compilation record. Inputs: `SourcePath` or `SourceAst`, `ClassName`, `ClassNames`, `MethodNames`, `StaticData`, `OutputPath`, `EntryPoint`, `Deterministic`. With `-Native` and `EntryPoint`: the lowered assembly's record and the native image's record. |
+| `Expression` | The typed expression of one method, with a live `Lambda`. Input: `MethodAst`, also from the pipeline. |
+| `Inspect` | The metadata of a compiled assembly. Input: `AssemblyPath`. |
+| `Capability` | Compiler identity and source SHA-256, PowerShell and runtime versions, and the semantic and dependency contracts. |
+| `Link` | COFF symbol resolution and, unless `-ResolveOnly`, a PE32+ image. Inputs: `LinkInput`, `LibraryDirectory`, `DefaultLibrary`, `NoDefaultLibrary`, `EntrySymbol`, `LinkMerge`, `Subsystem`, `StackReserve`, `OutputPath`. |
+| `PowerShell` | The path of PowerShell 7.7.0-preview.5 `pwsh.exe` beneath `build/cache`. The release archive is downloaded on first use (or read from `ArchivePath`) and checked against its published SHA-256 before extraction. |
+| `Describe` | One PowerShell project as live objects from SMA's parser: units, edges, coverage, absence and changes. Input: `ProjectPath`. |
+| `Lint`, `Profile`, `Report`, `Verify` | Findings over PowerShell files (by default every project beside this repository's folder), a profile of every project's functions and methods, a report on a stored profile (`ProfilePath`), and the description's structural fixture. |
 
-Use `& ./Invoke-PSC.ps1 -Help` or
-`Get-Help ./Invoke-PSC.ps1 -Full` for script help.
-`tests/Test-Slice1.ps1` checks a copied standalone script from an unrelated
-working directory, deterministic output, all four operations and live
-expression inspection. The complete 22-suite runner checks semantic
-parity, LambdaCompiler parity, native imports, rejection boundaries,
-consumer admission and execution without SMA on PowerShell
-7.7.0-preview.5 / .NET 11.0.0-rc.1.26425.128.
+`Compile` is the default mode whenever arguments are given.
 
-The single-file execution model follows read-only `Pwsh/setup.ps1` at
-[`3110a85a63a48b2dc1500364cb508d06f3ea3f91`](https://github.com/MansfieldPlumbing/Pwsh/blob/3110a85a63a48b2dc1500364cb508d06f3ea3f91/setup.ps1).
-Its source SHA-256 is
-`B95525F003601335A79AD0539D6147BF0AD384D4D4CB2E3D8981C49039B6F035`.
-Its application functionality is outside this compiler's scope.
+## Compiled language
 
-`tests/Test-SingleFileArchitecture.ps1` enforces the one-file implementation,
-rejects implementation loaders and additional implementation files, and runs
-all four modes and help in a fresh process from an unrelated directory.
-`tests/Test-LegacyReproduction.ps1` rebuilds 52 historical outputs and compares
-exact SHA-256, MVID and full assembly references with the frozen
-[`218f54e` baseline](tests/baseline/README.md), plus 13 exact diagnostics.
-Altered expected artifacts and diagnostics must fail the verifier process.
+Every class in the source is compiled into one assembly; `ClassNames` selects
+a subset. Supported:
 
-Native indirect calls and callbacks are described in
-[the native interop contract](docs/native-interop.md), with positive/negative
-fixtures, an independent native ABI oracle, exact signature metadata checks,
-PowerShell body parity and fresh zero-SMA hosts in `tests/Test-NativeInterop.ps1`.
-The verified target is Windows x64 on the pinned PowerShell/.NET toolchain.
-
-## Why it exists
-
-Projects that keep every line of their implementation in PowerShell still
-need managed code in places where a PowerShell runspace cannot be used: code
-that runs before the engine starts, code that must keep working when it
-fails to load, and hot paths that run per frame or per sample. Until now that
-code had to be written by hand as `System.Linq.Expressions` trees, node by
-node, which is slow to write and hard to review.
-
-PSLowering replaces that with the same method written as typed PowerShell.
-Its first consumers:
-
-- **[Pwsh](https://github.com/MansfieldPlumbing/Pwsh)**, PowerShell on Android: the methods of its emitted managed host,
-  the console core it lowers for performance, and a recovery path that must
-  run without the PowerShell engine. Pwsh's `FindProfile` is here as a
-  fixture: 12 lines of typed PowerShell in place of the expression-tree code
-  that builds it today, admitted by Pwsh's own persisted-method check.
-- **[Kokoro-Hexagon](https://github.com/MansfieldPlumbing/Kokoro-Hexagon)**, a text-to-speech engine:
-  the managed control code around its model, such as the `VoiceRowIndex` contract in the fixtures.
-
-## Example
-
-```powershell
-# Contract.ps1
-class Contract {
-    static [int] VoiceRowIndex([int] $phonemeCount) {
-        if ($phonemeCount -lt 1 -or $phonemeCount -gt 510) {
-            throw [System.ArgumentOutOfRangeException]::new('phonemeCount')
-        }
-        return $phonemeCount - 1
-    }
-}
-```
-
-```powershell
-& ./Invoke-PSC.ps1 -SourcePath ./Contract.ps1 -ClassName Contract -OutputPath ./build/Contract.dll -Deterministic
-
-$type = [Reflection.Assembly]::LoadFile("$PWD/build/Contract.dll").GetType('Contract')
-$type.GetMethod('VoiceRowIndex').Invoke($null, @(42))   # 41
-```
-
-With `-EntryPoint <method>`, the output is an executable with a runtime
-configuration beside it, run with `dotnet <file>.dll`. The entry method must
-be static, return `[int]` or `[void]`, and take no parameters or one
-`[string[]]`.
-
-`-Mode Capability` reports the PowerShell and .NET versions in use and
-the semantic contract. `-Mode Expression` returns a method's
-lowered expression tree for inspection, and `-Mode Inspect` checks a
-compiled assembly.
-
-## What it compiles
-
-A declared typed subset, exercised by the fixtures in `tests/fixtures`:
-
-- every class in the source file, compiled into one assembly, so classes can
-  use each other's types and members, including in generic types such as
-  `List[CellBox]`;
-- typed properties, compiled as public fields, with initial values; static
-  properties are initialized by the type initializer, instance properties
-  before each constructor body;
-- constructors with typed parameters, and `$this` in constructors and
-  instance methods;
-- static and instance methods with zero or more typed parameters and typed
-  returns, including `[void]`;
-- constants, typed locals, assignment, compound assignment (`+=`, `-=`, `*=`,
-  `/=`, `%=`) on variables, fields, properties and array elements, increment
-  and decrement;
-- arithmetic, comparison and Boolean operators on operands of the same type,
-  string concatenation with `+`, and the bitwise operators `-band`, `-bor`,
-  `-bxor`, `-bnot`, `-shl` and `-shr`;
-- `if`/`elseif`/`else`, `while`, `for`, `foreach` over a typed array,
-  `break`, `continue` and early `return`;
-- typed arrays: creation, literals (typed by their target), indexing with
-  PowerShell's negative indexes (`$a[-1]` is the last element), element
-  assignment and `Length`;
-- calls to .NET static and instance methods, properties, constants and
-  constructors, bound by exact signature;
-- `throw` and `try`/`catch`/`finally`;
+- typed properties as public fields, with initial values (static properties in
+  the type initializer, instance properties before each constructor body);
+  constructors with typed parameters; static and instance methods with typed
+  parameters and returns, including `[void]`; `$this`
+- typed locals, assignment as an expression, compound assignment, `++` and `--`
+  on variables, fields, properties and array elements
+- arithmetic, comparison and Boolean operators on operands of one type, string
+  concatenation with `+`, `-band`, `-bor`, `-bxor`, `-bnot`, `-shl`, `-shr`
+- string membership tests over typed string arrays
+- `if`/`elseif`/`else`, `while`, `for`, `foreach` over a typed one-dimensional
+  array, `break`, `continue`, early `return`
+- `switch` over an integer or enum value with constant clauses, and `switch`
+  whose clauses are script-block predicates over the current value
+- typed arrays: creation, literals typed by their target, negative indexes from
+  the end, element assignment, `Length`
+- indexing through a .NET default indexer: integer-indexed collections and keyed
+  collections
+- calls to .NET static and instance methods, properties, fields, constants and
+  constructors, bound by signature, including static generic methods whose type
+  arguments are inferred structurally from the argument types
+- value-type receivers addressed in their own storage (local, argument, field,
+  array element), so calls and stores on a struct reach the struct
+- `throw` of a string, of a constructed CoreLib exception, `try`/`catch`/`finally`
 - native imports: a static method marked
   `[System.Runtime.InteropServices.LibraryImport('library', EntryPoint = 'name')]`
-  whose body is a single `throw` compiles to a P/Invoke method. Parameters and
-  returns are blittable (integers, floating point, `IntPtr`, `UIntPtr`);
-  `[string]` parameters need `StringMarshalling` `Utf8` or `Utf16`.
-  `SetLastError = $true` keeps errno (or the Win32 last error) for
-  `[Runtime.InteropServices.Marshal]::GetLastPInvokeError()`. Mainline
-  PowerShell keeps the attribute as metadata and runs the `throw`, so the
-  source stays valid PowerShell.
+  whose body is a single `throw` compiles to a P/Invoke method; indirect calls
+  through unmanaged function pointers and native callbacks are described in
+  [the native interop contract](docs/native-interop.md)
+- statement keywords declared by the source: a static method marked
+  `[Keyword()]`, where `Keyword` is an attribute class in the same source, is
+  registered with SMA's parser as a `DynamicKeyword` before the source is parsed
+- typed primitive, string and array values supplied through `StaticData` as
+  static initialization
 
-Anything else is rejected before an assembly is written, with its line,
-column and reason: commands, pipelines, script blocks, expandable strings,
-`do`, `switch`, labeled `break` and `continue`, `break` or `continue`
-outside a loop, `foreach` over anything but a typed one-dimensional array,
-operators on mixed types, classes deriving from anything but
-`System.Object`, untyped properties and parameters, and base constructor
-calls with arguments (`tests/Test-Rejections.ps1`). Nothing falls back to
-running the original script.
-
-## Guarantees and how they are checked
-
-| Guarantee | Checked by |
-| --- | --- |
-| A compiled method returns what the same PowerShell method returns, or both throw | `tests/parity/PowerShellParity.ps1`: every fixture method run as PowerShell and as IL on the same inputs (221 calls) |
-| The emitter writes the IL the framework's own compiler would accept for the same tree | `tests/parity/LambdaCompilerParity.ps1`: the same trees compiled by `LambdaCompiler`, results compared |
-| Output references no `System.Management.Automation` type and no dynamic call site; its only assembly reference is `System.Private.CoreLib` | `tests/Test-ZeroSmaHost.ps1` |
-| The same input builds byte-identical assemblies with the same MVID | slices 1, 2, 4 and 5, which build twice and compare SHA-256 and MVID |
-| Output passes Pwsh's persisted-method admission | `tests/consumers/Test-PwshAdmission.ps1`: `Test-ExpressionGraph` from Pwsh's `setup.ps1` at a pinned commit and SHA-256 |
-| Compiled code runs with the `dotnet` host alone: no PowerShell engine assembly in the process | `tests/Test-DotnetHost.ps1`: a program compiled with `-EntryPoint Main` is run by `dotnet exec`, checks the loaded assemblies itself, and returns the expected exit codes |
-| Native imports call the native function with the declared marshalling | `tests/Test-NativeImports.ps1` (Windows): process ID, UTF-16 and UTF-8 string lengths and a tick count against .NET's own answers; invalid declarations rejected |
-| The Kokoro `VoiceRowIndex` contract holds | `tests/Test-Slice9.ps1`: all counts 1-510, the out-of-range and Int32 extremes, the exception's parameter name |
+Rejected before any assembly is written, with line, column and reason:
+commands and pipelines; script blocks outside `switch` predicates and keyword
+bodies; `do`; `switch` with options or over a string subject with constant
+clauses; labeled `break` and `continue`; `break` or `continue` outside a loop;
+`foreach` over anything but a typed one-dimensional array; operators on mixed
+operand types; classes deriving from anything but `System.Object`; untyped
+properties and parameters; base constructor calls with arguments; rethrow;
+throwing a variable, an `ErrorRecord` or a non-string literal; catch blocks that
+depend on `RuntimeException`, `$_` or `$Error`; uninferable or conflicting
+generic type arguments. Nothing falls back to running the PowerShell source.
 
 ## Semantics
 
-- Integral `+`, `-`, `*`, `++`, `--` and negation throw `OverflowException` on
-  overflow. PowerShell widens the intermediate result and then fails
-  converting it back to the method's type, so both sides throw; the
-  exception types differ.
+- Integral `+`, `-`, `*`, `++`, `--` and negation are checked and throw
+  `OverflowException`. PowerShell widens the intermediate result and then fails
+  converting it back to the declared type, so both throw, with different
+  exception types.
 - Integral `/` divides as `Double`: `7/2` is `3.5`, and `4` when returned as
   `[int]`. Division by zero throws.
-- Conversion from floating point to an integral type rounds half to even and
-  throws when out of range or NaN. Integral narrowing throws on overflow.
-- String `-eq`, `-ne`, `-lt`, `-le`, `-gt` and `-ge` compare with the
-  invariant culture, ignoring case unless the operator is case-sensitive
-  (`-ceq` and so on).
+- Floating-point to integral conversion rounds half to even and throws when out
+  of range or NaN. Integral narrowing, including integral to `[char]`, throws on
+  overflow.
+- String `-eq`, `-ne`, `-lt`, `-le`, `-gt` and `-ge` compare with the invariant
+  culture, ignoring case unless the operator is case-sensitive (`-ceq` and so on).
+- `throw` of a string throws `InvalidOperationException` with that message.
+  PowerShell throws `RuntimeException`.
 
-Known difference: an integral expression that overflows but is never stored
-in or returned as a typed value throws in compiled code, while PowerShell
-continues with a `Double`.
+Known differences from interpreted PowerShell:
+
+- An integral expression that overflows but is never stored in or returned as a
+  typed value throws in compiled code; PowerShell continues with a `Double`.
+- Reading a missing key through a keyed indexer throws `KeyNotFoundException`;
+  PowerShell returns `$null`.
+
+## Native executables
+
+`Compile -Native -EntryPoint <method>` lowers the classes to an assembly beside
+the executable, compiles it to one COFF object with ILC, and links that object
+with the Native AOT runtime and the Windows import libraries in PSC's own COFF
+linker. It writes `<name>.dll`, `<name>.runtimeconfig.json`, `<name>.ilc.rsp`,
+`<name>.obj` and `<name>.exe`. The image's entry symbol is `wmainCRTStartup`;
+`ucrt.lib` is its default library; its stack reserve is 1.5 MiB; `Subsystem` is
+`Console` or `Windows`.
+
+The toolchain is read from `NativeAOT/`, which Git ignores, taking the newest
+folder of each kind:
+
+| Folder | Contents | Hash manifest |
+|---|---|---|
+| `ilc-11.0.0-preview.6.26359.118` | ILC | `pin.sha256.csv`, verified on use |
+| `ilc-build-11.0.0-preview.6.26359.118` | ILC build files | `pin.sha256.csv`, verified on use |
+| `nativeaot-win-x64-11.0.0-preview.6.26359.118` | Native AOT runtime | `pin.sha256.csv`, verified on use |
+| `windows-sdk-lib-10.0.26100.0` | Windows SDK import libraries | `pin.sha256.csv`, verified on use |
+| `msvc-14.51.36223` | MSVC libraries | none; not verified |
+
+The lowered assembly is compiled against the runtime PowerShell is running on;
+ILC and the Native AOT runtime are 11.0.0-preview.6.
 
 ## Verification
 
-```powershell
-pwsh -NoLogo -NoProfile -File ./tests/Test-ConsolidatedRunner.ps1
-```
+`tests/Test-ConsolidatedRunner.ps1` runs 23 suites, each in its own process:
 
-The runner executes 22 suites (19 legacy suites plus three regression gates), each in its own process, on the one pinned
-PowerShell: 7.7.0-preview.5 with .NET 11.0.0-rc.1.26425.128.
-`& ./Invoke-PSC.ps1 -Mode PowerShell` downloads it (or takes `-ArchivePath` to a copy
-already downloaded), checks the SHA-256 GitHub publishes for the release
-asset, and extracts it beneath `build/cache`. The pin moves to preview.6 or
-to the 7.7 release when either is published. Generated assemblies are
-written beneath `build/`, which Git ignores.
+| Suite | Verifies |
+|---|---|
+| `tests/Test-OneParameterPersistence.ps1`, `tests/Test-TwoParameterPersistence.ps1`, `probes/Test-SmaCompilation.ps1` | the expression trees SMA's own compiler produces, as a comparison baseline |
+| `tests/Test-Slice1.ps1` | signatures and constants; a copied compiler in an unrelated directory; deterministic output; `Compile`, `Expression`, `Inspect`, `Capability` |
+| `tests/Test-Slice2.ps1` … `tests/Test-Slice8.ps1` | parameters, locals and arithmetic; IEEE 754 and Boolean logic; control flow; typed arrays; reflected calls and constructors; structured exceptions |
+| `tests/Test-Slice9.ps1` | a range-checked index contract over every input 1–510 and the `Int32` extremes |
+| `tests/parity/LambdaCompilerParity.ps1` | the same expression trees compiled by `LambdaCompiler` give the same results |
+| `tests/Test-ZeroSmaHost.ps1` | output loads and runs in a process without SMA; its only reference is `System.Private.CoreLib` |
+| `tests/parity/PowerShellParity.ps1` | each fixture method run as PowerShell and as IL on the same inputs |
+| `tests/consumers/Test-PwshAdmission.ps1` | output passes an external persisted-method admission check, pinned by commit and SHA-256 |
+| `tests/Test-DotnetHost.ps1` | a program compiled with `-EntryPoint Main` runs under `dotnet exec` with no PowerShell assembly loaded |
+| `tests/Test-Rejections.ps1` | each rejected construct is refused with its diagnostic and no output |
+| `tests/Test-NativeImports.ps1` | native imports call the native function with the declared marshalling |
+| `tests/Test-ConversionBoundary.ps1` | conversion semantics at type boundaries |
+| `tests/Test-SingleFileArchitecture.ps1` | one implementation script, no loaders, and every mode run from a copy in a fresh process |
+| `tests/Test-NativeInterop.ps1` | unmanaged function pointers and native callbacks, with signature metadata checks |
+| `tests/Test-PortableSimd.ps1` | static generic call inference and struct receivers, compared bitwise with PowerShell |
+| `tests/Test-LegacyReproduction.ps1` | 52 historical outputs rebuilt byte-identical (SHA-256, MVID, assembly references) to the [`218f54e` baseline](tests/baseline/README.md), 13 exact diagnostics, and two negative controls that must fail |
 
-`-Sanitized` reports only suite names, pass/fail results and aggregate
-measures. Complete child output and failure details stay under ignored
-`build/verification-diagnostics/`. The repository has no CI workflow; the
-suite runs locally. Dotnet-host verification also needs
-standalone runtime 11.0.0-rc.1.26425.128 available through `PATH`; the runtime
-bundled with PowerShell does not install that standalone host.
+Measured at `ee73e9c` on PowerShell 7.7.0-preview.5 / .NET 11.0.0-rc.1.26425.128
+(Windows x64, 2026-11-07): 23 of 23 suites passed; PowerShell parity 300 calls
+with 0 divergences; LambdaCompiler parity 19 methods; rejections 15 cases;
+portable SIMD 96 comparisons; reproduction 52 outputs and 13 diagnostics.
 
-## Status and next steps
+The suites run on that PowerShell and runtime only: `-Mode PowerShell` provides
+the PowerShell, and the dotnet-host suites need the standalone runtime
+11.0.0-rc.1.26425.128 on `PATH`. The repository has no CI workflow.
 
-Version 0.1. Compiled output matched PowerShell on the device for every
-parity call of `25427b2` on the x86-64 emulator, an arm64 device and an arm32
-device (Pwsh `scripts/probes/lowering`). The ordered plan, with acceptance
-gates, principles and the list of what is deliberately not supported, is
-[ROADMAP.md](ROADMAP.md).
+Not covered by any suite: `-Native`, `Link`, `Describe`, `Lint`, `Profile`,
+`Report`, `Api` and `PowerShell`. `tests/Test-LoweringParity.ps1`, which runs
+fixture methods interpreted and lowered in a child process, is not in the runner.
 
 ## Repository layout
 
-- `Invoke-PSC.ps1`: the complete compiler, parameters and execution driver.
-- `tests/`: fixtures, parity checks, consumer tests and the consolidated runner.
+- `Invoke-PSC.ps1`: the compiler.
+- `NativeAOT/`: the pinned Native AOT toolchain (ignored).
+- `tests/`: suites, fixtures, parity checks and the runner.
+- `tests/baseline/`: the frozen `218f54e` outputs and diagnostics.
+- `docs/`: the native interop contract.
 - `experiments/`: the earlier approach, which persists the expression trees
-  SMA's own compiler produces. Its output keeps SMA's semantics and depends
-  on SMA at run time; it is kept as a comparison baseline.
-- `probes/`: read-only runtime observation.
+  SMA's own compiler produces; its output depends on SMA at run time.
+- `probes/`: runtime observation.
+- `build/`: generated output and the pinned PowerShell and runtime (ignored).
 
 ## License
 
