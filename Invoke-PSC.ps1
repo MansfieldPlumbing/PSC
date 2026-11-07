@@ -3188,7 +3188,7 @@ function Convert-AstExpression {
         $result = & $branchValue $Node.ElseClause
         $clauses = @($Node.Clauses)
         for ($i = $clauses.Count - 1; $i -ge 0; $i--) {
-            $test = Convert-AstExpression -Node $clauses[$i].Item1 -Scope $Scope
+            $test = New-PredicateTruth (Convert-AstExpression -Node $clauses[$i].Item1 -Scope $Scope)
             $whenTrue = & $branchValue $clauses[$i].Item2
             $widened = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Conditional, $whenTrue, $result)
             if ($widened) { $whenTrue = $widened.Left; $result = $widened.Right }
@@ -3200,13 +3200,9 @@ function Convert-AstExpression {
         return $result
     }
 
-    # Ternary: $test ? $a : $b. An integer test is true when nonzero, as in PowerShell.
+    # Ternary: $test ? $a : $b, the test as a condition.
     if ($Node -is [System.Management.Automation.Language.TernaryExpressionAst]) {
-        $test = Convert-AstExpression -Node $Node.Condition -Scope $Scope
-        if ($test.Type -in $script:IntegralTypes) { $test = [Linq.Expressions.Expression]::NotEqual($test, [Linq.Expressions.Expression]::Constant([Convert]::ChangeType(0, $test.Type), $test.Type)) }
-        if ($test.Type -ne [bool]) {
-            throw "[{0}:{1}] A ternary test must be [bool] or an integer, got '{2}'." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $test.Type.FullName
-        }
+        $test = New-PredicateTruth (Convert-AstExpression -Node $Node.Condition -Scope $Scope)
         $whenTrue = Convert-AstExpression -Node $Node.IfTrue -Scope $Scope
         $whenFalse = Convert-AstExpression -Node $Node.IfFalse -Scope $Scope
         $widened = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Conditional, $whenTrue, $whenFalse)
@@ -3281,14 +3277,14 @@ function Convert-AstExpression {
                 return [Linq.Expressions.Expression]::Negate($operand)
             }
             'Plus'    { return $operand }
-            'Not'     { return [Linq.Expressions.Expression]::Not($operand) }
+            'Not'     { return [Linq.Expressions.Expression]::Not((New-PredicateTruth $operand)) }
             'Bnot'    {
                 if ($operand.Type -notin $script:IntegralTypes) {
                     throw "[{0}:{1}] -bnot requires an integral operand, got '{2}'." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $operand.Type.FullName
                 }
                 return [Linq.Expressions.Expression]::Not($operand)
             }
-            'Exclaim' { return [Linq.Expressions.Expression]::Not($operand) }
+            'Exclaim' { return [Linq.Expressions.Expression]::Not((New-PredicateTruth $operand)) }
             default {
                 throw "[{0}:{1}] Unsupported unary operator '{2}'." -f `
                     $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $Node.TokenKind
@@ -3332,6 +3328,10 @@ function Convert-AstExpression {
                 $et::IfThen($et::NotEqual($array, $et::Constant($null, [string[]])), $loop), $result)
         }
         $right = Convert-AstExpression -Node $Node.Right -Scope $Scope
+
+        # -and and -or test each operand as a condition, and the right only when the left does not decide.
+        if ($Node.Operator -eq 'And') { return [Linq.Expressions.Expression]::AndAlso((New-PredicateTruth $left), (New-PredicateTruth $right)) }
+        if ($Node.Operator -eq 'Or') { return [Linq.Expressions.Expression]::OrElse((New-PredicateTruth $left), (New-PredicateTruth $right)) }
 
         if ($Node.Operator -in 'Shl', 'Shr') {
             # The shift count is an Int32 in PowerShell and the CLR. A narrower left operand keeps its own type in
@@ -3378,14 +3378,12 @@ function Convert-AstExpression {
             }
             return $combined
         }
-        if ($Node.Operator -notin 'And', 'Or') {
-            # Narrow integers have no CLR arithmetic of their own, even when both sides match.
-            $kind = if ($Node.Operator -in 'Band', 'Bor', 'Bxor') { [PscOperatorKind]::Bitwise }
-                elseif ($Node.Operator -in 'Plus', 'Minus', 'Multiply', 'Divide', 'Rem') { [PscOperatorKind]::Arithmetic }
-                else { [PscOperatorKind]::Comparison }
-            $widened = $script:PscEnvironment.Get('NumericOperands').Bind($kind, $left, $right)
-            if ($widened) { $left = $widened.Left; $right = $widened.Right }
-        }
+        # Narrow integers have no CLR arithmetic of their own, even when both sides match.
+        $kind = if ($Node.Operator -in 'Band', 'Bor', 'Bxor') { [PscOperatorKind]::Bitwise }
+            elseif ($Node.Operator -in 'Plus', 'Minus', 'Multiply', 'Divide', 'Rem') { [PscOperatorKind]::Arithmetic }
+            else { [PscOperatorKind]::Comparison }
+        $widened = $script:PscEnvironment.Get('NumericOperands').Bind($kind, $left, $right)
+        if ($widened) { $left = $widened.Left; $right = $widened.Right }
         if ($left.Type -ne $right.Type) {
             throw "[{0}:{1}] Binary operator '{2}' requires identical operand types, got '{3}' and '{4}'." -f `
                 $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $Node.Operator, $left.Type.FullName, $right.Type.FullName
@@ -3422,8 +3420,6 @@ function Convert-AstExpression {
             { $_ -in 'Ile', 'Cle' } { return [Linq.Expressions.Expression]::LessThanOrEqual($left, $right) }
             { $_ -in 'Igt', 'Cgt' } { return [Linq.Expressions.Expression]::GreaterThan($left, $right) }
             { $_ -in 'Ige', 'Cge' } { return [Linq.Expressions.Expression]::GreaterThanOrEqual($left, $right) }
-            'And'      { return [Linq.Expressions.Expression]::AndAlso($left, $right) }
-            'Or'       { return [Linq.Expressions.Expression]::OrElse($left, $right) }
             default {
                 throw "[{0}:{1}] Unsupported binary operator '{2}'." -f `
                     $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $Node.Operator
@@ -3579,17 +3575,40 @@ function Convert-AstExpression {
         $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $Node.Extent.Text, $Node.GetType().Name
 }
 
+# A value as a condition, decided by its static type as PowerShell decides it (measured on SMA): a Boolean is itself;
+# a string is true when not empty; a number, character or enumeration value when not zero (NaN is not zero); a
+# Nullable value when it has a value that is true; a list by its count, and a list of one by its element; any other
+# reference when it is not $null; any other value type is true. A value typed [object] or a list of [object] is
+# decided by its run-time value, by PowerShellSemantics.IsTrue.
 function New-PredicateTruth {
     param([Linq.Expressions.Expression] $Value)
     $et = [Linq.Expressions.Expression]
-    if ($Value.Type -eq [bool]) { return $Value }
-    if ($Value.Type -eq [string]) {
+    $type = $Value.Type
+    if ($type -eq [bool]) { return $Value }
+    if ($Value -is [Linq.Expressions.ConstantExpression] -and $null -eq $Value.Value) { return $et::Constant($false) }
+    if ($type -eq [string]) {
         return $et::Not($et::Call([string].GetMethod('IsNullOrEmpty', [type[]]@([string])), $Value))
     }
-    if ($Value.Type -in ($script:IntegralTypes + @([single], [double], [decimal]))) {
-        return $et::NotEqual($Value, $et::Default($Value.Type))
+    if ($type -in ($script:IntegralTypes + @([single], [double], [decimal]))) {
+        return $et::NotEqual($Value, $et::Default($type))
     }
-    if ($Value.Type.IsArray -and $Value.Type.GetArrayRank() -eq 1) {
+    if ($type -eq [char]) { return $et::NotEqual($et::Convert($Value, [int]), $et::Constant(0)) }
+    if ($type.IsEnum) {
+        $underlying = [Enum]::GetUnderlyingType($type)
+        return $et::NotEqual($et::Convert($Value, $underlying), $et::Default($underlying))
+    }
+    if ($type.IsGenericType -and $type.GetGenericTypeDefinition() -eq [Nullable`1]) {
+        $held = $et::Variable($type, 'nullableCondition')
+        return $et::Block([bool], [Linq.Expressions.ParameterExpression[]]@($held), [Linq.Expressions.Expression[]]@(
+            $et::Assign($held, $Value),
+            $et::AndAlso($et::Property($held, 'HasValue'), (New-PredicateTruth $et::Property($held, 'Value')))))
+    }
+    $isTrue = { param($operand) $et::Call((Get-PscSemanticsMethod -Name 'IsTrue' -ParameterTypes @([object])), $et::Convert($operand, [object])) }
+    if ($type -eq [object]) { return & $isTrue $Value }
+    if ($type.IsArray -and $type.GetArrayRank() -eq 1 -and ($type.GetElementType() -eq [object] -or [System.Collections.IList].IsAssignableFrom($type.GetElementType()))) {
+        return & $isTrue $Value
+    }
+    if ($type.IsArray -and $type.GetArrayRank() -eq 1) {
         $item = $et::ArrayIndex($Value, $et::Constant(0))
         # PowerShell treats a nested singleton list by the nested list's
         # count, rather than recursively testing its first element.
@@ -3601,10 +3620,11 @@ function New-PredicateTruth {
             $et::AndAlso($et::GreaterThan($et::ArrayLength($Value), $et::Constant(0)),
                 $et::OrElse($et::GreaterThan($et::ArrayLength($Value), $et::Constant(1)), $one)))
     }
-    if ($Value -is [Linq.Expressions.ConstantExpression] -and $null -eq $Value.Value) {
-        return $et::Constant($false)
-    }
-    throw "Predicate truthiness requires a statically typed Boolean, string, number or one-dimensional array; got '$($Value.Type.FullName)'."
+    # Only a sealed type that is not a list proves no list is behind the reference; any other reference type may hold
+    # one, whose truth is its count.
+    if ([System.Collections.IList].IsAssignableFrom($type) -or (-not $type.IsValueType -and -not $type.IsSealed)) { return & $isTrue $Value }
+    if (-not $type.IsValueType) { return $et::NotEqual($Value, $et::Constant($null, $type)) }
+    return $et::Block($Value, $et::Constant($true))
 }
 
 function Convert-PredicateSwitch {
@@ -3929,7 +3949,7 @@ function Convert-AstStatement {
 
         $clauses = @($Statement.Clauses)
         for ($i = $clauses.Count - 1; $i -ge 0; $i--) {
-            $cond = Convert-AstExpression -Node $clauses[$i].Item1 -Scope $Scope
+            $cond = New-PredicateTruth (Convert-AstExpression -Node $clauses[$i].Item1 -Scope $Scope)
             $then = Convert-AstStatement -Statement $clauses[$i].Item2 -Scope $Scope
             $elseExpr = [Linq.Expressions.Expression]::IfThenElse($cond, $then, $elseExpr)
         }
@@ -3949,7 +3969,7 @@ function Convert-AstStatement {
         $continueLabel = [Linq.Expressions.Expression]::Label('forContinue')
 
         $condExpr = if ($Statement.Condition) {
-            Convert-AstExpression -Node $Statement.Condition -Scope $Scope
+            New-PredicateTruth (Convert-AstExpression -Node $Statement.Condition -Scope $Scope)
         } else {
             [Linq.Expressions.Expression]::Constant($true, [bool])
         }
@@ -3990,7 +4010,7 @@ function Convert-AstStatement {
         $breakLabel = [Linq.Expressions.Expression]::Label('whileBreak')
         $continueLabel = [Linq.Expressions.Expression]::Label('whileContinue')
 
-        $condExpr = Convert-AstExpression -Node $Statement.Condition -Scope $Scope
+        $condExpr = New-PredicateTruth (Convert-AstExpression -Node $Statement.Condition -Scope $Scope)
         $Scope.Loops.Push(@{ Break = $breakLabel; Continue = $continueLabel })
         try { $bodyExpr = Convert-AstStatement -Statement $Statement.Body -Scope $Scope }
         finally { $null = $Scope.Loops.Pop() }
