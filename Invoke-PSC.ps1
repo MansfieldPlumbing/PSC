@@ -84,11 +84,12 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Compile', 'Api', 'Expression', 'Inspect', 'Capability', 'Link', 'PowerShell', 'Describe', 'Lint', 'Profile', 'Report', 'Verify', 'Readme')]
+    [ValidateSet('Compile', 'Api', 'Expression', 'Inspect', 'Capability', 'Link', 'PowerShell', 'Describe', 'Lint', 'Profile', 'Report', 'Verify', 'Readme', 'Derive')]
     [string] $Mode = 'Compile',
     [string] $ArchivePath,
     [string] $ProjectPath,
     [string[]] $LintFiles,
+    [string[]] $DerivePath,
     [string] $ProfilePath,
     [string] $SourcePath,
     [System.Management.Automation.Language.ScriptBlockAst] $SourceAst,
@@ -6136,6 +6137,237 @@ class RegexUses : PscMeasurementMethod {
     }
 }
 
+# ============================================================================
+# DERIVED CHECKS
+# Every throw in a script, read from SMA's AST: the condition guarding it, the relation that condition tests, and
+# where each compared value comes from, established by following the value back through its assignments. A value
+# whose origin SMA cannot establish is Unresolved, at its location.
+# ============================================================================
+
+enum PscGuard {
+    Unguarded
+    Then
+    Else
+}
+
+enum PscPredicateKind {
+    Comparison
+    Negation
+    Conjunction
+    Disjunction
+    Truth
+}
+
+enum PscOperandOrigin {
+    Literal
+    ReflectedInvocation
+    PscInvocation
+    MethodCall
+    StaticMember
+    Computed
+    ProcessExitCode
+    Command
+    DynamicCommand
+    Variable
+    Unresolved
+}
+
+class PscOperand {
+    [PscOperandOrigin] $Origin
+    hidden [System.Management.Automation.Language.Ast] $Ast
+    hidden [System.Management.Automation.Language.Ast] $Source
+    [string] ToString() { return $this.Origin.ToString() + ': ' + $this.Ast.Extent.Text.ReplaceLineEndings(' ') }
+}
+
+# A condition as SMA parsed it: a tree whose inner nodes are -not, -and and -or (operands in evaluation order, so
+# short-circuiting is preserved) and whose leaves are comparisons or the truth of a single value.
+class PscPredicate {
+    [PscPredicateKind] $Kind
+    [System.Management.Automation.Language.TokenKind] $Operator
+    [PscOperand] $Left
+    [PscOperand] $Right
+    [PscPredicate[]] $Operands
+    hidden [System.Management.Automation.Language.Ast] $Ast
+    [string] ToString() { return $this.Ast.Extent.Text.ReplaceLineEndings(' ') }
+
+    # The leaves in evaluation order.
+    [PscPredicate[]] Leaves() {
+        $found = [System.Collections.Generic.List[PscPredicate]]::new()
+        if ($this.Kind -eq [PscPredicateKind]::Comparison -or $this.Kind -eq [PscPredicateKind]::Truth) { $found.Add($this) }
+        else { foreach ($operand in $this.Operands) { $found.AddRange($operand.Leaves()) } }
+        return $found.ToArray()
+    }
+}
+
+class PscDerivedCheck {
+    [string] $Path
+    [int] $Line
+    [PscGuard] $Guard
+    [PscPredicate] $Predicate
+    hidden [System.Management.Automation.Language.ThrowStatementAst] $Throw
+}
+
+# The expression a pipeline, parenthesis, command expression or conversion wraps, when it wraps exactly one.
+function Get-PscInnerExpression {
+    [CmdletBinding()]
+    [OutputType([System.Management.Automation.Language.Ast])]
+    param([Parameter(Mandatory)][System.Management.Automation.Language.Ast] $Ast)
+    $node = $Ast
+    while ($true) {
+        if ($node -is [System.Management.Automation.Language.ParenExpressionAst]) { $node = $node.Pipeline; continue }
+        if ($node -is [System.Management.Automation.Language.ArrayExpressionAst] -and $node.SubExpression.Statements.Count -eq 1) { $node = $node.SubExpression.Statements[0]; continue }
+        # A pipeline's value is what its last element produces.
+        if ($node -is [System.Management.Automation.Language.PipelineAst]) { $node = $node.PipelineElements[$node.PipelineElements.Count - 1]; continue }
+        if ($node -is [System.Management.Automation.Language.CommandExpressionAst]) { $node = $node.Expression; continue }
+        if ($node -is [System.Management.Automation.Language.ConvertExpressionAst]) { $node = $node.Child; continue }
+        return $node
+    }
+}
+
+# The last assignment to a variable before an offset, within a scope's AST.
+function Find-PscAssignment {
+    [CmdletBinding()]
+    [OutputType([System.Management.Automation.Language.AssignmentStatementAst])]
+    param(
+        [Parameter(Mandatory)][System.Management.Automation.Language.Ast] $Scope,
+        [Parameter(Mandatory)][string] $Name,
+        [Parameter(Mandatory)][int] $Before
+    )
+    $last = $null
+    foreach ($assignment in $Scope.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) {
+        if ($assignment.Extent.EndOffset -gt $Before) { continue }
+        $left = Get-PscInnerExpression $assignment.Left
+        if ($left -isnot [System.Management.Automation.Language.VariableExpressionAst] -or -not $left.VariablePath.UserPath.Equals($Name, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        if ($null -eq $last -or $assignment.Extent.StartOffset -gt $last.Extent.StartOffset) { $last = $assignment }
+    }
+    $last
+}
+
+function Get-PscOperand {
+    [CmdletBinding()]
+    [OutputType([PscOperand])]
+    param(
+        [Parameter(Mandatory)][System.Management.Automation.Language.Ast] $Ast,
+        [Parameter(Mandatory)][System.Management.Automation.Language.Ast] $Scope,
+        [int] $Depth = 0
+    )
+    $operand = [PscOperand]::new()
+    $operand.Ast = $Ast
+    $operand.Source = $Ast
+    $operand.Origin = [PscOperandOrigin]::Unresolved
+    $node = Get-PscInnerExpression $Ast
+    if ($Depth -gt 16) { return $operand }
+    if ($node -is [System.Management.Automation.Language.ConstantExpressionAst] -or $node -is [System.Management.Automation.Language.TypeExpressionAst]) { $operand.Origin = [PscOperandOrigin]::Literal; return $operand }
+    if ($node -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) {
+        $isReflectedInvoke = $node.Member -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $node.Member.Value -eq 'Invoke'
+        $operand.Origin = if ($isReflectedInvoke) { [PscOperandOrigin]::ReflectedInvocation } else { [PscOperandOrigin]::MethodCall }
+        return $operand
+    }
+    if ($node -is [System.Management.Automation.Language.MemberExpressionAst] -and $node.Static) { $operand.Origin = [PscOperandOrigin]::StaticMember; return $operand }
+    if ($node -is [System.Management.Automation.Language.IndexExpressionAst]) {
+        $inner = Get-PscOperand -Ast $node.Target -Scope $Scope -Depth ($Depth + 1)
+        $operand.Origin = $inner.Origin; $operand.Source = $inner.Source; return $operand
+    }
+    if ($node -is [System.Management.Automation.Language.BinaryExpressionAst] -or $node -is [System.Management.Automation.Language.UnaryExpressionAst]) { $operand.Origin = [PscOperandOrigin]::Computed; return $operand }
+    if ($node -is [System.Management.Automation.Language.MemberExpressionAst]) {
+        $inner = Get-PscOperand -Ast $node.Expression -Scope $Scope -Depth ($Depth + 1)
+        $operand.Origin = $inner.Origin; $operand.Source = $inner.Source; return $operand
+    }
+    if ($node -is [System.Management.Automation.Language.VariableExpressionAst]) {
+        if ($node.VariablePath.UserPath.Equals('LASTEXITCODE', [StringComparison]::OrdinalIgnoreCase)) { $operand.Origin = [PscOperandOrigin]::ProcessExitCode; return $operand }
+        $assignment = Find-PscAssignment -Scope $Scope -Name $node.VariablePath.UserPath -Before $node.Extent.StartOffset
+        if ($null -eq $assignment) { $operand.Origin = [PscOperandOrigin]::Variable; return $operand }
+        $inner = Get-PscOperand -Ast $assignment.Right -Scope $Scope -Depth ($Depth + 1)
+        $operand.Origin = $inner.Origin; $operand.Source = $assignment; return $operand
+    }
+    if ($node -is [System.Management.Automation.Language.CommandAst]) {
+        $first = $node.CommandElements[0]
+        if ($first -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $operand.Origin = [PscOperandOrigin]::Command; return $operand }
+        if ($first -is [System.Management.Automation.Language.VariableExpressionAst]) {
+            $assignment = Find-PscAssignment -Scope $Scope -Name $first.VariablePath.UserPath -Before $node.Extent.StartOffset
+            if ($null -ne $assignment) {
+                $target = Get-PscInnerExpression $assignment.Right
+                if ($target -is [System.Management.Automation.Language.CommandAst]) {
+                    $last = $target.CommandElements[$target.CommandElements.Count - 1]
+                    if ($last -is [System.Management.Automation.Language.StringConstantExpressionAst] -and [IO.Path]::GetFileName($last.Value).Equals([IO.Path]::GetFileName($PSCommandPath), [StringComparison]::OrdinalIgnoreCase)) {
+                        $operand.Origin = [PscOperandOrigin]::PscInvocation; $operand.Source = $assignment; return $operand
+                    }
+                }
+            }
+        }
+        # Any other command whose name is a value computed at run time.
+        $operand.Origin = [PscOperandOrigin]::DynamicCommand
+        return $operand
+    }
+    $operand
+}
+
+function Get-PscPredicate {
+    [CmdletBinding()]
+    [OutputType([PscPredicate])]
+    param(
+        [Parameter(Mandatory)][System.Management.Automation.Language.Ast] $Ast,
+        [Parameter(Mandatory)][System.Management.Automation.Language.Ast] $Scope
+    )
+    $node = Get-PscInnerExpression $Ast
+    $predicate = [PscPredicate]::new()
+    $predicate.Ast = $node
+    if ($node -is [System.Management.Automation.Language.BinaryExpressionAst] -and $node.Operator -in [System.Management.Automation.Language.TokenKind]::And, [System.Management.Automation.Language.TokenKind]::Or) {
+        $predicate.Kind = if ($node.Operator -eq [System.Management.Automation.Language.TokenKind]::And) { [PscPredicateKind]::Conjunction } else { [PscPredicateKind]::Disjunction }
+        $predicate.Operator = $node.Operator
+        $predicate.Operands = [PscPredicate[]]@((Get-PscPredicate -Ast $node.Left -Scope $Scope), (Get-PscPredicate -Ast $node.Right -Scope $Scope))
+        return $predicate
+    }
+    if ($node -is [System.Management.Automation.Language.UnaryExpressionAst] -and $node.TokenKind -in [System.Management.Automation.Language.TokenKind]::Not, [System.Management.Automation.Language.TokenKind]::Exclaim) {
+        $predicate.Kind = [PscPredicateKind]::Negation
+        $predicate.Operator = $node.TokenKind
+        $predicate.Operands = [PscPredicate[]]@(Get-PscPredicate -Ast $node.Child -Scope $Scope)
+        return $predicate
+    }
+    if ($node -is [System.Management.Automation.Language.BinaryExpressionAst]) {
+        $predicate.Kind = [PscPredicateKind]::Comparison
+        $predicate.Operator = $node.Operator
+        $predicate.Left = Get-PscOperand -Ast $node.Left -Scope $Scope
+        $predicate.Right = Get-PscOperand -Ast $node.Right -Scope $Scope
+        return $predicate
+    }
+    $predicate.Kind = [PscPredicateKind]::Truth
+    $predicate.Left = Get-PscOperand -Ast $node -Scope $Scope
+    $predicate
+}
+
+function Get-PscDerivedCheck {
+    [CmdletBinding()]
+    [OutputType([PscDerivedCheck])]
+    param([Parameter(Mandatory)][string] $Path)
+    $tokens = $null; $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tokens, [ref]$errors)
+    foreach ($throw in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.ThrowStatementAst] }, $true)) {
+        $check = [PscDerivedCheck]::new()
+        $check.Path = $Path
+        $check.Line = $throw.Extent.StartLineNumber
+        $check.Throw = $throw
+        $check.Guard = [PscGuard]::Unguarded
+        $scope = $throw.Parent
+        while ($scope -isnot [System.Management.Automation.Language.ScriptBlockAst]) { $scope = $scope.Parent }
+        $parent = $throw.Parent
+        while ($null -ne $parent -and $parent -ne $scope) {
+            if ($parent -is [System.Management.Automation.Language.IfStatementAst]) {
+                $condition = $null
+                foreach ($clause in $parent.Clauses) {
+                    if ($throw.Extent.StartOffset -ge $clause.Item2.Extent.StartOffset -and $throw.Extent.EndOffset -le $clause.Item2.Extent.EndOffset) { $condition = $clause.Item1 }
+                }
+                if ($null -ne $condition) { $check.Guard = [PscGuard]::Then }
+                else { $check.Guard = [PscGuard]::Else; $condition = $parent.Clauses[$parent.Clauses.Count - 1].Item1 }
+                $check.Predicate = Get-PscPredicate -Ast $condition -Scope $scope
+                break
+            }
+            $parent = $parent.Parent
+        }
+        $check
+    }
+}
+
 }
 
 process {
@@ -6181,6 +6413,12 @@ process {
             Get-SmaReport @(Get-SmaUnits $profiled) $profiled
         }
         'Verify' { Test-SmaDescription }
+        'Derive' {
+            if (-not $DerivePath) { throw 'Derive requires -DerivePath.' }
+            foreach ($item in $DerivePath) {
+                foreach ($file in Get-ChildItem -LiteralPath $item -Recurse -File -Include *.ps1, *.psm1) { Get-PscDerivedCheck -Path $file.FullName }
+            }
+        }
         'Readme' {
             $readme = Join-Path $PSScriptRoot 'README.md'
             [IO.File]::WriteAllLines($readme, [string[]]@(ConvertTo-PscReadme -Api (Get-PscApi)), [Text.UTF8Encoding]::new($false))
