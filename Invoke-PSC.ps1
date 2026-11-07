@@ -2129,8 +2129,9 @@ class PscDifferential {
     # arguments are copied so a method that mutates them cannot change another invocation's input. With a time limit the
     # call runs as a compiled delegate on a pool thread; an unfinished call is recorded as unfinished.
     static [PscOutcome] Invoke([System.Reflection.MethodInfo] $method, [object] $instance, [object[]] $arguments, [int] $timeLimitMilliseconds) {
-        $given = if ($null -eq $arguments) { [object[]]@() } else { $arguments }
-        $copies = [object[]]::new($given.Length)
+        [object[]] $given = [object[]]@()
+        if ($null -ne $arguments) { $given = $arguments }
+        $copies =[object[]]::new($given.Length)
         for ($i = 0; $i -lt $copies.Length; $i++) { $copies[$i] = if ($given[$i] -is [Array]) { ([Array]$given[$i]).Clone() } else { $given[$i] } }
         $outcome = [PscOutcome]::new()
         $clock = [System.Diagnostics.Stopwatch]::StartNew()
@@ -2164,13 +2165,15 @@ class PscDifferential {
     static [PscOutcome] Reference([scriptblock] $code, [object[]] $arguments, [bool] $strict) {
         if ($strict) { Set-StrictMode -Version Latest } else { Set-StrictMode -Off }
         $unbound = $code.Ast.GetScriptBlock()
-        $given = if ($null -eq $arguments) { [object[]]@() } else { $arguments }
+        [object[]] $given = [object[]]@()
+        if ($null -ne $arguments) { $given = $arguments }
         $outcome = [PscOutcome]::new()
         $clock = [System.Diagnostics.Stopwatch]::StartNew()
         try {
             $written = [System.Collections.Generic.List[object]]::new()
             foreach ($item in $unbound.InvokeReturnAsIs($given)) { $written.Add($item) }
-            $outcome.Value = if ($written.Count -eq 0) { $null } elseif ($written.Count -eq 1) { $written[0] } else { $written.ToArray() }
+            if ($written.Count -eq 1) { $outcome.Value = $written[0] }
+            elseif ($written.Count -gt 1) { $outcome.Value = $written.ToArray() }
         }
         catch { $outcome.Exception = [PscDifferential]::Unwrap($_.Exception) }
         $outcome.Milliseconds = $clock.Elapsed.TotalMilliseconds
@@ -5549,6 +5552,12 @@ class PscApi {
     # Boundary values of a type, and every combination of them for a parameter list, up to a limit.
     [System.Collections.Generic.List[object]] Values([type] $type) { return [PscDifferential]::Values($type) }
     [System.Collections.Generic.List[object[]]] ArgumentSets([type[]] $types, [int] $limit) { return [PscDifferential]::ArgumentSets($types, $limit) }
+
+    # Every instrument applied to the given files and directories and to each file they reference. Instruments call
+    # this script's functions, so the investigation runs in an invocation of the script.
+    [object] Investigate([string[]] $paths) {
+        return & $this.Script -Mode Investigate -InvestigatePath $paths
+    }
 }
 
 function Get-PscApi {
@@ -7079,7 +7088,6 @@ class RegexUses : PscMeasurementMethod {
 # ============================================================================
 
 enum PscGuard {
-    Unguarded
     Then
     Else
 }
@@ -7122,7 +7130,12 @@ class PscPredicate {
     [PscOperand] $Right
     [PscPredicate[]] $Operands
     hidden [System.Management.Automation.Language.Ast] $Ast
-    [string] ToString() { return $this.Ast.Extent.Text.ReplaceLineEndings(' ') }
+    [string] ToString() {
+        if ($this.Kind -eq [PscPredicateKind]::Comparison -and $this.Ast -isnot [System.Management.Automation.Language.BinaryExpressionAst]) {
+            return $this.Left.Ast.Extent.Text.ReplaceLineEndings(' ') + ' -' + $this.Operator.ToString().ToLowerInvariant() + ' ' + $this.Right.Ast.Extent.Text.ReplaceLineEndings(' ')
+        }
+        return $this.Ast.Extent.Text.ReplaceLineEndings(' ')
+    }
 
     # The leaves in evaluation order.
     [PscPredicate[]] Leaves() {
@@ -7133,11 +7146,19 @@ class PscPredicate {
     }
 }
 
+class PscCondition {
+    [PscGuard] $Guard
+    [PscPredicate] $Predicate
+    [string] ToString() { return $this.Guard.ToString() + ' ' + $this.Predicate.ToString() }
+}
+
 class PscDerivedCheck {
     [string] $Path
     [int] $Line
-    [PscGuard] $Guard
-    [PscPredicate] $Predicate
+    [string] $Type
+    [string] $Function
+    [PscCondition[]] $Conditions
+    hidden [System.Management.Automation.Language.Ast] $Definition
     hidden [System.Management.Automation.Language.ThrowStatementAst] $Throw
 }
 
@@ -7283,22 +7304,70 @@ function Get-PscDerivedCheck {
         $check.Path = $Path
         $check.Line = $throw.Extent.StartLineNumber
         $check.Throw = $throw
-        $check.Guard = [PscGuard]::Unguarded
-        $scope = $throw.Parent
-        while ($scope -isnot [System.Management.Automation.Language.ScriptBlockAst]) { $scope = $scope.Parent }
+        # Every if and switch between the throw and its function, outermost first. A throw in a clause's body is
+        # reached when that clause's condition held and, for if, every earlier clause's did not; a throw in else or
+        # default is reached when no clause's condition held.
+        $levels = [System.Collections.Generic.List[PscCondition[]]]::new()
+        $child = $throw
         $parent = $throw.Parent
-        while ($null -ne $parent -and $parent -ne $scope) {
-            if ($parent -is [System.Management.Automation.Language.IfStatementAst]) {
-                $condition = $null
-                foreach ($clause in $parent.Clauses) {
-                    if ($throw.Extent.StartOffset -ge $clause.Item2.Extent.StartOffset -and $throw.Extent.EndOffset -le $clause.Item2.Extent.EndOffset) { $condition = $clause.Item1 }
+        while ($null -ne $parent -and $parent -isnot [System.Management.Automation.Language.FunctionDefinitionAst] -and $parent -isnot [System.Management.Automation.Language.FunctionMemberAst]) {
+            $scope = $parent
+            while ($null -ne $scope -and $scope -isnot [System.Management.Automation.Language.ScriptBlockAst]) { $scope = $scope.Parent }
+            $level = [System.Collections.Generic.List[PscCondition]]::new()
+            # An earlier if in the same block, without else, whose every clause ends by leaving the block: the throw is
+            # reached only when none of its conditions held.
+            if ($parent -is [System.Management.Automation.Language.StatementBlockAst] -or $parent -is [System.Management.Automation.Language.NamedBlockAst]) {
+                foreach ($statement in $parent.Statements) {
+                    if ([object]::ReferenceEquals($statement, $child)) { break }
+                    if ($statement -isnot [System.Management.Automation.Language.IfStatementAst] -or $null -ne $statement.ElseClause) { continue }
+                    [bool] $leaves = $true
+                    foreach ($clause in $statement.Clauses) {
+                        $last = if ($clause.Item2.Statements.Count) { $clause.Item2.Statements[$clause.Item2.Statements.Count - 1] }
+                        if ($last -isnot [System.Management.Automation.Language.ReturnStatementAst] -and $last -isnot [System.Management.Automation.Language.ThrowStatementAst]) { $leaves = $false }
+                    }
+                    if (-not $leaves) { continue }
+                    foreach ($clause in $statement.Clauses) { $level.Add([PscCondition]@{ Guard = [PscGuard]::Else; Predicate = (Get-PscPredicate -Ast $clause.Item1 -Scope $scope) }) }
                 }
-                if ($null -ne $condition) { $check.Guard = [PscGuard]::Then }
-                else { $check.Guard = [PscGuard]::Else; $condition = $parent.Clauses[$parent.Clauses.Count - 1].Item1 }
-                $check.Predicate = Get-PscPredicate -Ast $condition -Scope $scope
-                break
             }
+            if ($parent -is [System.Management.Automation.Language.IfStatementAst] -or $parent -is [System.Management.Automation.Language.SwitchStatementAst]) {
+                [bool] $isSwitch = $parent -is [System.Management.Automation.Language.SwitchStatementAst]
+                [int] $taken = -1
+                for ($i = 0; $i -lt $parent.Clauses.Count; $i++) { if ([object]::ReferenceEquals($parent.Clauses[$i].Item2, $child)) { $taken = $i } }
+                [bool] $inDefault = $isSwitch -and [object]::ReferenceEquals($parent.Default, $child)
+                [bool] $inElse = -not $isSwitch -and [object]::ReferenceEquals($parent.ElseClause, $child)
+                if ($taken -ge 0 -or $inDefault -or $inElse) {
+                    for ($i = 0; $i -lt $parent.Clauses.Count; $i++) {
+                        if ($i -eq $taken) { $guard = [PscGuard]::Then }
+                        elseif ($taken -lt 0 -or (-not $isSwitch -and $i -lt $taken)) { $guard = [PscGuard]::Else }
+                        else { continue }
+                        $test = $parent.Clauses[$i].Item1
+                        if ($isSwitch -and $test -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) {
+                            $predicate = Get-PscPredicate -Ast $test.ScriptBlock.EndBlock.Statements[0] -Scope $scope
+                        }
+                        elseif ($isSwitch) {
+                            $predicate = [PscPredicate]::new()
+                            $predicate.Kind = [PscPredicateKind]::Comparison
+                            $predicate.Operator = [System.Management.Automation.Language.TokenKind]::Ieq
+                            $predicate.Ast = $test
+                            $predicate.Left = Get-PscOperand -Ast $parent.Condition -Scope $scope
+                            $predicate.Right = Get-PscOperand -Ast $test -Scope $scope
+                        }
+                        else { $predicate = Get-PscPredicate -Ast $test -Scope $scope }
+                        $level.Add([PscCondition]@{ Guard = $guard; Predicate = $predicate })
+                    }
+                }
+            }
+            if ($level.Count -gt 0) { $levels.Insert(0, $level.ToArray()) }
+            $child = $parent
             $parent = $parent.Parent
+        }
+        $conditions = [System.Collections.Generic.List[PscCondition]]::new()
+        foreach ($level in $levels) { $conditions.AddRange($level) }
+        $check.Conditions = $conditions.ToArray()
+        if ($null -ne $parent) {
+            $check.Definition = $parent
+            $check.Function = $parent.Name
+            if ($parent -is [System.Management.Automation.Language.FunctionMemberAst]) { $check.Type = $parent.Parent.Name }
         }
         $check
     }

@@ -2,7 +2,7 @@
 
 | Synopsis | Script | SourceSha512 | DefaultMode | Environment |
 |---|---|---|---|---|
-| A Pwsh script designed to amortize. | C:\dev\psc\Invoke-PSC.ps1 | 585062611642807668E8488E9805E90F41548C8C2645ECB4D7ACEC931FE4D5E55140D3812E057E29604C13268D679CF0BDC5B3173BF4B9080BA160806C71C8E5 | Compile | PscEnvironment |
+| A Pwsh script designed to amortize. | C:\dev\psc\Invoke-PSC.ps1 | 7B992B20ED2C2ED39D82B811F6CC939165EF0005A7E0B0D4F95C41277176D53B2D888799C86671A9FA687B4AECFEE622DC98D52CE497B495AEB9622735A3E337 | Compile | PscEnvironment |
 
 ## Modes
 
@@ -69,11 +69,11 @@
 | C:\dev\psc\Invoke-PSC.ps1 | ScriptBlockExpressions | 310 |
 | C:\dev\psc\Invoke-PSC.ps1 | CommandsNamedByVariable | 91 |
 | C:\dev\psc\Invoke-PSC.ps1 | ScriptBlockLiteralsInvoked | 0 |
-| C:\dev\psc\Invoke-PSC.ps1 | CommandsNamedByOtherExpression | 0 |
+| C:\dev\psc\Invoke-PSC.ps1 | CommandsNamedByOtherExpression | 1 |
 | C:\dev\psc\Invoke-PSC.ps1 | MemberLookupsByText | 18 |
-| C:\dev\psc\Invoke-PSC.ps1 | HashtableLiterals | 190 |
+| C:\dev\psc\Invoke-PSC.ps1 | HashtableLiterals | 192 |
 | C:\dev\psc\Invoke-PSC.ps1 | HashtableRecords | 75 |
-| C:\dev\psc\Invoke-PSC.ps1 | QuotedTextConstants | 1410 |
+| C:\dev\psc\Invoke-PSC.ps1 | QuotedTextConstants | 1415 |
 | C:\dev\psc\Invoke-PSC.ps1 | ExpandableTexts | 125 |
 | C:\dev\psc\Invoke-PSC.ps1 | NamespaceUsings | 0 |
 | C:\dev\psc\Invoke-PSC.ps1 | RegexUses | 18 |
@@ -84,4 +84,4 @@ Get-ProjectRemote, Get-Projects, Test-DriveRooted, Get-UnitProfile, Invoke-SmaPr
 
 ## Classes
 
-SmaUnit, SmaEdge, SmaSource, SmaCoverage, SmaAbsence, SmaChange, SmaProject, PscDifferential, PowerShellSemantics, PscBinding, PscEnvironment, PscOperatorKind, PscBoundOperands, PscOperandBinding, PowerShellNumericOperands, PscParameter, PscOperation, PscApi, PscMeasure, PscSource, PscMeasurementMethod, AddTypeCommands, AddTypeSourceText, InvokeExpressionCommands, ScriptBlockCreateCalls, HereStrings, ScriptBlockExpressions, CommandsNamedByVariable, ScriptBlockLiteralsInvoked, CommandsNamedByOtherExpression, MemberLookupsByText, HashtableLiterals, HashtableRecords, QuotedTextConstants, ExpandableTexts, NamespaceUsings, RegexUses, PscGuard, PscPredicateKind, PscOperandOrigin, PscOperand, PscPredicate, PscDerivedCheck, PscBlocked, PscObservation, PscInvestigation, PscInstrument, ParseInstrument, ParseErrorInstrument, MeasureInstrument, DerivedCheckInstrument, ReferenceInstrument, PscOutcome, PscRelation, PscComparison, PscNotExecuted, PscBindingEvaluation, PscIncludedScript, PscConsolidation, PscConsolidationState, PscMemberLowering, MemberLoweringInstrument, LowerInstrument, InterpretInstrument, CompareInstrument
+SmaUnit, SmaEdge, SmaSource, SmaCoverage, SmaAbsence, SmaChange, SmaProject, PscDifferential, PowerShellSemantics, PscBinding, PscEnvironment, PscOperatorKind, PscBoundOperands, PscOperandBinding, PowerShellNumericOperands, PscParameter, PscOperation, PscApi, PscMeasure, PscSource, PscMeasurementMethod, AddTypeCommands, AddTypeSourceText, InvokeExpressionCommands, ScriptBlockCreateCalls, HereStrings, ScriptBlockExpressions, CommandsNamedByVariable, ScriptBlockLiteralsInvoked, CommandsNamedByOtherExpression, MemberLookupsByText, HashtableLiterals, HashtableRecords, QuotedTextConstants, ExpandableTexts, NamespaceUsings, RegexUses, PscGuard, PscPredicateKind, PscOperandOrigin, PscOperand, PscPredicate, PscCondition, PscDerivedCheck, PscBlocked, PscObservation, PscInvestigation, PscInstrument, ParseInstrument, ParseErrorInstrument, MeasureInstrument, DerivedCheckInstrument, ReferenceInstrument, PscOutcome, PscRelation, PscComparison, PscNotExecuted, PscBindingEvaluation, PscIncludedScript, PscConsolidation, PscConsolidationState, PscMemberLowering, MemberLoweringInstrument, LowerInstrument, InterpretInstrument, CompareInstrument
