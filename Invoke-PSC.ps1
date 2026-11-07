@@ -1650,17 +1650,44 @@ function Use-ClassMirror {
     param([Parameter(Mandatory)][System.Management.Automation.Language.Ast] $Ast)
     $root = $Ast
     while ($root.Parent) { $root = $root.Parent }
+    $types = Get-ClassMirrorType -Root $root
+    $semanticsRoot = Get-PscSemanticsClass
+    while ($semanticsRoot.Parent) { $semanticsRoot = $semanticsRoot.Parent }
+    if ($root -ne $semanticsRoot -and -not $types.ContainsKey('PowerShellSemantics')) {
+        $types = $types + (Get-ClassMirrorType -Root $semanticsRoot)
+    }
+    $script:LoweringClassTypes = @{} + $types
+}
+
+# The mirror types of the classes and enums under one root, built once per root.
+function Get-ClassMirrorType {
+    param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Root)
     $types = $null
-    if (-not $script:ClassMirrorCache.TryGetValue($root, [ref]$types)) {
-        $classes = @($root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true) | Where-Object { -not (Test-AttributeClass $_) })
-        $enums = @($root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsEnum }, $true))
+    if (-not $script:ClassMirrorCache.TryGetValue($Root, [ref]$types)) {
+        $classes = @($Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true) | Where-Object { -not (Test-AttributeClass $_) })
+        $enums = @($Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsEnum }, $true))
         $script:LoweringClassTypes = @{}
         $mirror = New-ClassMirror -Model @(Get-ClassModel -ClassAsts $classes) -Enums $enums
         $types = @{}
         foreach ($name in $mirror.Keys) { $types[$name] = $mirror[$name] }
-        $script:ClassMirrorCache.Add($root, $types)
+        $script:ClassMirrorCache.Add($Root, $types)
     }
-    $script:LoweringClassTypes = @{} + $types
+    $types
+}
+
+# PowerShellSemantics' definition, read once from this script's AST and copied into a root of its own, so its methods
+# lower like any class's and every compile can include it. It has no constructor, so its copy is faithful (SMA's Copy()
+# of a constructor loses its implicit base call's node type).
+function Get-PscSemanticsClass {
+    if ($null -eq $script:PscSemanticsAst) {
+        $tokens = $null; $errors = $null
+        $own = [System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$tokens, [ref]$errors)
+        $definition = $own.Find({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.Name -eq 'PowerShellSemantics' }, $true)
+        $block = [System.Management.Automation.Language.StatementBlockAst]::new($definition.Extent, [System.Management.Automation.Language.StatementAst[]]@($definition.Copy()), [System.Management.Automation.Language.TrapStatementAst[]]@())
+        $root = [System.Management.Automation.Language.ScriptBlockAst]::new($definition.Extent, $null, $block, $false)
+        $script:PscSemanticsAst = $root.Find({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] }, $true)
+    }
+    $script:PscSemanticsAst
 }
 
 $script:ExpressionNewMethod = [Linq.Expressions.Expression].GetMethod(
@@ -1778,6 +1805,48 @@ function New-PowerShellArithmetic {
     }
 }
 
+# [int]($a / $b), or a typed target taking one, where $a and $b are Int32 or UInt32 (narrower integers widen to Int32).
+# PowerShell divides them as Double and rounds the quotient half to even into the integral type. Double holds every
+# such quotient and every half exactly, so the same value comes from integer arithmetic: the truncated quotient and
+# the remainder in Int64, stepped away from zero when twice the remainder passes the divisor, or equals it with an
+# odd quotient. No floating point and no call; a zero divisor throws DivideByZeroException as PowerShell does.
+# $null when the node is not such a quotient, and the Double path applies.
+function ConvertTo-IntegralQuotient {
+    param(
+        [Parameter(Mandatory)][System.Management.Automation.Language.Ast] $Node,
+        [Parameter(Mandatory)][Type] $Type,
+        [Parameter(Mandatory)][hashtable] $Scope
+    )
+    if ($Type -notin $script:IntegralTypes) { return $null }
+    $inner = $Node
+    while ($true) {
+        if ($inner -is [System.Management.Automation.Language.ParenExpressionAst]) { $inner = $inner.Pipeline; continue }
+        if ($inner -is [System.Management.Automation.Language.PipelineAst] -and $inner.PipelineElements.Count -eq 1 -and
+            $inner.PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst]) { $inner = $inner.PipelineElements[0].Expression; continue }
+        break
+    }
+    if ($inner -isnot [System.Management.Automation.Language.BinaryExpressionAst] -or $inner.Operator -ne 'Divide') { return $null }
+    $bound = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Arithmetic,
+        (Convert-AstExpression -Node $inner.Left -Scope $Scope), (Convert-AstExpression -Node $inner.Right -Scope $Scope))
+    if ($null -eq $bound -or $bound.Left.Type -notin [int], [uint32]) { return $null }
+    $semantics = $script:LoweringClassTypes['PowerShellSemantics']
+    if ($null -eq $semantics) { throw 'PowerShellSemantics is not part of this compile; Export-LoweredAssembly composes it into every one.' }
+    $rounded = [Linq.Expressions.Expression]::Call($semantics.GetMethod('RoundedQuotient'),
+        [Linq.Expressions.Expression]::Convert($bound.Left, [long]), [Linq.Expressions.Expression]::Convert($bound.Right, [long]))
+    ConvertTo-PowerShellType -Expression $rounded -Type $Type
+}
+
+# A copy of a using statement. SMA's UsingStatementAst.Copy() reuses its Name child for a statement without an alias
+# (using namespace System.IO), so it always throws there; the public constructor builds the copy from a copied Name.
+function Copy-UsingStatement {
+    param([Parameter(Mandatory)][System.Management.Automation.Language.UsingStatementAst] $Using)
+    if ($null -eq $Using.Alias -and $null -eq $Using.ModuleSpecification -and $null -ne $Using.Name) {
+        return [System.Management.Automation.Language.UsingStatementAst]::new($Using.Extent, $Using.UsingStatementKind, $Using.Name.Copy())
+    }
+    $Using.Copy()
+}
+
+
 function Get-AstArrayElements($node) {
     if ($node -is [System.Management.Automation.Language.ArrayLiteralAst]) {
         return @($node.Elements)
@@ -1885,6 +1954,8 @@ function Convert-AstExpressionAs {
         }
         return [Linq.Expressions.Expression]::NewArrayInit($elementType, [Linq.Expressions.Expression[]]$items.ToArray())
     }
+    $quotient = ConvertTo-IntegralQuotient -Node $Node -Type $Type -Scope $Scope
+    if ($null -ne $quotient) { return $quotient }
     $value = Convert-AstExpression -Node $Node -Scope $Scope
     if ($value.Type -eq $Type) { return $value }
     if ($value -is [Linq.Expressions.ConstantExpression] -and $null -eq $value.Value -and -not $Type.IsValueType) {
@@ -2070,14 +2141,18 @@ function Resolve-MatchingMethod {
         if ($match) { return $candidate }
     }
 
-    # 3. The one overload reachable by integer conversion; the call site converts each argument, checked.
+    # 3. The one overload reachable by PowerShell's argument conversion; the call site converts each argument with
+    # ConvertTo-PowerShellType. A number converts to any numeric parameter (checked, floating rounded to even), and an
+    # [object] argument, whose type PowerShell only learns when the call runs, converts to the parameter's type then.
     # An open generic definition is never callable as it stands; step 4 closes it or rejects it.
+    $numeric = [Type[]]@($script:IntegralTypes + $script:FloatingTypes)
     $reachable = @($all | Where-Object {
         if ($_.ContainsGenericParameters) { return $false }
         $params = $_.GetParameters()
         for ($i = 0; $i -lt $params.Length; $i++) {
             $wanted = $params[$i].ParameterType
-            if (-not $wanted.IsAssignableFrom($ArgumentTypes[$i]) -and -not ($wanted -in $script:IntegralTypes -and $ArgumentTypes[$i] -in $script:IntegralTypes)) { return $false }
+            $given = $ArgumentTypes[$i]
+            if (-not $wanted.IsAssignableFrom($given) -and -not ($wanted -in $numeric -and $given -in $numeric) -and $given -ne [object]) { return $false }
         }
         $true
     })
@@ -2179,27 +2254,128 @@ function Resolve-MatchingMember {
 # Int32; same signedness meets in the wider type; mixed signedness meets in the narrowest signed type
 # that holds both (Int32 with UInt32 is Int64). A signed type with UInt64 has no common integer type
 # and is rejected. Returns $null when no rule applies.
-function ConvertTo-CommonIntegralOperands {
-    param([Linq.Expressions.Expression] $Left, [Linq.Expressions.Expression] $Right)
-    if ($Left.Type -notin $script:IntegralTypes -or $Right.Type -notin $script:IntegralTypes) { return $null }
-    $size = @{ [sbyte] = 1; [byte] = 1; [short] = 2; [ushort] = 2; [int] = 4; [uint] = 4; [long] = 8; [ulong] = 8 }
-    $signed = { param($type) $type -in [sbyte], [short], [int], [long] }
-    $l = $Left.Type; $r = $Right.Type
-    $common = if ($size[$l] -lt 4 -and $size[$r] -lt 4) { [int] }
-        elseif ((& $signed $l) -eq (& $signed $r)) { if ($size[$l] -ge $size[$r]) { $l } else { $r } }
-        else {
-            $signedType = if (& $signed $l) { $l } else { $r }
-            $unsignedType = if (& $signed $l) { $r } else { $l }
-            if ($size[$signedType] -gt $size[$unsignedType]) { $signedType }
-            elseif ($size[$unsignedType] -lt 4) { [int] }
-            elseif ($size[$unsignedType] -eq 4) { [long] }
-            else { $null }
+# PowerShell's semantics as typed methods, written once here and lowered by PSC into every assembly it compiles;
+# lowering calls them wherever a construct needs them, in any program. Each runs the same interpreted by SMA.
+class PowerShellSemantics {
+    # [int]($dividend / $divisor) for Int32 and UInt32 operands: PowerShell divides as Double and rounds half to even.
+    # Double holds every such quotient and half exactly, so the integer quotient, stepped away from zero when twice the
+    # remainder passes the divisor or equals it with an odd quotient, is the same value. A zero divisor throws.
+    static [long] RoundedQuotient([long] $dividend, [long] $divisor) {
+        [long] $quotient = [Math]::DivRem($dividend, $divisor).Item1
+        [long] $remainder = $dividend - $quotient * $divisor
+        [long] $excess = 2 * [Math]::Abs($remainder) - [Math]::Abs($divisor)
+        if ($excess -gt 0 -or ($excess -eq 0 -and ($quotient -band 1) -ne 0)) {
+            if (($dividend -lt 0) -ne ($divisor -lt 0)) { return $quotient - 1 }
+            return $quotient + 1
         }
-    if ($null -eq $common) { return $null }
-    $convertLeft = if ($Left.Type -eq $common) { $Left } else { [Linq.Expressions.Expression]::Convert($Left, $common) }
-    $convertRight = if ($Right.Type -eq $common) { $Right } else { [Linq.Expressions.Expression]::Convert($Right, $common) }
-    [pscustomobject]@{ Left = $convertLeft; Right = $convertRight }
+        return $quotient
+    }
 }
+
+# A lowering decision PSC asks its environment for at the moment it lowers. The newest binding for a target wins and
+# keeps the binding it replaced, so how PSC came to lower a construct stays in the runspace with it.
+class PscBinding {
+    [string] $Target
+    [string] $Reason
+    [PscBinding] $Previous
+}
+
+# The bindings in force, by target, and every binding set, in order. The API object Invoke-PSC.ps1 returns holds the
+# environment, so it lives as long as the caller keeps that object; a binding set through it is the next one used.
+class PscEnvironment {
+    [Collections.Generic.Dictionary[string, PscBinding]] $Current = [Collections.Generic.Dictionary[string, PscBinding]]::new([StringComparer]::Ordinal)
+    [Collections.Generic.List[PscBinding]] $History = [Collections.Generic.List[PscBinding]]::new()
+
+    [PscBinding] Set([PscBinding] $binding) {
+        [PscBinding] $replaced = $null
+        if ($this.Current.TryGetValue($binding.Target, [ref] $replaced)) { $binding.Previous = $replaced }
+        $this.Current[$binding.Target] = $binding
+        $this.History.Add($binding)
+        return $binding
+    }
+
+    [PscBinding] Get([string] $target) {
+        [PscBinding] $binding = $null
+        if (-not $this.Current.TryGetValue($target, [ref] $binding)) { throw [InvalidOperationException]::new("No binding for '$target' in this environment.") }
+        return $binding
+    }
+}
+
+# What an operator does with its operands, which decides the type they are bound to.
+enum PscOperatorKind { Arithmetic; Comparison; Bitwise; Conditional }
+
+# Two operands converted to the type an operator works in.
+class PscBoundOperands {
+    [Linq.Expressions.Expression] $Left
+    [Linq.Expressions.Expression] $Right
+}
+
+# Binds the operands of a binary operator. Returns $null when it does not apply to their types.
+class PscOperandBinding : PscBinding {
+    [PscBoundOperands] Bind([PscOperatorKind] $kind, [Linq.Expressions.Expression] $left, [Linq.Expressions.Expression] $right) {
+        throw [NotImplementedException]::new($this.GetType().FullName + ' does not bind operands.')
+    }
+}
+
+# PowerShell's numeric operand binding, measured on SMA (PowerShell 7.7.0-preview.5), not C#'s:
+# - Arithmetic and comparison work in the higher-ranked operand type: Int32 < UInt32 < Int64 < UInt64 < Double <
+#   Decimal, with narrower integers ranked as Int32 and Single as Double. [uint32]5 + [int]2 is UInt32 and
+#   [uint64]5 + [long]2 is UInt64, where C# gives Int64 and refuses.
+# - Comparison of a Decimal with a Single or Double is done in Double ([decimal]0 -lt [single]NaN is False).
+# - Comparison of a signed integer with an unsigned one of higher rank is exact in Int64 (UInt32) or Decimal (UInt64).
+# - Bitwise operators work in the higher-ranked integer type, the signed operand's bits kept ([int]-1 -band [uint32]1
+#   is UInt32 1).
+# - Conditional arms: PowerShell converts neither, but a lowered expression has one type, so they take the arithmetic one.
+# Where SMA's result type depends on the value, nothing is chosen here and the binding does not apply: arithmetic on a
+# signed integer and an unsigned one of higher rank ([uint32]1 + [int]-2 is Int64, [uint32]5 + [int]2 is UInt32), and
+# bitwise operators with a Single, Double or Decimal operand (UInt64, or Int64 when negative). The program states the
+# type it means there, as PSNES does.
+class PowerShellNumericOperands : PscOperandBinding {
+    static [Type[]] $Ranks = @([int], [uint32], [long], [uint64], [double], [decimal])
+
+    PowerShellNumericOperands() {
+        $this.Target = 'NumericOperands'
+        $this.Reason = "PowerShell's operand conversions, measured on SMA"
+    }
+
+    static [int] Rank([Type] $type) {
+        if ($type -in [sbyte], [byte], [int16], [uint16], [int]) { return 0 }
+        if ($type -eq [uint32]) { return 1 }
+        if ($type -eq [long]) { return 2 }
+        if ($type -eq [uint64]) { return 3 }
+        if ($type -in [single], [double]) { return 4 }
+        if ($type -eq [decimal]) { return 5 }
+        return -1
+    }
+
+    static [Linq.Expressions.Expression] As([Linq.Expressions.Expression] $operand, [Type] $type) {
+        if ($operand.Type -eq $type) { return $operand }
+        return [Linq.Expressions.Expression]::Convert($operand, $type)
+    }
+
+    [PscBoundOperands] Bind([PscOperatorKind] $kind, [Linq.Expressions.Expression] $left, [Linq.Expressions.Expression] $right) {
+        [int] $leftRank = [PowerShellNumericOperands]::Rank($left.Type)
+        [int] $rightRank = [PowerShellNumericOperands]::Rank($right.Type)
+        if ($leftRank -lt 0 -or $rightRank -lt 0) { return $null }
+        if ($kind -eq [PscOperatorKind]::Bitwise -and [Math]::Max($leftRank, $rightRank) -ge 4) { return $null }
+        [int] $top = [Math]::Max($leftRank, $rightRank)
+        [Type] $common = [PowerShellNumericOperands]::Ranks[$top]
+        if ($kind -ne [PscOperatorKind]::Bitwise -and $top -in 1, 3) {
+            [Type] $other = if ($leftRank -eq $top) { $right.Type } else { $left.Type }
+            if ($other -in [sbyte], [int16], [int], [long]) {
+                if ($kind -ne [PscOperatorKind]::Comparison) { return $null }
+                $common = if ($top -eq 1) { [long] } else { [decimal] }
+            }
+        }
+        if ($kind -eq [PscOperatorKind]::Comparison -and $top -eq 5 -and [Math]::Min($leftRank, $rightRank) -eq 4) { $common = [double] }
+        return [PscBoundOperands]@{ Left = [PowerShellNumericOperands]::As($left, $common); Right = [PowerShellNumericOperands]::As($right, $common) }
+    }
+}
+
+$script:PscEnvironment = [PscEnvironment]::new()
+[void] $script:PscEnvironment.Set([PowerShellNumericOperands]::new())
+# PowerShellSemantics' definition from this script's AST, read on the first compile.
+$script:PscSemanticsAst = $null
 
 function Convert-AstExpression {
     <#
@@ -2295,7 +2471,7 @@ function Convert-AstExpression {
         for ($i = $clauses.Count - 1; $i -ge 0; $i--) {
             $test = Convert-AstExpression -Node $clauses[$i].Item1 -Scope $Scope
             $whenTrue = & $branchValue $clauses[$i].Item2
-            $widened = ConvertTo-CommonIntegralOperands -Left $whenTrue -Right $result
+            $widened = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Conditional, $whenTrue, $result)
             if ($widened) { $whenTrue = $widened.Left; $result = $widened.Right }
             if ($whenTrue.Type -ne $result.Type) {
                 throw "[{0}:{1}] Branches of an if used as a value require identical types, got '{2}' and '{3}'." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $whenTrue.Type.FullName, $result.Type.FullName
@@ -2314,12 +2490,20 @@ function Convert-AstExpression {
         }
         $whenTrue = Convert-AstExpression -Node $Node.IfTrue -Scope $Scope
         $whenFalse = Convert-AstExpression -Node $Node.IfFalse -Scope $Scope
-        $widened = ConvertTo-CommonIntegralOperands -Left $whenTrue -Right $whenFalse
+        $widened = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Conditional, $whenTrue, $whenFalse)
         if ($widened) { $whenTrue = $widened.Left; $whenFalse = $widened.Right }
         if ($whenTrue.Type -ne $whenFalse.Type) {
             throw "[{0}:{1}] Ternary arms require identical types, got '{2}' and '{3}'." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $whenTrue.Type.FullName, $whenFalse.Type.FullName
         }
         return [Linq.Expressions.Expression]::Condition($test, $whenTrue, $whenFalse)
+    }
+
+    # $a, $b, $c with no type stated: an object[], as PowerShell builds it. A stated type lowers through the cast or the
+    # typed target instead.
+    if ($Node -is [System.Management.Automation.Language.ArrayLiteralAst]) {
+        $items = [System.Collections.Generic.List[Linq.Expressions.Expression]]::new()
+        foreach ($element in $Node.Elements) { $items.Add([Linq.Expressions.Expression]::Convert((Convert-AstExpression -Node $element -Scope $Scope), [object])) }
+        return [Linq.Expressions.Expression]::NewArrayInit([object], [Linq.Expressions.Expression[]]$items.ToArray())
     }
 
     # 5. Paren expressions: ( $expr )
@@ -2353,6 +2537,8 @@ function Convert-AstExpression {
                 return [Linq.Expressions.Expression]::NewArrayInit($elemType, [Linq.Expressions.Expression[]]$elemExprList.ToArray())
             }
         }
+        $quotient = ConvertTo-IntegralQuotient -Node $Node.Child -Type $targetType -Scope $Scope
+        if ($null -ne $quotient) { return $quotient }
         $child = Convert-AstExpression -Node $Node.Child -Scope $Scope
         return (ConvertTo-PowerShellType -Expression $child -Type ($targetType))
     }
@@ -2363,7 +2549,7 @@ function Convert-AstExpression {
             $target = Convert-AstExpression -Node $Node.Child -Scope $Scope
             $one = [Linq.Expressions.Expression]::Constant(1, [int])
             $operand = $target
-            $widened = ConvertTo-CommonIntegralOperands -Left $target -Right $one
+            $widened = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Arithmetic, $target, $one)
             if ($widened) { $operand = $widened.Left; $one = $widened.Right } else { $one = [Linq.Expressions.Expression]::Constant([Convert]::ChangeType(1, $target.Type), $target.Type) }
             $operator = if ($Node.TokenKind -in 'PostfixPlusPlus', 'PrefixPlusPlus') { 'Plus' } else { 'Minus' }
             return [Linq.Expressions.Expression]::Assign($target, (ConvertTo-PowerShellType -Expression (New-PowerShellArithmetic -Operator $operator -Left $operand -Right $one) -Type $target.Type))
@@ -2445,7 +2631,10 @@ function Convert-AstExpression {
         }
         if ($Node.Operator -notin 'And', 'Or') {
             # Narrow integers have no CLR arithmetic of their own, even when both sides match.
-            $widened = ConvertTo-CommonIntegralOperands -Left $left -Right $right
+            $kind = if ($Node.Operator -in 'Band', 'Bor', 'Bxor') { [PscOperatorKind]::Bitwise }
+                elseif ($Node.Operator -in 'Plus', 'Minus', 'Multiply', 'Divide', 'Rem') { [PscOperatorKind]::Arithmetic }
+                else { [PscOperatorKind]::Comparison }
+            $widened = $script:PscEnvironment.Get('NumericOperands').Bind($kind, $left, $right)
             if ($widened) { $left = $widened.Left; $right = $widened.Right }
         }
         if ($left.Type -ne $right.Type) {
@@ -2784,7 +2973,7 @@ function Convert-AstStatement {
                 $element = New-PowerShellArrayIndex -Array $arrayExpr -Index (Convert-AstExpression -Node $leftNode.Index -Scope $Scope) -Scope $Scope
                 $right = Convert-AstExpression -Node $Statement.Right -Scope $Scope
                 $operandLeft = $element.Access
-                $widened = ConvertTo-CommonIntegralOperands -Left $operandLeft -Right $right
+                $widened = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Arithmetic, $operandLeft, $right)
                 if ($widened) { $operandLeft = $widened.Left; $right = $widened.Right }
                 if ($right.Type -ne $operandLeft.Type) {
                     throw "[{0}:{1}] Compound assignment '{2}' requires identical operand types, got '{3}' and '{4}'." -f `
@@ -2808,7 +2997,7 @@ function Convert-AstStatement {
             $target = Convert-AstExpression -Node $leftNode -Scope $Scope
             $right = Convert-AstExpression -Node $Statement.Right -Scope $Scope
             $operandLeft = $target
-            $widened = ConvertTo-CommonIntegralOperands -Left $operandLeft -Right $right
+            $widened = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Arithmetic, $operandLeft, $right)
             if ($widened) { $operandLeft = $widened.Left; $right = $widened.Right }
             if ($right.Type -ne $operandLeft.Type) {
                 throw "[{0}:{1}] Compound assignment '{2}' requires identical operand types, got '{3}' and '{4}'." -f `
@@ -3249,7 +3438,7 @@ function Convert-AstStatement {
                 $right = Convert-AstExpression -Node $clause.Item1 -Scope $Scope
                 if ($left.Type.IsEnum -and $right.Type -ne $left.Type) { $left = [Linq.Expressions.Expression]::Convert($left, [Enum]::GetUnderlyingType($left.Type)) }
                 if ($right.Type.IsEnum -and $right.Type -ne $left.Type) { $right = [Linq.Expressions.Expression]::Convert($right, [Enum]::GetUnderlyingType($right.Type)) }
-                $widened = ConvertTo-CommonIntegralOperands -Left $left -Right $right
+                $widened = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Comparison, $left, $right)
                 if ($widened) { $left = $widened.Left; $right = $widened.Right }
                 if ($left.Type -ne $right.Type) {
                     throw "[{0}:{1}] switch clause type '{2}' does not match the value's type '{3}'." -f $clause.Item1.Extent.StartLineNumber, $clause.Item1.Extent.StartColumnNumber, $right.Type.FullName, $value.Type.FullName
@@ -4648,7 +4837,11 @@ class PscApi {
     [PscMeasure[]] $Measures
     [string[]] $Functions
     [string[]] $Classes
+    [PscEnvironment] $Environment
     hidden [System.Management.Automation.Language.ScriptBlockAst] $Ast
+
+    # Sets a binding in this API's environment; the newest binding for its target wins.
+    [PscBinding] SetBinding([PscBinding] $binding) { return $this.Environment.Set($binding) }
 }
 
 function Get-PscApi {
@@ -4705,6 +4898,7 @@ function Get-PscApi {
     $api.Measures = [PscSource]::new($PSCommandPath).Measures
     $api.Functions = [string[]]@($functions.Keys)
     $api.Classes = [string[]]@($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.TypeDefinitionAst] }, $true) | ForEach-Object Name)
+    $api.Environment = $script:PscEnvironment
     $api.Ast = $ast
     $api
 }
@@ -4900,11 +5094,14 @@ function Export-LoweredAssembly {
     }
     $targetClass = $parsed.ClassAst
     $classAsts = @($parsed.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true) | Where-Object { -not (Test-AttributeClass $_) })
+    # PSC's semantic helpers are lowered with every program.
+    if ('PowerShellSemantics' -notin @($classAsts.Name)) { $classAsts += Get-PscSemanticsClass }
     $script:LoweringKeywords = @{}
     foreach ($definition in @(Get-LoweringKeywords $parsed.Ast)) { $script:LoweringKeywords[$definition.Name] = $definition }
     if ($ClassNames) {
-        $classAsts = @($classAsts | Where-Object Name -in $ClassNames)
-        if ($classAsts.Count -ne @($ClassNames | Sort-Object -Unique).Count -or $targetClass.Name -notin $ClassNames) { throw 'ClassNames must identify existing classes and include ClassName.' }
+        $selected = @(@($ClassNames) + 'PowerShellSemantics' | Sort-Object -Unique)
+        $classAsts = @($classAsts | Where-Object Name -in $selected)
+        if ($classAsts.Count -ne $selected.Count -or $targetClass.Name -notin $ClassNames) { throw 'ClassNames must identify existing classes and include ClassName.' }
     }
     $model = @(Get-ClassModel -ClassAsts $classAsts)
     Use-ClassMirror -Ast $parsed.Ast
@@ -6803,6 +7000,79 @@ function Compare-PscOutcome {
     [PscRelation]::Different
 }
 
+# One evaluation of an operator in SMA, as written and with an operand binding's type written into each operand.
+# Relation compares type and value; SameNumber says whether the two results are equal numbers whatever their types.
+class PscBindingEvaluation {
+    [System.Management.Automation.Language.TokenKind] $Operator
+    [type] $Left
+    [type] $Right
+    [type] $Bound
+    [object[]] $Arguments
+    [PscOutcome] $Reference
+    [PscOutcome] $Mutated
+    [PscRelation] $Relation
+    [bool] $SameNumber
+}
+
+# Checks an operand binding against SMA by mutating SMA's own AST: for each operator and pair of operand types, SMA
+# evaluates [L]$a op [R]$b and [B]([L]$a) op [B]([R]$b), B being the type the binding chose, on each pair of
+# boundary values. Every evaluation is returned; one whose Relation is not Equal is where the binding departs.
+function Compare-PscOperandBinding {
+    [CmdletBinding()]
+    [OutputType([PscBindingEvaluation])]
+    param(
+        [Parameter(Mandatory)][PscOperandBinding] $Binding,
+        [System.Management.Automation.Language.TokenKind[]] $Operator = @('Plus', 'Minus', 'Multiply', 'Divide', 'Rem', 'Band', 'Bor', 'Bxor', 'Ieq', 'Ilt'),
+        [type[]] $Type = @([sbyte], [byte], [int16], [uint16], [int], [uint32], [long], [uint64], [single], [double], [decimal])
+    )
+    $position = [System.Management.Automation.Language.ScriptPosition]::new('Compare-PscOperandBinding', 1, 1, '')
+    $extent = [System.Management.Automation.Language.ScriptExtent]::new($position, $position)
+    $a = [System.Management.Automation.Language.VariableExpressionAst]::new($extent, 'a', $false)
+    $b = [System.Management.Automation.Language.VariableExpressionAst]::new($extent, 'b', $false)
+    $parameters = [System.Management.Automation.Language.ParameterAst[]]@(
+        [System.Management.Automation.Language.ParameterAst]::new($extent, $a.Copy(), [System.Management.Automation.Language.AttributeBaseAst[]]@(), $null),
+        [System.Management.Automation.Language.ParameterAst]::new($extent, $b.Copy(), [System.Management.Automation.Language.AttributeBaseAst[]]@(), $null))
+    foreach ($token in $Operator) {
+        $kind = if ($token -in 'Band', 'Bor', 'Bxor') { [PscOperatorKind]::Bitwise }
+            elseif ($token -in 'Plus', 'Minus', 'Multiply', 'Divide', 'Rem') { [PscOperatorKind]::Arithmetic }
+            else { [PscOperatorKind]::Comparison }
+        foreach ($leftType in $Type) {
+            foreach ($rightType in $Type) {
+                $bound = $Binding.Bind($kind, [Linq.Expressions.Expression]::Parameter($leftType), [Linq.Expressions.Expression]::Parameter($rightType))
+                if ($null -eq $bound) { continue }
+                $left = [System.Management.Automation.Language.ConvertExpressionAst]::new($extent, [System.Management.Automation.Language.TypeConstraintAst]::new($extent, [System.Management.Automation.Language.ReflectionTypeName]::new($leftType)), $a.Copy())
+                $right = [System.Management.Automation.Language.ConvertExpressionAst]::new($extent, [System.Management.Automation.Language.TypeConstraintAst]::new($extent, [System.Management.Automation.Language.ReflectionTypeName]::new($rightType)), $b.Copy())
+                $boundLeft = [System.Management.Automation.Language.ConvertExpressionAst]::new($extent, [System.Management.Automation.Language.TypeConstraintAst]::new($extent, [System.Management.Automation.Language.ReflectionTypeName]::new($bound.Left.Type)), $left.Copy())
+                $boundRight = [System.Management.Automation.Language.ConvertExpressionAst]::new($extent, [System.Management.Automation.Language.TypeConstraintAst]::new($extent, [System.Management.Automation.Language.ReflectionTypeName]::new($bound.Right.Type)), $right.Copy())
+                $evaluators = foreach ($expression in [System.Management.Automation.Language.BinaryExpressionAst]::new($extent, $left, $token, $right, $extent),
+                                                      [System.Management.Automation.Language.BinaryExpressionAst]::new($extent, $boundLeft, $token, $boundRight, $extent)) {
+                    $statement = [System.Management.Automation.Language.PipelineAst]::new($extent, [System.Management.Automation.Language.CommandExpressionAst]::new($extent, $expression, $null))
+                    $body = [System.Management.Automation.Language.StatementBlockAst]::new($extent, [System.Management.Automation.Language.StatementAst[]]@($statement), $null)
+                    $paramBlock = [System.Management.Automation.Language.ParamBlockAst]::new($extent, [System.Management.Automation.Language.AttributeAst[]]@(), [System.Management.Automation.Language.ParameterAst[]]@($parameters | ForEach-Object { $_.Copy() }))
+                    [System.Management.Automation.Language.ScriptBlockAst]::new($extent, $paramBlock, $body, $false).GetScriptBlock()
+                }
+                foreach ($arguments in Get-PscArgumentSet -Types $leftType, $rightType -Limit 1024) {
+                    $outcomes = foreach ($evaluator in $evaluators) {
+                        $outcome = [PscOutcome]::new()
+                        try { $outcome.Value = $evaluator.InvokeReturnAsIs($arguments[0], $arguments[1]) }
+                        catch { $outcome.Exception = $_.Exception.GetBaseException() }
+                        $outcome
+                    }
+                    $sameNumber = $null -eq $outcomes[0].Exception -and $null -eq $outcomes[1].Exception -and
+                        [System.Management.Automation.LanguagePrimitives]::Equals($outcomes[0].Value, $outcomes[1].Value) -and
+                        [System.Management.Automation.LanguagePrimitives]::Equals($outcomes[1].Value, $outcomes[0].Value)
+                    [PscBindingEvaluation]@{
+                        Operator = $token; Left = $leftType; Right = $rightType; Bound = $bound.Left.Type; Arguments = $arguments
+                        Reference = $outcomes[0]; Mutated = $outcomes[1]
+                        Relation = Compare-PscOutcome -Lowered $outcomes[1] -Interpreted $outcomes[0]
+                        SameNumber = $sameNumber
+                    }
+                }
+            }
+        }
+    }
+}
+
 # The source's classes and enums defined by SMA, interpreted: a new script block holding copies of the source's type
 # definitions only (no other statement runs), invoked, with each runtime type read from its definition.
 function ConvertTo-PscInterpretedType {
@@ -6811,7 +7081,7 @@ function ConvertTo-PscInterpretedType {
     $definitions = [System.Collections.Generic.List[System.Management.Automation.Language.StatementAst]]::new()
     foreach ($definition in $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] }, $false)) { $definitions.Add($definition.Copy()) }
     $usings = [System.Collections.Generic.List[System.Management.Automation.Language.UsingStatementAst]]::new()
-    foreach ($using in $Ast.UsingStatements) { $usings.Add($using.Copy()) }
+    foreach ($using in $Ast.UsingStatements) { $usings.Add((Copy-UsingStatement $using)) }
     $block = [System.Management.Automation.Language.StatementBlockAst]::new($Ast.Extent, $definitions, [System.Management.Automation.Language.TrapStatementAst[]]@())
     $script = [System.Management.Automation.Language.ScriptBlockAst]::new($Ast.Extent, $usings, $null, $block, $false, $false)
     $null = & $script.GetScriptBlock()
