@@ -84,12 +84,12 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Compile', 'Api', 'Expression', 'Inspect', 'Capability', 'Link', 'PowerShell', 'Describe', 'Lint', 'Profile', 'Report', 'Verify', 'Readme', 'Derive')]
+    [ValidateSet('Compile', 'Api', 'Expression', 'Inspect', 'Capability', 'Link', 'PowerShell', 'Describe', 'Lint', 'Profile', 'Report', 'Verify', 'Readme', 'Investigate')]
     [string] $Mode = 'Compile',
     [string] $ArchivePath,
     [string] $ProjectPath,
     [string[]] $LintFiles,
-    [string[]] $DerivePath,
+    [string[]] $InvestigatePath,
     [string] $ProfilePath,
     [string] $SourcePath,
     [System.Management.Automation.Language.ScriptBlockAst] $SourceAst,
@@ -6339,9 +6339,11 @@ function Get-PscPredicate {
 function Get-PscDerivedCheck {
     [CmdletBinding()]
     [OutputType([PscDerivedCheck])]
-    param([Parameter(Mandatory)][string] $Path)
-    $tokens = $null; $errors = $null
-    $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tokens, [ref]$errors)
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Ast
+    )
+    $ast = $Ast
     foreach ($throw in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.ThrowStatementAst] }, $true)) {
         $check = [PscDerivedCheck]::new()
         $check.Path = $Path
@@ -6366,6 +6368,208 @@ function Get-PscDerivedCheck {
         }
         $check
     }
+}
+
+# The file a path expression names, folded from SMA's AST: text constants, $PSScriptRoot, variables followed to their
+# assignments, Join-Path with two positional values, and Split-Path -Parent. $null when the expression does not fold.
+function Resolve-PscPathExpression {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][System.Management.Automation.Language.Ast] $Ast,
+        [Parameter(Mandatory)][System.Management.Automation.Language.Ast] $Scope,
+        [Parameter(Mandatory)][string] $Directory,
+        [int] $Depth = 0
+    )
+    if ($Depth -gt 16) { return $null }
+    $node = Get-PscInnerExpression $Ast
+    if ($node -is [System.Management.Automation.Language.StringConstantExpressionAst]) { return $node.Value }
+    if ($node -is [System.Management.Automation.Language.VariableExpressionAst]) {
+        if ($node.VariablePath.UserPath.Equals('PSScriptRoot', [StringComparison]::OrdinalIgnoreCase)) { return $Directory }
+        $assignment = Find-PscAssignment -Scope $Scope -Name $node.VariablePath.UserPath -Before $node.Extent.StartOffset
+        if ($null -eq $assignment) { return $null }
+        return Resolve-PscPathExpression -Ast $assignment.Right -Scope $Scope -Directory $Directory -Depth ($Depth + 1)
+    }
+    if ($node -isnot [System.Management.Automation.Language.CommandAst]) { return $null }
+    $binding = [System.Management.Automation.Language.StaticParameterBinder]::BindCommand($node, $true)
+    $command = $node.GetCommandName()
+    if ($command -eq 'Join-Path' -and $binding.BoundParameters.ContainsKey('Path') -and $binding.BoundParameters.ContainsKey('ChildPath')) {
+        $parent = Resolve-PscPathExpression -Ast $binding.BoundParameters['Path'].Value -Scope $Scope -Directory $Directory -Depth ($Depth + 1)
+        $child = Resolve-PscPathExpression -Ast $binding.BoundParameters['ChildPath'].Value -Scope $Scope -Directory $Directory -Depth ($Depth + 1)
+        if ($null -eq $parent -or $null -eq $child) { return $null }
+        return [IO.Path]::GetFullPath([IO.Path]::Combine($parent, $child))
+    }
+    if ($command -eq 'Split-Path' -and $binding.BoundParameters.ContainsKey('Parent') -and $binding.BoundParameters.ContainsKey('Path')) {
+        $inner = Resolve-PscPathExpression -Ast $binding.BoundParameters['Path'].Value -Scope $Scope -Directory $Directory -Depth ($Depth + 1)
+        if ($null -eq $inner) { return $null }
+        return [IO.Path]::GetDirectoryName($inner)
+    }
+    $null
+}
+
+# ============================================================================
+# INVESTIGATION
+# A target is examined by every instrument that applies to it. Each instrument is a class deriving from
+# PscInstrument, found by type, and may require other instruments' results on the same target. An instrument that
+# throws is recorded as an observation (its ErrorRecord) and blocks only the instruments that require it; everything
+# else still runs. Instruments add observations as they make them, so a later failure cannot erase earlier evidence.
+# References an instrument finds become new targets. Each target is examined once.
+# ============================================================================
+
+# An instrument that could not run because an instrument it requires failed on the same target.
+class PscBlocked {
+    [type] $Instrument
+    [type] $Requires
+}
+
+class PscObservation {
+    [string] $Target
+    [type] $Instrument
+    [object] $Value
+}
+
+class PscInvestigation {
+    [System.Collections.Generic.List[string]] $Targets = [System.Collections.Generic.List[string]]::new()
+    [System.Collections.Generic.List[PscObservation]] $Observations = [System.Collections.Generic.List[PscObservation]]::new()
+    hidden [System.Collections.Generic.Queue[string]] $Pending = [System.Collections.Generic.Queue[string]]::new()
+    hidden [System.Collections.Generic.HashSet[string]] $Seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+
+    [void] AddTarget([string] $path) {
+        $full = [IO.Path]::GetFullPath($path)
+        if ($this.Seen.Add($full)) { $this.Pending.Enqueue($full); $this.Targets.Add($full) }
+    }
+
+    [void] Observe([string] $target, [type] $instrument, [object] $value) {
+        $observation = [PscObservation]::new()
+        $observation.Target = $target
+        $observation.Instrument = $instrument
+        $observation.Value = $value
+        $this.Observations.Add($observation)
+    }
+
+    # The values an instrument observed on a target.
+    [object[]] Find([string] $target, [type] $instrument) {
+        $found = [System.Collections.Generic.List[object]]::new()
+        foreach ($observation in $this.Observations) {
+            if ($observation.Instrument -eq $instrument -and $observation.Target.Equals($target, [StringComparison]::OrdinalIgnoreCase)) { $found.Add($observation.Value) }
+        }
+        return $found.ToArray()
+    }
+}
+
+class PscInstrument {
+    # The instruments whose results this one needs on the same target.
+    [type[]] Requires() { return [type[]]@() }
+    [bool] AppliesTo([string] $target) { throw [System.NotImplementedException]::new($this.GetType().Name) }
+    [void] Examine([PscInvestigation] $investigation, [string] $target) { throw [System.NotImplementedException]::new($this.GetType().Name) }
+
+    static [PscInstrument[]] All() {
+        $instruments = [System.Collections.Generic.List[PscInstrument]]::new()
+        foreach ($type in [PscInstrument].Assembly.GetTypes()) {
+            if ($type.IsSubclassOf([PscInstrument])) { $instruments.Add([PscInstrument][Activator]::CreateInstance($type)) }
+        }
+        return $instruments.ToArray()
+    }
+
+    static [PscSource] Source([PscInvestigation] $investigation, [string] $target) {
+        return [PscSource]@($investigation.Find($target, [ParseInstrument]))[0]
+    }
+}
+
+# SMA's parse of a PowerShell file: the PscSource, then each parse error as its own observation.
+class ParseInstrument : PscInstrument {
+    [bool] AppliesTo([string] $target) { return [IO.Path]::GetExtension($target) -in '.ps1', '.psm1' }
+    [void] Examine([PscInvestigation] $investigation, [string] $target) {
+        $source = [PscSource]::new($target)
+        $investigation.Observe($target, [ParseInstrument], $source)
+        foreach ($parseError in $source.ParseErrors) { $investigation.Observe($target, [ParseErrorInstrument], $parseError) }
+    }
+}
+
+# Holds the parse errors ParseInstrument observes; it examines nothing itself.
+class ParseErrorInstrument : PscInstrument {
+    [bool] AppliesTo([string] $target) { return $false }
+}
+
+class MeasureInstrument : PscInstrument {
+    [type[]] Requires() { return [type[]]@([ParseInstrument]) }
+    [bool] AppliesTo([string] $target) { return [IO.Path]::GetExtension($target) -in '.ps1', '.psm1' }
+    [void] Examine([PscInvestigation] $investigation, [string] $target) {
+        foreach ($measure in [PscInstrument]::Source($investigation, $target).Measures) { $investigation.Observe($target, [MeasureInstrument], $measure) }
+    }
+}
+
+class DerivedCheckInstrument : PscInstrument {
+    [type[]] Requires() { return [type[]]@([ParseInstrument]) }
+    [bool] AppliesTo([string] $target) { return [IO.Path]::GetExtension($target) -in '.ps1', '.psm1' }
+    [void] Examine([PscInvestigation] $investigation, [string] $target) {
+        foreach ($check in Get-PscDerivedCheck -Path $target -Ast ([PscInstrument]::Source($investigation, $target).Ast)) { $investigation.Observe($target, [DerivedCheckInstrument], $check) }
+    }
+}
+
+# Files a source names through path expressions that fold (dot-sourced scripts, Join-Path from $PSScriptRoot): each
+# existing file is observed and becomes a target.
+class ReferenceInstrument : PscInstrument {
+    [type[]] Requires() { return [type[]]@([ParseInstrument]) }
+    [bool] AppliesTo([string] $target) { return [IO.Path]::GetExtension($target) -in '.ps1', '.psm1' }
+    [void] Examine([PscInvestigation] $investigation, [string] $target) {
+        $ast = [PscInstrument]::Source($investigation, $target).Ast
+        $directory = [IO.Path]::GetDirectoryName($target)
+        $named = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($command in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+            $candidates = if ($command.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Dot) { @($command.CommandElements[0]) } elseif ($command.GetCommandName() -eq 'Join-Path') { @($command) } else { @() }
+            foreach ($candidate in $candidates) {
+                $scope = $candidate.Parent
+                while ($scope -isnot [System.Management.Automation.Language.ScriptBlockAst]) { $scope = $scope.Parent }
+                $path = Resolve-PscPathExpression -Ast $candidate -Scope $scope -Directory $directory
+                if ($null -ne $path -and [IO.File]::Exists($path) -and $named.Add($path)) {
+                    $investigation.Observe($target, [ReferenceInstrument], [IO.FileInfo]::new($path))
+                    $investigation.AddTarget($path)
+                }
+            }
+        }
+    }
+}
+
+function Invoke-PscInvestigation {
+    [CmdletBinding()]
+    [OutputType([PscInvestigation])]
+    param([Parameter(Mandatory)][string[]] $Path)
+    $investigation = [PscInvestigation]::new()
+    foreach ($item in $Path) {
+        if ([IO.Directory]::Exists($item)) { foreach ($file in Get-ChildItem -LiteralPath $item -Recurse -File -Include *.ps1, *.psm1) { $investigation.AddTarget($file.FullName) } }
+        else { $investigation.AddTarget($item) }
+    }
+    $instruments = [PscInstrument]::All()
+    while ($investigation.Pending.Count) {
+        $target = $investigation.Pending.Dequeue()
+        $outcome = [System.Collections.Generic.Dictionary[type, bool]]::new()
+        $remaining = [System.Collections.Generic.List[PscInstrument]]::new()
+        foreach ($instrument in $instruments) { if ($instrument.AppliesTo($target)) { $remaining.Add($instrument) } }
+        $progress = $true
+        while ($remaining.Count -and $progress) {
+            $progress = $false
+            foreach ($instrument in $remaining.ToArray()) {
+                $requirements = $instrument.Requires()
+                $failed = @($requirements | Where-Object { $outcome.ContainsKey($_) -and -not $outcome[$_] })
+                if ($failed.Count) {
+                    $blocked = [PscBlocked]::new(); $blocked.Instrument = $instrument.GetType(); $blocked.Requires = $failed[0]
+                    $investigation.Observe($target, [PscBlocked], $blocked)
+                    $outcome[$instrument.GetType()] = $false; $null = $remaining.Remove($instrument); $progress = $true
+                    continue
+                }
+                if (@($requirements | Where-Object { -not $outcome.ContainsKey($_) }).Count) { continue }
+                try { $instrument.Examine($investigation, $target); $outcome[$instrument.GetType()] = $true }
+                catch { $investigation.Observe($target, $instrument.GetType(), $_); $outcome[$instrument.GetType()] = $false }
+                $null = $remaining.Remove($instrument); $progress = $true
+            }
+        }
+        foreach ($instrument in $remaining) {
+            $blocked = [PscBlocked]::new(); $blocked.Instrument = $instrument.GetType()
+            $investigation.Observe($target, [PscBlocked], $blocked)
+        }
+    }
+    $investigation
 }
 
 }
@@ -6413,11 +6617,9 @@ process {
             Get-SmaReport @(Get-SmaUnits $profiled) $profiled
         }
         'Verify' { Test-SmaDescription }
-        'Derive' {
-            if (-not $DerivePath) { throw 'Derive requires -DerivePath.' }
-            foreach ($item in $DerivePath) {
-                foreach ($file in Get-ChildItem -LiteralPath $item -Recurse -File -Include *.ps1, *.psm1) { Get-PscDerivedCheck -Path $file.FullName }
-            }
+        'Investigate' {
+            if (-not $InvestigatePath) { throw 'Investigate requires -InvestigatePath.' }
+            Invoke-PscInvestigation -Path $InvestigatePath
         }
         'Readme' {
             $readme = Join-Path $PSScriptRoot 'README.md'
