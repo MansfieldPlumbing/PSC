@@ -2080,6 +2080,17 @@ class PscDifferential {
             return $values
         }
         if ($type.IsEnum) { foreach ($value in [Enum]::GetValues($type)) { $values.Add($value) }; return $values }
+        if ($type -eq [object]) {
+            # A value whose type is known only at run time: null, each listed type's values, collections empty, of one
+            # element and of several, nested, a dictionary, an enumeration value and an object with no other shape.
+            $values.Add($null)
+            foreach ($listedType in [type[]]@([bool], [int], [long], [byte], [double], [single], [decimal], [char], [string])) { $values.AddRange([PscDifferential]::Values($listedType)) }
+            $values.Add([object[]]@()); $values.Add([object[]]@(0)); $values.Add([object[]]@(1)); $values.Add([object[]]@('')); $values.Add([object[]]@(0, 0))
+            $values.Add([object[]]@(,[object[]]@())); $values.Add([object[]]@(,[object[]]@(0)))
+            $values.Add([System.Collections.Generic.List[int]]::new()); $values.Add([System.Collections.ArrayList]::new())
+            $values.Add([System.Collections.Hashtable]::new()); $values.Add([DayOfWeek]::Sunday); $values.Add([DayOfWeek]::Monday); $values.Add([object]::new())
+            return $values
+        }
         $listed = $null
         if ($type -eq [int]) { $listed = [object[]]@([int]::MinValue, [int]-1, [int]0, [int]1, [int]2, [int]7, [int]70000, [int]::MaxValue) }
         elseif ($type -eq [long]) { $listed = [object[]]@([long]::MinValue, [long]-1, [long]0, [long]1, [long]7, [long]::MaxValue) }
@@ -2132,7 +2143,10 @@ class PscDifferential {
         [object[]] $given = [object[]]@()
         if ($null -ne $arguments) { $given = $arguments }
         $copies =[object[]]::new($given.Length)
-        for ($i = 0; $i -lt $copies.Length; $i++) { $copies[$i] = if ($given[$i] -is [Array]) { ([Array]$given[$i]).Clone() } else { $given[$i] } }
+        for ($i = 0; $i -lt $copies.Length; $i++) {
+            $copies[$i] = $given[$i]
+            if ($given[$i] -is [Array]) { $copies[$i] = ([Array]$given[$i]).Clone() }
+        }
         $outcome = [PscOutcome]::new()
         $clock = [System.Diagnostics.Stopwatch]::StartNew()
         try {
@@ -2592,12 +2606,19 @@ function Resolve-MatchingMethod {
         $flags = $flags -bor [Reflection.BindingFlags]::Instance
     }
 
+    # An interface's methods include those of the interfaces it extends, which reflection on the interface itself does
+    # not return.
+    $searched = @($TargetType)
+    if ($TargetType.IsInterface) { $searched += $TargetType.GetInterfaces() }
+
     # 1. Exact match
-    $exact = $TargetType.GetMethod($MethodName, $flags, $null, $ArgumentTypes, $null)
-    if ($null -ne $exact -and -not $exact.ContainsGenericParameters) { return $exact }
+    foreach ($type in $searched) {
+        $exact = $type.GetMethod($MethodName, $flags, $null, $ArgumentTypes, $null)
+        if ($null -ne $exact -and -not $exact.ContainsGenericParameters) { return $exact }
+    }
 
     # 2. Compatible match
-    $all = @($TargetType.GetMethods($flags) | Where-Object {
+    $all = @($searched | ForEach-Object { $_.GetMethods($flags) } | Where-Object {
         $_.Name -eq $MethodName -and $_.GetParameters().Length -eq $ArgumentTypes.Length
     })
 
@@ -2707,18 +2728,24 @@ function Resolve-MatchingMember {
         [switch] $IsStatic
     )
 
-    $flags = [Reflection.BindingFlags]'Public'
+    # PowerShell binds member names ignoring case. An interface's members include those of the interfaces it extends,
+    # which reflection on the interface itself does not return.
+    $flags = [Reflection.BindingFlags]'Public' -bor [Reflection.BindingFlags]::IgnoreCase
     if ($IsStatic) {
         $flags = $flags -bor [Reflection.BindingFlags]::Static
     } else {
         $flags = $flags -bor [Reflection.BindingFlags]::Instance
     }
 
-    $prop = $TargetType.GetProperty($MemberName, $flags)
-    if ($null -ne $prop) { return $prop }
+    $searched = @($TargetType)
+    if ($TargetType.IsInterface) { $searched += $TargetType.GetInterfaces() }
+    foreach ($type in $searched) {
+        $prop = $type.GetProperty($MemberName, $flags)
+        if ($null -ne $prop) { return $prop }
 
-    $field = $TargetType.GetField($MemberName, $flags)
-    if ($null -ne $field) { return $field }
+        $field = $type.GetField($MemberName, $flags)
+        if ($null -ne $field) { return $field }
+    }
 
     throw "Could not resolve property or field '$MemberName' on '$($TargetType.FullName)'."
 }
@@ -2801,6 +2828,33 @@ class PowerShellSemantics {
         }
         throw [System.InvalidOperationException]::new("The property '" + $name + "' cannot be found on this object. Verify that the property exists.")
     }
+
+    # A value as a condition, by PowerShell's rules measured on SMA: $null is false; a Boolean is itself; a string or a
+    # collection is true when it is not empty, except that a collection of one element is that element as a condition,
+    # where an element that is itself a collection is true when it is not empty; a number, character or enumeration
+    # value is true when it is not zero (NaN is not zero); any other object is true.
+    static [bool] IsTrue([object] $value) {
+        if ($null -eq $value) { return $false }
+        if ($value -is [bool]) { return $value.Equals($true) }
+        if ($value -is [string]) { return ([string]$value).Length -ne 0 }
+        if ($value -is [char]) { return [System.Convert]::ToInt32($value) -ne 0 }
+        if ($value -is [System.Collections.IList]) {
+            [System.Collections.IList] $list = $value
+            if ($list.Count -eq 0) { return $false }
+            if ($list.Count -gt 1) { return $true }
+            [object] $only = $list[0]
+            if ($only -is [System.Collections.IList]) { return ([System.Collections.IList]$only).Count -ne 0 }
+            return [PowerShellSemantics]::IsTrue($only)
+        }
+        [System.Type] $type = $value.GetType()
+        if ($type.IsEnum -or $value -is [decimal] -or ($type.IsPrimitive -and $value -isnot [System.IntPtr] -and $value -isnot [System.UIntPtr])) {
+            return [System.Convert]::ToDouble($value) -ne 0.0
+        }
+        return $true
+    }
+
+    # -not and ! on a value as a condition.
+    static [bool] Not([object] $value) { return -not [PowerShellSemantics]::IsTrue($value) }
 
     # A function's output as an assignment or an expression receives it: $null when nothing was written, the object
     # when one was, and all of them, in order, when several were.
@@ -4507,6 +4561,8 @@ function Get-IlType([Type] $Type) {
 }
 
 function Get-IlMember([Reflection.MemberInfo] $Member) {
+    # A member this program compiles is its own builder, including when the program is PowerShellSemantics itself.
+    if ($script:IlMap.Members.ContainsKey($Member)) { return $script:IlMap.Members[$Member] }
     # A PowerShellSemantics method: the helper class enters this assembly on the first call that needs it, and every
     # helper a call needs is recorded for the compile's result.
     if ($Member.DeclaringType -and $Member.DeclaringType.Name -eq 'PowerShellSemantics' -and $script:IlMap.ContainsKey('Semantics') -and
@@ -5501,6 +5557,253 @@ class PscOperation {
     hidden [System.Management.Automation.Language.FunctionDefinitionAst[]] $Definitions
 }
 
+# A new tree with the same structure as a given one, built bottom up through SMA's visitor: each node is constructed
+# from its rebuilt children, then passed to Edit, whose result takes its place. Edit returns the node unchanged here;
+# a derived class overrides it. Nodes SMA cannot construct from children (expandable strings, whose constructor parses
+# their text again; dynamic keyword statements; using and configuration statements; parse errors) are copied whole,
+# and nothing inside them is edited.
+class PscAstRebuild : System.Management.Automation.Language.ICustomAstVisitor2 {
+    [System.Management.Automation.Language.Ast] Edit([System.Management.Automation.Language.Ast] $original, [System.Management.Automation.Language.Ast] $rebuilt) { return $rebuilt }
+
+    [System.Management.Automation.Language.Ast] Rebuild([System.Management.Automation.Language.Ast] $node) {
+        if ($null -eq $node) { return $null }
+        return $node.Visit($this)
+    }
+
+    hidden [System.Management.Automation.Language.Ast[]] Each([object] $nodes) {
+        $rebuilt = [System.Collections.Generic.List[System.Management.Automation.Language.Ast]]::new()
+        if ($null -ne $nodes) { foreach ($node in $nodes) { $rebuilt.Add($this.Rebuild($node)) } }
+        return $rebuilt.ToArray()
+    }
+
+    hidden [System.Management.Automation.Language.StatementBlockAst] Block([System.Management.Automation.Language.IScriptExtent] $extent, [object] $statements, [object] $traps) {
+        [System.Management.Automation.Language.TrapStatementAst[]] $rebuiltTraps = $null
+        if ($null -ne $traps) { $rebuiltTraps = $this.Each($traps) }
+        return [System.Management.Automation.Language.StatementBlockAst]::new($extent, [System.Management.Automation.Language.StatementAst[]]$this.Each($statements), $rebuiltTraps)
+    }
+
+    [object] DefaultVisit([System.Management.Automation.Language.Ast] $a) { return $this.Edit($a, $a.Copy()) }
+    [object] VisitErrorStatement([System.Management.Automation.Language.ErrorStatementAst] $a) { return $this.Edit($a, $a.Copy()) }
+    [object] VisitErrorExpression([System.Management.Automation.Language.ErrorExpressionAst] $a) { return $this.Edit($a, $a.Copy()) }
+    [object] VisitUsingStatement([System.Management.Automation.Language.UsingStatementAst] $a) { return $this.Edit($a, $a.Copy()) }
+    [object] VisitConfigurationDefinition([System.Management.Automation.Language.ConfigurationDefinitionAst] $a) { return $this.Edit($a, $a.Copy()) }
+    [object] VisitDynamicKeywordStatement([System.Management.Automation.Language.DynamicKeywordStatementAst] $a) { return $this.Edit($a, $a.Copy()) }
+    [object] VisitExpandableStringExpression([System.Management.Automation.Language.ExpandableStringExpressionAst] $a) { return $this.Edit($a, $a.Copy()) }
+
+    [object] VisitScriptBlock([System.Management.Automation.Language.ScriptBlockAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.ScriptBlockAst]::new($a.Extent,
+            [System.Management.Automation.Language.UsingStatementAst[]]$this.Each($a.UsingStatements),
+            [System.Management.Automation.Language.AttributeAst[]]$this.Each($a.Attributes),
+            $this.Rebuild($a.ParamBlock), $this.Rebuild($a.BeginBlock), $this.Rebuild($a.ProcessBlock), $this.Rebuild($a.EndBlock),
+            $this.Rebuild($a.CleanBlock), $this.Rebuild($a.DynamicParamBlock)))
+    }
+    [object] VisitParamBlock([System.Management.Automation.Language.ParamBlockAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.ParamBlockAst]::new($a.Extent, [System.Management.Automation.Language.AttributeAst[]]$this.Each($a.Attributes), [System.Management.Automation.Language.ParameterAst[]]$this.Each($a.Parameters)))
+    }
+    [object] VisitNamedBlock([System.Management.Automation.Language.NamedBlockAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.NamedBlockAst]::new($a.Extent, $a.BlockKind, $this.Block($a.Extent, $a.Statements, $a.Traps), $a.Unnamed))
+    }
+    [object] VisitTypeConstraint([System.Management.Automation.Language.TypeConstraintAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.TypeConstraintAst]::new($a.Extent, $a.TypeName))
+    }
+    [object] VisitAttribute([System.Management.Automation.Language.AttributeAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.AttributeAst]::new($a.Extent, $a.TypeName, [System.Management.Automation.Language.ExpressionAst[]]$this.Each($a.PositionalArguments), [System.Management.Automation.Language.NamedAttributeArgumentAst[]]$this.Each($a.NamedArguments)))
+    }
+    [object] VisitNamedAttributeArgument([System.Management.Automation.Language.NamedAttributeArgumentAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.NamedAttributeArgumentAst]::new($a.Extent, $a.ArgumentName, $this.Rebuild($a.Argument), $a.ExpressionOmitted))
+    }
+    [object] VisitParameter([System.Management.Automation.Language.ParameterAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.ParameterAst]::new($a.Extent, $this.Rebuild($a.Name), [System.Management.Automation.Language.AttributeBaseAst[]]$this.Each($a.Attributes), $this.Rebuild($a.DefaultValue)))
+    }
+    [object] VisitFunctionDefinition([System.Management.Automation.Language.FunctionDefinitionAst] $a) {
+        [System.Management.Automation.Language.ParameterAst[]] $parameters = $null
+        if ($null -ne $a.Parameters) { $parameters = $this.Each($a.Parameters) }
+        return $this.Edit($a, [System.Management.Automation.Language.FunctionDefinitionAst]::new($a.Extent, $a.IsFilter, $a.IsWorkflow, $a.Name, $parameters, $this.Rebuild($a.Body)))
+    }
+    [object] VisitStatementBlock([System.Management.Automation.Language.StatementBlockAst] $a) {
+        return $this.Edit($a, $this.Block($a.Extent, $a.Statements, $a.Traps))
+    }
+    [object] VisitIfStatement([System.Management.Automation.Language.IfStatementAst] $a) {
+        $clauses = [System.Collections.Generic.List[System.Tuple[System.Management.Automation.Language.PipelineBaseAst, System.Management.Automation.Language.StatementBlockAst]]]::new()
+        foreach ($clause in $a.Clauses) { $clauses.Add([System.Tuple[System.Management.Automation.Language.PipelineBaseAst, System.Management.Automation.Language.StatementBlockAst]]::new($this.Rebuild($clause.Item1), $this.Rebuild($clause.Item2))) }
+        return $this.Edit($a, [System.Management.Automation.Language.IfStatementAst]::new($a.Extent, $clauses, $this.Rebuild($a.ElseClause)))
+    }
+    [object] VisitTrap([System.Management.Automation.Language.TrapStatementAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.TrapStatementAst]::new($a.Extent, $this.Rebuild($a.TrapType), $this.Rebuild($a.Body)))
+    }
+    [object] VisitSwitchStatement([System.Management.Automation.Language.SwitchStatementAst] $a) {
+        $clauses = [System.Collections.Generic.List[System.Tuple[System.Management.Automation.Language.ExpressionAst, System.Management.Automation.Language.StatementBlockAst]]]::new()
+        foreach ($clause in $a.Clauses) { $clauses.Add([System.Tuple[System.Management.Automation.Language.ExpressionAst, System.Management.Automation.Language.StatementBlockAst]]::new($this.Rebuild($clause.Item1), $this.Rebuild($clause.Item2))) }
+        return $this.Edit($a, [System.Management.Automation.Language.SwitchStatementAst]::new($a.Extent, $a.Label, $this.Rebuild($a.Condition), $a.Flags, $clauses, $this.Rebuild($a.Default)))
+    }
+    [object] VisitDataStatement([System.Management.Automation.Language.DataStatementAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.DataStatementAst]::new($a.Extent, $a.Variable, [System.Management.Automation.Language.ExpressionAst[]]$this.Each($a.CommandsAllowed), $this.Rebuild($a.Body)))
+    }
+    [object] VisitForEachStatement([System.Management.Automation.Language.ForEachStatementAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.ForEachStatementAst]::new($a.Extent, $a.Label, $a.Flags, $this.Rebuild($a.ThrottleLimit), $this.Rebuild($a.Variable), $this.Rebuild($a.Condition), $this.Rebuild($a.Body)))
+    }
+    [object] VisitDoWhileStatement([System.Management.Automation.Language.DoWhileStatementAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.DoWhileStatementAst]::new($a.Extent, $a.Label, $this.Rebuild($a.Condition), $this.Rebuild($a.Body)))
+    }
+    [object] VisitDoUntilStatement([System.Management.Automation.Language.DoUntilStatementAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.DoUntilStatementAst]::new($a.Extent, $a.Label, $this.Rebuild($a.Condition), $this.Rebuild($a.Body)))
+    }
+    [object] VisitWhileStatement([System.Management.Automation.Language.WhileStatementAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.WhileStatementAst]::new($a.Extent, $a.Label, $this.Rebuild($a.Condition), $this.Rebuild($a.Body)))
+    }
+    [object] VisitForStatement([System.Management.Automation.Language.ForStatementAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.ForStatementAst]::new($a.Extent, $a.Label, $this.Rebuild($a.Initializer), $this.Rebuild($a.Condition), $this.Rebuild($a.Iterator), $this.Rebuild($a.Body)))
+    }
+    [object] VisitCatchClause([System.Management.Automation.Language.CatchClauseAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.CatchClauseAst]::new($a.Extent, [System.Management.Automation.Language.TypeConstraintAst[]]$this.Each($a.CatchTypes), $this.Rebuild($a.Body)))
+    }
+    [object] VisitTryStatement([System.Management.Automation.Language.TryStatementAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.TryStatementAst]::new($a.Extent, $this.Rebuild($a.Body), [System.Management.Automation.Language.CatchClauseAst[]]$this.Each($a.CatchClauses), $this.Rebuild($a.Finally)))
+    }
+    [object] VisitBreakStatement([System.Management.Automation.Language.BreakStatementAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.BreakStatementAst]::new($a.Extent, $this.Rebuild($a.Label)))
+    }
+    [object] VisitContinueStatement([System.Management.Automation.Language.ContinueStatementAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.ContinueStatementAst]::new($a.Extent, $this.Rebuild($a.Label)))
+    }
+    [object] VisitReturnStatement([System.Management.Automation.Language.ReturnStatementAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.ReturnStatementAst]::new($a.Extent, $this.Rebuild($a.Pipeline)))
+    }
+    [object] VisitExitStatement([System.Management.Automation.Language.ExitStatementAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.ExitStatementAst]::new($a.Extent, $this.Rebuild($a.Pipeline)))
+    }
+    [object] VisitThrowStatement([System.Management.Automation.Language.ThrowStatementAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.ThrowStatementAst]::new($a.Extent, $this.Rebuild($a.Pipeline)))
+    }
+    [object] VisitAssignmentStatement([System.Management.Automation.Language.AssignmentStatementAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.AssignmentStatementAst]::new($a.Extent, $this.Rebuild($a.Left), $a.Operator, $this.Rebuild($a.Right), $a.ErrorPosition))
+    }
+    [object] VisitPipeline([System.Management.Automation.Language.PipelineAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.PipelineAst]::new($a.Extent, [System.Management.Automation.Language.CommandBaseAst[]]$this.Each($a.PipelineElements), $a.Background))
+    }
+    [object] VisitPipelineChain([System.Management.Automation.Language.PipelineChainAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.PipelineChainAst]::new($a.Extent, $this.Rebuild($a.LhsPipelineChain), $this.Rebuild($a.RhsPipeline), $a.Operator, $a.Background))
+    }
+    [object] VisitCommand([System.Management.Automation.Language.CommandAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.CommandAst]::new($a.Extent, [System.Management.Automation.Language.CommandElementAst[]]$this.Each($a.CommandElements), $a.InvocationOperator, [System.Management.Automation.Language.RedirectionAst[]]$this.Each($a.Redirections)))
+    }
+    [object] VisitCommandExpression([System.Management.Automation.Language.CommandExpressionAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.CommandExpressionAst]::new($a.Extent, $this.Rebuild($a.Expression), [System.Management.Automation.Language.RedirectionAst[]]$this.Each($a.Redirections)))
+    }
+    [object] VisitCommandParameter([System.Management.Automation.Language.CommandParameterAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.CommandParameterAst]::new($a.Extent, $a.ParameterName, $this.Rebuild($a.Argument), $a.ErrorPosition))
+    }
+    [object] VisitFileRedirection([System.Management.Automation.Language.FileRedirectionAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.FileRedirectionAst]::new($a.Extent, $a.FromStream, $this.Rebuild($a.Location), $a.Append))
+    }
+    [object] VisitMergingRedirection([System.Management.Automation.Language.MergingRedirectionAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.MergingRedirectionAst]::new($a.Extent, $a.FromStream, $a.ToStream))
+    }
+    [object] VisitBinaryExpression([System.Management.Automation.Language.BinaryExpressionAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.BinaryExpressionAst]::new($a.Extent, $this.Rebuild($a.Left), $a.Operator, $this.Rebuild($a.Right), $a.ErrorPosition))
+    }
+    [object] VisitUnaryExpression([System.Management.Automation.Language.UnaryExpressionAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.UnaryExpressionAst]::new($a.Extent, $a.TokenKind, $this.Rebuild($a.Child)))
+    }
+    [object] VisitTernaryExpression([System.Management.Automation.Language.TernaryExpressionAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.TernaryExpressionAst]::new($a.Extent, $this.Rebuild($a.Condition), $this.Rebuild($a.IfTrue), $this.Rebuild($a.IfFalse)))
+    }
+    [object] VisitConvertExpression([System.Management.Automation.Language.ConvertExpressionAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.ConvertExpressionAst]::new($a.Extent, $this.Rebuild($a.Type), $this.Rebuild($a.Child)))
+    }
+    [object] VisitConstantExpression([System.Management.Automation.Language.ConstantExpressionAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.ConstantExpressionAst]::new($a.Extent, $a.Value))
+    }
+    [object] VisitStringConstantExpression([System.Management.Automation.Language.StringConstantExpressionAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.StringConstantExpressionAst]::new($a.Extent, $a.Value, $a.StringConstantType))
+    }
+    [object] VisitSubExpression([System.Management.Automation.Language.SubExpressionAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.SubExpressionAst]::new($a.Extent, $this.Rebuild($a.SubExpression)))
+    }
+    [object] VisitUsingExpression([System.Management.Automation.Language.UsingExpressionAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.UsingExpressionAst]::new($a.Extent, $this.Rebuild($a.SubExpression)))
+    }
+    [object] VisitVariableExpression([System.Management.Automation.Language.VariableExpressionAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.VariableExpressionAst]::new($a.Extent, $a.VariablePath, $a.Splatted))
+    }
+    [object] VisitTypeExpression([System.Management.Automation.Language.TypeExpressionAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.TypeExpressionAst]::new($a.Extent, $a.TypeName))
+    }
+    [object] VisitMemberExpression([System.Management.Automation.Language.MemberExpressionAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.MemberExpressionAst]::new($a.Extent, $this.Rebuild($a.Expression), $this.Rebuild($a.Member), $a.Static, $a.NullConditional))
+    }
+    [object] VisitInvokeMemberExpression([System.Management.Automation.Language.InvokeMemberExpressionAst] $a) {
+        [System.Management.Automation.Language.ExpressionAst[]] $arguments = $null
+        if ($null -ne $a.Arguments) { $arguments = $this.Each($a.Arguments) }
+        return $this.Edit($a, [System.Management.Automation.Language.InvokeMemberExpressionAst]::new($a.Extent, $this.Rebuild($a.Expression), $this.Rebuild($a.Member), $arguments, $a.Static, $a.NullConditional, $a.GenericTypeArguments))
+    }
+    [object] VisitBaseCtorInvokeMemberExpression([System.Management.Automation.Language.BaseCtorInvokeMemberExpressionAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.BaseCtorInvokeMemberExpressionAst]::new($a.Expression.Extent, $a.Extent, [System.Management.Automation.Language.ExpressionAst[]]$this.Each($a.Arguments)))
+    }
+    [object] VisitArrayExpression([System.Management.Automation.Language.ArrayExpressionAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.ArrayExpressionAst]::new($a.Extent, $this.Rebuild($a.SubExpression)))
+    }
+    [object] VisitArrayLiteral([System.Management.Automation.Language.ArrayLiteralAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.ArrayLiteralAst]::new($a.Extent, [System.Management.Automation.Language.ExpressionAst[]]$this.Each($a.Elements)))
+    }
+    [object] VisitHashtable([System.Management.Automation.Language.HashtableAst] $a) {
+        $pairs = [System.Collections.Generic.List[System.Tuple[System.Management.Automation.Language.ExpressionAst, System.Management.Automation.Language.StatementAst]]]::new()
+        foreach ($pair in $a.KeyValuePairs) { $pairs.Add([System.Tuple[System.Management.Automation.Language.ExpressionAst, System.Management.Automation.Language.StatementAst]]::new($this.Rebuild($pair.Item1), $this.Rebuild($pair.Item2))) }
+        return $this.Edit($a, [System.Management.Automation.Language.HashtableAst]::new($a.Extent, $pairs))
+    }
+    [object] VisitScriptBlockExpression([System.Management.Automation.Language.ScriptBlockExpressionAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.ScriptBlockExpressionAst]::new($a.Extent, $this.Rebuild($a.ScriptBlock)))
+    }
+    [object] VisitParenExpression([System.Management.Automation.Language.ParenExpressionAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.ParenExpressionAst]::new($a.Extent, $this.Rebuild($a.Pipeline)))
+    }
+    [object] VisitIndexExpression([System.Management.Automation.Language.IndexExpressionAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.IndexExpressionAst]::new($a.Extent, $this.Rebuild($a.Target), $this.Rebuild($a.Index), $a.NullConditional))
+    }
+    [object] VisitAttributedExpression([System.Management.Automation.Language.AttributedExpressionAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.AttributedExpressionAst]::new($a.Extent, $this.Rebuild($a.Attribute), $this.Rebuild($a.Child)))
+    }
+    [object] VisitBlockStatement([System.Management.Automation.Language.BlockStatementAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.BlockStatementAst]::new($a.Extent, $a.Kind, $this.Rebuild($a.Body)))
+    }
+    [object] VisitTypeDefinition([System.Management.Automation.Language.TypeDefinitionAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.TypeDefinitionAst]::new($a.Extent, $a.Name, [System.Management.Automation.Language.AttributeAst[]]$this.Each($a.Attributes), [System.Management.Automation.Language.MemberAst[]]$this.Each($a.Members), $a.TypeAttributes, [System.Management.Automation.Language.TypeConstraintAst[]]$this.Each($a.BaseTypes)))
+    }
+    [object] VisitPropertyMember([System.Management.Automation.Language.PropertyMemberAst] $a) {
+        return $this.Edit($a, [System.Management.Automation.Language.PropertyMemberAst]::new($a.Extent, $a.Name, $this.Rebuild($a.PropertyType), [System.Management.Automation.Language.AttributeAst[]]$this.Each($a.Attributes), $a.PropertyAttributes, $this.Rebuild($a.InitialValue)))
+    }
+    [object] VisitFunctionMember([System.Management.Automation.Language.FunctionMemberAst] $a) {
+        $inner = $a.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and [object]::ReferenceEquals($n.Parent, $a) }, $false)
+        $definition = [System.Management.Automation.Language.FunctionDefinitionAst]::new($inner.Extent, $false, $false, $a.Name, [System.Management.Automation.Language.ParameterAst[]]$this.Each($a.Parameters), $this.Rebuild($a.Body))
+        return $this.Edit($a, [System.Management.Automation.Language.FunctionMemberAst]::new($a.Extent, $definition, $this.Rebuild($a.ReturnType), [System.Management.Automation.Language.AttributeAst[]]$this.Each($a.Attributes), $a.MethodAttributes))
+    }
+}
+
+# Each operator whose token is a key becomes a static call to its method, on the operator's rebuilt operands: SMA
+# then evaluates that operator by the method instead of its own binder. Increment and decrement assign, and are kept.
+class PscOperatorRebinding : PscAstRebuild {
+    [System.Collections.Generic.Dictionary[System.Management.Automation.Language.TokenKind, System.Reflection.MethodInfo]] $Methods
+
+    PscOperatorRebinding([System.Collections.Generic.Dictionary[System.Management.Automation.Language.TokenKind, System.Reflection.MethodInfo]] $methods) { $this.Methods = $methods }
+
+    hidden [System.Management.Automation.Language.Ast] Call([System.Management.Automation.Language.IScriptExtent] $extent, [System.Reflection.MethodInfo] $method, [System.Management.Automation.Language.ExpressionAst[]] $operands) {
+        $type = [System.Management.Automation.Language.TypeExpressionAst]::new($extent, [System.Management.Automation.Language.ReflectionTypeName]::new($method.DeclaringType))
+        $name = [System.Management.Automation.Language.StringConstantExpressionAst]::new($extent, $method.Name, [System.Management.Automation.Language.StringConstantType]::BareWord)
+        return [System.Management.Automation.Language.InvokeMemberExpressionAst]::new($extent, $type, $name, $operands, $true)
+    }
+
+    [System.Management.Automation.Language.Ast] Edit([System.Management.Automation.Language.Ast] $original, [System.Management.Automation.Language.Ast] $rebuilt) {
+        if ($rebuilt -is [System.Management.Automation.Language.BinaryExpressionAst] -and $this.Methods.ContainsKey($rebuilt.Operator)) {
+            return $this.Call($rebuilt.Extent, $this.Methods[$rebuilt.Operator], [System.Management.Automation.Language.ExpressionAst[]]@($rebuilt.Left.Copy(), $rebuilt.Right.Copy()))
+        }
+        if ($rebuilt -is [System.Management.Automation.Language.UnaryExpressionAst] -and $this.Methods.ContainsKey($rebuilt.TokenKind) -and
+            $rebuilt.TokenKind -notin [System.Management.Automation.Language.TokenKind]::PlusPlus, [System.Management.Automation.Language.TokenKind]::MinusMinus, [System.Management.Automation.Language.TokenKind]::PostfixPlusPlus, [System.Management.Automation.Language.TokenKind]::PostfixMinusMinus) {
+            return $this.Call($rebuilt.Extent, $this.Methods[$rebuilt.TokenKind], [System.Management.Automation.Language.ExpressionAst[]]@($rebuilt.Child.Copy()))
+        }
+        return $rebuilt
+    }
+}
+
 class PscApi {
     [string] $Synopsis
     [string] $Script
@@ -5557,6 +5860,16 @@ class PscApi {
     # this script's functions, so the investigation runs in an invocation of the script.
     [object] Investigate([string[]] $paths) {
         return & $this.Script -Mode Investigate -InvestigatePath $paths
+    }
+
+    # A new tree of the same structure, every node constructed again by SMA.
+    [System.Management.Automation.Language.ScriptBlockAst] Rebuild([System.Management.Automation.Language.ScriptBlockAst] $source) {
+        return [PscAstRebuild]::new().Rebuild($source)
+    }
+
+    # The source with each operator whose token is a key evaluated by its method, for SMA to run.
+    [System.Management.Automation.Language.ScriptBlockAst] BindOperators([System.Management.Automation.Language.ScriptBlockAst] $source, [System.Collections.Generic.Dictionary[System.Management.Automation.Language.TokenKind, System.Reflection.MethodInfo]] $methods) {
+        return [PscOperatorRebinding]::new($methods).Rebuild($source)
     }
 }
 
