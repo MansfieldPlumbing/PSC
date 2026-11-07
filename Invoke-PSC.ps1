@@ -1243,12 +1243,9 @@ function Test-AstAdmitted {
 
     $violations = [System.Collections.Generic.List[pscustomobject]]::new()
 
-    # A lowered unit consists of its compiled classes, not the surrounding
-    # PowerShell host script. String throws intentionally lose SMA identity;
-    # catches in that unit must not depend on SMA exception inspection.
-    $unit = $Ast
-    while ($unit.Parent) { $unit = $unit.Parent }
-    foreach ($typeAst in $unit.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] }, $true)) {
+    # String throws intentionally lose SMA identity, so a lowered member's catches must not depend on SMA exception
+    # inspection. Each member is checked as it is lowered, so a compile checks every member of its unit.
+    foreach ($typeAst in @($Ast)) {
         foreach ($catchAst in $typeAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CatchClauseAst] }, $true)) {
             foreach ($catchType in $catchAst.CatchTypes) {
                 $resolved = Resolve-AstType $catchType.TypeName
@@ -1273,7 +1270,7 @@ function Test-AstAdmitted {
     # Disallowed AST node types in compiled methods
     $disallowed = $Ast.FindAll({
         param($node)
-        $node -is [System.Management.Automation.Language.CommandAst] -or
+        ($node -is [System.Management.Automation.Language.CommandAst] -and $null -eq (Find-ScriptFunction $node.GetCommandName())) -or
         ($node -is [System.Management.Automation.Language.PipelineAst] -and $node.PipelineElements.Count -gt 1) -or
         ($node -is [System.Management.Automation.Language.ScriptBlockExpressionAst] -and
             $node.Parent -isnot [System.Management.Automation.Language.DynamicKeywordStatementAst] -and
@@ -1531,14 +1528,19 @@ function Get-ClassModel {
     }
 }
 
+# A parameter's type: its type constraint, or [object] when it has none, as SMA gives an untyped parameter. A script
+# function's [switch] is a [bool]: present is $true, absent $false.
+function Get-ParameterType([System.Management.Automation.Language.ParameterAst] $Parameter, [bool] $IsFunction) {
+    $tc = $Parameter.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.TypeConstraintAst] } | Select-Object -First 1
+    if (-not $tc) { return [object] }
+    $type = Resolve-AstType $tc.TypeName
+    if ($IsFunction -and $type -eq [System.Management.Automation.SwitchParameter]) { return [bool] }
+    $type
+}
+
 function Get-ParameterTypes([System.Management.Automation.Language.FunctionMemberAst] $Function) {
-    , [Type[]]@($Function.Parameters | ForEach-Object {
-        $tc = $_.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.TypeConstraintAst] } | Select-Object -First 1
-        if (-not $tc) {
-            throw "[{0}:{1}] Parameter `${2} needs a type." -f $_.Extent.StartLineNumber, $_.Extent.StartColumnNumber, $_.Name.VariablePath.UserPath
-        }
-        Resolve-AstType $tc.TypeName
-    })
+    $isFunction = Test-ScriptFunctionMember $Function
+    , [Type[]]@($Function.Parameters | ForEach-Object { Get-ParameterType $_ $isFunction })
 }
 
 function New-ClassMirror {
@@ -1650,26 +1652,39 @@ function Use-ClassMirror {
     param([Parameter(Mandatory)][System.Management.Automation.Language.Ast] $Ast)
     $root = $Ast
     while ($root.Parent) { $root = $root.Parent }
-    $script:LoweringClassTypes = @{} + (Get-ClassMirrorType -Root $root)
+    # A source's function class resolves the source's own types; the source resolves its function class.
+    $source = $null
+    if ($script:ScriptFunctionSources.TryGetValue($root, [ref]$source)) {
+        $sourceTypes = Get-ClassMirrorType -Root $source
+        $script:LoweringClassTypes = @{} + $sourceTypes + (Get-ClassMirrorType -Root $root -Resolving $sourceTypes)
+        return
+    }
+    $types = Get-ClassMirrorType -Root $root
+    $functionClass = $null
+    if ($script:ScriptFunctionClasses.TryGetValue($root, [ref]$functionClass) -and $null -ne $functionClass) {
+        $functionRoot = $functionClass; while ($functionRoot.Parent) { $functionRoot = $functionRoot.Parent }
+        $types = $types + (Get-ClassMirrorType -Root $functionRoot -Resolving $types)
+    }
+    $script:LoweringClassTypes = @{} + $types
 }
 
-# The mirror types of the classes and enums under one root, built once per root. Building one leaves the lowering in
-# progress resolving the types it was resolving.
+# The mirror types of the classes and enums under one root, built once per root; -Resolving names types its
+# signatures may use from elsewhere. Building one leaves the lowering in progress resolving what it was resolving.
 function Get-ClassMirrorType {
-    param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Root)
+    param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Root, [hashtable] $Resolving = @{})
     $types = $null
     if (-not $script:ClassMirrorCache.TryGetValue($Root, [ref]$types)) {
-        $resolving = $script:LoweringClassTypes
+        $inProgress = $script:LoweringClassTypes
         try {
             $classes = @($Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true) | Where-Object { -not (Test-AttributeClass $_) })
             $enums = @($Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsEnum }, $true))
-            $script:LoweringClassTypes = @{}
+            $script:LoweringClassTypes = @{} + $Resolving
             $mirror = New-ClassMirror -Model @(Get-ClassModel -ClassAsts $classes) -Enums $enums
             $types = @{}
             foreach ($name in $mirror.Keys) { $types[$name] = $mirror[$name] }
             $script:ClassMirrorCache.Add($Root, $types)
         }
-        finally { $script:LoweringClassTypes = $resolving }
+        finally { $script:LoweringClassTypes = $inProgress }
     }
     $types
 }
@@ -1706,6 +1721,121 @@ function Add-PscSemanticsToSession {
     })
     $mc = $mirrorType.GetConstructor($declared, $null, [Type[]]@(), $null)
     if ($null -ne $mc) { $script:IlMap.ImplicitConstructors[$mc] = $tb }
+}
+
+# A source's top-level functions as one class of static methods, built from SMA's own nodes: each function's copy in a
+# FunctionMemberAst returning [object[]], its output. The class is named for the source file and has a root of its
+# own; its methods resolve the source's classes and enums (Use-ClassMirror). $null when the source has no functions.
+function Get-ScriptFunctionClass {
+    param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Root)
+    $class = $null
+    if ($script:ScriptFunctionClasses.TryGetValue($Root, [ref]$class)) { return $class }
+    $functions = @($Root.FindAll({ param($n)
+        if ($n -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { return $false }
+        for ($p = $n.Parent; $null -ne $p; $p = $p.Parent) {
+            if ($p -is [System.Management.Automation.Language.FunctionDefinitionAst] -or $p -is [System.Management.Automation.Language.TypeDefinitionAst]) { return $false }
+        }
+        $true }, $true))
+    if ($functions.Count -eq 0) { $script:ScriptFunctionClasses[$Root] = $null; return $null }
+    $stem = [IO.Path]::GetFileNameWithoutExtension([string]$Root.Extent.File)
+    $name = -join @($stem.ToCharArray() | Where-Object { [char]::IsLetterOrDigit($_) -or $_ -eq [char]'_' })
+    if (-not $name -or [char]::IsDigit($name[0])) { $name = 'Script' + $name }
+    $taken = @($Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] }, $true) | ForEach-Object Name)
+    while ($name -in $taken) { $name += 'Script' }
+    $objectArray = [System.Management.Automation.Language.TypeConstraintAst]::new($Root.Extent, [System.Management.Automation.Language.ReflectionTypeName]::new([object[]]))
+    $members = foreach ($function in $functions) {
+        $parameters = @(if ($function.Body.ParamBlock) { $function.Body.ParamBlock.Parameters } elseif ($function.Parameters) { $function.Parameters }) | ForEach-Object { $_.Copy() }
+        $definition = [System.Management.Automation.Language.FunctionDefinitionAst]::new($function.Extent, $false, $false, $function.Name,
+            [System.Management.Automation.Language.ParameterAst[]]@($parameters), $function.Body.Copy())
+        [System.Management.Automation.Language.FunctionMemberAst]::new($function.Extent, $definition, $objectArray.Copy(),
+            [System.Management.Automation.Language.AttributeAst[]]@(), [System.Management.Automation.Language.MethodAttributes]'Public,Static')
+    }
+    $type = [System.Management.Automation.Language.TypeDefinitionAst]::new($Root.Extent, $name, [System.Management.Automation.Language.AttributeAst[]]@(),
+        [System.Management.Automation.Language.MemberAst[]]@($members), [System.Management.Automation.Language.TypeAttributes]::Class,
+        [System.Management.Automation.Language.TypeConstraintAst[]]@())
+    $block = [System.Management.Automation.Language.StatementBlockAst]::new($Root.Extent, [System.Management.Automation.Language.StatementAst[]]@($type), [System.Management.Automation.Language.TrapStatementAst[]]@())
+    $functionRoot = [System.Management.Automation.Language.ScriptBlockAst]::new($Root.Extent, $null, $block, $false)
+    $class = $functionRoot.Find({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] }, $true)
+    $script:ScriptFunctionClasses[$Root] = $class
+    $script:ScriptFunctionSources[$functionRoot] = $Root
+    $class
+}
+
+# A value a script function's statement yields, written to its output; a statement with no value writes nothing.
+function New-OutputWrite {
+    param([Parameter(Mandatory)][Linq.Expressions.Expression] $Value, [Parameter(Mandatory)][hashtable] $Scope)
+    if ($Value.Type -eq [void]) { return $Value }
+    $write = Get-PscSemanticsMethod -Name Write -ParameterTypes ([System.Collections.Generic.List[object]], [object])
+    [Linq.Expressions.Expression]::Call($write, $Scope.Output, [Linq.Expressions.Expression]::Convert($Value, [object]))
+}
+
+# A command that calls one of the source's functions, bound as PowerShell binds it: -Name value (or a unique prefix of
+# the name), -Switch or -Switch:value, then the remaining arguments in parameter order, switches excepted. A parameter
+# left unbound takes its default, written in the callee as a constant, or its type's default. Returns the call, which
+# yields the function's [object[]] output; $null when the command is not one of the source's functions.
+function New-ScriptFunctionCall {
+    param([Parameter(Mandatory)][System.Management.Automation.Language.CommandAst] $Command, [Parameter(Mandatory)][hashtable] $Scope)
+    $name = $Command.GetCommandName()
+    if (-not $name -or $Command.InvocationOperator -ne [System.Management.Automation.Language.TokenKind]::Unknown) { return $null }
+    $member = Find-ScriptFunction $name
+    if ($null -eq $member) { return $null }
+    $where = '[{0}:{1}] ' -f $Command.Extent.StartLineNumber, $Command.Extent.StartColumnNumber
+    $parameters = @($member.Parameters)
+    $types = Get-ParameterTypes $member
+    $bound = [object[]]::new($parameters.Count)
+    $positional = [System.Collections.Generic.List[System.Management.Automation.Language.Ast]]::new()
+    $elements = @($Command.CommandElements)
+    for ($i = 1; $i -lt $elements.Count; $i++) {
+        $element = $elements[$i]
+        if ($element -isnot [System.Management.Automation.Language.CommandParameterAst]) { $positional.Add($element); continue }
+        $matched = @(for ($p = 0; $p -lt $parameters.Count; $p++) { if ($parameters[$p].Name.VariablePath.UserPath -eq $element.ParameterName) { $p } })
+        if ($matched.Count -eq 0) { $matched = @(for ($p = 0; $p -lt $parameters.Count; $p++) { if ($parameters[$p].Name.VariablePath.UserPath.StartsWith($element.ParameterName, [StringComparison]::OrdinalIgnoreCase)) { $p } }) }
+        if ($matched.Count -ne 1) { throw ($where + "'-$($element.ParameterName)' names no single parameter of $name.") }
+        $index = $matched[0]
+        if ($types[$index] -eq [bool] -and $null -eq $element.Argument -and (Get-ParameterType $parameters[$index] $false) -eq [System.Management.Automation.SwitchParameter]) {
+            $bound[$index] = [Linq.Expressions.Expression]::Constant($true)
+            continue
+        }
+        $argument = $element.Argument
+        if ($null -eq $argument) {
+            if (++$i -ge $elements.Count) { throw ($where + "'-$($element.ParameterName)' of $name has no argument.") }
+            $argument = $elements[$i]
+        }
+        $bound[$index] = Convert-AstExpressionAs -Node $argument -Type $types[$index] -Scope $Scope
+    }
+    $next = 0
+    foreach ($argument in $positional) {
+        while ($next -lt $parameters.Count -and ($null -ne $bound[$next] -or (Get-ParameterType $parameters[$next] $false) -eq [System.Management.Automation.SwitchParameter])) { $next++ }
+        if ($next -ge $parameters.Count) { throw ($where + "$name takes no further positional argument: $($argument.Extent.Text)") }
+        $bound[$next] = Convert-AstExpressionAs -Node $argument -Type $types[$next] -Scope $Scope
+        $next++
+    }
+    for ($p = 0; $p -lt $parameters.Count; $p++) {
+        if ($null -ne $bound[$p]) { continue }
+        $default = $parameters[$p].DefaultValue
+        if ($null -eq $default) { $bound[$p] = [Linq.Expressions.Expression]::Default($types[$p]); continue }
+        if ($default -isnot [System.Management.Automation.Language.ConstantExpressionAst]) {
+            throw ($where + "the default of `$$($parameters[$p].Name.VariablePath.UserPath) in $name is evaluated in $name ($($default.Extent.Text)); only a constant default lowers at the call.")
+        }
+        $bound[$p] = Convert-AstExpressionAs -Node $default -Type $types[$p] -Scope $Scope
+    }
+    $method = $script:LoweringClassTypes[$member.Parent.Name].GetMethod($member.Name, [Type[]]$types)
+    [Linq.Expressions.Expression]::Call($method, [Linq.Expressions.Expression[]]$bound)
+}
+
+# Whether a member is one of a source's functions, lowered with pipeline output.
+function Test-ScriptFunctionMember([System.Management.Automation.Language.Ast] $Member) {
+    $root = $Member; while ($root.Parent) { $root = $root.Parent }
+    $script:ScriptFunctionSources.ContainsKey($root)
+}
+
+# The FunctionMemberAst of a script function a lowering in progress can call, by its command name; $null for none.
+function Find-ScriptFunction([string] $Name) {
+    foreach ($class in $script:ScriptFunctionClasses.Values) {
+        if ($null -eq $class -or -not $script:LoweringClassTypes.ContainsKey($class.Name)) { continue }
+        foreach ($member in $class.Members) { if ($member.Name -eq $Name) { return $member } }
+    }
+    $null
 }
 
 # PowerShellSemantics' definition, read once from this script's AST and copied into a root of its own, so its methods
@@ -2308,6 +2438,25 @@ class PowerShellSemantics {
         return [double]$dividend / [double]$divisor
     }
 
+    # Writes a value to a function's output as PowerShell's pipeline does: a collection is written element by element,
+    # except a string or a dictionary, which is written whole.
+    static [void] Write([System.Collections.Generic.List[object]] $output, [object] $value) {
+        if ($value -is [string] -or $value -is [System.Collections.IDictionary] -or $value -isnot [System.Collections.IEnumerable]) {
+            $output.Add($value)
+            return
+        }
+        $items = ([System.Collections.IEnumerable] $value).GetEnumerator()
+        while ($items.MoveNext()) { $output.Add($items.Current) }
+    }
+
+    # A function's output as an assignment or an expression receives it: $null when nothing was written, the object
+    # when one was, and all of them, in order, when several were.
+    static [object] Collapse([object[]] $output) {
+        if ($output.Length -eq 0) { return $null }
+        if ($output.Length -eq 1) { return $output[0] }
+        return $output
+    }
+
     static [double] Quotient([uint64] $dividend, [uint64] $divisor) {
         [uint64] $quotient = [Math]::DivRem($dividend, $divisor).Item1
         if ($dividend - $quotient * $divisor -eq [uint64]0) { return [double]$quotient }
@@ -2419,6 +2568,9 @@ $script:PscEnvironment = [PscEnvironment]::new()
 [void] $script:PscEnvironment.Set([PowerShellNumericOperands]::new())
 # PowerShellSemantics' definition from this script's AST, read on the first compile.
 $script:PscSemanticsAst = $null
+# Each source's function class (or $null when it has none), and each function class's root to its source's root.
+$script:ScriptFunctionClasses = [System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast, System.Management.Automation.Language.TypeDefinitionAst]]::new()
+$script:ScriptFunctionSources = [System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast, System.Management.Automation.Language.Ast]]::new()
 
 function Convert-AstExpression {
     <#
@@ -2489,6 +2641,14 @@ function Convert-AstExpression {
         if ($Node.PipelineElements.Count -eq 1 -and
             $Node.PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst]) {
             return Convert-AstExpression -Node $Node.PipelineElements[0].Expression -Scope $Scope
+        }
+        # A call to one of the source's functions: its output, as an expression receives it.
+        if ($Node.PipelineElements.Count -eq 1 -and $Node.PipelineElements[0] -is [System.Management.Automation.Language.CommandAst]) {
+            $call = New-ScriptFunctionCall -Command $Node.PipelineElements[0] -Scope $Scope
+            if ($null -ne $call) {
+                $collapse = Get-PscSemanticsMethod -Name Collapse -ParameterTypes ([object[]])
+                return [Linq.Expressions.Expression]::Call($collapse, $call)
+            }
         }
     }
 
@@ -2622,6 +2782,14 @@ function Convert-AstExpression {
 
     # 8. Binary arithmetic and comparison expressions
     if ($Node -is [System.Management.Automation.Language.BinaryExpressionAst]) {
+        # $value -is [T] and -isnot [T]: whether the value is an instance of T ($null never is), as SMA tests it.
+        if ($Node.Operator -in 'Is', 'IsNot' -and $Node.Right -is [System.Management.Automation.Language.TypeExpressionAst]) {
+            $tested = Convert-AstExpression -Node $Node.Left -Scope $Scope
+            if ($tested.Type.IsValueType) { $tested = [Linq.Expressions.Expression]::Convert($tested, [object]) }
+            $instance = [Linq.Expressions.Expression]::TypeIs($tested, (Resolve-AstType $Node.Right.TypeName))
+            if ($Node.Operator -eq 'IsNot') { return [Linq.Expressions.Expression]::Not($instance) }
+            return $instance
+        }
         $left = Convert-AstExpression -Node $Node.Left -Scope $Scope
         if ($Node.Operator -in 'Iin', 'Inotin', 'Cin', 'Cnotin') {
             $right = Convert-AstExpressionAs -Node $Node.Right -Type ([string[]]) -Scope $Scope
@@ -3152,6 +3320,14 @@ function Convert-AstStatement {
     }
 
     # 2. Return statement
+    if ($Statement -is [System.Management.Automation.Language.ReturnStatementAst] -and $null -ne $Scope['Output']) {
+        # In a script function, return writes its value to the output and then returns all of it.
+        $all = [Linq.Expressions.Expression]::Call($Scope.Output, [System.Collections.Generic.List[object]].GetMethod('ToArray'))
+        if ($null -eq $Statement.Pipeline) { return [Linq.Expressions.Expression]::Return($Scope.ReturnTarget, $all) }
+        return [Linq.Expressions.Expression]::Block(
+            (New-OutputWrite -Value (Convert-AstExpression -Node $Statement.Pipeline -Scope $Scope) -Scope $Scope),
+            [Linq.Expressions.Expression]::Return($Scope.ReturnTarget, $all))
+    }
     if ($Statement -is [System.Management.Automation.Language.ReturnStatementAst]) {
         if ($null -eq $Statement.Pipeline) {
             # Void return
@@ -3342,7 +3518,17 @@ function Convert-AstStatement {
 
     # 9. Pipeline statement (single expression evaluated as statement)
     if ($Statement -is [System.Management.Automation.Language.PipelineAst]) {
-        return Convert-AstExpression -Node $Statement -Scope $Scope
+        # A call to one of the source's functions as a statement passes each of its outputs on (none when it wrote none).
+        if ($Statement.PipelineElements.Count -eq 1 -and $Statement.PipelineElements[0] -is [System.Management.Automation.Language.CommandAst]) {
+            $call = New-ScriptFunctionCall -Command $Statement.PipelineElements[0] -Scope $Scope
+            if ($null -ne $call) {
+                if ($null -ne $Scope['Output']) { return New-OutputWrite -Value $call -Scope $Scope }
+                return [Linq.Expressions.Expression]::Block([void], $call)
+            }
+        }
+        $value = Convert-AstExpression -Node $Statement -Scope $Scope
+        if ($null -ne $Scope['Output']) { return New-OutputWrite -Value $value -Scope $Scope }
+        return $value
     }
 
     # 10. foreach ($item in $array) { ... } over a typed one-dimensional array,
@@ -3531,11 +3717,11 @@ function Convert-MethodAstToLambda {
                elseif ($MethodAst.ReturnType) { Resolve-AstType $MethodAst.ReturnType.TypeName }
                else { [void] }
 
+    $isFunction = Test-ScriptFunctionMember $MethodAst
     $paramExprList = [System.Collections.Generic.List[Linq.Expressions.ParameterExpression]]::new()
     $paramMap = @{}
     foreach ($p in $MethodAst.Parameters) {
-        $tc = $p.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.TypeConstraintAst] } | Select-Object -First 1
-        $pType = if ($tc) { Resolve-AstType $tc.TypeName } else { [object] }
+        $pType = Get-ParameterType $p $isFunction
         $pName = $p.Name.VariablePath.UserPath
         $pExpr = [Linq.Expressions.Expression]::Parameter($pType, $pName)
         $paramExprList.Add($pExpr)
@@ -3554,7 +3740,7 @@ function Convert-MethodAstToLambda {
     $thisParam = if ($MethodAst.IsStatic) { $null } else { [Linq.Expressions.Expression]::Parameter($classType, 'this') }
     New-LoweredBody -Name $MethodAst.Name -ReturnType $retType -This $thisParam -Parameters $paramExprList -ParameterMap $paramMap `
         -Initializers $Initializers -Statements @($(if ($MethodAst.Body -and $MethodAst.Body.EndBlock) { $MethodAst.Body.EndBlock.Statements })) `
-        -IsStatic ([bool]$MethodAst.IsStatic) -IsConstructor ([bool]$MethodAst.IsConstructor)
+        -IsStatic ([bool]$MethodAst.IsStatic) -IsConstructor ([bool]$MethodAst.IsConstructor) -Output:$isFunction
 }
 
 function Convert-InitializersToLambda {
@@ -3581,11 +3767,18 @@ function New-LoweredBody {
         [string] $Name, [Type] $ReturnType, $This,
         [System.Collections.Generic.List[Linq.Expressions.ParameterExpression]] $Parameters, [hashtable] $ParameterMap,
         [System.Management.Automation.Language.PropertyMemberAst[]] $Initializers, [object[]] $Statements,
-        [bool] $IsStatic, [bool] $IsConstructor
+        [bool] $IsStatic, [bool] $IsConstructor,
+        # A script function: what its statements write is collected and returned as [object[]].
+        [switch] $Output
     )
 
     $returnTarget = [Linq.Expressions.Expression]::Label($ReturnType, 'returnTarget')
     $declaredLocals = [System.Collections.Generic.List[Linq.Expressions.ParameterExpression]]::new()
+    $outputList = $null
+    if ($Output) {
+        $outputList = [Linq.Expressions.Expression]::Variable([System.Collections.Generic.List[object]], 'output')
+        $declaredLocals.Add($outputList)
+    }
     $scope = @{
         ReturnType     = $ReturnType
         ReturnTarget   = $returnTarget
@@ -3594,9 +3787,14 @@ function New-LoweredBody {
         DeclaredLocals = $declaredLocals
         Loops          = [System.Collections.Generic.Stack[object]]::new()
         This           = $This
+        Output         = $outputList
     }
 
     $body = [System.Collections.Generic.List[Linq.Expressions.Expression]]::new()
+    if ($Output) {
+        $newList = $script:ExpressionNewMethod.Invoke($null, [object[]]@([System.Collections.Generic.List[object]].GetConstructor([Type[]]@()), [Linq.Expressions.Expression[]]@()))
+        $body.Add([Linq.Expressions.Expression]::Assign($outputList, $newList))
+    }
     foreach ($p in $Initializers) {
         if (-not $p.InitialValue) { continue }
         $classType = $script:LoweringClassTypes[$p.Parent.Name]
@@ -3618,7 +3816,8 @@ function New-LoweredBody {
         }
         $body.Add((Convert-AstStatement -Statement $stmt -Scope $scope))
     }
-    $defaultVal = if ($ReturnType -eq [void]) { [Linq.Expressions.Expression]::Empty() } else { [Linq.Expressions.Expression]::Default($ReturnType) }
+    $defaultVal = if ($Output) { [Linq.Expressions.Expression]::Call($outputList, [System.Collections.Generic.List[object]].GetMethod('ToArray')) }
+        elseif ($ReturnType -eq [void]) { [Linq.Expressions.Expression]::Empty() } else { [Linq.Expressions.Expression]::Default($ReturnType) }
     $body.Add([Linq.Expressions.Expression]::Label($returnTarget, $defaultVal))
 
     $bodyBlock = [Linq.Expressions.Expression]::Block($ReturnType,
@@ -4476,6 +4675,15 @@ function Write-IlExpression {
         return
     }
 
+    # 9.05 TypeIs: isinst T leaves the reference or null; comparing it unsigned-greater than null gives the bool.
+    if ($Expr -is [Linq.Expressions.TypeBinaryExpression] -and $Expr.NodeType -eq [Linq.Expressions.ExpressionType]::TypeIs) {
+        Write-IlExpression -IL $IL -Expr $Expr.Expression -Context $Context
+        $IL.Emit([Reflection.Emit.OpCodes]::Isinst, (Get-IlType $Expr.TypeOperand))
+        $IL.Emit([Reflection.Emit.OpCodes]::Ldnull)
+        $IL.Emit([Reflection.Emit.OpCodes]::Cgt_Un)
+        return
+    }
+
     # 9.1 Unary ArrayLength
     if ($Expr -is [Linq.Expressions.UnaryExpression] -and $Expr.NodeType -eq [Linq.Expressions.ExpressionType]::ArrayLength) {
         Write-IlExpression -IL $IL -Expr $Expr.Operand -Context $Context
@@ -5147,6 +5355,16 @@ function Export-LoweredAssembly {
     }
     $targetClass = $parsed.ClassAst
     $classAsts = @($parsed.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true) | Where-Object { -not (Test-AttributeClass $_) })
+    # The source's functions, as one class of static methods, when this compile selects it.
+    $functionClass = Get-ScriptFunctionClass -Root $parsed.Ast
+    if ($null -ne $functionClass) {
+        if (-not $ClassNames -or $functionClass.Name -in $ClassNames) { $classAsts += $functionClass }
+        else {
+            $functionRoot = $functionClass; while ($functionRoot.Parent) { $functionRoot = $functionRoot.Parent }
+            $null = $script:ScriptFunctionSources.Remove($functionRoot)
+            $script:ScriptFunctionClasses[$parsed.Ast] = $null
+        }
+    }
     $script:LoweringKeywords = @{}
     foreach ($definition in @(Get-LoweringKeywords $parsed.Ast)) { $script:LoweringKeywords[$definition.Name] = $definition }
     if ($ClassNames) {
@@ -7173,6 +7391,44 @@ function ConvertTo-PscInterpretedType {
 # A source's classes, lowered by PSC and loaded from the assembly's bytes. Lowering stops at a class's first refusal;
 # the refusal is recorded, the class it occurs in is set aside, and the remaining classes are lowered again, until what
 # remains lowers or nothing remains. Every class's first refusal is observed, and every class that lowers is lowered.
+# One member of a source, lowered on its own to an expression tree: every class's methods and constructors, and the
+# source's functions as their class. A refusal names the member and its line, so a source's whole board is visible at
+# once instead of one refusal at a time.
+class PscMemberLowering {
+    [string] $Class
+    [string] $Member
+    [int] $Line
+    [bool] $Lowered
+    [string] $Refusal
+    # Where in PSC the refusal was raised.
+    [string] $Origin
+}
+
+class MemberLoweringInstrument : PscInstrument {
+    [type[]] Requires() { return [type[]]@([ParseInstrument]) }
+    [bool] AppliesTo([string] $target) { return [IO.Path]::GetExtension($target) -in '.ps1', '.psm1' }
+    [void] Examine([PscInvestigation] $investigation, [string] $target) {
+        $source = [PscInstrument]::Source($investigation, $target)
+        $classes = [System.Collections.Generic.List[System.Management.Automation.Language.TypeDefinitionAst]]::new()
+        foreach ($class in $source.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $false)) { if (-not (Test-AttributeClass $class)) { $classes.Add($class) } }
+        $functionClass = Get-ScriptFunctionClass -Root $source.Ast
+        if ($null -ne $functionClass) { $classes.Add($functionClass) }
+        foreach ($class in $classes) {
+            foreach ($member in $class.Members) {
+                if ($member -isnot [System.Management.Automation.Language.FunctionMemberAst]) { continue }
+                $result = [PscMemberLowering]@{ Class = $class.Name; Member = $member.Name; Line = $member.Extent.StartLineNumber; Lowered = $true }
+                try { $null = Convert-MethodAstToLambda -MethodAst $member }
+                catch {
+                    $result.Lowered = $false
+                    $result.Refusal = $_.Exception.Message
+                    $result.Origin = $_.ScriptStackTrace.Split([char]10)[0]
+                }
+                $investigation.Observe($target, [MemberLoweringInstrument], $result)
+            }
+        }
+    }
+}
+
 class LowerInstrument : PscInstrument {
     [type[]] Requires() { return [type[]]@([ParseInstrument]) }
     [bool] AppliesTo([string] $target) { return [IO.Path]::GetExtension($target) -in '.ps1', '.psm1' }
