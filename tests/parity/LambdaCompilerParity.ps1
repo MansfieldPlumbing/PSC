@@ -5,7 +5,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
-$compilerPath = Join-Path $repoRoot 'Export-LoweredAssembly.ps1'
+$compilerPath = Join-Path $repoRoot 'Invoke-PSC.ps1'
 
 Write-Host "Comparing compiled IL with Microsoft LambdaCompiler..."
 

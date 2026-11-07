@@ -24,8 +24,8 @@ with `tests/LegacyMetadata.ps1`. Compile each frozen rejection source with
 that compiler and compare the complete exception message, normalizing only
 CRLF to LF. Reconstruction is a manual audit, not a mode of the verifier.
 
-`tests/Test-LegacyRatchet.ps1` rebuilds all outputs in ignored
-`build/legacy-ratchet`, independently reads their hashes and metadata, and
+`tests/Test-LegacyReproduction.ps1` rebuilds all outputs in ignored
+`build/legacy-reproduction`, independently reads their hashes and metadata, and
 compares exact diagnostic text. It has no baseline-writing mode. It also
 alters copies of an expected hash and diagnostic and proves that both the
 comparator and child verifier process fail. Full evidence remains under

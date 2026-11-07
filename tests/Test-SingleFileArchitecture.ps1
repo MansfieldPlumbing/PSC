@@ -2,13 +2,13 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 $root=Split-Path $PSScriptRoot -Parent
-$compiler=Join-Path $root 'Export-LoweredAssembly.ps1'
+$compiler=Join-Path $root 'Invoke-PSC.ps1'
 $files=@(& git -C $root ls-files --cached --others --exclude-standard)
 if($LASTEXITCODE) { throw 'Architecture inventory failed.' }
 foreach($file in $files) {
     if($file -match '^(src|modules)/' -or $file -match '\.(psm1|psd1|dll|cs|fs|vb)$') { throw "Additional compiler implementation surface: $file" }
-    if($file -match '\.ps1$' -and $file -cne 'Export-LoweredAssembly.ps1' -and
-        $file -cne 'tools/Get-PowerShell.ps1' -and $file -notmatch '^(tests|probes|experiments)/') { throw "Additional implementation script: $file" }
+    if($file -match '\.ps1$' -and $file -cne 'Invoke-PSC.ps1' -and
+        $file -notmatch '^(tests|probes|experiments)/') { throw "Additional implementation script: $file" }
 }
 $ast=[Management.Automation.Language.Parser]::ParseFile($compiler,[ref]$null,[ref]$null)
 $loaders=@($ast.FindAll({param($n) $n -is [Management.Automation.Language.CommandAst] -and
@@ -17,7 +17,7 @@ if($loaders.Count) { throw 'Compiler contains an external implementation loader.
 $dir=Join-Path ([IO.Path]::GetTempPath()) ('PSLowering-Isolated-'+[Guid]::NewGuid().ToString('N'))
 $null=New-Item -ItemType Directory $dir
 try {
-    Copy-Item -LiteralPath $compiler -Destination "$dir/Export-LoweredAssembly.ps1"
+    Copy-Item -LiteralPath $compiler -Destination "$dir/Invoke-PSC.ps1"
     Copy-Item -LiteralPath "$root/tests/fixtures/Slice1Fixture.ps1" -Destination "$dir/input.ps1"
     Copy-Item -LiteralPath "$root/tests/native-fixtures/NativeInteropFixture.ps1" -Destination "$dir/native.ps1"
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'SingleFileProbe.ps1') -Destination "$dir/Probe.ps1"

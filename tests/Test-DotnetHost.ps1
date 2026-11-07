@@ -16,7 +16,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path $PSScriptRoot -Parent
-$compilerPath = Join-Path $repoRoot 'Export-LoweredAssembly.ps1'
+$compilerPath = Join-Path $repoRoot 'Invoke-PSC.ps1'
 $outDir = Join-Path $repoRoot 'build/dotnet-host'
 $null = New-Item -ItemType Directory -Force -Path $outDir
 $program = Join-Path $outDir 'DotnetHostProgram.dll'

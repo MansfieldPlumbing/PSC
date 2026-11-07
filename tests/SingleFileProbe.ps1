@@ -2,7 +2,7 @@
 param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
-$scriptPath=Join-Path $PSScriptRoot 'Export-LoweredAssembly.ps1'
+$scriptPath=Join-Path $PSScriptRoot 'Invoke-PSC.ps1'
 $null=& $scriptPath -Mode Compile -SourcePath ./input.ps1 -OutputPath ./Isolated.dll
 $report=& $scriptPath -Mode Inspect -AssemblyPath ./Isolated.dll
 if($report.SmaReferenced -or -not $report.MVID) { throw 'Isolated output invalid.' }

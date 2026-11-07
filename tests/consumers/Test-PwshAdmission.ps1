@@ -20,7 +20,7 @@ $pwshCommit = 'fdf4719f4b55758242cdc6785408f4299bb046bf'
 $setupSha256 = 'B95525F003601335A79AD0539D6147BF0AD384D4D4CB2E3D8981C49039B6F035'
 
 $repoRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
-$compilerPath = Join-Path $repoRoot 'Export-LoweredAssembly.ps1'
+$compilerPath = Join-Path $repoRoot 'Invoke-PSC.ps1'
 
 $cache = Join-Path $repoRoot "build/cache/pwsh/$pwshCommit"
 $setup = Join-Path $cache 'setup.ps1'

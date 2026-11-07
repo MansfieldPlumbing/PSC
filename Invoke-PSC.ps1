@@ -1,24 +1,28 @@
 <#
 .SYNOPSIS
-    Compiles admitted typed PowerShell classes into managed IL.
+    Compiles admitted typed PowerShell classes into managed IL and native executables.
 .DESCRIPTION
-    Self-contained compiler with five operations. Compile emits an assembly;
+    Self-contained compiler. Compile emits an assembly (or, with -Native, an executable);
     Expression returns live AST and expression objects in the calling process;
     Inspect reads assembly metadata; Capability reports the admitted contract;
     Link reads COFF objects and libraries and resolves their symbols into a
     native image. No module import or external implementation source is required.
+    Called with no arguments, it returns its own API (Mode Api), read from this file's AST.
 .PARAMETER Mode
-    Compile (default), Expression, Inspect, Capability or Link; or, from SMA's own parser over PowerShell
-    projects: Describe (one project as live objects: units, edges, coverage, absence, changes), Lint,
-    Profile (every project's functions and methods), Report (on a historical profile) or Verify (the
-    description's structural fixture).
+    Compile (the default when compile inputs are given), Api (the default with no arguments), Expression,
+    Inspect, Capability, Link or PowerShell (the pinned PowerShell build, downloaded and verified on first use);
+    or, from SMA's own parser over PowerShell projects: Describe (one project as live objects: units, edges,
+    coverage, absence, changes), Lint, Profile (every project's functions and methods), Report (on a historical
+    profile) or Verify (the description's structural fixture).
+.PARAMETER ArchivePath
+    PowerShell: an already-downloaded release archive, verified the same way as a download.
 .PARAMETER Native
     Compile: produce a native executable at OutputPath. The lowered assembly is compiled to machine code by the
     pinned ILC and linked by PSC's own COFF linker with the pinned Native AOT runtime; requires EntryPoint.
 .PARAMETER ProjectPath
     Describe: the project folder to describe. Call with & to keep the returned live objects.
 .PARAMETER LintFiles
-    Lint: files to check; without it, every PowerShell file of every project beside the SMA root.
+    Lint: files to check; without it, every PowerShell file of every project beside this script's folder.
 .PARAMETER ProfilePath
     Report: a historical profile (CLIXML) to report on.
 .PARAMETER LinkInput
@@ -66,18 +70,23 @@
 .PARAMETER Help
     Displays full script help without compiling.
 .EXAMPLE
-    & ./Export-LoweredAssembly.ps1 -SourcePath ./tests/fixtures/Slice1Fixture.ps1 -ClassName Slice1Fixture -OutputPath ./build/Example.dll -Deterministic
+    & ./Invoke-PSC.ps1
 .EXAMPLE
-    & ./Export-LoweredAssembly.ps1 -Mode Expression -MethodAst $method
+    & ./Invoke-PSC.ps1 -SourcePath ./tests/fixtures/Slice1Fixture.ps1 -ClassName Slice1Fixture -OutputPath ./build/Example.dll -Deterministic
 .EXAMPLE
-    & ./Export-LoweredAssembly.ps1 -Mode Inspect -AssemblyPath ./build/Example.dll
+    & ./Invoke-PSC.ps1 -Mode Expression -MethodAst $method
 .EXAMPLE
-    & ./Export-LoweredAssembly.ps1 -Mode Capability
+    & ./Invoke-PSC.ps1 -Mode Inspect -AssemblyPath ./build/Example.dll
+.EXAMPLE
+    & ./Invoke-PSC.ps1 -Mode Capability
+.EXAMPLE
+    $pwsh = & ./Invoke-PSC.ps1 -Mode PowerShell
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Compile', 'Expression', 'Inspect', 'Capability', 'Link', 'Describe', 'Lint', 'Profile', 'Report', 'Verify')]
+    [ValidateSet('Compile', 'Api', 'Expression', 'Inspect', 'Capability', 'Link', 'PowerShell', 'Describe', 'Lint', 'Profile', 'Report', 'Verify')]
     [string] $Mode = 'Compile',
+    [string] $ArchivePath,
     [string] $ProjectPath,
     [string[]] $LintFiles,
     [string] $ProfilePath,
@@ -114,12 +123,11 @@ $ErrorActionPreference = 'Stop'
 
 # ============================================================================
 # SMA DESCRIPTION, LINT AND PROFILE
-# From C:\dev\sma\Invoke-Sma.ps1: projects described as live objects from SMA's own parser.
+# Projects described as live objects from SMA's own parser.
 # ============================================================================
 
-# The shared SMA root (pinned tools, sources, the store), and the projects beside it.
-$SmaRoot = if ($env:DEVDB) { $env:DEVDB } else { 'C:\dev\sma' }
-$ProjectsRoot = Split-Path -Parent $SmaRoot
+# The projects beside this script's folder.
+$ProjectsRoot = Split-Path -Parent $PSScriptRoot
 $ThirdPartyRemotes = 'microsoft/directml', 'microsoft/edit', 'ggml-org/llama.cpp'
 $WriteCommands = 'Set-Content','Add-Content','Out-File','New-Item','Remove-Item','Copy-Item','Move-Item','Rename-Item','Export-Clixml','Export-Csv','Clear-Content','Set-Item'
 $NetworkCommands = 'Invoke-WebRequest','Invoke-RestMethod','Start-BitsTransfer','New-PSSession','Enter-PSSession'
@@ -138,7 +146,7 @@ function Get-ProjectRemote([string] $path) {
 
 function Get-Projects {
     foreach ($d in Get-ChildItem -LiteralPath $ProjectsRoot -Directory -Force) {
-        if ($d.Name.StartsWith('.') -or $d.FullName -eq $SmaRoot) { continue }
+        if ($d.Name.StartsWith('.')) { continue }
         if (Test-Path -LiteralPath (Join-Path $d.FullName '.git')) {
             $remote = Get-ProjectRemote $d.FullName
             if ($remote -and $ThirdPartyRemotes -contains $remote) { continue }
@@ -950,8 +958,11 @@ function Invoke-SmaObservedOperation($Project, [string] $Name, [scriptblock] $Op
 }
 
 function Test-SmaDescription {
-    $directory = Join-Path $SmaRoot ('store/evidence/sma-fixtures/' + [guid]::NewGuid().ToString('N'))
+    # The fixture is an independent Git repository that exists only for this check; its evidence is the live
+    # description returned with each result.
+    $directory = Join-Path ([IO.Path]::GetTempPath()) ('PSC-Verify-' + [guid]::NewGuid().ToString('N'))
     $null = [IO.Directory]::CreateDirectory($directory)
+    try {
     git init --quiet $directory
     if($LASTEXITCODE){throw 'Could not create an independent Git fixture.'}
     $fixture = @'
@@ -1013,14 +1024,22 @@ Entry
     $checks.GraphSharedReferences = (Compare-SmaRuntimeGraph ([object[]]@($shared,$shared)) ([object[]]@($copy,$copy))).Equal
     $checks.GraphSplitReferencesRejected = -not (Compare-SmaRuntimeGraph ([object[]]@($shared,$shared)) ([object[]]@([int[]]@(4,5),[int[]]@(4,5)))).Equal
     foreach ($key in $checks.Keys) {
-        [pscustomobject]@{ Test = $key; Passed = [bool]$checks[$key]; Evidence = $directory }
+        [pscustomobject]@{ Test = $key; Passed = [bool]$checks[$key]; Evidence = $project }
     }
     if ($checks.Values -contains $false) { throw 'SMA independent structural fixture failed.' }
+    }
+    finally {
+        # The only removal target is the exact directory created above.
+        if ([IO.Path]::GetFullPath($directory).StartsWith([IO.Path]::GetFullPath([IO.Path]::GetTempPath()), [StringComparison]::OrdinalIgnoreCase)) {
+            Remove-Item -LiteralPath $directory -Recurse -Force
+        }
+    }
 }
 
 
-# Validate the invocation before parsing source or constructing an assembly.
-if (-not $Help) {
+# Validate the invocation before parsing source or constructing an assembly. With no arguments the script
+# describes its own API (the process block), so there is nothing to validate.
+if (-not $Help -and $PSBoundParameters.Count) {
     switch ($Mode) {
         'Compile' {
             if ([string]::IsNullOrEmpty($SourcePath) -and $null -eq $SourceAst) { throw 'Compile requires -SourcePath or -SourceAst.' }
@@ -4254,6 +4273,140 @@ function Write-IlMethodBody {
     $il.Emit([Reflection.Emit.OpCodes]::Ret)
 }
 
+function Get-PinnedPowerShell {
+    <#
+    .SYNOPSIS
+        Returns pwsh.exe of the pinned PowerShell build, downloading it into build/cache on first use.
+    .DESCRIPTION
+        PSC is verified on PowerShell 7.7.0-preview.5 (.NET 11) only. The archive is checked against the SHA-256
+        GitHub publishes for the release asset before it is extracted.
+    #>
+    [CmdletBinding()]
+    param([string] $ArchivePath)
+    $version = '7.7.0-preview.5'
+    $asset = "PowerShell-$version-win-x64.zip"
+    $sha256 = 'BA727D1890F7DBCBA05286BC0E61FC9F168DE9BA2A1003C4934BCE8E38BBFD1B'
+    $cache = Join-Path $PSScriptRoot "build/cache/pwsh/$version"
+    $pwsh = Join-Path $cache 'pwsh.exe'
+    if (Test-Path -LiteralPath $pwsh) { return $pwsh }
+    $null = New-Item -ItemType Directory -Force -Path $cache
+    $zip = if ($ArchivePath) { [IO.Path]::GetFullPath($ArchivePath) } else { Join-Path $PSScriptRoot "build/cache/pwsh/$asset" }
+    if (-not $ArchivePath -and -not (Test-Path -LiteralPath $zip)) {
+        Invoke-WebRequest -Uri "https://github.com/PowerShell/PowerShell/releases/download/v$version/$asset" -OutFile $zip
+    }
+    $actual = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
+    if ($actual -ne $sha256) {
+        if (-not $ArchivePath) { Remove-Item -LiteralPath $zip }
+        throw "$asset SHA-256 $actual does not match the pinned $sha256."
+    }
+    Expand-Archive -LiteralPath $zip -DestinationPath $cache
+    if (-not (Test-Path -LiteralPath $pwsh)) { throw "pwsh.exe missing from $asset." }
+    $pwsh
+}
+
+function Get-PscApi {
+    <#
+    .SYNOPSIS
+        Describes this script's API from its own AST: each mode, the script parameters its operation reads and
+        the functions it calls, with types, defaults and help.
+    .DESCRIPTION
+        A mode's parameters are the script parameters referenced in its clause of the process block's mode
+        switch, together with the script parameters a splatted call in that clause can bind by name.
+    #>
+    [CmdletBinding()]
+    param()
+    $tokens = $null; $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$tokens, [ref]$errors)
+    if ($errors.Count) { throw 'This script has parse errors; its API cannot be described.' }
+    $help = Get-Help -Name $PSCommandPath -Full
+    $parameterHelp = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in @($help.parameters.parameter)) {
+        $parameterHelp[$entry.name] = (@($entry.description | ForEach-Object Text) -join ' ').Trim()
+    }
+    $scriptParameters = [System.Collections.Generic.Dictionary[string, System.Management.Automation.Language.ParameterAst]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($parameter in $ast.ParamBlock.Parameters) { $scriptParameters[$parameter.Name.VariablePath.UserPath] = $parameter }
+    $functions = [System.Collections.Generic.Dictionary[string, System.Management.Automation.Language.FunctionDefinitionAst]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($function in $ast.BeginBlock.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
+        $functions[$function.Name] = $function
+    }
+    $modeParameter = $scriptParameters['Mode']
+    $switch = $ast.ProcessBlock.Find({ param($node) $node -is [System.Management.Automation.Language.SwitchStatementAst] }, $false)
+    $modes = foreach ($clause in $switch.Clauses) {
+        $mode = $clause.Item1.SafeGetValue()
+        $body = $clause.Item2
+        $used = [System.Collections.Generic.SortedSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($variable in $body.FindAll({ param($node) $node -is [System.Management.Automation.Language.VariableExpressionAst] }, $true)) {
+            $name = $variable.VariablePath.UserPath
+            if ($scriptParameters.ContainsKey($name) -and $name -ne 'Mode') { $null = $used.Add($name) }
+        }
+        $calls = [System.Collections.Generic.SortedSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($command in $body.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+            $name = $command.GetCommandName()
+            if (-not $name -or -not $functions.ContainsKey($name)) { continue }
+            $null = $calls.Add($name)
+            $splatted = @($command.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.VariableExpressionAst] -and $_.Splatted }).Count
+            if (-not $splatted) { continue }
+            $target = $functions[$name]
+            $targetParameters = if ($target.Body.ParamBlock) { $target.Body.ParamBlock.Parameters } else { $target.Parameters }
+            foreach ($parameter in @($targetParameters)) {
+                $parameterName = $parameter.Name.VariablePath.UserPath
+                if ($scriptParameters.ContainsKey($parameterName) -and $parameterName -ne 'Mode') { $null = $used.Add($parameterName) }
+            }
+        }
+        [pscustomobject]@{
+            Mode       = $mode
+            Parameters = @(foreach ($name in $used) { Get-PscApiParameter $scriptParameters[$name] $parameterHelp })
+            Operations = @(foreach ($name in $calls) {
+                $content = $functions[$name].GetHelpContent()
+                [pscustomobject]@{ Function = $name; Synopsis = if ($content -and $content.Synopsis) { $content.Synopsis.Trim() } else { $null }; Definition = $functions[$name] }
+            })
+        }
+    }
+    [pscustomobject]@{
+        PSTypeName   = 'PSC.Api'
+        Script       = $PSCommandPath
+        SourceSha256 = (Get-FileHash -LiteralPath $PSCommandPath).Hash
+        Synopsis     = $help.Synopsis
+        DefaultMode  = $modeParameter.DefaultValue.SafeGetValue()
+        Modes        = @($modes)
+        Parameters   = @(foreach ($parameter in $ast.ParamBlock.Parameters) { Get-PscApiParameter $parameter $parameterHelp })
+        Ast          = $ast
+    }
+}
+
+function Get-PscApiParameter {
+    <#
+    .SYNOPSIS
+        Describes one script parameter from its ParameterAst: name, type, default, allowed values, pipeline binding
+        and comment-based help.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][System.Management.Automation.Language.ParameterAst] $Parameter,
+        [Parameter(Mandatory)][System.Collections.Generic.Dictionary[string, string]] $ParameterHelp
+    )
+    $name = $Parameter.Name.VariablePath.UserPath
+    $attributes = @($Parameter.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.AttributeAst] })
+    $allowed = foreach ($attribute in $attributes) {
+        if ($attribute.TypeName.GetReflectionAttributeType() -eq [System.Management.Automation.ValidateSetAttribute]) {
+            foreach ($argument in $attribute.PositionalArguments) { $argument.SafeGetValue() }
+        }
+    }
+    $pipeline = $false
+    foreach ($attribute in $attributes) {
+        if ($attribute.TypeName.GetReflectionAttributeType() -ne [System.Management.Automation.ParameterAttribute]) { continue }
+        foreach ($argument in $attribute.NamedArguments) { if ($argument.ArgumentName -eq 'ValueFromPipeline') { $pipeline = $true } }
+    }
+    [pscustomobject]@{
+        Name          = $name
+        Type          = $Parameter.StaticType
+        Default       = if ($Parameter.DefaultValue) { $Parameter.DefaultValue.SafeGetValue() } else { $null }
+        AllowedValues = @($allowed)
+        Pipeline      = $pipeline
+        Description   = if ($ParameterHelp.ContainsKey($name)) { $ParameterHelp[$name] } else { $null }
+    }
+}
+
 function Get-LoweringCapability {
     <#
     .SYNOPSIS
@@ -4531,9 +4684,9 @@ function Export-LoweredAssembly {
 # Pinned tool folders already verified against their manifests in this process.
 $script:VerifiedPins = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 
-# Pinned tool folders under PSC's tools, found by enumerating the folder for the newest version of each.
+# Pinned Native AOT toolchain folders under PSC's NativeAOT folder, found by enumerating it for the newest version of each.
 function Get-NativeToolset {
-    $tools = Join-Path $PSScriptRoot 'tools'
+    $tools = Join-Path $PSScriptRoot 'NativeAOT'
     $find = { param([string] $prefix) $found = @(Get-ChildItem -LiteralPath $tools -Directory -Filter ($prefix + '*') | Sort-Object Name); if (-not $found.Count) { throw "Pinned tool '$prefix*' is missing under $tools." }; $found[-1].FullName }
     $toolset = [pscustomobject]@{
         Compiler = & $find 'ilc-1'
@@ -5370,7 +5523,11 @@ process {
         Get-Help -Name $PSCommandPath -Full
         return
     }
+    # With no arguments, the script describes itself instead of compiling nothing.
+    if ($PSBoundParameters.Count -eq 0) { return Get-PscApi }
     switch ($Mode) {
+        'Api' { Get-PscApi }
+        'PowerShell' { Get-PinnedPowerShell -ArchivePath $ArchivePath }
         'Compile' {
             $compileParameters = @{}
             foreach ($name in 'SourcePath', 'SourceAst', 'StaticData', 'ClassName', 'ClassNames', 'MethodNames', 'OutputPath', 'EntryPoint', 'Deterministic') {

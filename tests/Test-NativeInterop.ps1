@@ -11,7 +11,7 @@ if($DataAssemblyPath) {
 }
 if(-not $IsWindows -or [IntPtr]::Size -ne 8) { throw 'Native ABI gates require Windows x64.' }
 $root=Split-Path $PSScriptRoot -Parent
-$compiler=Join-Path $root 'Export-LoweredAssembly.ps1'
+$compiler=Join-Path $root 'Invoke-PSC.ps1'
 $dir=Join-Path $root 'build/native-interop'
 $null=New-Item -ItemType Directory -Force $dir
 $fixture=Join-Path $PSScriptRoot 'native-fixtures/NativeInteropFixture.ps1'
