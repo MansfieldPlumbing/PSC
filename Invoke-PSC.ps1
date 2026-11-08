@@ -1987,9 +1987,16 @@ function Invoke-PscRun {
     }
     $ast = $Ast
     $stubs = [System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast, int]]::new()
+    $callbacks = [System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast, int]]::new()
     foreach ($member in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionMemberAst] }, $true)) {
         $import = Get-NativeImport $member
         $contract = if ($null -eq $import) { Get-NativeMethodContract $member } else { $null }
+        if ($null -ne $contract -and $contract.Kind -eq 'Callback') {
+            $entry = [PscNativeEntry]::new()
+            $entry.ReturnType = $contract.ReturnType; $entry.ParameterTypes = $contract.ParameterTypes; $entry.Convention = $contract.Convention
+            $callbacks[$member] = [PscNativeCalls]::Add($entry)
+            continue
+        }
         if ($null -eq $import -and ($null -eq $contract -or $contract.Kind -ne 'Calli')) { continue }
         $entry = [PscNativeEntry]::new()
         $entry.ReturnType = if ($member.ReturnType) { Resolve-AstType $member.ReturnType.TypeName } else { [void] }
@@ -2002,8 +2009,22 @@ function Invoke-PscRun {
         else { $entry.Convention = $contract.Convention; $entry.ThroughPointer = $true }
         $stubs[$member] = [PscNativeCalls]::Add($entry)
     }
+    $fill = [PscNativeStubFill]::new($stubs)
+    foreach ($member in $callbacks.Keys) { $null = $fill.Callbacks.Add($member) }
+    # Each address taken of a callback, in the form PSC lowers: [C].GetMethod('M').MethodHandle.GetFunctionPointer().
+    foreach ($node in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and -not $n.Static -and $n.Member.Extent.Text -ceq 'GetFunctionPointer' }, $true)) {
+        $handle = $node.Expression
+        if ($handle -isnot [System.Management.Automation.Language.MemberExpressionAst] -or $handle.Member.Extent.Text -cne 'MethodHandle') { continue }
+        $lookup = $handle.Expression
+        if ($lookup -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst] -or $lookup.Member.Extent.Text -cne 'GetMethod' -or
+            $lookup.Expression -isnot [System.Management.Automation.Language.TypeExpressionAst] -or $lookup.Arguments.Count -ne 1 -or
+            $lookup.Arguments[0] -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { continue }
+        foreach ($member in $callbacks.Keys) {
+            if ($member.Name -ceq $lookup.Arguments[0].Value -and $member.Parent.Name -eq $lookup.Expression.TypeName.FullName) { $fill.Addresses[$node] = $callbacks[$member] }
+        }
+    }
     $root = $ast
-    if ($stubs.Count) { $root = [PscNativeStubFill]::new($stubs).Rebuild($ast) }
+    if ($stubs.Count -or $callbacks.Count) { $root = $fill.Rebuild($ast) }
     # The source runs as pwsh runs a script: strict mode off unless the source sets it, not PSC's own strict mode.
     Set-StrictMode -Off
     & $root.GetScriptBlock() @Parameters
@@ -5397,6 +5418,12 @@ function Write-IlConversion {
     if ($ToType -eq [ulong])  { $IL.Emit([Reflection.Emit.OpCodes]::Conv_U8); return }
     if ($ToType -eq [ushort]) { $IL.Emit([Reflection.Emit.OpCodes]::Conv_U2); return }
     if ($ToType -eq [char])   { $IL.Emit([Reflection.Emit.OpCodes]::Conv_U2); return }
+    # A pointer-sized integer from an integer: sign-extended from a signed type ([IntPtr]-1 is all ones), zero-extended
+    # from an unsigned one.
+    if ($ToType -eq [IntPtr] -or $ToType -eq [UIntPtr]) {
+        if ($FromType -in [byte], [ushort], [uint], [ulong], [char], [UIntPtr]) { $IL.Emit([Reflection.Emit.OpCodes]::Conv_U) } else { $IL.Emit([Reflection.Emit.OpCodes]::Conv_I) }
+        return
+    }
 
     throw "Unsupported conversion from '$($FromType.FullName)' to '$($ToType.FullName)'."
 }
@@ -6342,6 +6369,14 @@ class PscNativeCalls {
         return $entry.DelegateType
     }
 
+    # A callback's native address for an interpreted run: a delegate of the entry's signature and calling convention
+    # over the static method, kept alive with the entry, and its function pointer.
+    static [IntPtr] Callback([int] $index, [System.Reflection.MethodInfo] $method) {
+        $entry = [PscNativeCalls]::Entries[$index]
+        if ($null -eq $entry.Bound) { $entry.Bound = [Delegate]::CreateDelegate([PscNativeCalls]::DelegateFor($entry), $method) }
+        return [System.Runtime.InteropServices.Marshal]::GetFunctionPointerForDelegate($entry.Bound)
+    }
+
     # The stub's call: an import through its bound export; a pointer call through the pointer in its first argument.
     static [object] Invoke([int] $index, [object[]] $arguments) {
         $entry = [PscNativeCalls]::Entries[$index]
@@ -6372,7 +6407,29 @@ class PscNativeStubFill : PscAstRebuild {
 
     PscNativeStubFill([System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast, int]] $stubs) { $this.Stubs = $stubs }
 
+    # Callback methods ([UnmanagedCallersOnly]), whose attribute is removed so a delegate may call them, and the address
+    # expressions taken of them, each with its callback entry's number.
+    [System.Collections.Generic.HashSet[System.Management.Automation.Language.Ast]] $Callbacks = [System.Collections.Generic.HashSet[System.Management.Automation.Language.Ast]]::new()
+    [System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast, int]] $Addresses = [System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast, int]]::new()
+
     [System.Management.Automation.Language.Ast] Edit([System.Management.Automation.Language.Ast] $original, [System.Management.Automation.Language.Ast] $rebuilt) {
+        if ($this.Addresses.ContainsKey($original)) {
+            # [C].GetMethod('M').MethodHandle.GetFunctionPointer() becomes [PscNativeCalls]::Callback(n, [C].GetMethod('M')).
+            $extent = $rebuilt.Extent
+            $lookup = $rebuilt.Expression.Expression.Copy()
+            return [System.Management.Automation.Language.InvokeMemberExpressionAst]::new($extent,
+                [System.Management.Automation.Language.TypeExpressionAst]::new($extent, [System.Management.Automation.Language.ReflectionTypeName]::new([PscNativeCalls])),
+                [System.Management.Automation.Language.StringConstantExpressionAst]::new($extent, 'Callback', [System.Management.Automation.Language.StringConstantType]::BareWord),
+                [System.Management.Automation.Language.ExpressionAst[]]@([System.Management.Automation.Language.ConstantExpressionAst]::new($extent, $this.Addresses[$original]), $lookup), $true)
+        }
+        if ($this.Callbacks.Contains($original)) {
+            $kept = [System.Management.Automation.Language.AttributeAst[]]@($rebuilt.Attributes | Where-Object { $_.TypeName.FullName -notmatch '(^|\.)UnmanagedCallersOnly(Attribute)?$' } | ForEach-Object { $_.Copy() })
+            $inner = $rebuilt.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and [object]::ReferenceEquals($n.Parent, $rebuilt) }, $false)
+            $definition = [System.Management.Automation.Language.FunctionDefinitionAst]::new($inner.Extent, $false, $false, $rebuilt.Name, [System.Management.Automation.Language.ParameterAst[]]@($rebuilt.Parameters | ForEach-Object { $_.Copy() }), $rebuilt.Body.Copy())
+            $returnType = $null
+            if ($null -ne $rebuilt.ReturnType) { $returnType = $rebuilt.ReturnType.Copy() }
+            return [System.Management.Automation.Language.FunctionMemberAst]::new($rebuilt.Extent, $definition, $returnType, $kept, $rebuilt.MethodAttributes)
+        }
         if (-not $this.Stubs.ContainsKey($original)) { return $rebuilt }
         $extent = $rebuilt.Extent
         $arguments = [System.Collections.Generic.List[System.Management.Automation.Language.ExpressionAst]]::new()
