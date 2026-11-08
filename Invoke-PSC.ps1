@@ -3578,6 +3578,28 @@ function Convert-AstExpression {
         if ($Node.Operator -eq 'And') { return [Linq.Expressions.Expression]::AndAlso((New-PredicateTruth $left), (New-PredicateTruth $right)) }
         if ($Node.Operator -eq 'Or') { return [Linq.Expressions.Expression]::OrElse((New-PredicateTruth $left), (New-PredicateTruth $right)) }
 
+        # -match, -cmatch, -notmatch, -cnotmatch on a value written whole: its text against the pattern, ignoring case
+        # with the current culture unless case-sensitive (measured on SMA). A collection on the left filters in
+        # PowerShell and is refused; so is a function that reads $Matches, which the lowered match does not set.
+        if ($Node.Operator -in 'Imatch', 'Cmatch', 'Inotmatch', 'Cnotmatch') {
+            if (-not (Test-PscWrittenWhole $left.Type) -and -not ($left -is [Linq.Expressions.ConstantExpression] -and $null -eq $left.Value)) {
+                throw "[{0}:{1}] -{2} on a '{3}', which may be a collection, is not lowered." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $Node.Operator.ToString().ToLowerInvariant(), $left.Type.FullName
+            }
+            $owner = $Node.Parent
+            while ($null -ne $owner -and $owner -isnot [System.Management.Automation.Language.FunctionDefinitionAst] -and $owner -isnot [System.Management.Automation.Language.FunctionMemberAst]) { $owner = $owner.Parent }
+            if ($null -ne $owner -and $null -ne $owner.Find({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.UserPath -eq 'Matches' }, $true)) {
+                throw "[{0}:{1}] -{2} in a function that reads `$Matches is not lowered." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $Node.Operator.ToString().ToLowerInvariant()
+            }
+            $options = if ($Node.Operator -in 'Imatch', 'Inotmatch') { [System.Text.RegularExpressions.RegexOptions]::IgnoreCase } else { [System.Text.RegularExpressions.RegexOptions]::None }
+            # A [string] may still be $null from .NET; as text it is empty, as PowerShell matches it.
+            $asText = { param($operand) if ($operand.Type -eq [string]) { [Linq.Expressions.Expression]::Call((Get-PscSemanticsMethod -Name 'Text' -ParameterTypes @([object])), [Linq.Expressions.Expression]::Convert($operand, [object])) } else { ConvertTo-PowerShellType -Expression $operand -Type ([string]) } }
+            $isMatch = [Linq.Expressions.Expression]::Call([regex].GetMethod('IsMatch', [Type[]]@([string], [string], [System.Text.RegularExpressions.RegexOptions])),
+                (& $asText $left), (& $asText $right),
+                [Linq.Expressions.Expression]::Constant($options, [System.Text.RegularExpressions.RegexOptions]))
+            if ($Node.Operator -in 'Inotmatch', 'Cnotmatch') { return [Linq.Expressions.Expression]::Not($isMatch) }
+            return $isMatch
+        }
+
         # -f formats with the current culture (measured on SMA); an [object[]] on the right is the arguments, any other
         # value one argument; an array literal on the right is its elements.
         if ($Node.Operator -eq 'Format') {
@@ -4340,7 +4362,14 @@ function Convert-AstStatement {
             }
             return [Linq.Expressions.Expression]::Throw($exExpr, [void])
         } else {
-            throw "[$($Statement.Extent.File):$($Statement.Extent.StartLineNumber)] Rethrow requires a separate admission decision."
+            # A bare throw inside a catch block rethrows the exception being handled, in PowerShell and as the CLR's
+            # rethrow. Anywhere else it halts the script, which is not lowered.
+            $within = $Statement.Parent
+            while ($null -ne $within -and $within -isnot [System.Management.Automation.Language.CatchClauseAst] -and
+                   $within -isnot [System.Management.Automation.Language.FunctionDefinitionAst] -and $within -isnot [System.Management.Automation.Language.FunctionMemberAst] -and
+                   $within -isnot [System.Management.Automation.Language.ScriptBlockExpressionAst]) { $within = $within.Parent }
+            if ($within -is [System.Management.Automation.Language.CatchClauseAst]) { return [Linq.Expressions.Expression]::Rethrow() }
+            throw "[$($Statement.Extent.File):$($Statement.Extent.StartLineNumber)] A bare throw outside a catch block halts the script and is not lowered."
         }
     }
 
