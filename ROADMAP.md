@@ -20,16 +20,19 @@ of inputs and measurements.
 | Comparison and test tooling in it | 1,991 lines |
 | Model | 625 lines, now typed classes (`NotepadModel`, `NotepadTab`, `NotepadFind`, ...) on `psc-typed-model`, uncommitted |
 | App (painting, input, commands) | 895 lines |
-| Members lowering | 48 of 121 with the typed model (25 of 89 before) |
+| Members lowering | 56 of 122 with the typed model and PSC's later lowering (25 of 89 before); every model member but `ImportSession` |
 | `-VerifyModel`, `-VerifyGraphics` | pass on `psc-typed-model` |
 | 3-second UI run diagnostics | 24 of 24 entries equal to `main` except `ScrollX` `0` → `0.0` (one literal corrected in `Paint-Editor`) |
 
 ### To a native Notepad.exe
 
-1. Commit the typed model on `psc-typed-model`.
-2. PSC lowering gaps the typed model meets: `foreach` over `List[T]`; indexing a string; `String.Split(string)`;
-   `.Count` on an array; string `+` number; `$MyInvocation`; `catch` reading `$_`; expandable strings;
-   multi-element pipelines and cmdlets; nested script blocks; overload resolution with `[object]` arguments.
+1. Typed model: committed on `psc-typed-model` (`41dc8ed`).
+2. PSC lowering gaps remaining: `$MyInvocation`; `catch` reading `$_`; expandable strings; multi-element pipelines
+   and cmdlets; nested script blocks; overload resolution with `[object]` arguments; `DateTime` minus
+   `Nullable[DateTime]`; a parameter default that is not a constant. Closed: `foreach` over `IEnumerable<T>` and
+   values known only at run time; indexing a string; optional parameters (`String.Split(string)`); `.Count` on an
+   array; string `+` any value and `[string]` of any value, as PowerShell formats them.
+   Known difference: an index past the end of an array, list or string throws when lowered; SMA gives `$null`.
 3. Window, graphics and services modules (`New-Module -AsCustomObject`, 207, 310 and 78 lines) to classes with
    static native calls in place of `DynamicInvoke`, from QuickPS's versions as the one source.
 4. Notepad corrections, semantics preserved and checked by Notepad's own runs:

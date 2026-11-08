@@ -2088,6 +2088,22 @@ function ConvertTo-PowerShellType {
     $from = $Expression.Type
     if ($from -eq $Type) { return $Expression }
     if ($Type -eq [void]) { return [Linq.Expressions.Expression]::Block($Expression, [Linq.Expressions.Expression]::Empty()) }
+    # To text as PowerShell's [string] cast gives it (PowerShellSemantics.Text): a value type that is not a list
+    # formats with the invariant culture at compile-time-known type; anything else is decided at run time.
+    if ($Type -eq [string]) {
+        if ($Expression -is [Linq.Expressions.ConstantExpression] -and $null -eq $Expression.Value) { return [Linq.Expressions.Expression]::Constant('', [string]) }
+        $culture = [Linq.Expressions.Expression]::Property($null, [Globalization.CultureInfo].GetProperty('InvariantCulture'))
+        if ($from.IsValueType -and -not [System.Collections.IEnumerable].IsAssignableFrom($from) -and -not ($from.IsGenericType -and $from.GetGenericTypeDefinition() -eq [Nullable`1])) {
+            $formatted = $from.GetMethod('ToString', [Type[]]@([string], [IFormatProvider]))
+            # PowerShell formats a Double to 15 significant digits and a Single to 7 (measured on SMA).
+            $format = if ($from -eq [double]) { 'G15' } elseif ($from -eq [single]) { 'G7' } else { $null }
+            if ($null -ne $formatted) { return [Linq.Expressions.Expression]::Call($Expression, $formatted, [Linq.Expressions.Expression]::Constant($format, [string]), [Linq.Expressions.Expression]::Convert($culture, [IFormatProvider])) }
+            $plain = $from.GetMethod('ToString', [Type[]]@([IFormatProvider]))
+            if ($null -ne $plain) { return [Linq.Expressions.Expression]::Call($Expression, $plain, [Linq.Expressions.Expression]::Convert($culture, [IFormatProvider])) }
+            return [Linq.Expressions.Expression]::Call($Expression, $from.GetMethod('ToString', [Type[]]@()))
+        }
+        return [Linq.Expressions.Expression]::Call((Get-PscSemanticsMethod -Name 'Text' -ParameterTypes @([object])), [Linq.Expressions.Expression]::Convert($Expression, [object]))
+    }
     if ($from -in $script:IntegralTypes -and $Type -eq [char]) {
         # PowerShell's integral-to-Char cast checks the UTF-16 code-unit range.
         # A plain conv.u2 would silently truncate negative or oversized values.
@@ -2466,7 +2482,8 @@ function New-PowerShellArrayIndex {
     if ($Index.Type -ne [int]) { $Index = ConvertTo-PowerShellType -Expression $Index -Type ([int]) }
     # A list (any type with an Int32 indexer and a Count) follows the same rule as an array: PowerShell counts a
     # negative index from the end of an IList too.
-    $indexer = if ($Array.Type.IsArray) { $null } else { Get-IntIndexer $Array.Type }
+    # A string's characters follow the same rule, through its Chars indexer and Length.
+    $indexer = if ($Array.Type.IsArray) { $null } elseif ($Array.Type -eq [string]) { [string].GetProperty('Chars') } else { Get-IntIndexer $Array.Type }
     $access = { param($target, $at) if ($indexer) { [Linq.Expressions.Expression]::MakeIndex($target, $indexer, [Linq.Expressions.Expression[]]@($at)) } else { [Linq.Expressions.Expression]::ArrayAccess($target, $at) } }
     if ($Index -is [Linq.Expressions.ConstantExpression] -and [int]$Index.Value -ge 0) {
         return [pscustomobject]@{ Setup = $setup; Access = (& $access $Array $Index) }
@@ -2484,7 +2501,7 @@ function New-PowerShellArrayIndex {
         $setup.Add([Linq.Expressions.Expression]::Assign($indexTemp, $Index))
         $Index = $indexTemp
     }
-    $length = if ($indexer) { [Linq.Expressions.Expression]::Property($Array, 'Count') } else { [Linq.Expressions.Expression]::ArrayLength($Array) }
+    $length = if ($Array.Type -eq [string]) { [Linq.Expressions.Expression]::Property($Array, 'Length') } elseif ($indexer) { [Linq.Expressions.Expression]::Property($Array, 'Count') } else { [Linq.Expressions.Expression]::ArrayLength($Array) }
     $adjusted = [Linq.Expressions.Expression]::Condition(
         [Linq.Expressions.Expression]::LessThan($Index, [Linq.Expressions.Expression]::Constant(0)),
         [Linq.Expressions.Expression]::Add($Index, $length),
@@ -2632,6 +2649,8 @@ function New-MemberAccess {
             [Linq.Expressions.Expression]::Constant($Name, [string]),
             [Linq.Expressions.Expression]::Constant([bool]$strict, [bool]))
     }
+    # PowerShell gives every array a Count, its length.
+    if ($null -ne $Target -and $Type.IsArray -and $Type.GetArrayRank() -eq 1 -and $Name -eq 'Count') { return [Linq.Expressions.Expression]::ArrayLength($Target) }
     $member = Resolve-MatchingMember -TargetType $Type -MemberName $Name -IsStatic:($null -eq $Target)
     if ($member -is [Reflection.PropertyInfo]) { return [Linq.Expressions.Expression]::Property($Target, $member) }
     [Linq.Expressions.Expression]::Field($Target, $member)
@@ -2782,6 +2801,23 @@ function Resolve-MatchingMethod {
     })
     if ($reachable.Count -eq 1) { return $reachable[0] }
 
+    # Optional parameters, as PowerShell binds them: the one method whose leading parameters take the arguments and
+    # whose remaining parameters all have defaults ("a`nb".Split("`n") is Split(string, StringSplitOptions = None)).
+    # The call site supplies the defaults (Add-PscDefaultArguments).
+    $optional = [System.Collections.Generic.List[System.Reflection.MethodInfo]]::new()
+    foreach ($candidate in @($searched | ForEach-Object { $_.GetMethods($flags) })) {
+        if ($candidate.Name -ne $MethodName -or $candidate.ContainsGenericParameters) { continue }
+        $parameters = $candidate.GetParameters()
+        if ($parameters.Length -le $ArgumentTypes.Length) { continue }
+        $fits = $true
+        for ($i = 0; $i -lt $parameters.Length; $i++) {
+            if ($i -lt $ArgumentTypes.Length) { if (-not $parameters[$i].ParameterType.IsAssignableFrom($ArgumentTypes[$i])) { $fits = $false; break } }
+            elseif (-not $parameters[$i].HasDefaultValue) { $fits = $false; break }
+        }
+        if ($fits) { $optional.Add($candidate) }
+    }
+    if ($optional.Count -eq 1) { return $optional[0] }
+
     $failure = "Could not resolve method '$MethodName' with argument types ($($ArgumentTypes -join ', ')) on '$($TargetType.FullName)'."
     # 4. Static generic method definitions, closed by structural inference from the argument types. The
     # non-generic binder above and its diagnostics are unchanged; this runs only when it found nothing.
@@ -2849,6 +2885,20 @@ function Resolve-MatchingConstructor {
     }
 
     throw "Could not resolve constructor with argument types ($($ArgumentTypes -join ', ')) on '$($TargetType.FullName)'."
+}
+
+# The default of each parameter a call leaves out, appended to its arguments: the parameter's declared default as a
+# constant of the parameter's type (an enumeration's default as that enumeration's value).
+function Add-PscDefaultArguments {
+    param([Parameter(Mandatory)][System.Reflection.MethodBase] $Method, [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[Linq.Expressions.Expression]] $Arguments)
+    $parameters = $Method.GetParameters()
+    for ($i = $Arguments.Count; $i -lt $parameters.Length; $i++) {
+        $type = $parameters[$i].ParameterType
+        $value = $parameters[$i].DefaultValue
+        if ($null -eq $value -or $value -is [DBNull] -or $value -is [System.Reflection.Missing]) { $Arguments.Add([Linq.Expressions.Expression]::Default($type)); continue }
+        if ($type.IsEnum) { $value = [Enum]::ToObject($type, $value) }
+        $Arguments.Add([Linq.Expressions.Expression]::Constant($value, $type))
+    }
 }
 
 function Resolve-MatchingMember {
@@ -2985,6 +3035,28 @@ class PowerShellSemantics {
 
     # -not and ! on a value as a condition.
     static [bool] Not([object] $value) { return -not [PowerShellSemantics]::IsTrue($value) }
+
+    # A value as PowerShell's [string] cast gives it: $null is empty; a string is itself; a collection other than a
+    # dictionary is its elements' text separated by a space; a Double to 15 significant digits and a Single to 7; any
+    # other value is formatted with the invariant culture.
+    static [string] Text([object] $value) {
+        if ($null -eq $value) { return '' }
+        if ($value -is [string]) { return $value.ToString() }
+        if ($value -is [double]) { return ([double]$value).ToString('G15', [System.Globalization.CultureInfo]::InvariantCulture) }
+        if ($value -is [single]) { return ([single]$value).ToString('G7', [System.Globalization.CultureInfo]::InvariantCulture) }
+        if ($value -is [System.Collections.IEnumerable] -and $value -isnot [System.Collections.IDictionary]) {
+            $text = [System.Text.StringBuilder]::new()
+            [bool] $first = $true
+            $items = ([System.Collections.IEnumerable]$value).GetEnumerator()
+            while ($items.MoveNext()) {
+                if (-not $first) { $null = $text.Append(' ') }
+                $null = $text.Append([PowerShellSemantics]::Text($items.Current))
+                $first = $false
+            }
+            return $text.ToString()
+        }
+        return [System.Convert]::ToString($value, [System.Globalization.CultureInfo]::InvariantCulture)
+    }
 
     # A function's output as an assignment or an expression receives it: $null when nothing was written, the object
     # when one was, and all of them, in order, when several were.
@@ -3406,6 +3478,11 @@ function Convert-AstExpression {
         if ($Node.Operator -eq 'And') { return [Linq.Expressions.Expression]::AndAlso((New-PredicateTruth $left), (New-PredicateTruth $right)) }
         if ($Node.Operator -eq 'Or') { return [Linq.Expressions.Expression]::OrElse((New-PredicateTruth $left), (New-PredicateTruth $right)) }
 
+        # A string on the left of + appends the right operand as text, as PowerShell's [string] cast gives it.
+        if ($Node.Operator -eq 'Plus' -and $left.Type -eq [string]) {
+            return [Linq.Expressions.Expression]::Call([string].GetMethod('Concat', [Type[]]@([string], [string])), $left, (ConvertTo-PowerShellType -Expression $right -Type ([string])))
+        }
+
         if ($Node.Operator -in 'Shl', 'Shr') {
             # The shift count is an Int32 in PowerShell and the CLR. A narrower left operand keeps its own type in
             # PowerShell ([byte] -shl 8 loses the high bits), so it shifts as an Int32 and truncates back.
@@ -3504,7 +3581,7 @@ function Convert-AstExpression {
     if ($Node -is [System.Management.Automation.Language.IndexExpressionAst]) {
         $targetExpr = Convert-AstExpression -Node $Node.Target -Scope $Scope
         $idxExpr = Convert-AstExpression -Node $Node.Index -Scope $Scope
-        $isList = -not $targetExpr.Type.IsArray -and $null -ne (Get-IntIndexer $targetExpr.Type)
+        $isList = -not $targetExpr.Type.IsArray -and ($targetExpr.Type -eq [string] -or $null -ne (Get-IntIndexer $targetExpr.Type))
         if (($targetExpr.Type.IsArray -and $targetExpr.Type.GetArrayRank() -eq 1) -or $isList) {
             $element = New-PowerShellArrayIndex -Array $targetExpr -Index $idxExpr -Scope $Scope
             $read = if ($isList) { $element.Access } else { [Linq.Expressions.Expression]::ArrayIndex($element.Access.Object, $element.Access.Arguments[0]) }
@@ -3578,6 +3655,7 @@ function Convert-AstExpression {
             if ($method.IsDefined([Runtime.InteropServices.UnmanagedCallersOnlyAttribute],$false)) {
                 throw ('[{0}:{1}] UnmanagedCallersOnly method cannot be called from managed code.' -f $Node.Extent.StartLineNumber,$Node.Extent.StartColumnNumber)
             }
+            Add-PscDefaultArguments -Method $method -Arguments $argExprs
             $params = $method.GetParameters()
             for ($i = 0; $i -lt $params.Length; $i++) {
                 if ($argExprs[$i].Type -ne $params[$i].ParameterType) {
@@ -3599,6 +3677,7 @@ function Convert-AstExpression {
             if ($method.IsDefined([Runtime.InteropServices.UnmanagedCallersOnlyAttribute],$false)) {
                 throw ('[{0}:{1}] UnmanagedCallersOnly method cannot be called from managed code.' -f $Node.Extent.StartLineNumber,$Node.Extent.StartColumnNumber)
             }
+            Add-PscDefaultArguments -Method $method -Arguments $argExprs
             $params = $method.GetParameters()
             for ($i = 0; $i -lt $params.Length; $i++) {
                 if ($argExprs[$i].Type -ne $params[$i].ParameterType) {
@@ -4190,17 +4269,84 @@ function Convert-AstStatement {
         return $value
     }
 
-    # 10. foreach ($item in $array) { ... } over a typed one-dimensional array,
-    # lowered as an indexed loop. As in PowerShell, a $null array iterates zero
-    # times, and the loop variable keeps its last value afterwards.
+    # 10. foreach ($item in $value) { ... }. As in PowerShell, $null iterates zero times; a string, a dictionary, or a
+    # value that is not enumerable iterates once; anything else iterates its elements; the loop variable keeps its
+    # last value afterwards. A one-dimensional array is an indexed loop; an IEnumerable<T> iterates its enumerator,
+    # disposed afterwards, with T as the loop variable's type; a value whose kind is known only at run time is
+    # written as output is written (PowerShellSemantics.Write) and the elements written are iterated.
     if ($Statement -is [System.Management.Automation.Language.ForEachStatementAst]) {
         if ($Statement.Flags -ne [System.Management.Automation.Language.ForEachFlags]::None) {
             throw "[{0}:{1}] foreach -parallel is not supported." -f $Statement.Extent.StartLineNumber, $Statement.Extent.StartColumnNumber
         }
+        $et = [Linq.Expressions.Expression]
         $collection = Convert-AstExpression -Node $Statement.Condition -Scope $Scope
-        if (-not $collection.Type.IsArray -or $collection.Type.GetArrayRank() -ne 1) {
-            throw "[{0}:{1}] foreach requires a typed one-dimensional array, got '{2}'." -f `
-                $Statement.Extent.StartLineNumber, $Statement.Extent.StartColumnNumber, $collection.Type.FullName
+        $sourceType = $collection.Type
+        $isArray = $sourceType.IsArray -and $sourceType.GetArrayRank() -eq 1
+        $enumerable = $null
+        if (-not $isArray -and $sourceType -ne [string] -and -not [System.Collections.IDictionary].IsAssignableFrom($sourceType)) {
+            $generic = @(@($sourceType) + @($sourceType.GetInterfaces()) | Where-Object { $_.IsGenericType -and $_.GetGenericTypeDefinition() -eq [System.Collections.Generic.IEnumerable`1] } | Select-Object -Unique)
+            if ($generic.Count -eq 1) { $enumerable = $generic[0] }
+        }
+        if (-not $isArray -and $null -eq $enumerable) {
+            if (Test-PscWrittenWhole $sourceType) {
+                # Iterated once as itself; $null not at all.
+                $one = $et::NewArrayInit($sourceType, [Linq.Expressions.Expression[]]@($collection))
+                if ($sourceType.IsValueType -and -not ($sourceType.IsGenericType -and $sourceType.GetGenericTypeDefinition() -eq [Nullable`1])) { $collection = $one }
+                else {
+                    $held = $et::Variable($sourceType, 'foreachValue' + $Scope.DeclaredLocals.Count)
+                    $Scope.DeclaredLocals.Add($held)
+                    $collection = $et::Block($sourceType.MakeArrayType(), [Linq.Expressions.Expression[]]@($et::Assign($held, $collection),
+                        $et::Condition($et::Equal($held, $et::Constant($null, $sourceType)), $et::NewArrayBounds($sourceType, [Linq.Expressions.Expression[]]@($et::Constant(0))),
+                            $et::NewArrayInit($sourceType, [Linq.Expressions.Expression[]]@($held)))))
+                }
+            }
+            else {
+                $held = $et::Variable([object], 'foreachValue' + $Scope.DeclaredLocals.Count)
+                $list = $et::Variable([System.Collections.Generic.List[object]], 'foreachWritten' + $Scope.DeclaredLocals.Count)
+                $Scope.DeclaredLocals.Add($held); $Scope.DeclaredLocals.Add($list)
+                $created = $script:ExpressionNewMethod.Invoke($null, [object[]]@([System.Collections.Generic.List[object]].GetConstructor([type[]]@()), [Linq.Expressions.Expression[]]@()))
+                $write = Get-PscSemanticsMethod -Name Write -ParameterTypes ([System.Collections.Generic.List[object]], [object])
+                $collection = $et::Block([object[]], [Linq.Expressions.Expression[]]@($et::Assign($held, $et::Convert($collection, [object])),
+                    $et::Condition($et::Equal($held, $et::Constant($null, [object])), $et::NewArrayBounds([object], [Linq.Expressions.Expression[]]@($et::Constant(0))),
+                        $et::Block([object[]], [Linq.Expressions.Expression[]]@($et::Assign($list, $created), $et::Call($write, $list, $held), $et::Call($list, [System.Collections.Generic.List[object]].GetMethod('ToArray')))))))
+            }
+            $isArray = $true
+        }
+        if ($null -ne $enumerable) {
+            $elementType = $enumerable.GetGenericArguments()[0]
+            $varName = $Statement.Variable.VariablePath.UserPath
+            $item = if ($Scope.Parameters.ContainsKey($varName)) { $Scope.Parameters[$varName] }
+                    elseif ($Scope.Locals.ContainsKey($varName)) { $Scope.Locals[$varName] }
+                    else {
+                        $declared = $et::Variable($elementType, $varName)
+                        $Scope.Locals[$varName] = $declared
+                        $Scope.DeclaredLocals.Add($declared)
+                        $declared
+                    }
+            $id = $Scope.DeclaredLocals.Count
+            $enumeratorType = [System.Collections.Generic.IEnumerator`1].MakeGenericType($elementType)
+            $source = $et::Variable($enumerable, "foreachSource$id")
+            $enumerator = $et::Variable($enumeratorType, "foreachEnumerator$id")
+            $Scope.DeclaredLocals.Add($source); $Scope.DeclaredLocals.Add($enumerator)
+            $breakLabel = $et::Label("foreachBreak$id")
+            $continueLabel = $et::Label("foreachContinue$id")
+            $Scope.Loops.Push(@{ Break = $breakLabel; Continue = $continueLabel })
+            try { $bodyExpr = Convert-AstStatement -Statement $Statement.Body -Scope $Scope }
+            finally { $null = $Scope.Loops.Pop() }
+            $current = ConvertTo-PowerShellType -Expression ($et::Property($enumerator, $enumeratorType.GetProperty('Current'))) -Type $item.Type
+            $loop = $et::Loop(
+                $et::IfThenElse($et::Call($enumerator, [System.Collections.IEnumerator].GetMethod('MoveNext')),
+                    $et::Block($et::Assign($item, $current), $bodyExpr, $et::Label($continueLabel), $et::Empty()),
+                    $et::Break($breakLabel)),
+                $breakLabel)
+            $dispose = $et::Call($enumerator, [System.IDisposable].GetMethod('Dispose'))
+            return $et::Block(
+                $et::Assign($source, $et::Convert($collection, $enumerable)),
+                $et::IfThen($et::NotEqual($source, $et::Constant($null, $enumerable)),
+                    $et::Block(
+                        $et::Assign($enumerator, $et::Call($source, $enumerable.GetMethod('GetEnumerator'))),
+                        $et::TryFinally($loop, $dispose))),
+                $et::Empty())
         }
         $elementType = $collection.Type.GetElementType()
         $varName = $Statement.Variable.VariablePath.UserPath
