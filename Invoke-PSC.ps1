@@ -1259,6 +1259,11 @@ function Test-AstAdmitted {
                 ($n -is [System.Management.Automation.Language.MemberExpressionAst] -and $n.Member -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $n.Member.Value -eq 'ErrorRecord') -or
                 ($n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.UserPath -in '_', 'PSItem', 'Error', 'ErrorRecord')
             }, $true)) {
+                # $_.Exception is the exception caught, which the CLR's catch has.
+                if ($read -is [System.Management.Automation.Language.VariableExpressionAst] -and $read.VariablePath.UserPath -in '_', 'PSItem' -and
+                    $read.Parent -is [System.Management.Automation.Language.MemberExpressionAst] -and -not $read.Parent.Static -and
+                    [object]::ReferenceEquals($read.Parent.Expression, $read) -and $read.Parent.Member -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+                    $read.Parent.Member.Value -eq 'Exception') { continue }
                 $target = $read
                 if ($target.Parent -is [System.Management.Automation.Language.ConvertExpressionAst]) { $target = $target.Parent }
                 if ($target.Parent -is [System.Management.Automation.Language.AssignmentStatementAst] -and
@@ -3285,6 +3290,16 @@ class PowerShellNumericOperands : PscOperandBinding {
         if ($kind -ne [PscOperatorKind]::Bitwise -and $top -in 1, 3) {
             [Type] $other = if ($leftRank -eq $top) { $right.Type } else { $left.Type }
             if ($other -in [sbyte], [int16], [int], [long]) {
+                # SMA's type for an unsigned and a signed operand depends on the signed value (measured): non-negative
+                # gives the unsigned type ([uint32]5 + 1 is UInt32), negative gives Int64 or Decimal. A constant's
+                # sign is known here; any other signed operand's is not, and the operation is refused.
+                [Linq.Expressions.Expression] $signed = if ($leftRank -eq $top) { $right } else { $left }
+                if ($kind -ne [PscOperatorKind]::Comparison -and $signed -is [Linq.Expressions.ConstantExpression] -and [long]$signed.Value -ge 0) {
+                    [Type] $unsigned = [PowerShellNumericOperands]::Ranks[$top]
+                    $constant = [Linq.Expressions.Expression]::Constant([Convert]::ChangeType($signed.Value, $unsigned), $unsigned)
+                    if ($leftRank -eq $top) { return [PscBoundOperands]@{ Left = [PowerShellNumericOperands]::As($left, $unsigned); Right = $constant } }
+                    return [PscBoundOperands]@{ Left = $constant; Right = [PowerShellNumericOperands]::As($right, $unsigned) }
+                }
                 if ($kind -ne [PscOperatorKind]::Comparison) { return $null }
                 $common = if ($top -eq 1) { [long] } else { [decimal] }
             }
@@ -3867,6 +3882,12 @@ function Convert-AstExpression {
             $Node.Member.Extent.Text
         }
 
+        # $_.Exception in a catch body is the exception the catch caught.
+        if (-not $Node.Static -and $memberName -eq 'Exception' -and $Node.Expression -is [System.Management.Automation.Language.VariableExpressionAst] -and
+            $Node.Expression.VariablePath.UserPath -in '_', 'PSItem' -and $Scope.ContainsKey('Caught') -and $Scope['Caught'].Count) {
+            return $Scope['Caught'].Peek()
+        }
+
         if ($Node.Static) {
             $targetType = if ($Node.Expression -is [System.Management.Automation.Language.TypeExpressionAst]) {
                 Resolve-AstType $Node.Expression.TypeName
@@ -4048,6 +4069,11 @@ function Convert-AstStatement {
     # 1. Assignment statement: $x = <expr>, [int]$x = <expr>, or $arr[$i] = <expr>
     if ($Statement -is [System.Management.Automation.Language.AssignmentStatementAst]) {
         $leftNode = $Statement.Left
+        # $null = value evaluates the value and discards it; $null is not a variable to declare or type.
+        if ($Statement.Operator -eq [System.Management.Automation.Language.TokenKind]::Equals -and
+            $leftNode -is [System.Management.Automation.Language.VariableExpressionAst] -and $leftNode.VariablePath.UserPath -eq 'null') {
+            return [Linq.Expressions.Expression]::Block([void], [Linq.Expressions.Expression[]]@((Convert-AstExpression -Node $Statement.Right -Scope $Scope)))
+        }
 
         if ($Statement.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals) {
             $compound = @{ PlusEquals = 'Plus'; MinusEquals = 'Minus'; MultiplyEquals = 'Multiply'; DivideEquals = 'Divide'; RemainderEquals = 'Rem' }[[string]$Statement.Operator]
@@ -4376,6 +4402,11 @@ function Convert-AstStatement {
                 elseif ($operand -is [System.Management.Automation.Language.CommandExpressionAst]) { $operand = $operand.Expression }
                 else { $operand = $operand.Pipeline }
             }
+            # A value whose static type is an exception, other than SMA's own, is thrown as the CLR throws it, as
+            # PowerShell's throw raises that exception.
+            if ([Exception].IsAssignableFrom($exExpr.Type) -and $exExpr.Type.Assembly.GetName().Name -ne 'System.Management.Automation') {
+                return [Linq.Expressions.Expression]::Throw($exExpr, [void])
+            }
             if ($operand -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst] -or
                 -not $operand.Static -or $operand.Member.Value -ne 'new' -or
                 -not [Exception].IsAssignableFrom($exExpr.Type) -or $exExpr.Type.Assembly -ne [object].Assembly) {
@@ -4405,8 +4436,13 @@ function Convert-AstStatement {
                 if ($cc.CatchTypes -and $cc.CatchTypes.Count -gt 0) {
                     $catchType = Resolve-AstType $cc.CatchTypes[0].TypeName
                 }
-                $catchBody = Convert-AstStatement -Statement $cc.Body -Scope $Scope
-                $catchBlocks.Add([Linq.Expressions.Expression]::Catch($catchType, $catchBody))
+                # The exception caught, which $_.Exception reads in the catch body.
+                $caught = [Linq.Expressions.Expression]::Variable($catchType, 'caught' + $Scope.DeclaredLocals.Count)
+                if (-not $Scope.ContainsKey('Caught')) { $Scope['Caught'] = [System.Collections.Generic.Stack[Linq.Expressions.ParameterExpression]]::new() }
+                $Scope['Caught'].Push($caught)
+                try { $catchBody = Convert-AstStatement -Statement $cc.Body -Scope $Scope }
+                finally { $null = $Scope['Caught'].Pop() }
+                $catchBlocks.Add([Linq.Expressions.Expression]::Catch($caught, $catchBody))
             }
         }
 
@@ -5358,6 +5394,20 @@ function Write-IlConstant {
         return
     }
 
+    # The other integral types load as the bits of their value: 32 bits for those up to UInt32, 64 for UInt64.
+    if ($val -is [sbyte] -or $val -is [byte] -or $val -is [short] -or $val -is [ushort] -or $val -is [char]) {
+        Write-IlConstant -IL $IL -Expr ([Linq.Expressions.Expression]::Constant([int][Convert]::ToInt64($val), [int]))
+        return
+    }
+    if ($val -is [uint]) {
+        Write-IlConstant -IL $IL -Expr ([Linq.Expressions.Expression]::Constant([BitConverter]::ToInt32([BitConverter]::GetBytes([uint]$val), 0), [int]))
+        return
+    }
+    if ($val -is [ulong]) {
+        $IL.Emit([Reflection.Emit.OpCodes]::Ldc_I8, [BitConverter]::ToInt64([BitConverter]::GetBytes([ulong]$val), 0))
+        return
+    }
+
     throw "Unsupported constant type '$($val.GetType().FullName)'."
 }
 
@@ -5408,14 +5458,18 @@ function Write-IlConversion {
     }
 
     if ($ToType -eq [int])    { $IL.Emit([Reflection.Emit.OpCodes]::Conv_I4); return }
-    if ($ToType -eq [long])   { $IL.Emit([Reflection.Emit.OpCodes]::Conv_I8); return }
+    # Widening to 64 bits zero-extends an unsigned source ([uint]::MaxValue stays 4294967295) and sign-extends a
+    # signed one.
+    if ($ToType -eq [long] -or $ToType -eq [ulong]) {
+        if ($FromType -in [byte], [ushort], [uint], [char]) { $IL.Emit([Reflection.Emit.OpCodes]::Conv_U8) } else { $IL.Emit([Reflection.Emit.OpCodes]::Conv_I8) }
+        return
+    }
     if ($ToType -eq [double]) { $IL.Emit([Reflection.Emit.OpCodes]::Conv_R8); return }
     if ($ToType -eq [single]) { $IL.Emit([Reflection.Emit.OpCodes]::Conv_R4); return }
     if ($ToType -eq [short])  { $IL.Emit([Reflection.Emit.OpCodes]::Conv_I2); return }
     if ($ToType -eq [byte])   { $IL.Emit([Reflection.Emit.OpCodes]::Conv_U1); return }
     if ($ToType -eq [sbyte])  { $IL.Emit([Reflection.Emit.OpCodes]::Conv_I1); return }
     if ($ToType -eq [uint])   { $IL.Emit([Reflection.Emit.OpCodes]::Conv_U4); return }
-    if ($ToType -eq [ulong])  { $IL.Emit([Reflection.Emit.OpCodes]::Conv_U8); return }
     if ($ToType -eq [ushort]) { $IL.Emit([Reflection.Emit.OpCodes]::Conv_U2); return }
     if ($ToType -eq [char])   { $IL.Emit([Reflection.Emit.OpCodes]::Conv_U2); return }
     # A pointer-sized integer from an integer: sign-extended from a signed type ([IntPtr]-1 is all ones), zero-extended
