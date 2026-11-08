@@ -1274,6 +1274,9 @@ function Test-AstAdmitted {
         }
     }
 
+    # An expandable string joins a collection with $OFS; a source that uses $OFS decides that separator at run time.
+    $sourceRoot = $Ast; while ($null -ne $sourceRoot.Parent) { $sourceRoot = $sourceRoot.Parent }
+    $usesSeparator = $null -ne $sourceRoot.Find({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.UserPath -eq 'OFS' }, $true)
     # Disallowed AST node types in compiled methods
     $disallowed = $Ast.FindAll({
         param($node)
@@ -1283,7 +1286,7 @@ function Test-AstAdmitted {
             $node.Parent -isnot [System.Management.Automation.Language.DynamicKeywordStatementAst] -and
             -not ($node.Parent -is [System.Management.Automation.Language.SwitchStatementAst] -and
                 @($node.Parent.Clauses | Where-Object { [object]::ReferenceEquals($_.Item1, $node) }).Count -eq 1)) -or
-        $node -is [System.Management.Automation.Language.ExpandableStringExpressionAst]
+        ($node -is [System.Management.Automation.Language.ExpandableStringExpressionAst] -and $usesSeparator)
     }, $true)
 
     foreach ($bad in $disallowed) {
@@ -1292,7 +1295,7 @@ function Test-AstAdmitted {
             'CommandExpressionAst' { "Command expressions are not allowed in compiled methods." }
             'PipelineAst' { "Multi-element pipelines are not allowed in compiled methods." }
             'ScriptBlockExpressionAst' { "Nested script blocks or lambdas are not allowed in compiled methods." }
-            'ExpandableStringExpressionAst' { "Expandable double-quoted strings are not allowed; use string concatenation or single-quoted literals." }
+            'ExpandableStringExpressionAst' { "An expandable string in a source that sets `$OFS joins collections with a separator known only at run time." }
             default { "Unsupported AST node '$($bad.GetType().Name)'." }
         }
 
@@ -3315,6 +3318,8 @@ $script:PscEnvironment = [PscEnvironment]::new()
 $script:PscSemanticsAst = $null
 # SMA's type inference method, found on first use.
 $script:PscTypeInference = $null
+# SMA's format expression of an expandable string (internal), found on first use.
+$script:PscStringFormat = $null
 # Each source's function class (or $null when it has none), and each function class's root to its source's root.
 $script:ScriptFunctionClasses = [System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast, System.Management.Automation.Language.TypeDefinitionAst]]::new()
 $script:ScriptFunctionSources = [System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast, System.Management.Automation.Language.Ast]]::new()
@@ -3450,6 +3455,21 @@ function Convert-AstExpression {
         $items = [System.Collections.Generic.List[Linq.Expressions.Expression]]::new()
         foreach ($element in $Node.Elements) { $items.Add([Linq.Expressions.Expression]::Convert((Convert-AstExpression -Node $element -Scope $Scope), [object])) }
         return [Linq.Expressions.Expression]::NewArrayInit([object], [Linq.Expressions.Expression[]]$items.ToArray())
+    }
+
+    # "...$x...$(...)...": the text of each nested expression, by PowerShell's [string] conversion (measured: the same
+    # invariant formatting), placed by SMA's own format expression for the string, in which the literal text is
+    # already unescaped and its braces doubled.
+    if ($Node -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
+        if ($Node.NestedExpressions.Count -eq 0) { return [Linq.Expressions.Expression]::Constant($Node.Value, [string]) }
+        if ($null -eq $script:PscStringFormat) {
+            $script:PscStringFormat = [System.Management.Automation.Language.ExpandableStringExpressionAst].GetProperty('FormatExpression', [Reflection.BindingFlags]'NonPublic,Instance')
+        }
+        $parts = [Linq.Expressions.Expression[]]@(foreach ($nested in $Node.NestedExpressions) {
+            [Linq.Expressions.Expression]::Convert((ConvertTo-PowerShellType -Expression (Convert-AstExpression -Node $nested -Scope $Scope) -Type ([string])), [object])
+        })
+        return [Linq.Expressions.Expression]::Call([string].GetMethod('Format', [Type[]]@([string], [object[]])),
+            [Linq.Expressions.Expression]::Constant([string]$script:PscStringFormat.GetValue($Node), [string]), [Linq.Expressions.Expression]::NewArrayInit([object], $parts))
     }
 
     # @( ... ): the output of its statements as an object[]. One array literal is its elements; one expression whose
