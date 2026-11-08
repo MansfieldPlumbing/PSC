@@ -1,284 +1,151 @@
-# PSLowering roadmap
+# Roadmap
 
-The single plan for this repository. Each item names why it matters, what
-done means, and how it is checked. Work items in order unless a consumer is
-blocked; a checked item names the commit and the test that proves it.
+Measured 2026-11-08 on branch `condense-into-invoke-psc` (PSC `5238476`), Notepad branch
+`psc-typed-model`, pwsh `515a49a`, kokoro-hexagon `6d88079`. Line and node counts are from SMA's AST through
+`$api.ReadSource`; source measures are PSC's own (`PscMeasure`). Counts that group code by purpose are grouped by
+function name and line range, and are approximate.
 
-## Where things stand (2026-10-09)
+## 1. Notepad (ships first)
 
-- The compiler: typed PowerShell classes compile to IL through PSLowering's
-  own emitter in the self-contained `Export-LoweredAssembly.ps1`. Every class
-  in a source file compiles into one assembly through a mirror of runtime types
-  (`Use-ClassMirror` in the root compiler script).
-- Supported: static and instance methods; typed properties as fields with
-  initializers; constructors; `$this`; classes that use each other, including
-  in generic types; locals; assignment and compound assignment on variables,
-  fields, properties and array elements; checked integral arithmetic,
-  Double integral division, round-half-to-even conversion; bitwise operators;
-  string comparison through the invariant culture; string concatenation;
-  `if`/`elseif`/`else`, `while`, `for`, `foreach` over typed arrays, `break`,
-  `continue`, `return`; typed arrays with negative indexing; .NET calls and
-  constructors; `throw`, `try`/`catch`/`finally`; native imports through
-  `[LibraryImport]`; executables through `-EntryPoint`.
-- Verification: 22 suites (19 legacy suites and three regression gates) in `tests/Test-ConsolidatedRunner.ps1` on the one
-  pinned PowerShell, 7.7.0-preview.5 with .NET 11.0.0-rc.1.26425.128
-  (`tools/Get-PowerShell.ps1`). The PowerShell parity check runs 256 calls
-  over 17 fixtures with no divergence. CI on GitHub runs the same suite on
-  the same build.
-- On devices: PSLowering output (`25427b2`) compiled on Windows matched
-  PowerShell running on the device for all 196 parity calls of that commit,
-  on the x86-64 emulator, an arm64 physical device and an arm32 device, each
-  on .NET 11.0.0-rc.1 (Pwsh `157852c`, `scripts/probes/lowering`).
-- Against the real workload: 39 of the 70 class methods in Pwsh's
-  `modules/Console.psm1` lower (from 3 before classes landed).
-- Consumers: Pwsh (managed host, console core, Recovery) and Kokoro-Hexagon
-  (the managed DSP and audio session). Kokoro is waiting on items 1.1 and
-  1.2.
+The app is to become `Invoke-Notepad.ps1`, compiled by `Invoke-PSC.ps1` to a NativeAOT `Notepad.exe`; a glue
+script fetches both and the NuGet inputs, records the SHA-512 of each, compiles, runs the checks, and keeps a record
+of inputs and measurements.
 
-## Principles
+### State
 
-1. **PowerShell defines the meaning.** A compiled method returns what the
-   same PowerShell method returns, or both throw. The PowerShell parity check is the
-   judge; a divergence is a compiler defect, never a reason to change an
-   expected result.
-2. **Stay a strict subset.** Every PSLowering source is valid PowerShell
-   that runs unchanged in mainline PowerShell. Extend through what the
-   language already allows: attributes, conventions, and intrinsics written
-   as ordinary method calls. Never add syntax. Never fork SMA.
-3. **The workload chooses features.** A construct is added because a
-   consumer's code needs it, ranked by measured lines unlocked (the
-   admission report), never for parity with C#.
-4. **Reject, never guess.** Anything outside the subset fails before output,
-   with line, column and reason. Nothing falls back to running the script.
-5. **Staging is the design.** PowerShell runs at build time with full power
-   (data, tables, device facts) and generates small, specialized, typed code;
-   the compiled subset stays small because PowerShell does the thinking
-   before compilation.
-6. **Use the .NET library; do not rebuild the language.** Collections,
-   generics and math are calls into the base library.
-7. **Measure before optimizing.** Profiles and device timings choose
-   performance work.
+| Measure | Value |
+|---|---|
+| Notepad.ps1 | 14,152 lines, 727,618 bytes, 75,193 AST nodes (before the model change) |
+| Framework code in it | 10,600 lines; `Invoke-Design` alone 9,835 |
+| Comparison and test tooling in it | 1,991 lines |
+| Model | 625 lines, now typed classes (`NotepadModel`, `NotepadTab`, `NotepadFind`, ...) on `psc-typed-model`, uncommitted |
+| App (painting, input, commands) | 895 lines |
+| Members lowering | 48 of 121 with the typed model (25 of 89 before) |
+| `-VerifyModel`, `-VerifyGraphics` | pass on `psc-typed-model` |
+| 3-second UI run diagnostics | 24 of 24 entries equal to `main` except `ScrollX` `0` → `0.0` (one literal corrected in `Paint-Editor`) |
 
-### Not doing (until a consumer's measured need moves an item)
+### To a native Notepad.exe
 
-Inheritance hierarchies; interfaces beyond what interop needs; events;
-`async`/`await`; operator overloading; defining generic types or generic
-methods; properties with custom accessors; pipelines and cmdlets inside
-compiled code; script blocks as values; dynamic member access.
+1. Commit the typed model on `psc-typed-model`.
+2. PSC lowering gaps the typed model meets: `foreach` over `List[T]`; indexing a string; `String.Split(string)`;
+   `.Count` on an array; string `+` number; `$MyInvocation`; `catch` reading `$_`; expandable strings;
+   multi-element pipelines and cmdlets; nested script blocks; overload resolution with `[object]` arguments.
+3. Window, graphics and services modules (`New-Module -AsCustomObject`, 207, 310 and 78 lines) to classes with
+   static native calls in place of `DynamicInvoke`, from QuickPS's versions as the one source.
+4. Notepad corrections, semantics preserved and checked by Notepad's own runs:
+   - identities held in strings (`$ui.Hover`, `Pressed`, `Focus`, `Menu`, `Submenu`, `Nodes` keyed by string) to
+     typed identities;
+   - `$Event` untyped; 22 `$ui` slots untyped or written with two types (`EditorOrigin` `Double[]` and `Int32[]`);
+   - `$settings` as a typed key table (8 accesses by run-time key; passed to `Invoke-Model`, `New-Module`, a
+     `[hashtable]` parameter);
+   - cmdlets on app paths (`Join-Path`, `Test-Path`, `Split-Path`, `Get-Content`, `Set-Content`).
+5. Remove the in-app comparison page, its megaphone button, and the person button (it duplicates the gear).
+6. One copy button: the selection when there is one, else the document; copy as file stays opt-in.
+7. Move the comparison tooling and `-VerifyWindow` out of Notepad into PSC (section 2).
+8. Glue script.
+9. Measure which files PSC's linker reads from the 706 MB `msvc-*` folder; MSVC libraries have no NuGet package.
 
-## Phase 1: unblock the consumers
+### Observed defects
 
-### 1.1 Kokoro consumer template and handoff
-Why: Kokoro-Hexagon (`9f3d2e37`) binds its native calls through delegates
-invoked with `DynamicInvoke` (`src/runspace/Audio.AAudio.psm1`,
-`FastRpcProbe.ps1`, `FastRpcDirectIoctlProbe.ps1`); compiled P/Invoke methods
-replace that per-call reflection.
-Done when:
-- `tests/fixtures/KokoroToneSessionFixture.ps1` expresses the session's
-  managed half as a typed class with `[LibraryImport]` bindings, signatures
-  from pinned headers:
-  - DSP session setup through `libcdsprpc.so`, once: `remote_session_control`,
-    `remote_handle64_open`, `remote_handle64_close` (qualcomm/fastrpc
-    `d2475196`, `inc/remote.h:803,871,935`);
-  - per-job packets through the same library's queue: `dspqueue_create`,
-    `dspqueue_export`, `dspqueue_write`, `dspqueue_read`, `dspqueue_close`
-    (`inc/dspqueue.h`), with a blocking timed read, no polling;
-  - the direct route, libc `open`, `ioctl` and `close` with
-    `SetLastError = $true` (bionic `e4df46f2`: `ioctl(int, int, ...)`);
-  - `libaaudio.so` builder, stream, write, state and close (frameworks/av
-    `e2f09893`).
-  `Marshal` allocation and cleanup in `try`/`finally`; handles returned
-  through buffers (by-reference parameters are not supported). The drain is
-  `AAudioStream_requestStop` then `AAudioStream_waitForStateChange` to
-  STOPPED; that call is a futex wait that also wakes at least every 20 ms
-  (`AudioStream.cpp:445-466`), so it removes the application's sleep loop but
-  is not purely event-driven. The data callback is, and needs 1.2.
-- A compile-only test (the libraries exist only on Android) checks that it
-  compiles, that every import is a P/Invoke method with the declared library,
-  entry point and last-error flag, and that Pwsh's admission rule accepts it.
-- `docs/handoff/kokoro.md` names the pinned commit, the template, the
-  out-parameter pattern and the drain.
-Done so far: `SetLastError` on native imports, tested against kernel32
-`SetLastError` on both runtimes.
-Device: none here; the Kokoro agent runs its own device test.
+- Status bar showed `Unix (LF)` for a new document; the model creates `Windows (CRLF)`.
+- Caption buttons drawn twice (a stale frame under the current one), once.
+- Title bar and caption buttons do not follow the edge during a live resize (frame loop shares the thread with the
+  modal size loop).
+- `WM_NCHITTEST` never returns `HTMAXBUTTON`, so Snap Layouts cannot appear.
+- Type sizes, icon weights and the status bar differ from stock Windows Notepad.
 
-### 1.2 Callbacks and function-pointer calls
-Why: event-driven native code (AAudio data callbacks, window and input
-callbacks) calls into managed code; exports resolved at run time and
-function tables (COM, JNI, Vulkan) need calls through a pointer.
-Done when:
-- A static method marked
-  `[System.Runtime.InteropServices.UnmanagedCallersOnly]` compiles with that
-  attribute, blittable signature only, and its address can be taken through
-  an intrinsic written as an ordinary method call (emitting `ldftn`).
-- A function-pointer call intrinsic emits unmanaged `calli` with a declared
-  signature, blittable only.
-- Both stay valid PowerShell (the intrinsics must be callable, even if they
-  throw, in mainline PowerShell).
-- Test (Windows, no device): compile a callback, take its address, call it
-  back through the function-pointer intrinsic, and pass it to a Windows API
-  that calls back (for example `EnumWindows`), checking results against
-  .NET.
+### Features
 
-Verified native spike: `tests/Test-NativeInterop.ps1` on Windows x64,
-PowerShell 7.7.0-preview.5 / .NET 11.0.0-rc.1.26425.128 checks explicit
-Cdecl/Stdcall `calli`, strict UnmanagedCallersOnly emission, typed `ldftn`
-acquisition, scalar and pointer ABI contracts, CRT qsort reverse callbacks,
-PowerShell body parity, instance ThreadStart delegates and fresh zero-SMA
-hosts. [Contract and evidence](docs/native-interop.md). Android/device
-integration remains a consumer gate and was not run here. The original
-52-output / 14-diagnostic baseline is frozen independently in
-`tests/baseline/218f54e.json` and enforced by CI.
+Animation type setting (slide, fade, rise, none, turnstile); kinetic scrolling; tab reorder and tear-off; minimap;
+virtual-file copy through reverse COM (`IDataObject` with `CFSTR_FILEDESCRIPTORW` / `CFSTR_FILECONTENTS`); an
+integrated console (ConPTY to the installed pwsh, or SMA hosted on CoreCLR); an installer built on the same framework.
 
-### 1.3 References between emitted assemblies
-Why: composable parts. Assembly B compiles against assembly A's real types
-and calls A directly.
-Done when: `Export-LoweredAssembly -Reference <path>` resolves types and
-members from referenced assemblies loaded by path; the output carries a
-normal assembly reference; a two-assembly test runs in a fresh process and
-under `dotnet exec`.
+## 2. PSC capabilities to build
 
-### 1.4 Console core gaps (from the admission report)
-Why: Pwsh ROADMAP R3. Remaining categories in `modules/Console.psm1`:
-- indexing into `List` (`get_Item`/`set_Item`) and `foreach` over
-  collections that are not arrays (5 + 4 methods, about 200 lines);
-- PowerShell's numeric promotion for mixed operand types, matched exactly
-  and checked by the parity check (7 methods);
-- `if` used as a value, and the remaining expression forms (9 methods);
-- conversions the CLR has no operator for (2 methods).
-Done when: the admission report reaches the target the console work needs,
-with every new construct carrying parity cases. Rewrite the remaining
-script block and expandable-string uses in the console source rather than
-supporting them.
-How to measure: parse `Console.psm1` from a pinned Pwsh commit, run every
-class method through `ConvertTo-TypedExpression`, and group the rejection
-messages with their positions and quoted source removed; report methods
-lowered, lines lowered, and lines per rejection category. Make this a
-script under `tools/` the first time it is needed again, so the number is
-reproducible.
+| Capability | Source |
+|---|---|
+| Framework parts selected by a typed `[Flags()]` enum on Compile; a part used without its flag is refused | Notepad, QuickPS |
+| Composition layer (3D transforms, independent animation) | QuickPS `src\Composition.Windows.ps1` |
+| Window capture | QuickPS `src\WindowCapture.Windows.ps1`, `src\Capture.Windows.ps1` |
+| Window instruments: live-resize anchoring, minimum size, Snap Layouts hit test, maximize to work area, restore, minimize, Win+arrow snapping, backdrop | Notepad `Invoke-Window.Verify` |
+| Comparison instruments: capture a reference app (UI Automation tree, region images, window attributes), drive it, compare as measurements; intended differences recorded as such | Notepad comparison tooling |
+| Timing measurements: cold start to first frame, working set, frame time typing and resizing | none yet |
+| Design system as types | Notepad `Invoke-Design` (9,835 lines of transcribed HTML/CSS) |
+| Fluent controls: buttons, inputs, dropdowns, modals, tooltips, colour picker, four-corner gradient editor | Notepad app code |
 
-### 1.5 Typed functions
-Why: `Console.psm1` has 81 functions beside its 70 class methods, and the
-drawing path is mostly functions.
-Done when: a function with typed parameters, `[OutputType(...)]` and output
-only through `return` compiles to a static method of a generated class; a
-function that emits anything else to its output stream is rejected. Parity
-vectors compare against calling the function in PowerShell.
+## 3. To acquire from pwsh
 
-## Phase 2: adoption (in the consumer repositories)
+`setup.ps1`: 9,448 lines, 222 functions, 77,993 AST nodes.
 
-These are done in Pwsh and Kokoro-Hexagon, each taking PSLowering from GitHub
-at a pinned commit and digest. Listed here so the compiler work serves them.
-- Pwsh `setup.ps1` replaces its hand-built expression trees
-  (`New-FindProfileMethod`, `New-ManagedHostAssemblyBytes`) with PSLowering;
-  gate: the managed host behaves the same and gates 2a-2d pass on all three
-  backends.
-- Kokoro replaces its copy of the private LambdaCompiler helper.
-- Pwsh R3: compile the console core's hot paths; measure compiled against
-  interpreted on the arm64 and arm32 test devices.
-- Pwsh R6: Recovery as an assembly with no SMA reference, run as
-  `Test-DotnetHost` proves.
+| Component | Lines | Functions (examples) | Into PSC as |
+|---|---|---|---|
+| Expression-tree kit, managed host generation | ~1,330 | `New-Clr*`, `Write-MicrosoftLambdaToMethodBuilder`, `Add-PersistedMethod`, `New-ManagedHostAssemblyBytes` | the host written as PowerShell classes, lowered by PSC |
+| Machine code: Thumb-2, AArch64, x64, ARM32, with ABI tests | ~1,290 | `New-A64*`, `New-T32Step`, `New-X64Instruction`, `Test-*CallAbi`, `New-PslNativeLibrary*` | native back end |
+| Android resources, binary manifest, validation | ~1,035 | `New-ResourceTable`, `New-BinaryAxmlManifest`, `Test-BinaryAxml` | Android target |
+| ELF writer and reader | ~945 | `New-ElfCodeLibrary`, `New-ElfPayloadLibrary`, `Read-ElfImage` | object formats, beside COFF |
+| Native host library | ~800 | `New-NativeHostLibrary` (527) | Android target |
+| Text interface | ~770 | `Get-CanvasCells`, `Render-Canvas`, `Start-PipelineWorker` | UI framework |
+| Acquisition | ~660 | `Get-GitObject` (smart HTTP), `Get-VerifiedPackageBytes`, `Assert-PackageIdentity`, `Get-FileSha512` | acquisition, shared with the glue script |
+| APK: ZIP, deflate, CRC-32, signing | ~580 | `New-ApkArchive`, `New-SignedApk`, `Get-ApkContentDigest` | Android target |
+| Assembly store | ~520 | `New-AssemblyStoreBytes`, `Test-AssemblyStoreBytes` | Android target |
+| DEX writer | ~490 | `New-JavaPeerDex`, `ConvertTo-DexImage` | Android target |
+| PE: ReadyToRun to IL-only, MVID, inspection | ~375 | `ConvertTo-IlOnlyImage`, `Set-DeterministicMvid` | PE tools (PSC already has `Set-DeterministicMvid`) |
+| Steps, write plan, approval, help | ~480 | `Resolve-StepOrder`, `Resolve-WritePlan` | stays in `setup.ps1` |
 
-## Phase 3: speed and self-sufficiency
+Other pwsh sources: `modules\Console.psm1` (939 lines), `modules\AndroidCanvas.psm1` (1,042), `scripts\adb.ps1`
+(1,535; adb client), `scripts\usbaoa.ps1` (474; USB accessory), `scripts\CellCanvas.ps1` (827),
+`tools\Get-AssemblyClosure.ps1` (589), `scripts\commands\Parsers\*`.
 
-### 3.1 Compiler profile
-Measured 2026-10-04 (classes fixture, PowerShell 7.7): module import
-707 ms; mirror 656 ms; lowering 12 methods 1,939 ms cold; whole export
-3,572 ms cold, 748-937 ms warm. Most of the cost is PowerShell interpreting
-the compiler. Each test suite runs in a fresh process and pays the cold cost.
+## 4. To acquire from kokoro-hexagon
 
-### 3.2 Self-hosting admission and recoverable source
+Source outside `build\` and `data\`: 109 scripts, 39,386 lines.
 
-Scheduling: this is the next spike after the single-script consolidation
-passes its original local equivalence checks and GitHub Actions. It does
-not authorize a compiler DLL build, source embedding, language expansion,
-or compiler rewrite during consolidation.
+| Component | Where | Into PSC as |
+|---|---|---|
+| Hexagon instruction encoder, packets, emission | `Invoke-HexagonDevelopment.ps1` (`HexagonEncoder`, `Group-HexagonPackets`, `ConvertTo-HexagonAssembly`) | native back end, beside AArch64 and x64 |
+| Kernel builders over expression trees | `tools\Kokoro.CaptureKernels.psm1` (`Get-Conv1dKernel`, `Get-MatrixApplyKernel`, ...) | kernels written as PowerShell, lowered by PSC |
+| Numeric primitives: STFT and inverse, LSTM, attention, layer norm, convolution, quantization | `tools\Invoke-KokoroPrecomputedDecoder.ps1` | numeric library |
+| Audio measurement: spectrogram, pitch, comparison, PNG and line plots | `tools\Kokoro.AudioMeasurement.psm1` | instruments for audio apps |
+| PyTorch checkpoint reader | `src\runspace\Torch.Checkpoint.psm1` | data readers |
+| Android audio, DSP queue layout, native binding | `src\runspace\Audio.AAudio.psm1`, `DspQueue.Layout.psm1`, `Native.Binding.psm1` | Android target |
+| Device sessions over adb, resident jobs | `tools\Kokoro.Evaluator.psm1`, `Get-Adb` | one adb client, with pwsh `scripts\adb.ps1` |
+| English phonemizer | `phonemizer\Invoke-EnglishPhonemizer.ps1` (4,220 lines, 34 classes) | stays an app; its build path uses PSC |
 
-Authoritative source: the complete, directly executable root script
-`Export-LoweredAssembly.ps1`. The long-term target is one managed compiler,
-`Dev.MansfieldPlumbing.PSLowering.dll`, containing executable compiler IL
-and an exact, independently recoverable copy of that script. No module,
-parallel compiler, implementation fragments, auxiliary resource file,
-source archive or generated source wrapper.
+Not acquired: the Student (`student\Invoke-Student.ps1`, 5,582 lines) and anything shaped like stock Kokoro.
 
-First spike: establish a source-positioned admission report against the
-consolidated script at a recorded commit and toolchain. Identify the exact
-unsupported constructs and current entrypoint boundaries preventing
-self-compilation. Ordinary functions, dynamic values, hashtables,
-pipelines, scriptblocks and runtime command dispatch are inspection
-candidates, not a substitute for measured findings. Do not broaden
-admission, rewrite semantics or execute an embedded script to manufacture
-a passing self-hosting test. Report the blockers without claiming
-self-hosting or changing existing expectations.
+## 5. Triage
 
-Subsequent proof gates, requiring separately scoped implementation work:
+### kokoro-hexagon
 
-- Source preservation: embed the original `.ps1` bytes as a named managed
-  assembly resource; extract them without executing the script and verify
-  byte equality and SHA-256. Pin and verify the .NET resource-emission
-  mechanism before implementation. A DLL containing source proves source
-  preservation only, regardless of whether its compiler IL is executable.
-- Determinism: retain deterministic resource ordering and MVID generation.
-  Existing deterministic fixture outputs must match their consolidation
-  baselines. Source embedding legitimately changes the new compiler DLL's
-  hash; establish its own deterministic baseline including embedded source.
-- Actual self-hosting: the source compiler produces the compiler DLL; that
-  DLL's generated IL compiles the same authoritative source into an
-  equivalent second-generation compiler DLL, independently of executing
-  the original or embedded script. Embedding and interpreting PowerShell
-  does not satisfy this gate.
-- Bootstrap verification: compare semantic behavior, assembly references,
-  deterministic SHA-256, MVID and exact source extraction across bootstrap
-  generations, using identical source bytes, names, options and toolchain.
-  Measure compilation time against 3.1 only after correctness is proved.
+- 109 source scripts against one script per project.
+- `ScriptBlock.Create`: 12 (`src\jobs\Kokoro.Albert16Run.ps1` 10, `Invoke-HexagonDevelopment.ps1` 2).
+- `Add-Type`: 1 (`student\Invoke-Student.ps1`).
+- Hashtables used as records: 6,719 of 7,739 hashtable literals.
+- Member lookups by text: 220. Commands named by a variable: 3,876; by another expression: 240. Regex uses: 157.
+- Functions defined in more than one file: 10 names (`Get-Even` in 8 files).
+- `build\` holds copies of other repositories: pwsh at `7398372` (including its `setup.ps1`) and PSC's earlier
+  compiler (`Export-LoweredAssembly.ps1`, PSLowering), plus retained driver scripts of 5 to 7 MB.
+- Terms: `Get-KokoroRatchetCase`, `Test-KokoroRatchet`, `Update-KokoroRatchet`, `Write-EnglishBuildReceipt`.
+- Uncommitted changes in the working tree (`AGENTS.md` deleted; four files modified), not made in this session.
 
-Dependency contracts are separate: the compiler DLL may require SMA to
-parse PowerShell input; compiled application outputs retain their existing
-CoreLib-only contract. Source preservation and self-hosting remain
-unproved until their respective gates run and their evidence is recorded.
+### pwsh
 
-### 3.3 Publishing
-The standalone script to the PowerShell Gallery, later the self-compiled DLL to
-nuget.org, under `Dev.MansfieldPlumbing.*`. Each publish needs the owner's
-approval; versions are permanent.
+- 31 scripts against one script per project; `scripts\probes\canvas\Jni.ps1` and `scripts\probes\jni\Jni.ps1`
+  are 376 lines each, defined twice.
+- Functions defined in more than one file: 34 names.
+- `ScriptBlock.Create`: 3. `Add-Type`: 1 (`setup.ps1`).
+- Pinned, hash-verified addresses, where the direction is to record and compare, rolling forward.
+- Terms: "receipt" in the README and `docs\receipt-*`.
 
-## Phase 4: reach
+### PSC
 
-- **Gradual typing** (second output mode, needs SMA at run time): untyped
-  operations compile to call sites into SMA's binders, typed code to plain
-  IL; values flowing into typed variables convert with PowerShell's rules.
-  The route for users' untyped scripts. The SMA persistence experiment in
-  `experiments/` is the starting point for the call-site half.
-- **Speculative compilation** (alternative, entry-guarded only): record
-  parameter types in SMA, compile a typed copy, check types at entry, fall
-  back to the original script block. Only for functions whose every type
-  follows from the parameters.
-- **Captured native leaves**: PSLowering output, then RyuJIT, then capture
-  of leaf methods (no calls, no GC references, no memory-resident constants)
-  under Pwsh AGENTS.md's rule, with every instruction decoded and checked.
-  First consumer: a calculator whose logic is one leaf over a fixed state
-  layout (needs a raw memory load/store intrinsic), packaged by the
-  RyuJitDetach PE writer; console version first.
-- **JIT recording**: SuperPMI's collector on a debuggable build as evidence
-  of what RyuJIT does per architecture, used for comparison, never to produce code.
-
-## Practices for agents working here
-
-- Run the full suite before every commit with the pinned PowerShell from
-  `tools/Get-PowerShell.ps1`:
-  `& (pwsh -NoProfile -File ./tools/Get-PowerShell.ps1) -NoProfile -File ./tests/Test-ConsolidatedRunner.ps1`.
-  No other PowerShell or .NET version is a test target.
-- New constructs come with parity cases in `tests/parity/ParityCases.ps1`
-  and, where PowerShell cannot run them (native imports, callbacks), a test
-  against an independent answer.
-- Run code from files with `-File`; load assemblies by path. A Defender or
-  AMSI detection stops the work and is reported.
-- Edit through files, not long inline commands: the agent shell evaluates
-  commands as strings, and text such as `*` or `/=` can be read as a path.
-  Edit scripts that replace exact text must fail when their anchor is not
-  found exactly once.
-- `$Node.Operator` and similar AST values are enums, not strings; convert
-  with `[string]` before string operations. A function returning `, $array`
-  must be assigned before it is looped over.
-- Commit in small steps with plain factual messages; no AI attribution.
-  Push only with the owner's approval.
+- Investigation: the third PSNES lowering pass throws `NullReferenceException` inside `-Mode Investigate` and not
+  in a plain process.
+- Refusals are positioned text, not records carrying the AST node.
+- `Invoke-PSC.ps1` parses under `pwsh -NoProfile` only after `Import-Module Microsoft.PowerShell.Utility`.
+- Classes PSC defines cannot be named by a caller after the script returns.
+- `Add-PscFoldedScript` edits source text by offset; `PscAstRebuild` is the structural replacement.
+- Type inference for records reaches SMA's internal `AstTypeInference` by reflection.
+- Lowering refuses a class deriving from another class (adb.ps1 and PSC itself).
+- `[string]` conversion of a `[bool]` is not lowered.
+- SMA defect: `Copy()` of a `BaseCtorInvokeMemberExpressionAst` yields an `InvokeMemberExpressionAst`.
