@@ -2143,6 +2143,43 @@ function ConvertTo-PowerShellType {
         }
         return [Linq.Expressions.Expression]::Call((Get-PscSemanticsMethod -Name 'Text' -ParameterTypes @([object])), [Linq.Expressions.Expression]::Convert($Expression, [object]))
     }
+    # An array to an array of another element type, as PowerShell converts it: each element converted in order; $null
+    # stays $null.
+    if ($Type.IsArray -and $Type.GetArrayRank() -eq 1 -and $from.IsArray -and $from.GetArrayRank() -eq 1) {
+        $et = [Linq.Expressions.Expression]
+        $element = $Type.GetElementType()
+        $source = $et::Variable($from, 'convertSource')
+        $result = $et::Variable($Type, 'convertResult')
+        $index = $et::Variable([int], 'convertIndex')
+        $done = $et::Label('convertDone')
+        $each = $et::Loop(
+            $et::IfThenElse($et::LessThan($index, $et::ArrayLength($source)),
+                $et::Block(
+                    $et::Assign($et::ArrayAccess($result, $index), (ConvertTo-PowerShellType -Expression ($et::ArrayIndex($source, $index)) -Type $element)),
+                    $et::Assign($index, $et::Add($index, $et::Constant(1)))),
+                $et::Break($done)),
+            $done)
+        return $et::Block($Type, [Linq.Expressions.ParameterExpression[]]@($source, $result, $index), [Linq.Expressions.Expression[]]@(
+            $et::Assign($source, $Expression),
+            $et::Condition($et::Equal($source, $et::Constant($null, $from)), $et::Constant($null, $Type),
+                $et::Block($Type, [Linq.Expressions.Expression[]]@(
+                    $et::Assign($result, $et::NewArrayBounds($element, [Linq.Expressions.Expression[]]@($et::ArrayLength($source)))),
+                    $et::Assign($index, $et::Constant(0)),
+                    $each,
+                    $result)))))
+    }
+    # Text to a type that reads text, as PowerShell converts it: the type's Parse(string, IFormatProvider) with the
+    # invariant culture, else Parse(string), else a constructor taking a string. Numbers, characters and Booleans keep
+    # their own conversions below.
+    if ($from -eq [string] -and $Type -notin ($script:IntegralTypes + $script:FloatingTypes + @([char], [bool], [object])) -and -not $Type.IsEnum -and -not $Type.IsAssignableFrom([string])) {
+        $culture = [Linq.Expressions.Expression]::Convert([Linq.Expressions.Expression]::Property($null, [Globalization.CultureInfo].GetProperty('InvariantCulture')), [IFormatProvider])
+        $parse = $Type.GetMethod('Parse', [Reflection.BindingFlags]'Public,Static', $null, [Type[]]@([string], [IFormatProvider]), $null)
+        if ($null -ne $parse -and $parse.ReturnType -eq $Type) { return [Linq.Expressions.Expression]::Call($parse, $Expression, $culture) }
+        $parse = $Type.GetMethod('Parse', [Reflection.BindingFlags]'Public,Static', $null, [Type[]]@([string]), $null)
+        if ($null -ne $parse -and $parse.ReturnType -eq $Type) { return [Linq.Expressions.Expression]::Call($parse, $Expression) }
+        $constructor = $Type.GetConstructor([Type[]]@([string]))
+        if ($null -ne $constructor) { return $script:ExpressionNewMethod.Invoke($null, [object[]]@($constructor, [Linq.Expressions.Expression[]]@($Expression))) }
+    }
     if ($from -in $script:IntegralTypes -and $Type -eq [char]) {
         # PowerShell's integral-to-Char cast checks the UTF-16 code-unit range.
         # A plain conv.u2 would silently truncate negative or oversized values.
@@ -2834,11 +2871,27 @@ function Resolve-MatchingMethod {
         for ($i = 0; $i -lt $params.Length; $i++) {
             $wanted = $params[$i].ParameterType
             $given = $ArgumentTypes[$i]
-            if (-not $wanted.IsAssignableFrom($given) -and -not ($wanted -in $numeric -and $given -in $numeric) -and $given -ne [object]) { return $false }
+            # A one-character string converts to [char], as PowerShell converts '#' for TrimStart.
+            if (-not $wanted.IsAssignableFrom($given) -and -not ($wanted -in $numeric -and $given -in $numeric) -and $given -ne [object] -and -not ($wanted -eq [char] -and $given -eq [string])) { return $false }
         }
         $true
     })
     if ($reachable.Count -eq 1) { return $reachable[0] }
+    # Several reachable: the closest, as PowerShell ranks them. A parameter of the argument's own type ranks above one
+    # the argument is assignable to, which ranks above one reached by conversion; the one best overload is chosen.
+    if ($reachable.Count -gt 1) {
+        $ranked = foreach ($candidate in $reachable) {
+            $score = 0
+            $params = $candidate.GetParameters()
+            for ($i = 0; $i -lt $params.Length; $i++) {
+                if ($params[$i].ParameterType -eq $ArgumentTypes[$i]) { $score += 2 }
+                elseif ($params[$i].ParameterType.IsAssignableFrom($ArgumentTypes[$i])) { $score += 1 }
+            }
+            [pscustomobject]@{ Method = $candidate; Score = $score }
+        }
+        $best = @($ranked | Sort-Object Score -Descending)
+        if ($best[0].Score -gt $best[1].Score) { return $best[0].Method }
+    }
 
     # Optional parameters, as PowerShell binds them: the one method whose leading parameters take the arguments and
     # whose remaining parameters all have defaults ("a`nb".Split("`n") is Split(string, StringSplitOptions = None)).
@@ -3074,6 +3127,14 @@ class PowerShellSemantics {
 
     # -not and ! on a value as a condition.
     static [bool] Not([object] $value) { return -not [PowerShellSemantics]::IsTrue($value) }
+
+    # The arguments of -f from its right operand: an [object[]] is the arguments; any other value is one argument.
+    static [object[]] FormatArguments([object] $value) {
+        if ($value -is [object[]]) { return [object[]]$value }
+        $one = [object[]]::new(1)
+        $one[0] = $value
+        return $one
+    }
 
     # A value as PowerShell's [string] cast gives it: $null is empty; a string is itself; a collection other than a
     # dictionary is its elements' text separated by a space; a Double to 15 significant digits and a Single to 7; any
@@ -3517,6 +3578,20 @@ function Convert-AstExpression {
         if ($Node.Operator -eq 'And') { return [Linq.Expressions.Expression]::AndAlso((New-PredicateTruth $left), (New-PredicateTruth $right)) }
         if ($Node.Operator -eq 'Or') { return [Linq.Expressions.Expression]::OrElse((New-PredicateTruth $left), (New-PredicateTruth $right)) }
 
+        # -f formats with the current culture (measured on SMA); an [object[]] on the right is the arguments, any other
+        # value one argument; an array literal on the right is its elements.
+        if ($Node.Operator -eq 'Format') {
+            $et = [Linq.Expressions.Expression]
+            $arguments = if ($Node.Right -is [System.Management.Automation.Language.ArrayLiteralAst]) {
+                $et::NewArrayInit([object], [Linq.Expressions.Expression[]]@($Node.Right.Elements | ForEach-Object { $et::Convert((Convert-AstExpression -Node $_ -Scope $Scope), [object]) }))
+            }
+            elseif ($right.Type -eq [object[]]) { $right }
+            elseif ($right.Type -eq [object]) { $et::Call((Get-PscSemanticsMethod -Name 'FormatArguments' -ParameterTypes @([object])), $right) }
+            else { $et::NewArrayInit([object], [Linq.Expressions.Expression[]]@($et::Convert($right, [object]))) }
+            $culture = $et::Convert($et::Property($null, [Globalization.CultureInfo].GetProperty('CurrentCulture')), [IFormatProvider])
+            return $et::Call([string].GetMethod('Format', [Type[]]@([IFormatProvider], [string], [object[]])), $culture, (ConvertTo-PowerShellType -Expression $left -Type ([string])), $arguments)
+        }
+
         # A string on the left of + appends the right operand as text, as PowerShell's [string] cast gives it.
         if ($Node.Operator -eq 'Plus' -and $left.Type -eq [string]) {
             return [Linq.Expressions.Expression]::Call([string].GetMethod('Concat', [Type[]]@([string], [string])), $left, (ConvertTo-PowerShellType -Expression $right -Type ([string])))
@@ -3650,12 +3725,25 @@ function Convert-AstExpression {
 
         # Convert arguments
         $argExprs = [System.Collections.Generic.List[Linq.Expressions.Expression]]::new()
+        $byReference = [System.Collections.Generic.HashSet[int]]::new()
         if ($Node.Arguments) {
             foreach ($arg in $Node.Arguments) {
+                # [ref]$variable passes the variable itself, to a by-reference parameter of its type.
+                if ($arg -is [System.Management.Automation.Language.ConvertExpressionAst] -and (Resolve-AstType $arg.Type.TypeName) -eq [ref] -and
+                    $arg.Child -is [System.Management.Automation.Language.VariableExpressionAst]) {
+                    $variable = Convert-AstExpression -Node $arg.Child -Scope $Scope
+                    if ($variable -isnot [Linq.Expressions.ParameterExpression]) {
+                        throw "[{0}:{1}] [ref] passes a local variable or a parameter." -f $arg.Extent.StartLineNumber, $arg.Extent.StartColumnNumber
+                    }
+                    $null = $byReference.Add($argExprs.Count)
+                    $argExprs.Add($variable)
+                    continue
+                }
                 $argExprs.Add((Convert-AstExpression -Node $arg -Scope $Scope))
             }
         }
-        $argTypes = [Type[]]@($argExprs | ForEach-Object { $_.Type })
+        $argTypes = [Type[]]::new($argExprs.Count)
+        for ($i = 0; $i -lt $argExprs.Count; $i++) { $argTypes[$i] = if ($byReference.Contains($i)) { $argExprs[$i].Type.MakeByRefType() } else { $argExprs[$i].Type } }
 
         if ($Node.Static) {
             $targetType = if ($Node.Expression -is [System.Management.Automation.Language.TypeExpressionAst]) {
@@ -3682,7 +3770,7 @@ function Convert-AstExpression {
                 $ctor = Resolve-MatchingConstructor -TargetType $targetType -ArgumentTypes $argTypes
                 $params = $ctor.GetParameters()
                 for ($i = 0; $i -lt $params.Length; $i++) {
-                    if ($argExprs[$i].Type -ne $params[$i].ParameterType) {
+                    if (-not $params[$i].ParameterType.IsByRef -and $argExprs[$i].Type -ne $params[$i].ParameterType) {
                         $argExprs[$i] = (ConvertTo-PowerShellType -Expression $argExprs[$i] -Type ($params[$i].ParameterType))
                     }
                 }
@@ -3697,7 +3785,7 @@ function Convert-AstExpression {
             Add-PscDefaultArguments -Method $method -Arguments $argExprs
             $params = $method.GetParameters()
             for ($i = 0; $i -lt $params.Length; $i++) {
-                if ($argExprs[$i].Type -ne $params[$i].ParameterType) {
+                if (-not $params[$i].ParameterType.IsByRef -and $argExprs[$i].Type -ne $params[$i].ParameterType) {
                     $argExprs[$i] = (ConvertTo-PowerShellType -Expression $argExprs[$i] -Type ($params[$i].ParameterType))
                 }
             }
@@ -3719,7 +3807,7 @@ function Convert-AstExpression {
             Add-PscDefaultArguments -Method $method -Arguments $argExprs
             $params = $method.GetParameters()
             for ($i = 0; $i -lt $params.Length; $i++) {
-                if ($argExprs[$i].Type -ne $params[$i].ParameterType) {
+                if (-not $params[$i].ParameterType.IsByRef -and $argExprs[$i].Type -ne $params[$i].ParameterType) {
                     $argExprs[$i] = (ConvertTo-PowerShellType -Expression $argExprs[$i] -Type ($params[$i].ParameterType))
                 }
             }
@@ -5595,7 +5683,15 @@ function Write-IlExpression {
         if ($Expr.Object) {
             Write-IlReceiver -IL $IL -Expr $Expr.Object -Context $Context
         }
-        foreach ($arg in $Expr.Arguments) {
+        $declared = $Expr.Method.GetParameters()
+        for ($i = 0; $i -lt $Expr.Arguments.Count; $i++) {
+            $arg = $Expr.Arguments[$i]
+            # A by-reference parameter receives the address of the local or parameter passed ([ref]$variable).
+            if ($declared[$i].ParameterType.IsByRef) {
+                if ($arg -is [Linq.Expressions.ParameterExpression] -and $Context.Locals.ContainsKey($arg)) { $IL.Emit([Reflection.Emit.OpCodes]::Ldloca, [Reflection.Emit.LocalBuilder]$Context.Locals[$arg]); continue }
+                if ($arg -is [Linq.Expressions.ParameterExpression] -and $Context.Parameters.ContainsKey($arg)) { $IL.Emit([Reflection.Emit.OpCodes]::Ldarga, [int16]$Context.Parameters[$arg]); continue }
+                throw "A by-reference argument of '$($Expr.Method.Name)' must be a local variable or a parameter."
+            }
             Write-IlExpression -IL $IL -Expr $arg -Context $Context
         }
         $receiverType = if ($Expr.Object) { $Expr.Object.Type } else { $null }
