@@ -2004,6 +2004,8 @@ function Invoke-PscRun {
     }
     $root = $ast
     if ($stubs.Count) { $root = [PscNativeStubFill]::new($stubs).Rebuild($ast) }
+    # The source runs as pwsh runs a script: strict mode off unless the source sets it, not PSC's own strict mode.
+    Set-StrictMode -Off
     & $root.GetScriptBlock() @Parameters
 }
 
