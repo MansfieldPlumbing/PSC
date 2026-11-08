@@ -84,8 +84,10 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Compile', 'Api', 'Expression', 'Inspect', 'Capability', 'Link', 'PowerShell', 'Describe', 'Lint', 'Profile', 'Report', 'Verify', 'Readme', 'Investigate', 'Consolidate', 'Records')]
+    [ValidateSet('Compile', 'Api', 'Expression', 'Inspect', 'Capability', 'Link', 'PowerShell', 'Describe', 'Lint', 'Profile', 'Report', 'Verify', 'Readme', 'Investigate', 'Consolidate', 'Records', 'Run')]
     [string] $Mode = 'Compile',
+    # Run: the parameters the source is run with, by name.
+    [hashtable] $RunParameters = @{},
     [string] $ArchivePath,
     [string] $ProjectPath,
     [string[]] $LintFiles,
@@ -1968,6 +1970,41 @@ function Get-PscRecord {
         }
         $record
     }
+}
+
+# A source run interpreted by SMA with its native stubs filled just in time: each [LibraryImport] method and each
+# [UnmanagedCallConv] pointer stub becomes a call through PscNativeCalls with the same signature, convention,
+# last-error setting and string marshalling the lowered P/Invoke or calli has; the rebuilt source then runs with the
+# given parameters. A source without stubs runs as it is.
+function Invoke-PscRun {
+    [CmdletBinding()]
+    param([string] $Path, [System.Management.Automation.Language.ScriptBlockAst] $Ast, [hashtable] $Parameters = @{})
+    if ($null -eq $Ast) {
+        $full = [IO.Path]::GetFullPath($Path)
+        $tokens = $null; $errors = $null
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile($full, [ref]$tokens, [ref]$errors)
+        if ($errors.Count) { throw ('{0}: {1} parse errors; the first: {2}' -f $full, $errors.Count, $errors[0].Message) }
+    }
+    $ast = $Ast
+    $stubs = [System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast, int]]::new()
+    foreach ($member in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionMemberAst] }, $true)) {
+        $import = Get-NativeImport $member
+        $contract = if ($null -eq $import) { Get-NativeMethodContract $member } else { $null }
+        if ($null -eq $import -and ($null -eq $contract -or $contract.Kind -ne 'Calli')) { continue }
+        $entry = [PscNativeEntry]::new()
+        $entry.ReturnType = if ($member.ReturnType) { Resolve-AstType $member.ReturnType.TypeName } else { [void] }
+        $entry.ParameterTypes = Get-ParameterTypes $member
+        if ($null -ne $import) {
+            $entry.Library = $import.Library; $entry.EntryPoint = $import.EntryPoint
+            $entry.Convention = [System.Runtime.InteropServices.CallingConvention]::Winapi
+            $entry.SetLastError = $import.SetLastError; $entry.StringMarshalling = $import.StringMarshalling
+        }
+        else { $entry.Convention = $contract.Convention; $entry.ThroughPointer = $true }
+        $stubs[$member] = [PscNativeCalls]::Add($entry)
+    }
+    $root = $ast
+    if ($stubs.Count) { $root = [PscNativeStubFill]::new($stubs).Rebuild($ast) }
+    & $root.GetScriptBlock() @Parameters
 }
 
 # The source with each record variable given its own class: a class whose public properties are the record's slots,
@@ -6124,6 +6161,124 @@ class PscAstRebuild : System.Management.Automation.Language.ICustomAstVisitor2 {
     }
 }
 
+# One native stub of a source run interpreted: a [LibraryImport] method, bound to its export, or an
+# [UnmanagedCallConv] stub, bound per function pointer (its first argument). Its delegate type carries the stub's
+# calling convention, last-error setting and string marshalling, as the lowered P/Invoke or calli would.
+class PscNativeEntry {
+    [string] $Library
+    [string] $EntryPoint
+    [type] $ReturnType
+    [type[]] $ParameterTypes
+    [System.Runtime.InteropServices.CallingConvention] $Convention
+    [bool] $SetLastError
+    [System.Runtime.InteropServices.StringMarshalling] $StringMarshalling
+    [bool] $ThroughPointer
+    hidden [type] $DelegateType
+    hidden [Delegate] $Bound
+    hidden [System.Collections.Generic.Dictionary[IntPtr, Delegate]] $ByPointer = [System.Collections.Generic.Dictionary[IntPtr, Delegate]]::new()
+}
+
+# The native calls of sources run interpreted, by entry number; PscNativeStubFill gives each stub a body calling
+# Invoke with its entry's number and its arguments.
+class PscNativeCalls {
+    static [System.Collections.Generic.List[PscNativeEntry]] $Entries = [System.Collections.Generic.List[PscNativeEntry]]::new()
+    hidden static [System.Reflection.Emit.ModuleBuilder] $Module
+
+    static [int] Add([PscNativeEntry] $entry) {
+        [PscNativeCalls]::Entries.Add($entry)
+        return [PscNativeCalls]::Entries.Count - 1
+    }
+
+    hidden static [type] DelegateFor([PscNativeEntry] $entry) {
+        if ($null -ne $entry.DelegateType) { return $entry.DelegateType }
+        if ($null -eq [PscNativeCalls]::Module) {
+            $assembly = [System.Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly([System.Reflection.AssemblyName]::new('PscNativeCalls'), [System.Reflection.Emit.AssemblyBuilderAccess]::Run)
+            [PscNativeCalls]::Module = $assembly.DefineDynamicModule('PscNativeCalls')
+        }
+        $parameters = [type[]]@($entry.ParameterTypes | Select-Object -Skip $(if ($entry.ThroughPointer) { 1 } else { 0 }))
+        $builder = [PscNativeCalls]::Module.DefineType('Call' + [PscNativeCalls]::Entries.IndexOf($entry), [System.Reflection.TypeAttributes]'Public,Sealed,Class', [System.MulticastDelegate])
+        $constructor = $builder.DefineConstructor([System.Reflection.MethodAttributes]'Public,HideBySig,RTSpecialName', [System.Reflection.CallingConventions]::Standard, [type[]]@([object], [IntPtr]))
+        $constructor.SetImplementationFlags([System.Reflection.MethodImplAttributes]'Runtime,Managed')
+        $invoke = $builder.DefineMethod('Invoke', [System.Reflection.MethodAttributes]'Public,HideBySig,NewSlot,Virtual', $entry.ReturnType, $parameters)
+        $invoke.SetImplementationFlags([System.Reflection.MethodImplAttributes]'Runtime,Managed')
+        $marshalAs = [System.Runtime.InteropServices.MarshalAsAttribute].GetConstructor([type[]]@([System.Runtime.InteropServices.UnmanagedType]))
+        for ($i = 0; $i -lt $parameters.Length; $i++) {
+            if ($parameters[$i] -ne [string]) { continue }
+            $kind = [System.Runtime.InteropServices.UnmanagedType]::LPWStr
+            if ($entry.StringMarshalling -eq [System.Runtime.InteropServices.StringMarshalling]::Utf8) { $kind = [System.Runtime.InteropServices.UnmanagedType]::LPUTF8Str }
+            $invoke.DefineParameter($i + 1, [System.Reflection.ParameterAttributes]::HasFieldMarshal, $null).SetCustomAttribute([System.Reflection.Emit.CustomAttributeBuilder]::new($marshalAs, [object[]]@($kind)))
+        }
+        $pointer = [System.Runtime.InteropServices.UnmanagedFunctionPointerAttribute]
+        $builder.SetCustomAttribute([System.Reflection.Emit.CustomAttributeBuilder]::new($pointer.GetConstructor([type[]]@([System.Runtime.InteropServices.CallingConvention])), [object[]]@($entry.Convention),
+            [System.Reflection.FieldInfo[]]@($pointer.GetField('SetLastError')), [object[]]@($entry.SetLastError)))
+        $entry.DelegateType = $builder.CreateType()
+        return $entry.DelegateType
+    }
+
+    # The stub's call: an import through its bound export; a pointer call through the pointer in its first argument.
+    static [object] Invoke([int] $index, [object[]] $arguments) {
+        $entry = [PscNativeCalls]::Entries[$index]
+        $type = [PscNativeCalls]::DelegateFor($entry)
+        if (-not $entry.ThroughPointer) {
+            if ($null -eq $entry.Bound) {
+                $library = [System.Runtime.InteropServices.NativeLibrary]::Load($entry.Library)
+                $entry.Bound = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer([System.Runtime.InteropServices.NativeLibrary]::GetExport($library, $entry.EntryPoint), $type)
+            }
+            return $entry.Bound.DynamicInvoke($arguments)
+        }
+        [IntPtr] $address = $arguments[0]
+        $bound = $null
+        if (-not $entry.ByPointer.TryGetValue($address, [ref]$bound)) {
+            $bound = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer($address, $type)
+            $entry.ByPointer[$address] = $bound
+        }
+        $rest = [object[]]::new($arguments.Length - 1)
+        [Array]::Copy($arguments, 1, $rest, 0, $rest.Length)
+        return $bound.DynamicInvoke($rest)
+    }
+}
+
+# A source rebuilt for an interpreted run: each native stub's body becomes a call to PscNativeCalls.Invoke with its
+# entry's number and its parameters, returned when the stub returns a value.
+class PscNativeStubFill : PscAstRebuild {
+    [System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast, int]] $Stubs
+
+    PscNativeStubFill([System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast, int]] $stubs) { $this.Stubs = $stubs }
+
+    [System.Management.Automation.Language.Ast] Edit([System.Management.Automation.Language.Ast] $original, [System.Management.Automation.Language.Ast] $rebuilt) {
+        if (-not $this.Stubs.ContainsKey($original)) { return $rebuilt }
+        $extent = $rebuilt.Extent
+        $arguments = [System.Collections.Generic.List[System.Management.Automation.Language.ExpressionAst]]::new()
+        foreach ($parameter in $rebuilt.Parameters) { $arguments.Add([System.Management.Automation.Language.VariableExpressionAst]::new($extent, $parameter.Name.VariablePath, $false)) }
+        $array = $null
+        if ($arguments.Count -eq 0) {
+            $array = [System.Management.Automation.Language.ArrayExpressionAst]::new($extent, [System.Management.Automation.Language.StatementBlockAst]::new($extent, [System.Management.Automation.Language.StatementAst[]]@(), $null))
+        }
+        else {
+            $array = [System.Management.Automation.Language.ConvertExpressionAst]::new($extent,
+                [System.Management.Automation.Language.TypeConstraintAst]::new($extent, [System.Management.Automation.Language.ReflectionTypeName]::new([object[]])),
+                [System.Management.Automation.Language.ArrayLiteralAst]::new($extent, [System.Management.Automation.Language.ExpressionAst[]]$arguments.ToArray()))
+        }
+        $call = [System.Management.Automation.Language.InvokeMemberExpressionAst]::new($extent,
+            [System.Management.Automation.Language.TypeExpressionAst]::new($extent, [System.Management.Automation.Language.ReflectionTypeName]::new([PscNativeCalls])),
+            [System.Management.Automation.Language.StringConstantExpressionAst]::new($extent, 'Invoke', [System.Management.Automation.Language.StringConstantType]::BareWord),
+            [System.Management.Automation.Language.ExpressionAst[]]@([System.Management.Automation.Language.ConstantExpressionAst]::new($extent, $this.Stubs[$original]), $array), $true)
+        $pipeline = [System.Management.Automation.Language.PipelineAst]::new($extent, [System.Management.Automation.Language.CommandExpressionAst]::new($extent, $call, $null))
+        $statement = $null
+        if ($null -ne $rebuilt.ReturnType -and $rebuilt.ReturnType.TypeName.FullName -notin 'void', 'System.Void') { $statement = [System.Management.Automation.Language.ReturnStatementAst]::new($extent, $pipeline) }
+        else { $statement = [System.Management.Automation.Language.AssignmentStatementAst]::new($extent, [System.Management.Automation.Language.VariableExpressionAst]::new($extent, 'null', $false), [System.Management.Automation.Language.TokenKind]::Equals, $pipeline, $extent) }
+        $block = [System.Management.Automation.Language.StatementBlockAst]::new($extent, [System.Management.Automation.Language.StatementAst[]]@($statement), $null)
+        $body = [System.Management.Automation.Language.ScriptBlockAst]::new($rebuilt.Body.Extent, $null, $block, $false)
+        $parameters = [System.Management.Automation.Language.ParameterAst[]]@($rebuilt.Parameters | ForEach-Object { $_.Copy() })
+        $inner = $rebuilt.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and [object]::ReferenceEquals($n.Parent, $rebuilt) }, $false)
+        $definition = [System.Management.Automation.Language.FunctionDefinitionAst]::new($inner.Extent, $false, $false, $rebuilt.Name, $parameters, $body)
+        $attributes = [System.Management.Automation.Language.AttributeAst[]]@($rebuilt.Attributes | ForEach-Object { $_.Copy() })
+        $returnType = $null
+        if ($null -ne $rebuilt.ReturnType) { $returnType = $rebuilt.ReturnType.Copy() }
+        return [System.Management.Automation.Language.FunctionMemberAst]::new($rebuilt.Extent, $definition, $returnType, $attributes, $rebuilt.MethodAttributes)
+    }
+}
+
 # Each operator whose token is a key becomes a static call to its method, on the operator's rebuilt operands: SMA
 # then evaluates that operator by the method instead of its own binder. Increment and decrement assign, and are kept.
 class PscOperatorRebinding : PscAstRebuild {
@@ -6277,6 +6432,9 @@ class PscApi {
         if ($records.Count -eq 0) { return $source }
         return [PscRecordRewrite]::new($source, $records).Rebuild($source)
     }
+
+    # The source run by SMA with its native stubs filled just in time, given its parameters by name.
+    [object] Run([System.Management.Automation.Language.ScriptBlockAst] $source, [hashtable] $parameters) { return & $this.Script -Mode Run -SourceAst $source -RunParameters $parameters }
 
     # A new tree of the same structure, every node constructed again by SMA.
     [System.Management.Automation.Language.ScriptBlockAst] Rebuild([System.Management.Automation.Language.ScriptBlockAst] $source) {
@@ -8868,6 +9026,11 @@ process {
         'Records' {
             if ($null -eq $SourceAst) { throw 'Records requires -SourceAst.' }
             Get-PscRecord -Root $SourceAst
+        }
+        'Run' {
+            if ($null -ne $SourceAst) { Invoke-PscRun -Ast $SourceAst -Parameters $RunParameters }
+            elseif ($SourcePath) { Invoke-PscRun -Path $SourcePath -Parameters $RunParameters }
+            else { throw 'Run requires -SourcePath or -SourceAst.' }
         }
         'Readme' {
             $readme = Join-Path $PSScriptRoot 'README.md'
