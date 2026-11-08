@@ -18,23 +18,28 @@ of inputs and measurements.
 | Notepad.ps1 | 14,152 lines, 727,618 bytes, 75,193 AST nodes (before the model change) |
 | Framework code in it | 10,600 lines; `Invoke-Design` alone 9,835 |
 | Comparison and test tooling in it | 1,991 lines |
-| Model | 625 lines, now typed classes (`NotepadModel`, `NotepadTab`, `NotepadFind`, ...) on `psc-typed-model`, uncommitted |
-| App (painting, input, commands) | 895 lines |
-| Members lowering | 56 of 122 with the typed model and PSC's later lowering (25 of 89 before); every model member but `ImportSession` |
-| `-VerifyModel`, `-VerifyGraphics` | pass on `psc-typed-model` |
-| 3-second UI run diagnostics | 24 of 24 entries equal to `main` except `ScrollX` `0` → `0.0` (one literal corrected in `Paint-Editor`) |
+| Model, window, graphics | typed classes on `psc-typed-model`: `NotepadModel` and its records, `NotepadWindow` (Win32 imports, an `[UnmanagedCallersOnly]` window procedure), `NotepadGraphics` (Direct2D, DirectWrite and WIC through COM pointer stubs) |
+| Interpreted runs | through PSC: `Invoke-PSC.ps1 -Mode Run -SourcePath Notepad.ps1 -RunParameters @{...}` fills the native stubs and callbacks just in time; run directly under pwsh, the first native call throws |
+| Members lowering | 213 of 274 (native stubs included), every member of the classes; 25 of 89 before the model change |
+| `-VerifyModel`, `-VerifyGraphics` | pass through PSC Run |
+| 3-second UI run diagnostics | 24 of 24 entries equal to `main` except `ScrollX` `0` → `0.0` (one literal corrected in `Paint-Editor`); with the entrance animation on, the entrance completes |
 
 ### To a native Notepad.exe
 
-1. Typed model: committed on `psc-typed-model` (`41dc8ed`).
-2. PSC lowering gaps remaining: `$MyInvocation`; `catch` reading `$_`; expandable strings; multi-element pipelines
-   and cmdlets; nested script blocks; overload resolution with `[object]` arguments; `DateTime` minus
-   `Nullable[DateTime]`; a parameter default that is not a constant. Closed: `foreach` over `IEnumerable<T>` and
-   values known only at run time; indexing a string; optional parameters (`String.Split(string)`); `.Count` on an
-   array; string `+` any value and `[string]` of any value, as PowerShell formats them.
-   Known difference: an index past the end of an array, list or string throws when lowered; SMA gives `$null`.
-3. Window, graphics and services modules (`New-Module -AsCustomObject`, 207, 310 and 78 lines) to classes with
-   static native calls in place of `DynamicInvoke`, from QuickPS's versions as the one source.
+1. Model, window and graphics as typed classes: done. Services module (78 lines) remains a `New-Module` object.
+2. PSC lowering gaps remaining: `$MyInvocation` (the dot-source guards of the folded scripts); multi-element
+   pipelines and cmdlets; nested script blocks; overload resolution with `[object]` arguments; `DateTime` minus
+   `Nullable[DateTime]`; a parameter default that is not a constant.
+   Closed: `foreach` over any value; indexing a string; optional parameters; `.Count` on an array; `[string]`
+   and string `+` as PowerShell formats them; `@( )`, `$( )`, `@{ }`, statements as values; `-f`; text read by a
+   type's `Parse`; `[ref]` arguments; closest overload; array conversion; `-match` family; rethrow; `$_.Exception`
+   in a catch; throw of an exception value; `$null =`; expandable strings; conditions by static type.
+   Known differences, lowered against SMA: an index past the end throws (SMA gives `$null`); Int32, Int64 and
+   unsigned overflow throws (SMA moves to `Double`); exact integral division is `Double` (SMA keeps the integral
+   type); a mixed signed and unsigned operation whose signed operand is not a non-negative constant is refused (SMA's
+   type depends on the value); a `$null` passed by reflection into a `[string]` parameter stays `$null` (SMA gives
+   `''`).
+3. `-VerifyWindow` launches Notepad.ps1 directly and is to launch through PSC Run.
 4. Notepad corrections, semantics preserved and checked by Notepad's own runs:
    - identities held in strings (`$ui.Hover`, `Pressed`, `Focus`, `Menu`, `Submenu`, `Nodes` keyed by string) to
      typed identities;
