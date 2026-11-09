@@ -20,8 +20,8 @@ of inputs and measurements.
 | Comparison and test tooling in it | 1,991 lines |
 | Model, window, graphics | typed classes on `psc-typed-model`: `NotepadModel` and its records, `NotepadWindow` (Win32 imports, an `[UnmanagedCallersOnly]` window procedure), `NotepadGraphics` (Direct2D, DirectWrite and WIC through COM pointer stubs) |
 | Interpreted runs | through PSC: `Invoke-PSC.ps1 -Mode Run -SourcePath Notepad.ps1 -RunParameters @{...}` fills the native stubs and callbacks just in time; run directly under pwsh, the first native call throws |
-| Members lowering | 223 of 274 (native stubs included), every member of the classes; 25 of 89 before the model change |
-| Interface state | `$ui` is `[NotepadUi]`; its colour picker, modal and dropdown are `NotepadColorPicker`, `NotepadModal` (`NotepadModalButton`) and `NotepadDropdown` (`NotepadOption`) |
+| Members lowering | 227 of 275 (native stubs included), every member of the classes; 25 of 89 before the model change |
+| Interface state | `$ui` is `[NotepadUi]`; its colour picker, modal and dropdown are `NotepadColorPicker`, `NotepadModal` (`NotepadModalButton`) and `NotepadDropdown` (`NotepadOption`); hit-test nodes are `NotepadHitNode` (their `Data` is still `[object]`); window events reach `Handle-Event` and `Key-Input` as `NotepadWindowEvent` |
 | `-VerifyModel`, `-VerifyGraphics` | pass through PSC Run |
 | 3-second UI run diagnostics | 24 of 24 entries equal to `main` except `ScrollX` `0` → `0.0` (one literal corrected in `Paint-Editor`); with the entrance animation on, the entrance completes |
 
@@ -36,14 +36,21 @@ of inputs and measurements.
    type's `Parse`; `[ref]` arguments; closest overload; array conversion; `-match` family; rethrow; `$_.Exception`
    in a catch; throw of an exception value; `$null =`; expandable strings; conditions by static type; `Nullable`
    equality; `$null`/`$true`/`$false` defaults; `$MyInvocation.InvocationName`; a hashtable literal converted to a
-   class; a number to `[bool]`; `$null` to `[string]` is `''` at every typed site.
+   class; a number to `[bool]`; `$null` to `[string]` is `''` at every typed site; a number `-in` a list of numeric
+   constants; `+` and `-` with a numeric `Nullable` when its `$null` and its value give one result type; `++` and
+   `--` on a numeric `Nullable`.
+   Refused because SMA's result type depends on the value: `+`/`-` with a `Nullable` whose `$null` and value give
+   different types (`Nullable[double] + int` is `Int32` when `$null`); `*`, `/`, `%` with a `Nullable`.
    Known differences, lowered against SMA: an index past the end throws (SMA gives `$null`); Int32, Int64 and
    unsigned overflow throws (SMA moves to `Double`); exact integral division is `Double` (SMA keeps the integral
    type); a mixed signed and unsigned operation whose signed operand is not a non-negative constant is refused (SMA's
    type depends on the value); a `$null` passed by reflection into a `[string]` parameter stays `$null` (SMA gives
    `''`).
 3. `-VerifyWindow` launches Notepad.ps1 directly and is to launch through PSC Run.
-4. Notepad corrections, semantics preserved and checked by Notepad's own runs:
+4. Notepad corrections, semantics preserved and checked by Notepad's own runs (the 3-second run's `Generation`
+   counts frames and varies with timing: 9 in one of four runs where the others gave 7):
+   - a command's data (`NotepadHitNode.Data`, `Command`'s `$Data`) as typed records: text, a tab or palette index,
+     a dropdown, a modal button, a setting choice;
    - identities held in strings (`$ui.Hover`, `Pressed`, `Focus`, `Menu`, `Submenu`, `Nodes` keyed by string) to
      typed identities;
    - `$Event` untyped; 22 `$ui` slots untyped or written with two types (`EditorOrigin` `Double[]` and `Int32[]`);

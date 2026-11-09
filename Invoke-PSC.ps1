@@ -3625,6 +3625,20 @@ function Convert-AstExpression {
             $target = Convert-AstExpression -Node $Node.Child -Scope $Scope
             $one = [Linq.Expressions.Expression]::Constant(1, [int])
             $operand = $target
+            # A numeric Nullable steps from its value, or from zero when $null ($null++ is 1 in PowerShell); the result is
+            # stored back as the Nullable's type, whichever type the step had.
+            if ($target.Type.IsGenericType -and $target.Type.GetGenericTypeDefinition() -eq [Nullable`1] -and
+                ($target.Type.GetGenericArguments()[0] -in $script:IntegralTypes -or $target.Type.GetGenericArguments()[0] -in $script:FloatingTypes)) {
+                $slot = [Linq.Expressions.Expression]::Variable($target.Type, 'stepped' + $Scope.DeclaredLocals.Count)
+                $Scope.DeclaredLocals.Add($slot)
+                $operand = [Linq.Expressions.Expression]::Block($target.Type.GetGenericArguments()[0], [Linq.Expressions.Expression[]]@(
+                    [Linq.Expressions.Expression]::Assign($slot, $target), [Linq.Expressions.Expression]::Call($slot, $target.Type.GetMethod('GetValueOrDefault', [Type[]]@()))))
+                $widened = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Arithmetic, $operand, $one)
+                if ($widened) { $operand = $widened.Left; $one = $widened.Right } else { $one = [Linq.Expressions.Expression]::Constant([Convert]::ChangeType(1, $operand.Type), $operand.Type) }
+                $operator = if ($Node.TokenKind -in 'PostfixPlusPlus', 'PrefixPlusPlus') { 'Plus' } else { 'Minus' }
+                $stepped = ConvertTo-PowerShellType -Expression (New-PowerShellArithmetic -Operator $operator -Left $operand -Right $one) -Type $target.Type.GetGenericArguments()[0]
+                return [Linq.Expressions.Expression]::Assign($target, [Linq.Expressions.Expression]::Convert($stepped, $target.Type))
+            }
             $widened = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Arithmetic, $target, $one)
             if ($widened) { $operand = $widened.Left; $one = $widened.Right } else { $one = [Linq.Expressions.Expression]::Constant([Convert]::ChangeType(1, $target.Type), $target.Type) }
             $operator = if ($Node.TokenKind -in 'PostfixPlusPlus', 'PrefixPlusPlus') { 'Plus' } else { 'Minus' }
@@ -3664,6 +3678,38 @@ function Convert-AstExpression {
             return $instance
         }
         $left = Convert-AstExpression -Node $Node.Left -Scope $Scope
+        # A number -in a list of numeric constants: PowerShell tests item -eq value for each item; lowered as that
+        # comparison, the value evaluated once.
+        if ($Node.Operator -in 'Iin', 'Inotin', 'Cin', 'Cnotin' -and ($left.Type -in $script:IntegralTypes -or $left.Type -in $script:FloatingTypes)) {
+            $listed = $Node.Right
+            if ($listed -is [System.Management.Automation.Language.ArrayExpressionAst] -and $null -eq $listed.SubExpression.Traps -and $listed.SubExpression.Statements.Count -eq 1 -and
+                $listed.SubExpression.Statements[0] -is [System.Management.Automation.Language.PipelineAst] -and $listed.SubExpression.Statements[0].PipelineElements.Count -eq 1 -and
+                $listed.SubExpression.Statements[0].PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst]) {
+                $listed = $listed.SubExpression.Statements[0].PipelineElements[0].Expression
+            }
+            $items = if ($listed -is [System.Management.Automation.Language.ArrayLiteralAst]) { @($listed.Elements) } else { @($listed) }
+            $numeric = @($items | Where-Object { $_ -is [System.Management.Automation.Language.ConstantExpressionAst] -and $_ -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -and
+                ($_.StaticType -in $script:IntegralTypes -or $_.StaticType -in $script:FloatingTypes) })
+            if ($numeric.Count -ne $items.Count) {
+                throw "[$($Node.Extent.StartLineNumber):$($Node.Extent.StartColumnNumber)] Membership of a number is lowered only in a list of numeric constants."
+            }
+            $et = [Linq.Expressions.Expression]
+            $value = $et::Variable($left.Type, "membershipValue$($Scope.DeclaredLocals.Count)")
+            $Scope.DeclaredLocals.Add($value)
+            [Linq.Expressions.Expression] $found = $et::Constant($false)
+            foreach ($item in $items) {
+                $element = $et::Constant($item.Value, $item.StaticType)
+                $compared = $value
+                $widened = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Comparison, $element, $compared)
+                if ($widened) { $element = $widened.Left; $compared = $widened.Right }
+                if ($element.Type -ne $compared.Type) {
+                    throw "[{0}:{1}] Membership has no common type for '{2}' and '{3}'." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $item.StaticType.FullName, $left.Type.FullName
+                }
+                $found = if ($found -is [Linq.Expressions.ConstantExpression]) { $et::Equal($element, $compared) } else { $et::OrElse($found, $et::Equal($element, $compared)) }
+            }
+            $result = if ($Node.Operator -in 'Inotin', 'Cnotin') { $et::Not($found) } else { $found }
+            return $et::Block([bool], [Linq.Expressions.Expression[]]@($et::Assign($value, $left), $result))
+        }
         if ($Node.Operator -in 'Iin', 'Inotin', 'Cin', 'Cnotin') {
             $right = Convert-AstExpressionAs -Node $Node.Right -Type ([string[]]) -Scope $Scope
             if ($left.Type -ne [string]) {
@@ -3778,6 +3824,33 @@ function Convert-AstExpression {
                 if ($null -ne $equal) {
                     if ($Node.Operator -in 'Ine', 'Cne') { $equal = $et::Not($equal) }
                     return $et::Block([bool], [Linq.Expressions.Expression[]]@($et::Assign($value, $held), $equal))
+                }
+            }
+        }
+        # + and - with a numeric Nullable[T] and a number: a $null Nullable acts as zero of the other operand's type, a
+        # held value as T (measured on SMA). Lowered as the value or zero when both give one type; when they do not
+        # ($null + 5 is Int32 for a Nullable[double]), the type depends on the value and the operation is refused below.
+        # *, / and % with a $null give $null, 0, Infinity, NaN or throw by side and are not lowered.
+        if ($Node.Operator -in 'Plus', 'Minus') {
+            $nullableNumber = { param([Type] $t) $t.IsGenericType -and $t.GetGenericTypeDefinition() -eq [Nullable`1] -and ($t.GetGenericArguments()[0] -in $script:IntegralTypes -or $t.GetGenericArguments()[0] -in $script:FloatingTypes) }
+            $number = { param([Type] $t) $t -in $script:IntegralTypes -or $t -in $script:FloatingTypes }
+            $heldLeft = (& $nullableNumber $left.Type) -and (& $number $right.Type)
+            $heldRight = (& $nullableNumber $right.Type) -and (& $number $left.Type)
+            if ($heldLeft -or $heldRight) {
+                $et = [Linq.Expressions.Expression]
+                $other = if ($heldLeft) { $right.Type } else { $left.Type }
+                $held = if ($heldLeft) { $left.Type.GetGenericArguments()[0] } else { $right.Type.GetGenericArguments()[0] }
+                $operands = $script:PscEnvironment.Get('NumericOperands')
+                $withValue = if ($heldLeft) { $operands.Bind([PscOperatorKind]::Arithmetic, $et::Default($held), $et::Default($other)) } else { $operands.Bind([PscOperatorKind]::Arithmetic, $et::Default($other), $et::Default($held)) }
+                $withNull = $operands.Bind([PscOperatorKind]::Arithmetic, $et::Default($other), $et::Default($other))
+                $valueType = if ($withValue) { $withValue.Left.Type } elseif ($held -eq $other) { $held } else { $null }
+                $nullType = if ($withNull) { $withNull.Left.Type } else { $other }
+                if ($null -ne $valueType -and $valueType -eq $nullType) {
+                    $nullable = if ($heldLeft) { $left } else { $right }
+                    $slot = $et::Variable($nullable.Type, 'operand' + $Scope.DeclaredLocals.Count)
+                    $Scope.DeclaredLocals.Add($slot)
+                    $read = $et::Block($held, [Linq.Expressions.Expression[]]@($et::Assign($slot, $nullable), $et::Call($slot, $nullable.Type.GetMethod('GetValueOrDefault', [Type[]]@()))))
+                    if ($heldLeft) { $left = $read } else { $right = $read }
                 }
             }
         }
