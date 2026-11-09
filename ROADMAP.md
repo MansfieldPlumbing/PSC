@@ -11,6 +11,9 @@ The app is to become `Invoke-Notepad.ps1`, compiled by `Invoke-PSC.ps1` to a Nat
 script fetches both and the NuGet inputs, records the SHA-512 of each, compiles, runs the checks, and keeps a record
 of inputs and measurements.
 
+Order, set by Scott: a native Notepad.exe first (compile a script: item 8; the remaining refusals: items 2, 4, 9
+and 10); the reusable Fluent framework (item 14) after it.
+
 ### State
 
 | Measure | Value |
@@ -107,7 +110,11 @@ of inputs and measurements.
     backend implements on Android. Decided by Scott: the framework lives in PSC and is compiled into an app that
     asks for it, under a flag. It is PowerShell classes in Invoke-PSC.ps1; SMA must see them as it sees the app's
     own (in a Run, defined before the app runs; in a Compile, its class definitions join the app's source before
-    lowering), so an app written against them parses, runs interpreted and compiles alike.
+    lowering), so an app written against them parses, runs interpreted and compiles alike. The framework is general:
+    nothing in it names Notepad. First piece: theming (the palette and colour lookup), hit testing (the node and its
+    collections) and `Button`, each a framework class taking its surface, theme and input state as arguments;
+    Notepad then uses them, checked by its own runs (model, graphics, diagnostics equal). The other controls, the
+    window and drawing follow. Order, set by Scott: after a native Notepad.exe.
 15. Acrylic in an unfocused window. DWM's system backdrops (`DWMWA_SYSTEMBACKDROP_TYPE`, which Notepad uses) fall
     back to a solid colour when the window is inactive. Windows Terminal keeps acrylic unfocused
     (`compatibility.enableUnfocusedAcrylic`): its terminal background is a XAML `AcrylicBrush`, `HostBackdrop`
