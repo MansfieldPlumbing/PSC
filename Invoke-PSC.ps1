@@ -1861,7 +1861,9 @@ function New-ScriptFunctionCall {
         if ($null -ne $bound[$p]) { continue }
         $default = $parameters[$p].DefaultValue
         if ($null -eq $default) { $bound[$p] = [Linq.Expressions.Expression]::Default($types[$p]); continue }
-        if ($default -isnot [System.Management.Automation.Language.ConstantExpressionAst]) {
+        # $null, $true and $false are constants too, though SMA's AST holds them as variables.
+        $constantVariable = $default -is [System.Management.Automation.Language.VariableExpressionAst] -and $default.VariablePath.UserPath -in 'null', 'true', 'false'
+        if ($default -isnot [System.Management.Automation.Language.ConstantExpressionAst] -and -not $constantVariable) {
             throw ($where + "the default of `$$($parameters[$p].Name.VariablePath.UserPath) in $name is evaluated in $name ($($default.Extent.Text)); only a constant default lowers at the call.")
         }
         $bound[$p] = Convert-AstExpressionAs -Node $default -Type $types[$p] -Scope $Scope
@@ -3697,6 +3699,29 @@ function Convert-AstExpression {
         if ($Node.Operator -in 'Ieq', 'Ine', 'Ceq', 'Cne') {
             if ($left -is [Linq.Expressions.ConstantExpression] -and $null -eq $left.Value -and -not $right.Type.IsValueType) { $left = [Linq.Expressions.Expression]::Constant($null, $right.Type) }
             if ($right -is [Linq.Expressions.ConstantExpression] -and $null -eq $right.Value -and -not $left.Type.IsValueType) { $right = [Linq.Expressions.Expression]::Constant($null, $left.Type) }
+            # A Nullable[T] against a T or $null compares lifted: $null equals only $null, as in PowerShell. (Ordering
+            # differs: PowerShell orders $null first, a lifted comparison is false; it is not lowered.)
+            # Built as HasValue tests rather than a lifted operator: against $null, no value; against a T, a value equal
+            # to it.
+            $nullable = { param([Type] $t) $t.IsGenericType -and $t.GetGenericTypeDefinition() -eq [Nullable`1] }
+            $held = $null; $other = $null
+            if ((& $nullable $left.Type) -and -not (& $nullable $right.Type)) { $held = $left; $other = $right }
+            elseif ((& $nullable $right.Type) -and -not (& $nullable $left.Type)) { $held = $right; $other = $left }
+            if ($null -ne $held) {
+                $et = [Linq.Expressions.Expression]
+                $value = $et::Variable($held.Type, 'compared' + $Scope.DeclaredLocals.Count)
+                $Scope.DeclaredLocals.Add($value)
+                $hasValue = $et::Property($value, 'HasValue')
+                $equal = $null
+                if ($other -is [Linq.Expressions.ConstantExpression] -and $null -eq $other.Value) { $equal = $et::Not($hasValue) }
+                elseif ($other.Type -eq $held.Type.GetGenericArguments()[0]) {
+                    $equal = $et::AndAlso($hasValue, $et::Equal($et::Call($value, $held.Type.GetMethod('GetValueOrDefault', [Type[]]@())), $other))
+                }
+                if ($null -ne $equal) {
+                    if ($Node.Operator -in 'Ine', 'Cne') { $equal = $et::Not($equal) }
+                    return $et::Block([bool], [Linq.Expressions.Expression[]]@($et::Assign($value, $held), $equal))
+                }
+            }
         }
         # Bitwise operators on enums, as SMA gives them: computed on the enums' underlying integral types; the result is
         # the left operand's enum type when the left operand is an enum, and the integral type when it is an integer.
@@ -3900,6 +3925,15 @@ function Convert-AstExpression {
             $Node.Member.Value
         } else {
             $Node.Member.Extent.Text
+        }
+
+        # $MyInvocation.InvocationName in a script function lowered as a method is the function's own name: it is called
+        # by name, never dot-sourced.
+        if (-not $Node.Static -and $memberName -eq 'InvocationName' -and $Node.Expression -is [System.Management.Automation.Language.VariableExpressionAst] -and
+            $Node.Expression.VariablePath.UserPath -eq 'MyInvocation') {
+            $owner = $Node.Parent
+            while ($null -ne $owner -and $owner -isnot [System.Management.Automation.Language.FunctionMemberAst]) { $owner = $owner.Parent }
+            if ($null -ne $owner -and (Test-ScriptFunctionMember $owner)) { return [Linq.Expressions.Expression]::Constant($owner.Name, [string]) }
         }
 
         # $_.Exception in a catch body is the exception the catch caught.
@@ -5347,6 +5381,14 @@ function Write-IlConstant {
 
     $val = $Expr.Value
     if ($null -eq $val) {
+        # A null of a value type (a Nullable's $null) is its default value, not a null reference.
+        if ($Expr.Type.IsValueType) {
+            $empty = $IL.DeclareLocal((Get-IlType $Expr.Type))
+            $IL.Emit([Reflection.Emit.OpCodes]::Ldloca, $empty)
+            $IL.Emit([Reflection.Emit.OpCodes]::Initobj, (Get-IlType $Expr.Type))
+            $IL.Emit([Reflection.Emit.OpCodes]::Ldloc, $empty)
+            return
+        }
         $IL.Emit([Reflection.Emit.OpCodes]::Ldnull)
         return
     }
@@ -5440,6 +5482,21 @@ function Write-IlConversion {
     )
 
     if ($FromType -eq $ToType) { return }
+
+    # Nullable[T] from T is the constructor; T from Nullable[T] is its Value, read through a local's address (an
+    # empty Nullable throws, as PowerShell's cast of $null to a value type does not reach here: it is a default).
+    $isNullable = { param([Type] $t) $t.IsGenericType -and $t.GetGenericTypeDefinition() -eq [Nullable`1] }
+    if ((& $isNullable $ToType) -and $FromType -eq $ToType.GetGenericArguments()[0]) {
+        $IL.Emit([Reflection.Emit.OpCodes]::Newobj, (Get-IlType $ToType).GetConstructor([Type[]]@((Get-IlType $FromType))))
+        return
+    }
+    if ((& $isNullable $FromType) -and $ToType -eq $FromType.GetGenericArguments()[0]) {
+        $held = $IL.DeclareLocal((Get-IlType $FromType))
+        $IL.Emit([Reflection.Emit.OpCodes]::Stloc, $held)
+        $IL.Emit([Reflection.Emit.OpCodes]::Ldloca, $held)
+        $IL.Emit([Reflection.Emit.OpCodes]::Call, (Get-IlType $FromType).GetProperty('Value').GetGetMethod())
+        return
+    }
 
     # Boxing and unboxing come first: a numeric opcode applied to a reference
     # converts the reference's bits, not the value it holds.
