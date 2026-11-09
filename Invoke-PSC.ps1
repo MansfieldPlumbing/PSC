@@ -2211,6 +2211,10 @@ function ConvertTo-PowerShellType {
         $constructor = $Type.GetConstructor([Type[]]@([string]))
         if ($null -ne $constructor) { return $script:ExpressionNewMethod.Invoke($null, [object[]]@($constructor, [Linq.Expressions.Expression[]]@($Expression))) }
     }
+    # A number to [bool], as PowerShell converts it: $true when it is not zero (NaN is not zero).
+    if ($Type -eq [bool] -and ($from -in $script:IntegralTypes -or $from -in $script:FloatingTypes)) {
+        return [Linq.Expressions.Expression]::NotEqual($Expression, [Linq.Expressions.Expression]::Default($from))
+    }
     if ($from -in $script:IntegralTypes -and $Type -eq [char]) {
         # PowerShell's integral-to-Char cast checks the UTF-16 code-unit range.
         # A plain conv.u2 would silently truncate negative or oversized values.
@@ -2654,11 +2658,19 @@ function Convert-AstExpressionAs {
         $built = New-TypedArrayLiteral -Node $inner -ElementType $Type.GetElementType() -Scope $Scope
         if ($null -ne $built) { return $built }
     }
+    $table = $inner
+    if ($table -is [System.Management.Automation.Language.CommandExpressionAst] -and $table.Redirections.Count -eq 0) { $table = $table.Expression }
+    if ($table -is [System.Management.Automation.Language.HashtableAst]) {
+        $object = New-PowerShellTableObject -Table $table -Type $Type -Scope $Scope
+        if ($null -ne $object) { return $object }
+    }
     $quotient = ConvertTo-IntegralQuotient -Node $Node -Type $Type -Scope $Scope
     if ($null -ne $quotient) { return $quotient }
     $value = Convert-AstExpression -Node $Node -Scope $Scope
     if ($value.Type -eq $Type) { return $value }
-    if ($value -is [Linq.Expressions.ConstantExpression] -and $null -eq $value.Value -and -not $Type.IsValueType) {
+    # $null to a reference type stays $null, except to [string]: PowerShell converts it to '' at every typed site
+    # (return, argument, typed variable, property, array element and cast; measured on SMA).
+    if ($value -is [Linq.Expressions.ConstantExpression] -and $null -eq $value.Value -and -not $Type.IsValueType -and $Type -ne [string]) {
         return [Linq.Expressions.Expression]::Constant($null, $Type)
     }
     ConvertTo-PowerShellType -Expression $value -Type $Type
@@ -2667,6 +2679,48 @@ function Convert-AstExpressionAs {
 # A PowerShell custom object is an SMA PSObject over PSCustomObject whose members are note properties in the
 # order they were written. Compiled code builds and uses it through SMA's own PSObject API, so its Extended Type
 # System behaviour (ordering, type identity, formatting, later Add-Member) is PowerShell's, not an imitation.
+function New-PowerShellTableObject {
+    <#
+    .SYNOPSIS
+        Lowers a hashtable literal converted to a class, as PowerShell converts a
+        dictionary to a type with a parameterless constructor.
+    .DESCRIPTION
+        PowerShell constructs the type, then sets each key's member (a public
+        settable property or a public field, matched without regard to case) to
+        the key's value converted to that member's type. Values are lowered in
+        source order. Returns $null when the conversion is not this one: the type
+        is a dictionary, PSObject or value type, or has no public parameterless
+        constructor, or a key is not constant text. A key that names no settable
+        member throws, as PowerShell's conversion does at run time.
+    #>
+    param(
+        [Parameter(Mandatory)][System.Management.Automation.Language.HashtableAst] $Table,
+        [Parameter(Mandatory)][Type] $Type,
+        [Parameter(Mandatory)][hashtable] $Scope
+    )
+    if ($Type.IsValueType -or $Type.IsAbstract -or $Type -eq [object] -or $Type -eq [System.Management.Automation.PSObject] -or
+        [System.Collections.IDictionary].IsAssignableFrom($Type)) { return $null }
+    $constructor = $Type.GetConstructor([Type]::EmptyTypes)
+    if ($null -eq $constructor) { return $null }
+    $flags = [Reflection.BindingFlags]'Public,Instance,IgnoreCase'
+    $object = [Linq.Expressions.Expression]::Variable($Type, "tableObject$($Scope.DeclaredLocals.Count)")
+    $Scope.DeclaredLocals.Add($object)
+    $parts = [System.Collections.Generic.List[Linq.Expressions.Expression]]::new()
+    $parts.Add([Linq.Expressions.Expression]::Assign($object, $script:ExpressionNewMethod.Invoke($null, @($constructor, [Linq.Expressions.Expression[]]@()))))
+    foreach ($pair in $Table.KeyValuePairs) {
+        if ($pair.Item1 -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { return $null }
+        $name = $pair.Item1.Value
+        [Reflection.MemberInfo] $member = $Type.GetProperty($name, $flags)
+        if ($null -ne $member -and -not $member.CanWrite) { $member = $null }
+        if ($null -eq $member) { $member = $Type.GetField($name, $flags) }
+        if ($null -eq $member) { throw "[$($pair.Item1.Extent.StartLineNumber):$($pair.Item1.Extent.StartColumnNumber)] $($Type.Name) has no settable member '$name'." }
+        $memberType = if ($member -is [Reflection.PropertyInfo]) { $member.PropertyType } else { $member.FieldType }
+        $parts.Add([Linq.Expressions.Expression]::Assign([Linq.Expressions.Expression]::MakeMemberAccess($object, $member), (Convert-AstExpressionAs -Node $pair.Item2 -Type $memberType -Scope $Scope)))
+    }
+    $parts.Add($object)
+    [Linq.Expressions.Expression]::Block($Type, [Linq.Expressions.Expression[]]$parts.ToArray())
+}
+
 function New-PowerShellCustomObject {
     param([Parameter(Mandatory)][System.Management.Automation.Language.HashtableAst] $Table, [Parameter(Mandatory)][hashtable] $Scope)
     $object = [Linq.Expressions.Expression]::Variable([System.Management.Automation.PSObject], "customObject$($Scope.DeclaredLocals.Count)")
@@ -3547,6 +3601,10 @@ function Convert-AstExpression {
         # [pscustomobject]@{ ... }: a PowerShell custom object, built through SMA's PSObject.
         if ($targetType -eq [System.Management.Automation.PSObject] -and $Node.Child -is [System.Management.Automation.Language.HashtableAst]) {
             return New-PowerShellCustomObject -Table $Node.Child -Scope $Scope
+        }
+        if ($Node.Child -is [System.Management.Automation.Language.HashtableAst]) {
+            $object = New-PowerShellTableObject -Table $Node.Child -Type $targetType -Scope $Scope
+            if ($null -ne $object) { return $object }
         }
         if ($targetType.IsArray) {
             $childNode = $Node.Child

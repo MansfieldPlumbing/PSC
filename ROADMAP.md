@@ -20,7 +20,8 @@ of inputs and measurements.
 | Comparison and test tooling in it | 1,991 lines |
 | Model, window, graphics | typed classes on `psc-typed-model`: `NotepadModel` and its records, `NotepadWindow` (Win32 imports, an `[UnmanagedCallersOnly]` window procedure), `NotepadGraphics` (Direct2D, DirectWrite and WIC through COM pointer stubs) |
 | Interpreted runs | through PSC: `Invoke-PSC.ps1 -Mode Run -SourcePath Notepad.ps1 -RunParameters @{...}` fills the native stubs and callbacks just in time; run directly under pwsh, the first native call throws |
-| Members lowering | 213 of 274 (native stubs included), every member of the classes; 25 of 89 before the model change |
+| Members lowering | 223 of 274 (native stubs included), every member of the classes; 25 of 89 before the model change |
+| Interface state | `$ui` is `[NotepadUi]`; its colour picker, modal and dropdown are `NotepadColorPicker`, `NotepadModal` (`NotepadModalButton`) and `NotepadDropdown` (`NotepadOption`) |
 | `-VerifyModel`, `-VerifyGraphics` | pass through PSC Run |
 | 3-second UI run diagnostics | 24 of 24 entries equal to `main` except `ScrollX` `0` → `0.0` (one literal corrected in `Paint-Editor`); with the entrance animation on, the entrance completes |
 
@@ -33,7 +34,9 @@ of inputs and measurements.
    Closed: `foreach` over any value; indexing a string; optional parameters; `.Count` on an array; `[string]`
    and string `+` as PowerShell formats them; `@( )`, `$( )`, `@{ }`, statements as values; `-f`; text read by a
    type's `Parse`; `[ref]` arguments; closest overload; array conversion; `-match` family; rethrow; `$_.Exception`
-   in a catch; throw of an exception value; `$null =`; expandable strings; conditions by static type.
+   in a catch; throw of an exception value; `$null =`; expandable strings; conditions by static type; `Nullable`
+   equality; `$null`/`$true`/`$false` defaults; `$MyInvocation.InvocationName`; a hashtable literal converted to a
+   class; a number to `[bool]`; `$null` to `[string]` is `''` at every typed site.
    Known differences, lowered against SMA: an index past the end throws (SMA gives `$null`); Int32, Int64 and
    unsigned overflow throws (SMA moves to `Double`); exact integral division is `Double` (SMA keeps the integral
    type); a mixed signed and unsigned operation whose signed operand is not a non-negative constant is refused (SMA's
@@ -61,6 +64,9 @@ of inputs and measurements.
   modal size loop).
 - `WM_NCHITTEST` never returns `HTMAXBUTTON`, so Snap Layouts cannot appear.
 - Type sizes, icon weights and the status bar differ from stock Windows Notepad.
+- `Open-Modal`'s `[bool]$Input` parameter is shadowed by PowerShell's automatic `$input`: under SMA it is always
+  `$true`, so every modal draws an input box and takes `dialog-input` focus. A lowered build would read the
+  parameter's real value. Renaming the parameter changes the interpreted behaviour; not done.
 
 ### Features
 
@@ -156,4 +162,9 @@ Not acquired: the Student (`student\Invoke-Student.ps1`, 5,582 lines) and anythi
 - Type inference for records reaches SMA's internal `AstTypeInference` by reflection.
 - Lowering refuses a class deriving from another class (adb.ps1 and PSC itself).
 - `[string]` conversion of a `[bool]` is not lowered.
+- `-join` with a typed array (`[double[]]`) on the left is refused.
+- A parameter named `$Input` is not modelled: SMA's automatic `$input` overrides it inside the function; lowering
+  reads the parameter. Admission should refuse or model it.
+- A run-time `$null` of static type `[string]` (from a .NET call) assigned to a typed `[string]` stays `$null`
+  lowered; SMA gives `''` (read from the lowering, not yet measured).
 - SMA defect: `Copy()` of a `BaseCtorInvokeMemberExpressionAst` yields an `InvokeMemberExpressionAst`.
