@@ -104,8 +104,10 @@ of inputs and measurements.
     (`NotepadWindow`) and drawing (`NotepadGraphics`). To be reused they become typed classes that take what they
     draw on, the theme and the input state as arguments instead of reading `$ui`, `$settings`, `$graphics` and
     `$palette`; drawing and windowing sit behind contracts that Direct2D and Win32 implement on Windows and another
-    backend implements on Android. Where the framework lives (its own script, or compiled into apps by PSC under a
-    flag) is Scott's decision; each project is one script.
+    backend implements on Android. Decided by Scott: the framework lives in PSC and is compiled into an app that
+    asks for it, under a flag. It is PowerShell classes in Invoke-PSC.ps1; SMA must see them as it sees the app's
+    own (in a Run, defined before the app runs; in a Compile, its class definitions join the app's source before
+    lowering), so an app written against them parses, runs interpreted and compiles alike.
 15. Acrylic in an unfocused window. DWM's system backdrops (`DWMWA_SYSTEMBACKDROP_TYPE`, which Notepad uses) fall
     back to a solid colour when the window is inactive. Windows Terminal keeps acrylic unfocused
     (`compatibility.enableUnfocusedAcrylic`): its terminal background is a XAML `AcrylicBrush`, `HostBackdrop`
