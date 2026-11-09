@@ -88,8 +88,10 @@ of inputs and measurements.
     OLE needs `OleInitialize` on the window's single-threaded apartment.
 12. Glue script, and an installer. A per-user install (under the user's `AppData\Local\Programs`) keeps
     `config.ini` beside the exe writable; under Program Files it is not. The installer asks, opt-in, whether Notepad
-    should open `.txt` and `.md`: it registers the program as a handler for them, and Windows has the user confirm
-    the default in its Default apps settings (to be checked on Windows 11 before it is built).
+    should open `.txt` and `.md`: it registers the program as a handler for them, and when the user says yes it
+    opens Windows 11's Default apps settings page, where the user confirms (an app cannot set the default itself;
+    observed by Scott). Whether the page can open on Notepad's own entry (an `ms-settings:defaultapps` query) is to
+    be checked.
 13. Measure which files PSC's linker reads from the 706 MB `msvc-*` folder; MSVC libraries have no NuGet package.
 
 ### Observed defects
