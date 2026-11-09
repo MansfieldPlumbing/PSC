@@ -89,13 +89,30 @@ of inputs and measurements.
 12. Glue script, and an installer. A per-user install (under the user's `AppData\Local\Programs`) keeps
     `config.ini` beside the exe writable; under Program Files it is not. The installer puts the files in place and
     registers the program as a handler for `.txt` and `.md`; the choices are Notepad's own.
-13. First run, in the manner of Windows' out-of-box experience: on its first launch Notepad shows a short welcome
-    flow, once (recorded in `config.ini`), that also serves a portable copy no installer ran. Suggested steps:
-    whether Notepad should open `.txt` and `.md` (opt-in; a yes opens Windows 11's Default apps settings page,
-    where the user confirms, since an app cannot set the default itself, as Scott observed; whether the page can
-    open on Notepad's own entry through an `ms-settings:defaultapps` query is to be checked); theme and backdrop;
-    the entrance animation; whether to restore open tabs on start.
+13. First run, in the manner of Windows' out-of-box experience: on its first launch Notepad asks one thing, once
+    (recorded in `config.ini`): whether it should open `.txt` and `.md`. It is opt-in; a yes opens Windows 11's
+    Default apps settings page, where the user confirms, since an app cannot set the default itself, as Scott
+    observed. Whether the page can open on Notepad's own entry through an `ms-settings:defaultapps` query is to be
+    checked. Everything else is left to Settings, with defaults of a solid backdrop and a fade-in entrance, as stock
+    Notepad has.
 13. Measure which files PSC's linker reads from the 706 MB `msvc-*` folder; MSVC libraries have no NuGet package.
+
+14. The Fluent layer as a framework other apps reuse (a download manager over .NET, the Photos, Paint and Terminal
+    counterparts, Android). Today its parts live in Notepad.ps1 and read Notepad's script state: the controls
+    (`Button`, `InputBox`, `Select-Control`, `Toggle-Control`, menus, the modal, the colour picker, the four-corner
+    gradient), hit testing (`NotepadHitNode`), theming (the palette from the design's CSS), the window
+    (`NotepadWindow`) and drawing (`NotepadGraphics`). To be reused they become typed classes that take what they
+    draw on, the theme and the input state as arguments instead of reading `$ui`, `$settings`, `$graphics` and
+    `$palette`; drawing and windowing sit behind contracts that Direct2D and Win32 implement on Windows and another
+    backend implements on Android. Where the framework lives (its own script, or compiled into apps by PSC under a
+    flag) is Scott's decision; each project is one script.
+15. Acrylic in an unfocused window. DWM's system backdrops (`DWMWA_SYSTEMBACKDROP_TYPE`, which Notepad uses) fall
+    back to a solid colour when the window is inactive. Windows Terminal keeps acrylic unfocused
+    (`compatibility.enableUnfocusedAcrylic`): its terminal background is a XAML `AcrylicBrush`, `HostBackdrop`
+    while focused and `Backdrop` while unfocused (microsoft/terminal PR #15923); its tab row still loses acrylic
+    (issue #19544, reopened April 2026). Notepad has no XAML. Its candidates, to be measured before choosing: a
+    Windows.UI.Composition visual tree on the window (`ICompositorDesktopInterop`, a backdrop brush and a blur
+    effect: the mechanism XAML's brush is built on), or the undocumented `SetWindowCompositionAttribute` accent.
 
 ### Observed defects
 
