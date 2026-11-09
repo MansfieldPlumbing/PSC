@@ -69,8 +69,28 @@ of inputs and measurements.
    variables and its top-level statements (the entry point) are lowered member by member by Investigate but not
    yet emitted into an assembly. Development-only code (`Invoke-NotepadComparison`, the Verify functions) is to be
    left out of the native build.
-9. Glue script.
-10. Measure which files PSC's linker reads from the 706 MB `msvc-*` folder; MSVC libraries have no NuGet package.
+9. No JSON in the app. NativeAOT cannot load an assembly or generate code at run time (Microsoft's Native AOT
+   limitations), so settings cannot live in a managed assembly the app rewrites. Defaults (the default settings, the
+   palette, the design's declarations) are compiled into the exe as static data: the lowering of `Invoke-Design`'s
+   `data { }` section. Settings are `config.ini` beside the program: every setting listed, the changed ones as
+   `key=value` and the rest commented out as `;key=value`, so only changes take effect and new defaults reach
+   untouched settings; `[Colors]` and `[AnsiColors]` sections entry by entry. A missing file is all defaults. The
+   session (open tabs) is `session.bin` in the user's application data (`BinaryWriter`/`BinaryReader`). Done in
+   Notepad; JSON remains only in the development diagnostics dump, which stays until the UI Automation primitives
+   (item 7) read the running app instead, and is left out of the native build. PSC is to lower `$PSScriptRoot` to
+   `AppContext.BaseDirectory`, the program's directory.
+10. Cmdlets in app code lower to .NET (`Join-Path`, `Test-Path`, `Get-Content`, `Set-Content`, `New-Item`,
+    `Start-Sleep`, `Where-Object`, `ForEach-Object`, `Select-Object -First`), bound by SMA's `StaticParameterBinder`,
+    each checked against SMA. SMA itself cannot be in a NativeAOT image (it depends on reflection).
+11. Reverse COM: interfaces implemented by the app as vtables of `[UnmanagedCallersOnly]` function pointers (NativeAOT
+    has no built-in COM). `IDropTarget` with `RegisterDragDrop` for dropping files (UTF-8, UTF-16) onto the window
+    and its tabs; `IDataObject` for virtual-file copy (`CFSTR_FILEDESCRIPTORW`/`CFSTR_FILECONTENTS`) and tab tear-off.
+    OLE needs `OleInitialize` on the window's single-threaded apartment.
+12. Glue script, and an installer. A per-user install (under the user's `AppData\Local\Programs`) keeps
+    `config.ini` beside the exe writable; under Program Files it is not. The installer asks, opt-in, whether Notepad
+    should open `.txt` and `.md`: it registers the program as a handler for them, and Windows has the user confirm
+    the default in its Default apps settings (to be checked on Windows 11 before it is built).
+13. Measure which files PSC's linker reads from the 706 MB `msvc-*` folder; MSVC libraries have no NuGet package.
 
 ### Observed defects
 
