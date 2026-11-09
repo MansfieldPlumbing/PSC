@@ -20,8 +20,8 @@ of inputs and measurements.
 | Comparison and test tooling in it | 1,991 lines |
 | Model, window, graphics | typed classes on `psc-typed-model`: `NotepadModel` and its records, `NotepadWindow` (Win32 imports, an `[UnmanagedCallersOnly]` window procedure), `NotepadGraphics` (Direct2D, DirectWrite and WIC through COM pointer stubs) |
 | Interpreted runs | through PSC: `Invoke-PSC.ps1 -Mode Run -SourcePath Notepad.ps1 -RunParameters @{...}` fills the native stubs and callbacks just in time; run directly under pwsh, the first native call throws |
-| Members lowering | 230 of 275 (native stubs included), every member of the classes; 25 of 89 before the model change |
-| Interface state | `$ui` is `[NotepadUi]`; its colour picker, modal and dropdown are `NotepadColorPicker`, `NotepadModal` (`NotepadModalButton`) and `NotepadDropdown` (`NotepadOption`); hit-test nodes are `NotepadHitNode` (their `Data` is still `[object]`); window events reach `Handle-Event` and `Key-Input` as `NotepadWindowEvent` |
+| Members lowering | 239 of 279 (native stubs included), every member of the classes; 25 of 89 before the model change |
+| Interface state | `$ui` is `[NotepadUi]`; its colour picker, modal and dropdown are `NotepadColorPicker`, `NotepadModal` (`NotepadModalButton`) and `NotepadDropdown` (`NotepadOption`); hit-test nodes are `NotepadHitNode` (their `Data` is still `[object]`); settings are `NotepadSettings` (typed properties, `Get`/`Set` by run-time name); the palette is a `Dictionary[string,string]`; window events reach `Handle-Event` and `Key-Input` as `NotepadWindowEvent` |
 | `-VerifyModel`, `-VerifyGraphics` | pass through PSC Run |
 | 3-second UI run diagnostics | 24 of 24 entries equal to `main` except `ScrollX` `0` → `0.0` (one literal corrected in `Paint-Editor`); with the entrance animation on, the entrance completes |
 
@@ -55,8 +55,6 @@ of inputs and measurements.
    - identities held in strings (`$ui.Hover`, `Pressed`, `Focus`, `Menu`, `Submenu`, `Nodes` keyed by string) to
      typed identities;
    - `$Event` untyped; 22 `$ui` slots untyped or written with two types (`EditorOrigin` `Double[]` and `Int32[]`);
-   - `$settings` as a typed key table (8 accesses by run-time key; passed to `Invoke-Model`, `New-Module`, a
-     `[hashtable]` parameter);
    - cmdlets on app paths (`Join-Path`, `Test-Path`, `Split-Path`, `Get-Content`, `Set-Content`).
 5. Remove the in-app comparison page, its megaphone button, and the person button (it duplicates the gear).
 6. One copy button: the selection when there is one, else the document; copy as file stays opt-in.
