@@ -1820,6 +1820,157 @@ function New-OutputWrite {
 # the name), -Switch or -Switch:value, then the remaining arguments in parameter order, switches excepted. A parameter
 # left unbound takes its default, written in the callee as a constant, or its type's default. Returns the call, which
 # yields the function's [object[]] output; $null when the command is not one of the source's functions.
+function Measure-PscOutputStatement {
+    <#
+    .SYNOPSIS
+        The outcomes of one statement for the count of values a script function
+        has written: 'F<n>' falls through having written n, 'T<n>' returns having
+        written n, 'X' throws. $null when the statement's writes are not counted
+        here. -Terminals collects each statement or return value that writes one
+        value.
+    #>
+    param(
+        [Parameter(Mandatory)][System.Management.Automation.Language.StatementAst] $Statement,
+        [Parameter(Mandatory)][int] $Written,
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[System.Management.Automation.Language.Ast]] $Terminals
+    )
+    # An assignment writes nothing; it captures what its right side writes.
+    if ($Statement -is [System.Management.Automation.Language.AssignmentStatementAst]) { return @("F$Written") }
+    if ($Statement -is [System.Management.Automation.Language.BreakStatementAst] -or $Statement -is [System.Management.Automation.Language.ContinueStatementAst]) { return @("F$Written") }
+    if ($Statement -is [System.Management.Automation.Language.ThrowStatementAst]) { return @('X') }
+    if ($Statement -is [System.Management.Automation.Language.ReturnStatementAst]) {
+        if ($null -eq $Statement.Pipeline) { return @("T$Written") }
+        if ($Written -ge 1) { return $null }
+        $Terminals.Add($Statement.Pipeline)
+        return @('T1')
+    }
+    if ($Statement -is [System.Management.Automation.Language.PipelineAst]) {
+        if ($Statement.PipelineElements.Count -ne 1) { return $null }
+        $element = $Statement.PipelineElements[0]
+        # $i++ and $i-- as statements write nothing.
+        if ($element -is [System.Management.Automation.Language.CommandExpressionAst] -and $element.Redirections.Count -eq 0 -and
+            $element.Expression -is [System.Management.Automation.Language.UnaryExpressionAst] -and
+            $element.Expression.TokenKind -in 'PostfixPlusPlus', 'PrefixPlusPlus', 'PostfixMinusMinus', 'PrefixMinusMinus') { return @("F$Written") }
+        $counted = ($element -is [System.Management.Automation.Language.CommandExpressionAst] -and $element.Redirections.Count -eq 0) -or
+            ($element -is [System.Management.Automation.Language.CommandAst] -and $element.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Unknown -and
+             $element.Redirections.Count -eq 0 -and $null -ne $element.GetCommandName() -and $null -ne (Find-ScriptFunction $element.GetCommandName()))
+        if (-not $counted -or $Written -ge 1) { return $null }
+        $Terminals.Add($Statement)
+        return @('F1')
+    }
+    if ($Statement -is [System.Management.Automation.Language.IfStatementAst]) {
+        $outcomes = [System.Collections.Generic.HashSet[string]]::new()
+        foreach ($clause in $Statement.Clauses) {
+            $branch = Measure-PscOutputPaths -Statements @($clause.Item2.Statements) -Written $Written -Terminals $Terminals
+            if ($null -eq $branch) { return $null }
+            foreach ($outcome in $branch) { $null = $outcomes.Add($outcome) }
+        }
+        if ($null -ne $Statement.ElseClause) {
+            $branch = Measure-PscOutputPaths -Statements @($Statement.ElseClause.Statements) -Written $Written -Terminals $Terminals
+            if ($null -eq $branch) { return $null }
+            foreach ($outcome in $branch) { $null = $outcomes.Add($outcome) }
+        }
+        else { $null = $outcomes.Add("F$Written") }
+        return [string[]]@($outcomes)
+    }
+    # A loop counts only when its body writes nothing on every pass.
+    if ($Statement -is [System.Management.Automation.Language.LoopStatementAst]) {
+        $inner = [System.Collections.Generic.List[System.Management.Automation.Language.Ast]]::new()
+        $body = Measure-PscOutputPaths -Statements @($Statement.Body.Statements) -Written 0 -Terminals $inner
+        if ($null -eq $body -or @($body | Where-Object { $_ -notin 'F0', 'X' }).Count) { return $null }
+        return @("F$Written")
+    }
+    $null
+}
+
+function Measure-PscOutputPaths {
+    <#
+    .SYNOPSIS
+        The outcomes of a statement sequence for the count of values written
+        (see Measure-PscOutputStatement); $null when any statement is not counted
+        or a path would write more than one value.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]] $Statements,
+        [Parameter(Mandatory)][int] $Written,
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[System.Management.Automation.Language.Ast]] $Terminals
+    )
+    $open = [System.Collections.Generic.HashSet[string]]::new([string[]]@("F$Written"))
+    $ended = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($statement in $Statements) {
+        if ($open.Count -eq 0) { break }
+        $next = [System.Collections.Generic.HashSet[string]]::new()
+        foreach ($outcome in $open) {
+            $result = Measure-PscOutputStatement -Statement $statement -Written ([int]$outcome.Substring(1)) -Terminals $Terminals
+            if ($null -eq $result) { return $null }
+            foreach ($r in $result) { if ($r.StartsWith('F')) { $null = $next.Add($r) } else { $null = $ended.Add($r) } }
+        }
+        $open = $next
+    }
+    foreach ($outcome in $open) { $null = $ended.Add($outcome) }
+    [string[]]@($ended)
+}
+
+$script:PscFunctionOutputTypes = [System.Runtime.CompilerServices.ConditionalWeakTable[object, object]]::new()
+$script:PscOutputWatch = $null
+
+function Get-PscFunctionOutputType {
+    <#
+    .SYNOPSIS
+        The type of the one value a script function writes, when it provably
+        writes exactly one on every path that returns; otherwise $null.
+    .DESCRIPTION
+        PowerShell collapses one written value to that value, so a call to such a
+        function, used as a value, is its output cast to this type. The paths are
+        counted on the AST (Measure-PscOutputPaths): assignments, loops that write
+        nothing and ++/-- write nothing; each return value, expression statement or
+        call to a counted script function writes one. The type is read by lowering
+        the function once and recording each terminal's static type; all must be
+        one type that is written whole, and not void. Cached per function AST, so
+        per class mirror.
+    #>
+    param([Parameter(Mandatory)][System.Management.Automation.Language.FunctionMemberAst] $Member)
+    $known = $null
+    if ($script:PscFunctionOutputTypes.TryGetValue($Member, [ref]$known)) { return $(if ($known -is [Type]) { $known } else { $null }) }
+    # Unknown while it is worked out, so a function reaching itself is not counted.
+    $script:PscFunctionOutputTypes.AddOrUpdate($Member, [DBNull]::Value)
+    if ($null -eq $Member.Body -or $null -eq $Member.Body.EndBlock -or $Member.Body.BeginBlock -or $Member.Body.ProcessBlock) { return $null }
+    $terminals = [System.Collections.Generic.List[System.Management.Automation.Language.Ast]]::new()
+    $outcomes = Measure-PscOutputPaths -Statements @($Member.Body.EndBlock.Statements) -Written 0 -Terminals $terminals
+    if ($null -eq $outcomes -or @($outcomes | Where-Object { $_ -in 'F0', 'T0' }).Count -or -not @($outcomes | Where-Object { $_ -in 'F1', 'T1' }).Count) { return $null }
+    $types = [System.Collections.Generic.List[Type]]::new()
+    $watched = [System.Collections.Generic.List[System.Management.Automation.Language.Ast]]::new()
+    foreach ($terminal in $terminals) {
+        $element = if ($terminal -is [System.Management.Automation.Language.PipelineAst]) { $terminal.PipelineElements[0] } else { $null }
+        if ($element -is [System.Management.Automation.Language.CommandAst]) {
+            $callee = Get-PscFunctionOutputType -Member (Find-ScriptFunction $element.GetCommandName())
+            if ($null -eq $callee) { return $null }
+            $types.Add($callee)
+        }
+        else { $watched.Add($terminal) }
+    }
+    if ($watched.Count) {
+        $outer = $script:PscOutputWatch
+        $outerTypes = $script:LoweringClassTypes
+        $script:PscOutputWatch = [System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast, Type]]::new()
+        try {
+            try { $null = Convert-MethodAstToLambda -MethodAst $Member } catch { return $null }
+            foreach ($terminal in $watched) {
+                $type = $null
+                if (-not $script:PscOutputWatch.TryGetValue($terminal, [ref]$type)) { return $null }
+                $types.Add($type)
+            }
+        }
+        finally { $script:PscOutputWatch = $outer; $script:LoweringClassTypes = $outerTypes }
+    }
+    $distinct = [System.Collections.Generic.HashSet[Type]]::new($types)
+    if ($distinct.Count -ne 1) { return $null }
+    $single = $types[0]
+    if ($single -eq [void] -or -not (Test-PscWrittenWhole $single)) { return $null }
+    $script:PscFunctionOutputTypes.AddOrUpdate($Member, $single)
+    $single
+}
+
 function New-ScriptFunctionCall {
     param([Parameter(Mandatory)][System.Management.Automation.Language.CommandAst] $Command, [Parameter(Mandatory)][hashtable] $Scope)
     $name = $Command.GetCommandName()
@@ -3461,7 +3612,11 @@ function Convert-AstExpression {
             $call = New-ScriptFunctionCall -Command $Node.PipelineElements[0] -Scope $Scope
             if ($null -ne $call) {
                 $collapse = Get-PscSemanticsMethod -Name Collapse -ParameterTypes ([object[]])
-                return [Linq.Expressions.Expression]::Call($collapse, $call)
+                $collapsed = [Linq.Expressions.Expression]::Call($collapse, $call)
+                # A function that writes exactly one value of one type: that value, as that type.
+                $single = Get-PscFunctionOutputType -Member (Find-ScriptFunction $Node.PipelineElements[0].GetCommandName())
+                if ($null -ne $single) { return [Linq.Expressions.Expression]::Convert($collapsed, $single) }
+                return $collapsed
             }
         }
     }
@@ -3941,6 +4096,17 @@ function Convert-AstExpression {
         $keyed = Get-KeyIndexer $targetExpr.Type $idxExpr.Type
         if ($keyed) {
             $key = ConvertTo-PowerShellType -Expression $idxExpr -Type $keyed.GetIndexParameters()[0].ParameterType
+            # A key a generic dictionary lacks reads as $null in PowerShell (measured), where its indexer throws: read
+            # through TryGetValue, which leaves the default, $null, when the value type holds $null. A value type that
+            # cannot is read through the indexer and throws (a recorded difference).
+            $valueType = $keyed.PropertyType
+            $tryGet = $targetExpr.Type.GetMethod('TryGetValue', [Type[]]@($key.Type, $valueType.MakeByRefType()))
+            if ($null -ne $tryGet -and (-not $valueType.IsValueType -or ($valueType.IsGenericType -and $valueType.GetGenericTypeDefinition() -eq [Nullable`1]))) {
+                $found = [Linq.Expressions.Expression]::Variable($valueType, 'keyed' + $Scope.DeclaredLocals.Count)
+                $Scope.DeclaredLocals.Add($found)
+                return [Linq.Expressions.Expression]::Block($valueType, [Linq.Expressions.Expression[]]@(
+                    [Linq.Expressions.Expression]::Call($targetExpr, $tryGet, [Linq.Expressions.Expression[]]@($key, $found)), $found))
+            }
             return [Linq.Expressions.Expression]::MakeIndex($targetExpr, $keyed, [Linq.Expressions.Expression[]]@($key))
         }
         throw "[{0}:{1}] Indexing into non-array type '{2}' is not supported." -f `
@@ -4443,8 +4609,11 @@ function Convert-AstStatement {
         # In a script function, return writes its value to the output and then returns all of it.
         $all = [Linq.Expressions.Expression]::Call($Scope.Output, [System.Collections.Generic.List[object]].GetMethod('ToArray'))
         if ($null -eq $Statement.Pipeline) { return [Linq.Expressions.Expression]::Return($Scope.ReturnTarget, $all) }
+        $returned = Convert-AstExpression -Node $Statement.Pipeline -Scope $Scope
+        # Get-PscFunctionOutputType reads the static type of what each return writes.
+        if ($null -ne $script:PscOutputWatch) { $script:PscOutputWatch[$Statement.Pipeline] = $returned.Type }
         return [Linq.Expressions.Expression]::Block(
-            (New-OutputWrite -Value (Convert-AstExpression -Node $Statement.Pipeline -Scope $Scope) -Scope $Scope),
+            (New-OutputWrite -Value $returned -Scope $Scope),
             [Linq.Expressions.Expression]::Return($Scope.ReturnTarget, $all))
     }
     if ($Statement -is [System.Management.Automation.Language.ReturnStatementAst]) {
@@ -4663,6 +4832,8 @@ function Convert-AstStatement {
             }
         }
         $value = Convert-AstExpression -Node $Statement -Scope $Scope
+        # Get-PscFunctionOutputType reads the static type of what each expression statement writes.
+        if ($null -ne $script:PscOutputWatch) { $script:PscOutputWatch[$Statement] = $value.Type }
         if ($null -ne $Scope['Output']) { return New-OutputWrite -Value $value -Scope $Scope }
         return $value
     }
