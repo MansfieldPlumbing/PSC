@@ -68,7 +68,8 @@ and 10); the reusable Fluent framework (item 14) after it.
    window and frame captures, pixel and geometry measurement, input replay, and comparison of the same against a
    reference app. They serve the planned ports of HTML/TypeScript/JavaScript apps and the Photos, Paint and
    Terminal counterparts as much as Notepad.
-8. Compile a script, not only classes: PSC's Compile mode takes classes; a script's function class, its script
+8. Compile a script, not only classes. Notepad's 28 classes compile together into one assembly (58,368 bytes,
+   2026-11-09). PSC's Compile mode takes classes; a script's function class, its script
    variables and its top-level statements (the entry point) are lowered member by member by Investigate but not
    yet emitted into an assembly. Development-only code (`Invoke-NotepadComparison`, the Verify functions) is to be
    left out of the native build.
@@ -111,7 +112,9 @@ and 10); the reusable Fluent framework (item 14) after it.
     asks for it, under a flag. It is PowerShell classes in Invoke-PSC.ps1; SMA must see them as it sees the app's
     own (in a Run, defined before the app runs; in a Compile, its class definitions join the app's source before
     lowering), so an app written against them parses, runs interpreted and compiles alike. The framework is general:
-    nothing in it names Notepad. First piece: theming (the palette and colour lookup), hit testing (the node and its
+    nothing in it names Notepad. Scott also intends simulacra of Material and Metro, so the core (layout, hit
+    testing, input, animation, drawing and windowing contracts) belongs to no design language; Fluent, Material and
+    Metro are design languages over it (their controls' look, metrics, motion and theme). First piece: theming (the palette and colour lookup), hit testing (the node and its
     collections) and `Button`, each a framework class taking its surface, theme and input state as arguments;
     Notepad then uses them, checked by its own runs (model, graphics, diagnostics equal). The other controls, the
     window and drawing follow. Order, set by Scott: after a native Notepad.exe.
