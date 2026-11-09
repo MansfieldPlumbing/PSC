@@ -64,9 +64,6 @@ of inputs and measurements.
   modal size loop).
 - `WM_NCHITTEST` never returns `HTMAXBUTTON`, so Snap Layouts cannot appear.
 - Type sizes, icon weights and the status bar differ from stock Windows Notepad.
-- `Open-Modal`'s `[bool]$Input` parameter is shadowed by PowerShell's automatic `$input`: under SMA it is always
-  `$true`, so every modal draws an input box and takes `dialog-input` focus. A lowered build would read the
-  parameter's real value. Renaming the parameter changes the interpreted behaviour; not done.
 
 ### Features
 
