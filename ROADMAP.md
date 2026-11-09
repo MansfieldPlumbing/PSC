@@ -20,7 +20,7 @@ of inputs and measurements.
 | Comparison and test tooling in it | 1,991 lines |
 | Model, window, graphics | typed classes on `psc-typed-model`: `NotepadModel` and its records, `NotepadWindow` (Win32 imports, an `[UnmanagedCallersOnly]` window procedure), `NotepadGraphics` (Direct2D, DirectWrite and WIC through COM pointer stubs) |
 | Interpreted runs | through PSC: `Invoke-PSC.ps1 -Mode Run -SourcePath Notepad.ps1 -RunParameters @{...}` fills the native stubs and callbacks just in time; run directly under pwsh, the first native call throws |
-| Members lowering | 239 of 279 (native stubs included), every member of the classes; 25 of 89 before the model change |
+| Members lowering | 239 of 275 (native stubs included), every member of the classes; 25 of 89 before the model change |
 | Interface state | `$ui` is `[NotepadUi]`; its colour picker, modal and dropdown are `NotepadColorPicker`, `NotepadModal` (`NotepadModalButton`) and `NotepadDropdown` (`NotepadOption`); hit-test nodes are `NotepadHitNode` (their `Data` is still `[object]`); settings are `NotepadSettings` (typed properties, `Get`/`Set` by run-time name); the palette is a `Dictionary[string,string]`; window events reach `Handle-Event` and `Key-Input` as `NotepadWindowEvent` |
 | `-VerifyModel`, `-VerifyGraphics` | pass through PSC Run |
 | 3-second UI run diagnostics | 24 of 24 entries equal to `main` except `ScrollX` `0` → `0.0` (one literal corrected in `Paint-Editor`); with the entrance animation on, the entrance completes |
@@ -54,13 +54,23 @@ of inputs and measurements.
      a dropdown, a modal button, a setting choice;
    - identities held in strings (`$ui.Hover`, `Pressed`, `Focus`, `Menu`, `Submenu`, `Nodes` keyed by string) to
      typed identities;
-   - `$Event` untyped; 22 `$ui` slots untyped or written with two types (`EditorOrigin` `Double[]` and `Int32[]`);
+   - `$ui` slots still untyped (`OpacityTrack`, `TextCache`, `IconCatalog`, `Expanded`) and `@( )` arrays used as
+     tuples (menu entries, find buttons, colour roles);
    - cmdlets on app paths (`Join-Path`, `Test-Path`, `Split-Path`, `Get-Content`, `Set-Content`).
-5. Remove the in-app comparison page, its megaphone button, and the person button (it duplicates the gear).
+5. In-app comparison page, megaphone and person buttons: removed. The copy and writing-tools buttons moved right
+   into the space.
 6. One copy button: the selection when there is one, else the document; copy as file stays opt-in.
-7. Move the comparison tooling and `-VerifyWindow` out of Notepad into PSC (section 2).
-8. Glue script.
-9. Measure which files PSC's linker reads from the 706 MB `msvc-*` folder; MSVC libraries have no NuGet package.
+7. Comparison: `Invoke-NotepadComparison` (`-Compare`) and `-VerifyWindow` stay in Notepad as they are. PSC gains
+   general primitives in their place, usable for any app it builds: UI Automation queries of a running window,
+   window and frame captures, pixel and geometry measurement, input replay, and comparison of the same against a
+   reference app. They serve the planned ports of HTML/TypeScript/JavaScript apps and the Photos, Paint and
+   Terminal counterparts as much as Notepad.
+8. Compile a script, not only classes: PSC's Compile mode takes classes; a script's function class, its script
+   variables and its top-level statements (the entry point) are lowered member by member by Investigate but not
+   yet emitted into an assembly. Development-only code (`Invoke-NotepadComparison`, the Verify functions) is to be
+   left out of the native build.
+9. Glue script.
+10. Measure which files PSC's linker reads from the 706 MB `msvc-*` folder; MSVC libraries have no NuGet package.
 
 ### Observed defects
 
