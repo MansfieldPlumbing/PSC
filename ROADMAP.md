@@ -87,11 +87,14 @@ of inputs and measurements.
     and its tabs; `IDataObject` for virtual-file copy (`CFSTR_FILEDESCRIPTORW`/`CFSTR_FILECONTENTS`) and tab tear-off.
     OLE needs `OleInitialize` on the window's single-threaded apartment.
 12. Glue script, and an installer. A per-user install (under the user's `AppData\Local\Programs`) keeps
-    `config.ini` beside the exe writable; under Program Files it is not. The installer asks, opt-in, whether Notepad
-    should open `.txt` and `.md`: it registers the program as a handler for them, and when the user says yes it
-    opens Windows 11's Default apps settings page, where the user confirms (an app cannot set the default itself;
-    observed by Scott). Whether the page can open on Notepad's own entry (an `ms-settings:defaultapps` query) is to
-    be checked.
+    `config.ini` beside the exe writable; under Program Files it is not. The installer puts the files in place and
+    registers the program as a handler for `.txt` and `.md`; the choices are Notepad's own.
+13. First run, in the manner of Windows' out-of-box experience: on its first launch Notepad shows a short welcome
+    flow, once (recorded in `config.ini`), that also serves a portable copy no installer ran. Suggested steps:
+    whether Notepad should open `.txt` and `.md` (opt-in; a yes opens Windows 11's Default apps settings page,
+    where the user confirms, since an app cannot set the default itself, as Scott observed; whether the page can
+    open on Notepad's own entry through an `ms-settings:defaultapps` query is to be checked); theme and backdrop;
+    the entrance animation; whether to restore open tabs on start.
 13. Measure which files PSC's linker reads from the 706 MB `msvc-*` folder; MSVC libraries have no NuGet package.
 
 ### Observed defects
