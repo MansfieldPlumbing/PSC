@@ -2,7 +2,7 @@
 
 | Synopsis | Script | SourceSha512 | DefaultMode | Environment |
 |---|---|---|---|---|
-| A Pwsh script designed to amortize. | C:\dev\psc\Invoke-PSC.ps1 | 34DE9BE5583ABEC63680FBAE1E2F56EA795A693AB8BD324CDEFBBBF884401CF0D620EC76B55AA67188743019B6B783810D1C9945E05FBB87ED9D091DA7C0A597 | Compile | PscEnvironment |
+| A Pwsh script designed to amortize. | C:\dev\psc\Invoke-PSC.ps1 | 82B934342D990F3681BBEE1D026AF54C1A39A204FB657FE9FAE3F2BAE49CAD0CC412374735BBFC8E44F059C1FC1F6B2AB7FC6B2BA00CD7808B0DE83FCFAD5085 | Compile | PscEnvironment |
 
 ## Modes
 
@@ -12,13 +12,14 @@
 | PowerShell | ArchivePath | Get-PinnedPowerShell |
 | Compile | ClassName, ClassNames, Deterministic, EntryPoint, FixedParameters, MethodNames, Native, OutputPath, Program, SourceAst, SourcePath, StaticData, Subsystem | Export-LoweredAssembly, Export-NativeImage, Read-PowerShellSource |
 | Expression | MethodAst | ConvertTo-TypedExpression |
-| Inspect | AssemblyPath | Test-LoweredAssembly |
+| Inspect | AssemblyPath, ClassName, MethodNames | Test-LoweredAssembly |
 | Capability |  | Get-LoweringCapability |
-| Describe | ProjectPath | Get-SmaDescription |
-| Lint | LintFiles | Get-Projects, Get-SmaLint |
+| Graph | ProjectPath | Get-SmaGraph |
+| Lint | LintEdit, LintFiles | Edit-SmaLintFinding, Get-Projects, Get-SmaLint |
+| Guard | CheckerHash, LintFiles | Test-SmaGuard |
 | Profile |  | Invoke-SmaProfile |
 | Report | ProfilePath | Get-SmaReport, Get-SmaUnits |
-| Verify |  | Test-SmaDescription |
+| Verify |  | Test-SmaGraph |
 | Consolidate | OutputPath, SourcePath | ConvertTo-PscSingleScript |
 | Investigate | InvestigatePath | Invoke-PscInvestigation |
 | Records | SourceAst | Get-PscRecord |
@@ -30,11 +31,13 @@
 
 | Name | Type | Default | AllowedValues | Pipeline |
 |---|---|---|---|---|
-| Mode | System.String | Compile | Compile, Api, Expression, Inspect, Capability, Link, PowerShell, Describe, Lint, Profile, Report, Verify, Readme, Investigate, Consolidate, Records, Run | False |
+| Mode | System.String | Compile | Compile, Api, Expression, Inspect, Capability, Link, PowerShell, Graph, Lint, Guard, Profile, Report, Verify, Readme, Investigate, Consolidate, Records, Run | False |
 | RunParameters | System.Collections.Hashtable | System.Collections.Hashtable |  | False |
 | ArchivePath | System.String |  |  | False |
 | ProjectPath | System.String |  |  | False |
 | LintFiles | System.String[] |  |  | False |
+| LintEdit | System.Management.Automation.SwitchParameter |  |  | False |
+| CheckerHash | System.String |  |  | False |
 | InvestigatePath | System.String[] |  |  | False |
 | ProfilePath | System.String |  |  | False |
 | SourcePath | System.String |  |  | False |
@@ -71,22 +74,22 @@
 | C:\dev\psc\Invoke-PSC.ps1 | InvokeExpressionCommands | 0 |
 | C:\dev\psc\Invoke-PSC.ps1 | ScriptBlockCreateCalls | 0 |
 | C:\dev\psc\Invoke-PSC.ps1 | HereStrings | 1 |
-| C:\dev\psc\Invoke-PSC.ps1 | ScriptBlockExpressions | 360 |
-| C:\dev\psc\Invoke-PSC.ps1 | CommandsNamedByVariable | 108 |
+| C:\dev\psc\Invoke-PSC.ps1 | ScriptBlockExpressions | 403 |
+| C:\dev\psc\Invoke-PSC.ps1 | CommandsNamedByVariable | 131 |
 | C:\dev\psc\Invoke-PSC.ps1 | ScriptBlockLiteralsInvoked | 0 |
-| C:\dev\psc\Invoke-PSC.ps1 | CommandsNamedByOtherExpression | 4 |
-| C:\dev\psc\Invoke-PSC.ps1 | MemberLookupsByText | 49 |
-| C:\dev\psc\Invoke-PSC.ps1 | HashtableLiterals | 205 |
-| C:\dev\psc\Invoke-PSC.ps1 | HashtableRecords | 78 |
-| C:\dev\psc\Invoke-PSC.ps1 | QuotedTextConstants | 1641 |
-| C:\dev\psc\Invoke-PSC.ps1 | ExpandableTexts | 145 |
+| C:\dev\psc\Invoke-PSC.ps1 | CommandsNamedByOtherExpression | 5 |
+| C:\dev\psc\Invoke-PSC.ps1 | MemberLookupsByText | 57 |
+| C:\dev\psc\Invoke-PSC.ps1 | HashtableLiterals | 217 |
+| C:\dev\psc\Invoke-PSC.ps1 | HashtableRecords | 75 |
+| C:\dev\psc\Invoke-PSC.ps1 | QuotedTextConstants | 1500 |
+| C:\dev\psc\Invoke-PSC.ps1 | ExpandableTexts | 152 |
 | C:\dev\psc\Invoke-PSC.ps1 | NamespaceUsings | 0 |
-| C:\dev\psc\Invoke-PSC.ps1 | RegexUses | 20 |
+| C:\dev\psc\Invoke-PSC.ps1 | RegexUses | 19 |
 
 ## Functions
 
-Get-ProjectRemote, Get-Projects, Test-DriveRooted, Get-UnitProfile, Invoke-SmaProfile, Get-SmaUnits, Get-SmaCheckOnly, Get-SmaReport, Get-SmaLint, Get-SmaLexicalScope, Get-SmaOwner, Add-SmaDescribedSource, Resolve-SmaEdges, Get-SmaSourceFiles, Get-SmaEncodedSourceOrigins, Get-SmaDescription, Compare-SmaRuntimeGraph, Invoke-SmaObservedOperation, Test-SmaDescription, Test-AttributeClass, Get-LoweringKeywords, Enter-LoweringKeywords, Resolve-AstType, Test-AstAdmitted, Get-AttributeArgumentValue, Get-NativeImport, Add-NativeImportMethod, Get-NativeMethodContract, Set-NativeCallbackAttribute, Convert-NativeAddressExpression, Get-ClassModel, Get-ParameterType, Get-ParameterTypes, New-ClassMirror, Get-EnumUnderlyingType, Get-EnumLiterals, Use-ClassMirror, Get-ClassMirrorType, Get-PscSemanticsMethod, Add-PscSemanticsToSession, Get-ScriptFunctionClass, New-OutputBlock, Test-PscWrittenWhole, New-OutputWrite, Measure-PscOutputStatement, Measure-PscOutputPaths, Get-PscFunctionOutputType, New-ScriptFunctionCall, Get-VariableName, Get-SmaVariableName, Get-PscInferredType, Get-PscRecord, Invoke-PscRun, ConvertTo-PscRecordSource, Get-ScriptVariable, Get-ScriptField, Test-ScriptFunctionMember, Find-ScriptFunction, Get-PscSemanticsClass, ConvertTo-PowerShellType, New-PowerShellStringComparison, New-PowerShellArithmetic, ConvertTo-IntegralQuotient, New-TypedArrayLiteral, New-PowerShellArrayIndex, Get-KeyIndexer, Get-IntIndexer, Convert-AstExpressionAs, New-PowerShellTableObject, New-PowerShellCustomObject, Test-PSObjectView, Get-PowerShellNoteProperty, New-PowerShellNotePropertyRead, Test-PscDynamicMemberTarget, Test-PscStrictMode, New-MemberAccess, Read-PowerShellSource, Read-PowerShellClass, Add-GenericInference, Resolve-MatchingMethod, Resolve-MatchingConstructor, Add-PscDefaultArguments, Resolve-MatchingMember, Convert-AstExpression, New-PredicateTruth, Convert-PredicateSwitch, Convert-AstStatement, Convert-MethodAstToLambda, Convert-InitializersToLambda, New-LoweredBody, Set-DeterministicMvid, New-PersistedAssemblySession, Save-PersistedAssemblySession, Get-IlType, Get-IlMember, Write-IlReceiver, Write-IlInstanceCall, Write-IlArgumentLoad, Write-IlArgumentStore, Write-IlLocalLoad, Write-IlLocalStore, Write-IlArrayLoad, Write-IlArrayStore, Write-IlConstant, Write-IlConversion, Write-IlDiscarded, Write-IlAssign, Write-IlStoredValue, Write-IlExpression, Write-IlMethodBody, Get-PinnedPowerShell, Get-PscApi, Get-PscApiParameter, Get-PscPresentedProperty, ConvertTo-PscMarkdownCell, ConvertTo-PscMarkdownTable, ConvertTo-PscReadme, Get-LoweringCapability, ConvertTo-TypedExpression, ConvertTo-StaticDataExpression, Export-LoweredAssembly, Get-NativeToolset, Export-NativeImage, Test-LoweredAssembly, Read-CoffName, Read-CoffStringAt, Split-CoffDirectives, Read-CoffImportObject, Read-CoffObject, Read-CoffArchive, Get-CoffArchiveMember, Find-CoffLibrary, Resolve-CoffLink, Get-CoffSectionDefinitions, Write-CoffImage, Get-PscInnerExpression, Find-PscAssignment, Get-PscOperand, Get-PscPredicate, Get-PscDerivedCheck, Resolve-PscPathExpression, Invoke-PscInvestigation, Find-PscEffect, Compare-PscOperandBinding, ConvertTo-PscSingleScript, Get-PscFixedPath, Get-PscFixedVariable, Resolve-PscScriptInvocation, Get-PscScriptDifference, Add-PscFoldedScript
+Get-ProjectRemote, Get-Projects, Test-DriveRooted, Get-UnitProfile, Invoke-SmaProfile, Get-SmaUnits, Get-SmaCheckOnly, Get-SmaReport, Get-SmaLint, Edit-SmaLintFinding, Get-SmaChecker, Test-SmaGuard, Get-SmaLexicalScope, Get-SmaOwner, Add-SmaGraphSource, Resolve-SmaEdges, Get-SmaSourceFiles, Get-SmaEncodedSourceOrigins, Get-SmaGraph, Compare-SmaRuntimeGraph, Invoke-SmaObservedOperation, Test-SmaGraph, Test-AttributeClass, Test-PscInlineMethod, Assert-PscInlineOverrides, Test-PscInline, Get-LoweringKeywords, Enter-LoweringKeywords, Resolve-AstType, Test-AstAdmitted, Get-AttributeArgumentValue, Get-NativeImport, Add-NativeImportMethod, Get-NativeMethodContract, Set-NativeCallbackAttribute, Convert-NativeAddressExpression, Get-ClassModel, Get-ParameterType, Get-ParameterTypes, New-ClassMirror, Get-EnumUnderlyingType, Get-EnumLiterals, Use-ClassMirror, Get-ClassMirrorType, Get-PscSemanticsMethod, Add-PscSemanticsToSession, Get-ScriptFunctionClass, New-OutputBlock, Test-PscWrittenWhole, New-OutputWrite, Measure-PscOutputStatement, Measure-PscOutputPaths, Get-PscFunctionOutputType, New-ScriptFunctionCall, Get-VariableName, Get-SmaVariableName, Get-PscInferredType, Get-PscRecord, Invoke-PscRun, ConvertTo-PscRecordSource, Get-ScriptVariable, Get-ScriptField, Test-ScriptFunctionMember, Find-ScriptFunction, Get-PscSemanticsClass, ConvertTo-PowerShellType, New-PowerShellStringComparison, New-PowerShellArithmetic, ConvertTo-IntegralQuotient, New-TypedArrayLiteral, New-PowerShellArrayIndex, Get-KeyIndexer, Get-IntIndexer, Convert-AstExpressionAs, New-PowerShellTableObject, New-PowerShellCustomObject, Test-PSObjectView, Get-PowerShellNoteProperty, New-PowerShellNotePropertyRead, Test-PscDynamicMemberTarget, Test-PscStrictMode, New-MemberAccess, Read-PowerShellSource, Read-PowerShellClass, Add-GenericInference, Resolve-MatchingMethod, Resolve-MatchingConstructor, Add-PscDefaultArguments, Resolve-MatchingMember, Convert-AstExpression, New-PredicateTruth, Convert-PredicateSwitch, Convert-AstStatement, Convert-MethodAstToLambda, Convert-InitializersToLambda, New-LoweredBody, Set-DeterministicMvid, New-PersistedAssemblySession, Save-PersistedAssemblySession, Get-IlType, Get-IlMember, Write-IlReceiver, Write-IlInstanceCall, Write-IlArgumentLoad, Write-IlArgumentStore, Write-IlLocalLoad, Write-IlLocalStore, Write-IlArrayLoad, Write-IlArrayStore, Write-IlConstant, Write-IlConversion, Write-IlDiscarded, Write-IlAssign, Write-IlStoredValue, Write-IlExpression, Write-IlFieldDataArray, Write-IlMethodBody, Get-PinnedPowerShell, Get-PscApi, Get-PscApiParameter, Get-PscPresentedProperty, ConvertTo-PscMarkdownCell, ConvertTo-PscMarkdownTable, ConvertTo-PscReadme, Get-LoweringCapability, ConvertTo-TypedExpression, Get-PscStaticInstance, Complete-PscStaticGraph, Get-PscStaticGraphPrologue, ConvertTo-StaticDataExpression, Get-RequiredClassMethods, Export-LoweredAssembly, Get-NativeToolset, Export-NativeImage, Test-LoweredAssembly, Read-CoffName, Read-CoffStringAt, Split-CoffDirectives, Read-CoffImportObject, Read-CoffObject, Read-CoffArchive, Get-CoffArchiveMember, Find-CoffLibrary, Resolve-CoffLink, Get-CoffSectionDefinitions, Write-CoffImage, Get-PscInnerExpression, Find-PscAssignment, Get-PscOperand, Get-PscPredicate, Get-PscDerivedCheck, Resolve-PscPathExpression, Invoke-PscInvestigation, Find-PscEffect, Compare-PscOperandBinding, ConvertTo-PscSingleScript, Get-PscFixedPath, Get-PscFixedVariable, Resolve-PscScriptInvocation, Get-PscScriptDifference, Add-PscFoldedScript
 
 ## Classes
 
-SmaUnit, SmaEdge, SmaSource, SmaCoverage, SmaAbsence, SmaChange, SmaProject, PscDifferential, PowerShellSemantics, PscBinding, PscEnvironment, PscOperatorKind, PscBoundOperands, PscOperandBinding, PowerShellNumericOperands, PscParameter, PscOperation, PscAstRebuild, PscNativeEntry, PscNativeCalls, PscNativeStubFill, PscOperatorRebinding, PscRecordSlot, PscRecord, PscFixedParameters, PscReachability, PscRecordRewrite, PscApi, PscMeasure, PscSource, PscMeasurementMethod, AddTypeCommands, AddTypeSourceText, InvokeExpressionCommands, ScriptBlockCreateCalls, HereStrings, ScriptBlockExpressions, CommandsNamedByVariable, ScriptBlockLiteralsInvoked, CommandsNamedByOtherExpression, MemberLookupsByText, HashtableLiterals, HashtableRecords, QuotedTextConstants, ExpandableTexts, NamespaceUsings, RegexUses, PscGuard, PscPredicateKind, PscOperandOrigin, PscOperand, PscPredicate, PscCondition, PscDerivedCheck, PscBlocked, PscObservation, PscInvestigation, PscInstrument, ParseInstrument, ParseErrorInstrument, MeasureInstrument, DerivedCheckInstrument, ReferenceInstrument, PscOutcome, PscRelation, PscComparison, PscNotExecuted, PscBindingEvaluation, PscIncludedScript, PscConsolidation, PscConsolidationState, PscMemberLowering, MemberLoweringInstrument, LowerInstrument, InterpretInstrument, CompareInstrument
+PscChecker, SmaLintEdit, SmaLintFinding, SmaLintEditedFile, SmaLintRebinding, SmaLintEnumSource, SmaLintEnumFit, SmaLintConversion, PscGuardVerdict, SmaUnit, SmaEdge, SmaSource, SmaCoverage, SmaAbsence, SmaChange, SmaProject, PscInline, PscInlineLoop, PscInlineOverride, PscDifferential, PowerShellSemantics, PscBinding, PscEnvironment, PscOperatorKind, PscBoundOperands, PscOperandBinding, PowerShellNumericOperands, PscParameter, PscOperation, PscAstRebuild, PscNativeEntry, PscNativeCalls, PscNativeStubFill, PscOperatorRebinding, PscRecordSlot, PscRecord, PscFixedParameters, PscReachability, PscRecordRewrite, PscApi, PscFieldData, PscStaticGraph, PscMethodClosure, PscLoweringSource, PscStaticDataField, PscMemberPlan, PscClassPlan, PscSemanticsPlan, PscLoweredAssembly, PscMethodInspection, PscAssemblyInspection, PscCoffDirective, PscCoffInput, PscCoffLinkerDefined, PscCoffImport, PscCoffSection, PscCoffSymbol, PscCoffObject, PscCoffSpan, PscCoffArchiveMember, PscCoffArchive, PscCoffResolvedImport, PscCoffResolution, PscCoffSectionDefinition, PscCoffContribution, PscCoffTargetKind, PscCoffTarget, PscCoffOutputSection, PscCoffImageSection, PscCoffImageImport, PscCoffImage, PscMeasure, PscSource, PscMeasurementMethod, AddTypeCommands, AddTypeSourceText, InvokeExpressionCommands, ScriptBlockCreateCalls, HereStrings, ScriptBlockExpressions, CommandsNamedByVariable, ScriptBlockLiteralsInvoked, CommandsNamedByOtherExpression, MemberLookupsByText, HashtableLiterals, HashtableRecords, QuotedTextConstants, ExpandableTexts, NamespaceUsings, RegexUses, PscGuard, PscPredicateKind, PscOperandOrigin, PscOperand, PscPredicate, PscCondition, PscDerivedCheck, PscBlocked, PscObservation, PscInvestigation, PscInstrument, ParseInstrument, ParseErrorInstrument, MeasureInstrument, DerivedCheckInstrument, ReferenceInstrument, PscOutcome, PscRelation, PscComparison, PscNotExecuted, PscBindingEvaluation, PscIncludedScript, PscConsolidation, PscConsolidationState, PscMemberLowering, MemberLoweringInstrument, LowerInstrument, InterpretInstrument, CompareInstrument

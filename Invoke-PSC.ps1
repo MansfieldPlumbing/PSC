@@ -11,16 +11,16 @@
 .PARAMETER Mode
     Compile (the default when compile inputs are given), Api (the default with no arguments), Expression,
     Inspect, Capability, Link or PowerShell (the pinned PowerShell build, downloaded and verified on first use);
-    or, from SMA's own parser over PowerShell projects: Describe (one project as live objects: units, edges,
+    or, from SMA's own parser over PowerShell projects: Graph (one project as live objects: units, edges,
     coverage, absence, changes), Lint, Profile (every project's functions and methods), Report (on a historical
-    profile) or Verify (the description's structural fixture).
+    profile) or Verify (the graph's structural fixture).
 .PARAMETER ArchivePath
     PowerShell: an already-downloaded release archive, verified the same way as a download.
 .PARAMETER Native
     Compile: produce a native executable at OutputPath. The lowered assembly is compiled to machine code by the
     pinned ILC and linked by PSC's own COFF linker with the pinned Native AOT runtime; requires EntryPoint.
 .PARAMETER ProjectPath
-    Describe: the project folder to describe. Call with & to keep the returned live objects.
+    Graph: the project folder to graph. Call with & to keep the returned live objects.
 .PARAMETER LintFiles
     Lint: files to check; without it, every PowerShell file of every project beside this script's folder.
 .PARAMETER ProfilePath
@@ -84,7 +84,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Compile', 'Api', 'Expression', 'Inspect', 'Capability', 'Link', 'PowerShell', 'Describe', 'Lint', 'Guard', 'Profile', 'Report', 'Verify', 'Readme', 'Investigate', 'Consolidate', 'Records', 'Run')]
+    [ValidateSet('Compile', 'Api', 'Expression', 'Inspect', 'Capability', 'Link', 'PowerShell', 'Graph', 'Lint', 'Guard', 'Profile', 'Report', 'Verify', 'Readme', 'Investigate', 'Consolidate', 'Records', 'Run')]
     [string] $Mode = 'Compile',
     # Run: the parameters the source is run with, by name.
     [hashtable] $RunParameters = @{},
@@ -135,8 +135,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # ============================================================================
-# SMA DESCRIPTION, LINT AND PROFILE
-# Projects described as live objects from SMA's own parser.
+# SMA GRAPH, LINT AND PROFILE
+# Projects graphed as live objects from SMA's own parser.
 # ============================================================================
 
 # The projects beside this script's folder.
@@ -410,7 +410,7 @@ function Get-SmaLint {
     $tokens = $errors = $null
     $ast = if ($PSBoundParameters.ContainsKey('text')) { [System.Management.Automation.Language.Parser]::ParseInput($text, $file, [ref]$tokens, [ref]$errors) }
         else { [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$tokens, [ref]$errors) }
-    $finding = { param([string] $rule, $node, [string] $detail, [object[]] $edits = @()) [pscustomobject]@{ File = $file; Line = $node.Extent.StartLineNumber; Rule = $rule; Detail = $detail; Edits = $edits } }
+    $finding = { param([string] $rule, $node, [string] $detail, [object[]] $edits = @()) [SmaLintFinding]@{ File = $file; Line = $node.Extent.StartLineNumber; Rule = $rule; Detail = $detail; Edits = $edits } }
     $variables = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.VariableExpressionAst] }, $true))
     foreach ($group in $variables | Where-Object { -not $_.VariablePath.IsDriveQualified } | Group-Object { $_.VariablePath.UserPath.ToLowerInvariant() }) {
         $spellings = @($group.Group | ForEach-Object { $_.VariablePath.UserPath } | Sort-Object -Unique -CaseSensitive)
@@ -464,14 +464,14 @@ function Get-SmaLint {
                 # An accumulator ($t += x, $t = $t + x) carries its own value forward; that is not a clobber.
                 if ($null -ne $loop -and ($a.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals -or @($a.Right.FindAll({ param($x) $x -is [System.Management.Automation.Language.VariableExpressionAst] -and $x.VariablePath.UserPath -ieq $name }, $true)).Count)) { continue }
                 if (-not $assigned.ContainsKey($name)) { $assigned[$name] = [Collections.Generic.List[object]]::new() }
-                $assigned[$name].Add([pscustomobject]@{ Node = $a; Loop = $loop; Offset = $a.Extent.StartOffset })
+                $assigned[$name].Add([SmaLintRebinding]@{ Node = $a; Loop = $loop; Offset = $a.Extent.StartOffset })
             }
         }
         foreach ($loopNode in $body.FindAll({ $args[0] -is [System.Management.Automation.Language.ForEachStatementAst] }, $true)) {
             if ((& $loopOf $loopNode) -eq 'nested') { continue }
             $name = $loopNode.Variable.VariablePath.UserPath.ToLowerInvariant()
             if (-not $assigned.ContainsKey($name)) { $assigned[$name] = [Collections.Generic.List[object]]::new() }
-            $assigned[$name].Add([pscustomobject]@{ Node = $loopNode; Loop = $loopNode; Offset = $loopNode.Extent.StartOffset })
+            $assigned[$name].Add([SmaLintRebinding]@{ Node = $loopNode; Loop = $loopNode; Offset = $loopNode.Extent.StartOffset })
         }
         foreach ($name in $assigned.Keys) {
             $top = @($assigned[$name] | Where-Object { $null -eq $_.Loop }); $inner = @($assigned[$name] | Where-Object { $null -ne $_.Loop })
@@ -573,7 +573,7 @@ function Get-SmaLint {
         if ($fileEnums.ContainsKey($typeName.Name)) { $enums[$typeName.Name] = $fileEnums[$typeName.Name] }
         elseif ($null -ne $reflected -and $reflected.IsEnum) { $enums[$reflected.FullName] = [Enum]::GetNames($reflected) }
         else { return }
-        [pscustomobject]@{ Enums = $enums; Declared = $false }
+        [SmaLintEnumSource]@{ Enums = $enums; Declared = $false }
     }
     # The string literals an expression is made of: one, a comma list, or either inside ( ) or @( ).
     $literalsOf = {
@@ -593,7 +593,7 @@ function Get-SmaLint {
         param($node)
         if ($node -is [System.Management.Automation.Language.MemberExpressionAst] -and $node -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
             $node.Member -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $enumsByProperty.ContainsKey($node.Member.Value)) {
-            return [pscustomobject]@{ Enums = $enumsByProperty[$node.Member.Value]; Declared = $otherProperties.Contains($node.Member.Value) }
+            return [SmaLintEnumSource]@{ Enums = $enumsByProperty[$node.Member.Value]; Declared = $otherProperties.Contains($node.Member.Value) }
         }
         if ($node -isnot [System.Management.Automation.Language.VariableExpressionAst]) { return }
         $name = $node.VariablePath.UserPath
@@ -620,12 +620,12 @@ function Get-SmaLint {
         param($source, [System.Management.Automation.Language.StringConstantExpressionAst[]] $literals, [bool] $parenthesized)
         $enums = $source.Enums
         $having = @($enums.Keys | Where-Object { $members = $enums[$_]; @($literals | Where-Object { $_.Value -notin $members }).Count -eq 0 })
-        if ($having.Count -ne 1 -or $source.Declared) { return [pscustomobject]@{ Enums = $having; Edits = @() } }
+        if ($having.Count -ne 1 -or $source.Declared) { return [SmaLintEnumFit]@{ Enums = $having; Edits = @() } }
         $edits = foreach ($literal in $literals) {
             $member = '[{0}]::{1}' -f $having[0], @($enums[$having[0]] | Where-Object { $_ -eq $literal.Value })[0]
-            [pscustomobject]@{ Start = $literal.Extent.StartOffset; End = $literal.Extent.EndOffset; Text = $(if ($parenthesized) { "($member)" } else { $member }) }
+            [SmaLintEdit]@{ Start = $literal.Extent.StartOffset; End = $literal.Extent.EndOffset; Text = $(if ($parenthesized) { "($member)" } else { $member }) }
         }
-        [pscustomobject]@{ Enums = $having; Edits = @($edits) }
+        [SmaLintEnumFit]@{ Enums = $having; Edits = @($edits) }
     }
     $describeEdits = {
         param($resolved, [string] $text)
@@ -660,10 +660,10 @@ function Get-SmaLint {
     }
     # Literals an enum type converts: the operand of a cast, a parameter's default value.
     $converted = @(
-        foreach ($cast in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.ConvertExpressionAst] }, $true)) { [pscustomobject]@{ Node = $cast; TypeName = $cast.Type.TypeName; Value = $cast.Child } }
+        foreach ($cast in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.ConvertExpressionAst] }, $true)) { [SmaLintConversion]@{ Node = $cast; TypeName = $cast.Type.TypeName; Value = $cast.Child } }
         foreach ($parameter in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.ParameterAst] -and $null -ne $args[0].DefaultValue }, $true)) {
             $typeName = @($parameter.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.TypeConstraintAst] } | ForEach-Object TypeName)
-            if ($typeName.Count -eq 1) { [pscustomobject]@{ Node = $parameter; TypeName = $typeName[0]; Value = $parameter.DefaultValue } }
+            if ($typeName.Count -eq 1) { [SmaLintConversion]@{ Node = $parameter; TypeName = $typeName[0]; Value = $parameter.DefaultValue } }
         })
     foreach ($conversion in $converted) {
         $source = & $enumNamed $conversion.TypeName
@@ -698,12 +698,64 @@ function Edit-SmaLintFinding {
         $null = [System.Management.Automation.Language.Parser]::ParseInput($text, $group.Name, [ref]$tokens, [ref]$errors)
         if ($errors.Count) { throw ('{0}: the edited text has {1} parse errors, first at line {2}: {3}' -f $group.Name, $errors.Count, $errors[0].Extent.StartLineNumber, $errors[0].Message) }
         [IO.File]::WriteAllText($group.Name, $text, [Text.UTF8Encoding]::new($false))
-        [pscustomobject]@{ File = $group.Name; Edits = $edits.Count }
+        [SmaLintEditedFile]@{ File = $group.Name; Edits = $edits.Count }
     }
 }
 
 # Marks a function as part of the checker: the functions that decide whether a file is accepted.
 class PscChecker : Attribute {}
+
+# A replacement of the source text from offset Start up to offset End.
+class SmaLintEdit {
+    [int] $Start
+    [int] $End
+    [string] $Text
+}
+
+# One lint finding: the rule, where it was found, what was found, and the edits that correct it when the rule
+# knows them.
+class SmaLintFinding {
+    [string] $File
+    [int] $Line
+    [string] $Rule
+    [string] $Detail
+    [SmaLintEdit[]] $Edits
+}
+
+# A file Edit-SmaLintFinding rewrote, and how many edits it applied.
+class SmaLintEditedFile {
+    [string] $File
+    [int] $Edits
+}
+
+# A statement that rebinds a variable in a function: an assignment or a foreach. Loop is the outermost loop around
+# it inside the function, $null at the function's top level.
+class SmaLintRebinding {
+    [System.Management.Automation.Language.StatementAst] $Node
+    [System.Management.Automation.Language.LoopStatementAst] $Loop
+    [int] $Offset
+}
+
+# The enums an expression's value can be, each with its member names. Declared says a class in the file also
+# declares the property with a type that is not an enum.
+class SmaLintEnumSource {
+    [System.Collections.Generic.Dictionary[string, string[]]] $Enums
+    [bool] $Declared
+}
+
+# The enums that have every literal written at one place, and the edits that write the members when exactly one
+# enum fits.
+class SmaLintEnumFit {
+    [string[]] $Enums
+    [SmaLintEdit[]] $Edits
+}
+
+# A value a type converts: a cast's operand or a parameter's default.
+class SmaLintConversion {
+    [System.Management.Automation.Language.Ast] $Node
+    [System.Management.Automation.Language.ITypeName] $TypeName
+    [System.Management.Automation.Language.ExpressionAst] $Value
+}
 
 # Guard's answer for one file. CheckerChanged names the checker functions of the file whose text differs from the
 # committed one. CheckerHash is the SHA-256 of the checker functions of the script that is running, for comparison
@@ -762,8 +814,8 @@ function Test-SmaGuard {
     [PscGuardVerdict]@{ File = $file; Passed = $reasons.Count -eq 0; Reasons = $reasons; CheckerChanged = $changed; CheckerHash = $hash }
 }
 
-# Describe: one project as live objects, built only from its parsed source. Every fact carries where it was read
-# (file and line). Code held in string literals is parsed and described too, marked Embedded: it is cruft by the AST
+# Graph: one project as live objects, built only from its parsed source. Every fact carries where it was read
+# (file and line). Code held in string literals is parsed and graphed too, marked Embedded: it is cruft by the AST
 # rule, and it is still part of what the project does. String literals that are not PowerShell are listed as Foreign.
 class SmaUnit {
     [string] $Identity; [string] $Scope; [string] $BodyScope
@@ -797,7 +849,7 @@ class SmaChange {
     [string] $File; [string] $Before; [string] $After; [string] $Kind
 }
 class SmaProject {
-    [string] $Root; [string] $Commit; [datetime] $DescribedUtc
+    [string] $Root; [string] $Commit; [datetime] $BuiltUtc
     [Collections.Generic.List[SmaUnit]] $Units
     [Collections.Generic.List[SmaEdge]] $Edges
     SmaProject() { $this.Units = [Collections.Generic.List[SmaUnit]]::new(); $this.Edges = [Collections.Generic.List[SmaEdge]]::new() }
@@ -808,7 +860,7 @@ class SmaProject {
     [Collections.Generic.List[object]] $Parameters = [Collections.Generic.List[object]]::new()
     [Collections.Generic.List[object]] $Variables = [Collections.Generic.List[object]]::new()
     [string[]] $Files
-    [string[]] $Operations = @('Describe','Find','Callers','Callees','Path','Coverage','Absent','Changes')
+    [string[]] $Operations = @('Graph','Find','Callers','Callees','Path','Coverage','Absent','Changes')
     [Collections.Generic.List[SmaSource]] $Sources = [Collections.Generic.List[SmaSource]]::new()
     [Collections.Generic.List[object]] $Symbols = [Collections.Generic.List[object]]::new()
     [Collections.Generic.List[object]] $TypeReferences = [Collections.Generic.List[object]]::new()
@@ -816,7 +868,7 @@ class SmaProject {
     [Collections.Generic.List[object]] $Diagnostics = [Collections.Generic.List[object]]::new()
     [Collections.Generic.List[object]] $Observations = [Collections.Generic.List[object]]::new()
     [Collections.Generic.Dictionary[System.Management.Automation.Language.Ast,SmaUnit]] $NodeOwners = [Collections.Generic.Dictionary[System.Management.Automation.Language.Ast,SmaUnit]]::new()
-    [SmaProject] Describe() { return $this }
+    [SmaProject] Graph() { return $this }
     [SmaCoverage] Coverage() { return $this.Coverage('Execution') }
     [SmaCoverage] Coverage([string] $Scope) {
         if ($Scope -notin 'Declarations','Execution') { throw 'Scope must be Declarations or Execution.' }
@@ -900,7 +952,7 @@ function Get-SmaOwner($node, $project, [string] $sourceIdentity) {
     return $project.Units | Where-Object Identity -eq ($sourceIdentity + ':script') | Select-Object -First 1
 }
 
-function Add-SmaDescribedSource($project, [string] $relative, $ast, [bool] $embedded, [int] $lineOffset, [string] $sourceIdentity) {
+function Add-SmaGraphSource($project, [string] $relative, $ast, [bool] $embedded, [int] $lineOffset, [string] $sourceIdentity) {
     $scriptName=if($embedded){'<embedded-script>'+$sourceIdentity}else{'<script>'+$relative}
     $scriptUnit = [SmaUnit]@{ Identity = $sourceIdentity + ':script'; Name = $scriptName; Kind = 'script'; File = $relative
         Line = 1 + $lineOffset; Lines = $ast.Extent.EndLineNumber; Ast = $ast; Embedded = $embedded
@@ -994,7 +1046,8 @@ function Add-SmaDescribedSource($project, [string] $relative, $ast, [bool] $embe
             }
             if ($memberName -in 'GetMethod','GetProperty','GetField','GetMember','GetType','CreateDelegate') {
                 $edge.Kind = 'reflection'; $edge.Reason = 'Reflection receiver and overload are not established.'
-                if($node.Arguments.Count -and $node.Arguments[0] -is [System.Management.Automation.Language.StringConstantExpressionAst]){$edge.To=$node.Arguments[0].Value}
+                # A member read without a call has no arguments, and a call without arguments has $null for them.
+                if($node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $null -ne $node.Arguments -and $node.Arguments.Count -and $node.Arguments[0] -is [System.Management.Automation.Language.StringConstantExpressionAst]){$edge.To=$node.Arguments[0].Value}
             }
             if ($memberName -in 'Invoke','DynamicInvoke') { $edge.Kind = 'delegate-or-reflection'; $edge.Reason = 'Callable value is not established.' }
         }
@@ -1095,10 +1148,10 @@ function Get-SmaEncodedSourceOrigins($Ast, [string]$SourceIdentity) {
         }
     }
 }
-function Get-SmaDescription {
+function Get-SmaGraph {
     param([string] $root)
     $root = [IO.Path]::GetFullPath($root)
-    $project = [SmaProject]::new(); $project.Root = $root; $project.DescribedUtc = [DateTime]::UtcNow
+    $project = [SmaProject]::new(); $project.Root = $root; $project.BuiltUtc = [DateTime]::UtcNow
     if ([IO.Directory]::Exists((Join-Path $root '.git'))) { $project.Commit = (git -C $root rev-parse HEAD 2>$null) }
     # Tracked and untracked-but-not-ignored PowerShell files: a working directory's whole source.
     $project.Files = @(Get-SmaSourceFiles $root)
@@ -1121,7 +1174,7 @@ function Get-SmaDescription {
         $project.Sources.Add([SmaSource]@{ Identity = $identity; File = $relative; Sha256 = $hash; Provenance = $project.Commit
             Ast = $ast; ParseErrors = @($errors); Boundary = 'PowerShellFile' })
         foreach ($errorRecord in $errors) { $project.Diagnostics.Add([pscustomobject]@{ Rule = 'ParseFailure'; File = $relative; Line = $errorRecord.Extent.StartLineNumber; Column = $errorRecord.Extent.StartColumnNumber; Detail = $errorRecord.Message; Ast = $errorRecord.Extent }) }
-        Add-SmaDescribedSource $project $relative $ast $false 0 $identity
+        Add-SmaGraphSource $project $relative $ast $false 0 $identity
         $encodedOrigins=@(Get-SmaEncodedSourceOrigins $ast $identity)
         foreach($origin in $encodedOrigins){$project.Relationships.Add([pscustomobject]@{Kind='ExecutableSourceBoundary';File=$relative;Line=$origin.Literal.Extent.StartLineNumber;Source=$origin.Literal;Consumer=$origin.Consumer;Transform=$origin.Transform;Target=$origin.Target;Resolution='Structurally established source construction; execution not observed'})}
         # String literals long enough to be source: parse each; PowerShell with definitions is Embedded, the rest Foreign.
@@ -1147,7 +1200,7 @@ function Get-SmaDescription {
                     ParseErrors = @($innerErrors); Embedded = $true; Container = $literal; ParentIdentity = $identity; Boundary = $record.Boundary })
                 $offset=$literal.Extent.StartLineNumber-1
                 if($literal.StringConstantType -in [System.Management.Automation.Language.StringConstantType]::SingleQuotedHereString,[System.Management.Automation.Language.StringConstantType]::DoubleQuotedHereString){$offset++}
-                Add-SmaDescribedSource $project $relative $inner $true $offset $innerIdentity
+                Add-SmaGraphSource $project $relative $inner $true $offset $innerIdentity
             } else { $project.Foreign.Add($record) }
         }
         try { foreach ($finding in @(Get-SmaLint $path)) { $finding.File = $relative; $project.Lint.Add($finding) } }
@@ -1212,10 +1265,10 @@ function Invoke-SmaObservedOperation($Project, [string] $Name, [scriptblock] $Op
     }
 }
 
-function Test-SmaDescription {
+function Test-SmaGraph {
     param()
     # The fixture is an independent Git repository that exists only for this check; its evidence is the live
-    # description returned with each result.
+    # graph returned with each result.
     $directory = Join-Path ([IO.Path]::GetTempPath()) ('PSC-Verify-' + [guid]::NewGuid().ToString('N'))
     $null = [IO.Directory]::CreateDirectory($directory)
     try {
@@ -1247,7 +1300,7 @@ powershell.exe -EncodedCommand $conditionalTransport
 Entry
 '@
     [IO.File]::WriteAllText((Join-Path $directory 'untracked.ps1'), $fixture)
-    $project = Get-SmaDescription $directory
+    $project = Get-SmaGraph $directory
     $checks = [ordered]@{
         DuplicateDeclarations = @($project.Diagnostics | Where-Object Rule -eq 'DuplicateDeclaration').Count -eq 1
         CaseFoldSymbols = @($project.Diagnostics | Where-Object Rule -eq 'CaseFoldSymbol').Count -ge 1
@@ -1273,12 +1326,13 @@ Entry
     [IO.File]::AppendAllText((Join-Path $directory 'untracked.ps1'), "`n# source revision")
     $checks.SourceInvalidation = $project.Changes().Count -eq 1
     [IO.File]::WriteAllText((Join-Path $directory 'broken.ps1'),'function Broken { 1 + }')
-    $broken=Get-SmaDescription $directory
+    $broken=Get-SmaGraph $directory
     $checks.ParsePositions = @($broken.Diagnostics | Where-Object { $_.Rule -eq 'ParseFailure' -and $_.Line -eq 1 -and $_.Column -gt 0 }).Count -gt 0
     $checks.ParseFailureLimitsAbsence = $broken.Absent('UnseenDeclaration','Declarations').Status -eq 'Unknown'
     $shared=[int[]]@(4,5);$copy=[int[]]@(4,5)
     $checks.GraphSharedReferences = (Compare-SmaRuntimeGraph ([object[]]@($shared,$shared)) ([object[]]@($copy,$copy))).Equal
     $checks.GraphSplitReferencesRejected = -not (Compare-SmaRuntimeGraph ([object[]]@($shared,$shared)) ([object[]]@([int[]]@(4,5),[int[]]@(4,5)))).Equal
+    Test-PscInline -Directory $directory
     foreach ($key in $checks.Keys) {
         [pscustomobject]@{ Test = $key; Passed = [bool]$checks[$key]; Evidence = $project }
     }
@@ -1321,6 +1375,109 @@ $script:LoweringKeywords = @{}
 # A class in the source deriving from System.Attribute is a marker for other members, not code to compile.
 function Test-AttributeClass([System.Management.Automation.Language.TypeDefinitionAst] $Class) {
     $Class.BaseTypes.Count -eq 1 -and (Resolve-AstType $Class.BaseTypes[0].TypeName) -eq [Attribute]
+}
+
+# Author intent for a method: its implementation is final and is an inline candidate.
+[AttributeUsage([AttributeTargets]::Method)]
+class PscInline : Attribute {
+    PscInline() {}
+}
+
+function Test-PscInlineMethod([System.Management.Automation.Language.FunctionMemberAst] $Method) {
+    $attributes = @($Method.Attributes | Where-Object { $_.TypeName.GetReflectionAttributeType() -eq [PscInline] })
+    if (-not $attributes.Count) { return $false }
+    if ($attributes.Count -ne 1 -or $attributes[0].PositionalArguments.Count -or $attributes[0].NamedArguments.Count -or $Method.IsConstructor) {
+        throw ('[{0}:{1}] PscInline requires one argument-free attribute on a method.' -f $Method.Extent.StartLineNumber, $Method.Extent.StartColumnNumber)
+    }
+    return $true
+}
+
+function Assert-PscInlineOverrides([System.Management.Automation.Language.TypeDefinitionAst[]] $classes) {
+    $definitions = [Collections.Generic.Dictionary[string,System.Management.Automation.Language.TypeDefinitionAst]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($class in $classes) { $definitions.Add($class.Name, $class) }
+    foreach ($class in $classes) {
+        $ancestors = [Collections.Generic.HashSet[System.Management.Automation.Language.TypeDefinitionAst]]::new()
+        $base = $class
+        while ($base.BaseTypes.Count -and $definitions.TryGetValue($base.BaseTypes[0].TypeName.Name, [ref]$base) -and $ancestors.Add($base)) {
+            foreach ($method in $base.Members) {
+                if ($method -isnot [System.Management.Automation.Language.FunctionMemberAst] -or -not (Test-PscInlineMethod $method)) { continue }
+                foreach ($candidate in $class.Members) {
+                    if ($candidate -isnot [System.Management.Automation.Language.FunctionMemberAst] -or $candidate.IsStatic -or $candidate.IsConstructor -or $candidate.Name -ine $method.Name) { continue }
+                    $expected = Get-ParameterTypes $method
+                    $actual = Get-ParameterTypes $candidate
+                    if ([Linq.Enumerable]::SequenceEqual[Type]([Type[]]$expected, [Type[]]$actual)) {
+                        throw ('[{0}:{1}] Method {2}.{3} overrides PscInline method {4}.{5}.' -f $candidate.Extent.StartLineNumber, $candidate.Extent.StartColumnNumber, $class.Name, $candidate.Name, $base.Name, $method.Name)
+                    }
+                }
+            }
+        }
+    }
+}
+
+function Test-PscInline([string] $Directory) {
+    # Keep the authored fixture as AST, never executable source text. SMA parses the real attribute;
+    # composition attaches that AttributeAst to the method without binding a test class in PSC's runtime.
+    $intent = { [PscInline()] param() }.Ast.ParamBlock.Attributes[0]
+    $fixture = {
+        class PscInlineLoop {
+            [int] Increment([int] $value) { return $value + 1 }
+            [int] Run([int] $count) {
+                $sum = 0
+                for ($index = 0; $index -lt $count; $index++) { $sum += $this.Increment($index) }
+                return $sum
+            }
+        }
+        class PscInlineOverride : PscInlineLoop {
+            [int] Increment([int] $value) { return $value + 2 }
+        }
+    }.Ast
+    $classes = [Collections.Generic.List[System.Management.Automation.Language.StatementAst]]::new()
+    foreach ($class in $fixture.EndBlock.Statements) {
+        $members = [Collections.Generic.List[System.Management.Automation.Language.MemberAst]]::new()
+        foreach ($member in $class.Members) {
+            if ($class.Name -eq 'PscInlineLoop' -and $member.Name -eq 'Increment') {
+                $members.Add([System.Management.Automation.Language.FunctionMemberAst]::new($member.Extent,
+                    $member.Body.Parent.Copy(), $member.ReturnType.Copy(),
+                    [System.Management.Automation.Language.AttributeAst[]]@($intent.Copy()), $member.MethodAttributes))
+            } else { $members.Add($member.Copy()) }
+        }
+        $classes.Add([System.Management.Automation.Language.TypeDefinitionAst]::new($class.Extent, $class.Name,
+            [System.Management.Automation.Language.AttributeAst[]]@(), $members, $class.TypeAttributes,
+            [System.Management.Automation.Language.TypeConstraintAst[]]@($class.BaseTypes | ForEach-Object { $_.Copy() })))
+    }
+    $root = [System.Management.Automation.Language.ScriptBlockAst]::new($fixture.Extent, $null,
+        [System.Management.Automation.Language.StatementBlockAst]::new($fixture.Extent, $classes, $null), $false)
+    $output = Join-Path $Directory 'PscInlineLoop.dll'
+    $null = Export-LoweredAssembly -SourceAst $root -ClassName PscInlineLoop -ClassNames PscInlineLoop -OutputPath $output
+    $inspection = Test-LoweredAssembly -AssemblyPath $output -ClassName PscInlineLoop
+    $increment = @($inspection.Methods | Where-Object Name -eq 'Increment')[0]
+    if (-not ($increment.Attributes -band [Reflection.MethodAttributes]::Final) -or -not ($increment.Implementation -band [Reflection.MethodImplAttributes]::AggressiveInlining)) { throw 'PscInline metadata was not emitted.' }
+    $assembly = [Reflection.Assembly]::Load([IO.File]::ReadAllBytes($output))
+    $type = $assembly.GetType('PscInlineLoop', $true)
+    $run = $type.GetMethod('Run').CreateDelegate([Func[int,int]], [Activator]::CreateInstance($type))
+    if ($run.Invoke(100) -ne 5050) { throw 'PscInline loop result differs.' }
+    $rejected = $false
+    try { $null = Export-LoweredAssembly -SourceAst $root -ClassName PscInlineLoop -OutputPath (Join-Path $Directory 'PscInlineOverride.dll') }
+    catch { if ($_.Exception.Message.Contains('overrides PscInline method')) { $rejected = $true } else { throw } }
+    if (-not $rejected) { throw 'PSC accepted an override of a PscInline method.' }
+    # Inspect prepares the caller in a fresh, fully optimized process; its native listing must exist
+    # and contain no call to the marked callee. Restore the caller's diagnostic environment exactly.
+    $oldTiering = [Environment]::GetEnvironmentVariable('DOTNET_TieredCompilation')
+    $oldDisasm = [Environment]::GetEnvironmentVariable('DOTNET_JitDisasm')
+    try {
+        [Environment]::SetEnvironmentVariable('DOTNET_TieredCompilation', '0')
+        [Environment]::SetEnvironmentVariable('DOTNET_JitDisasm', 'PscInlineLoop:Run')
+        $listing = @(& (Join-Path $PSHOME 'pwsh') -NoProfile -File $PSCommandPath -Mode Inspect -AssemblyPath $output -ClassName PscInlineLoop -MethodNames Run)
+        if ($LASTEXITCODE) { throw 'PscInline Inspect process failed.' }
+        $jit = $listing -join [Environment]::NewLine
+        if (-not $jit.Contains('Assembly listing for method PscInlineLoop:Run') -or $jit.Contains('PscInlineLoop:Increment(')) { throw 'Inspect did not establish removal of the marked call from the caller JIT output.' }
+    } finally {
+        [Environment]::SetEnvironmentVariable('DOTNET_TieredCompilation', $oldTiering)
+        [Environment]::SetEnvironmentVariable('DOTNET_JitDisasm', $oldDisasm)
+    }
+    foreach ($name in 'PscInlineMetadata','PscInlineLoopResult','PscInlineOverrideRejected','PscInlineInspectCallRemoved') {
+        [pscustomobject]@{ Test = $name; Passed = $true; Evidence = $inspection }
+    }
 }
 
 # The source declares its own keywords: a static method marked [Keyword()], where Keyword is an attribute
@@ -1931,12 +2088,15 @@ function Use-ClassMirror {
 # The mirror types of the classes and enums under one root, built once per root; -Resolving names types its
 # signatures may use from elsewhere. Building one leaves the lowering in progress resolving what it was resolving.
 function Get-ClassMirrorType {
-    param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Root, [hashtable] $Resolving = @{})
+    param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Root, [hashtable] $Resolving = @{},
+        [System.Management.Automation.Language.TypeDefinitionAst[]] $SelectedClassAst)
+    if ($PSBoundParameters.ContainsKey('SelectedClassAst')) { $null = $script:ClassMirrorCache.Remove($Root) }
     $types = $null
     if (-not $script:ClassMirrorCache.TryGetValue($Root, [ref]$types)) {
         $inProgress = $script:LoweringClassTypes
         try {
-            $classes = @($Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true) | Where-Object { -not (Test-AttributeClass $_) })
+            $classes = @(if ($PSBoundParameters.ContainsKey('SelectedClassAst')) { $SelectedClassAst }
+                else { $Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true) | Where-Object { -not (Test-AttributeClass $_) } })
             $enums = @($Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsEnum }, $true))
             $script:LoweringClassTypes = @{} + $Resolving
             $types = @{}
@@ -1980,7 +2140,7 @@ function Add-PscSemanticsToSession {
         $mb = $tb.DefineMethod($mm.Name, $mm.Attributes, (Get-IlType $mm.ReturnType), [Type[]]@($types | ForEach-Object { Get-IlType $_ }))
         for ($i = 0; $i -lt $m.Parameters.Count; $i++) { $null = $mb.DefineParameter($i + 1, [Reflection.ParameterAttributes]::None, $m.Parameters[$i].Name.VariablePath.UserPath) }
         $script:IlMap.Members[$mm] = $mb
-        [pscustomobject]@{ Ast = $m; Builder = $mb }
+        [PscMemberPlan]@{ Ast = $m; Builder = $mb }
     })
     $mc = $mirrorType.GetConstructor($declared, $null, [Type[]]@(), $null)
     if ($null -ne $mc) { $script:IlMap.ImplicitConstructors[$mc] = $tb }
@@ -3367,7 +3527,7 @@ function Read-PowerShellClass {
         $classes[0]
     }
 
-    [pscustomobject]@{
+    [PscLoweringSource]@{
         Ast      = $ast
         ClassAst = $targetClass
     }
@@ -7109,7 +7269,18 @@ class PscAstRebuild : System.Management.Automation.Language.ICustomAstVisitor2 {
     [object] DefaultVisit([System.Management.Automation.Language.Ast] $a) { return $this.Edit($a, $a.Copy()) }
     [object] VisitErrorStatement([System.Management.Automation.Language.ErrorStatementAst] $a) { return $this.Edit($a, $a.Copy()) }
     [object] VisitErrorExpression([System.Management.Automation.Language.ErrorExpressionAst] $a) { return $this.Edit($a, $a.Copy()) }
-    [object] VisitUsingStatement([System.Management.Automation.Language.UsingStatementAst] $a) { return $this.Edit($a, $a.Copy()) }
+    [object] VisitUsingStatement([System.Management.Automation.Language.UsingStatementAst] $a) {
+        if ($null -ne $a.ModuleSpecification) {
+            if ($null -ne $a.Name) {
+                return $this.Edit($a, [System.Management.Automation.Language.UsingStatementAst]::new($a.Extent, $this.Rebuild($a.Name), $this.Rebuild($a.ModuleSpecification)))
+            }
+            return $this.Edit($a, [System.Management.Automation.Language.UsingStatementAst]::new($a.Extent, $this.Rebuild($a.ModuleSpecification)))
+        }
+        if ($null -ne $a.Alias) {
+            return $this.Edit($a, [System.Management.Automation.Language.UsingStatementAst]::new($a.Extent, $a.UsingStatementKind, $this.Rebuild($a.Name), $this.Rebuild($a.Alias)))
+        }
+        return $this.Edit($a, [System.Management.Automation.Language.UsingStatementAst]::new($a.Extent, $a.UsingStatementKind, $this.Rebuild($a.Name)))
+    }
     [object] VisitConfigurationDefinition([System.Management.Automation.Language.ConfigurationDefinitionAst] $a) { return $this.Edit($a, $a.Copy()) }
     [object] VisitDynamicKeywordStatement([System.Management.Automation.Language.DynamicKeywordStatementAst] $a) { return $this.Edit($a, $a.Copy()) }
     [object] VisitExpandableStringExpression([System.Management.Automation.Language.ExpandableStringExpressionAst] $a) { return $this.Edit($a, $a.Copy()) }
@@ -8117,6 +8288,112 @@ function ConvertTo-StaticDataExpression {
     return [Linq.Expressions.Expression]::Constant($Value, $Type)
 }
 
+class PscMethodClosure : System.Linq.Expressions.ExpressionVisitor {
+    [Collections.Generic.Dictionary[Reflection.MethodInfo, System.Management.Automation.Language.FunctionMemberAst]] $Bindings = [Collections.Generic.Dictionary[Reflection.MethodInfo, System.Management.Automation.Language.FunctionMemberAst]]::new()
+    [Collections.Generic.HashSet[System.Management.Automation.Language.FunctionMemberAst]] $Required = [Collections.Generic.HashSet[System.Management.Automation.Language.FunctionMemberAst]]::new()
+    [Collections.Generic.Queue[System.Management.Automation.Language.FunctionMemberAst]] $Pending = [Collections.Generic.Queue[System.Management.Automation.Language.FunctionMemberAst]]::new()
+
+    [void] Require([System.Management.Automation.Language.FunctionMemberAst] $method) {
+        if ($this.Required.Add($method)) { $this.Pending.Enqueue($method) }
+    }
+
+    [System.Linq.Expressions.Expression] VisitMethodCall([System.Linq.Expressions.MethodCallExpression] $node) {
+        if ($this.Bindings.ContainsKey($node.Method)) { $this.Require($this.Bindings[$node.Method]) }
+        return ([System.Linq.Expressions.ExpressionVisitor]$this).VisitMethodCall($node)
+    }
+}
+
+function Get-RequiredClassMethods {
+    param([Parameter(Mandatory)][object[]] $Model, [Parameter(Mandatory)][hashtable] $MethodMirror,
+        [Parameter(Mandatory)][string] $ClassName, [Parameter(Mandatory)][string[]] $MethodNames)
+    $closure = [PscMethodClosure]::new()
+    $roots = 0
+    foreach ($class in $Model) {
+        foreach ($method in $class.Methods) {
+            $member = $MethodMirror[$class.Name].GetMethod($method.Name, (Get-ParameterTypes $method))
+            $closure.Bindings.Add($member, $method)
+            if ($class.Name -ne $ClassName -or $method.Name -in $MethodNames) {
+                $closure.Require($method)
+                if ($class.Name -eq $ClassName) { $roots++ }
+            }
+        }
+    }
+    if (-not $roots) { throw "No matching methods found in class '$ClassName' to export." }
+    foreach ($class in $Model) {
+        $instanceInitializers = @($class.Properties | Where-Object { -not $_.IsStatic -and $_.InitialValue })
+        $staticInitializers = @($class.Properties | Where-Object { $_.IsStatic -and $_.InitialValue })
+        foreach ($constructor in $class.Constructors) {
+            $lowered = Convert-MethodAstToLambda -MethodAst $constructor -Initializers $instanceInitializers
+            $null = $closure.Visit($lowered.Lambda.Body)
+        }
+        if (-not $class.Constructors.Count -and $instanceInitializers.Count) {
+            $lowered = Convert-InitializersToLambda -ClassAst $class.Ast -Initializers $instanceInitializers
+            $null = $closure.Visit($lowered.Lambda.Body)
+        }
+        if ($staticInitializers.Count) {
+            $lowered = Convert-InitializersToLambda -ClassAst $class.Ast -Initializers $staticInitializers -Static
+            $null = $closure.Visit($lowered.Lambda.Body)
+        }
+    }
+    while ($closure.Pending.Count) {
+        $lowered = Convert-MethodAstToLambda -MethodAst $closure.Pending.Dequeue()
+        $null = $closure.Visit($lowered.Lambda.Body)
+    }
+    return ,$closure.Required
+}
+
+# The records of one compile (Export-LoweredAssembly).
+
+# A parsed source and the class the compile targets. ClassAst is $null for a program, whose target is the class of
+# its functions.
+class PscLoweringSource {
+    [System.Management.Automation.Language.ScriptBlockAst] $Ast
+    [System.Management.Automation.Language.TypeDefinitionAst] $ClassAst
+}
+
+# A static field that -StaticData fills, with the expression that builds its value.
+class PscStaticDataField {
+    [System.Reflection.FieldInfo] $Field
+    [System.Linq.Expressions.Expression] $Expression
+}
+
+# A method or constructor with the builder its body is written into. Ast is $null for the constructor PSC supplies
+# to a class that declares none.
+class PscMemberPlan {
+    [System.Management.Automation.Language.FunctionMemberAst] $Ast
+    [System.Reflection.MethodBase] $Builder
+}
+
+# One class's members to emit. Class is its model (Get-ClassModel).
+class PscClassPlan {
+    [object] $Class
+    [PscMemberPlan[]] $Constructors
+    [PscMemberPlan[]] $Methods
+}
+
+# PowerShellSemantics in the assembly being compiled. Session is the assembly's session (New-PersistedAssemblySession).
+# Methods is $null until an emitted call needs a helper; Needed names the helpers the compile used.
+class PscSemanticsPlan {
+    [object] $Session
+    [PscMemberPlan[]] $Methods
+    [System.Collections.Generic.SortedSet[string]] $Needed
+}
+
+# What a compile produced. EntryPoint and RuntimeConfig are $null for a library.
+class PscLoweredAssembly {
+    [string] $OutputPath
+    [int] $Length
+    [string] $SHA256
+    [string] $ClassName
+    [string[]] $Classes
+    # The PowerShellSemantics helpers this compile switched on, because lowering needed them.
+    [string[]] $Helpers
+    [string[]] $EmittedMethods
+    [bool] $Deterministic
+    [string] $EntryPoint
+    [string] $RuntimeConfig
+}
+
 function Export-LoweredAssembly {
     <#
     .SYNOPSIS
@@ -8136,8 +8413,7 @@ function Export-LoweredAssembly {
         [Parameter()][Collections.IDictionary] $StaticData,
         [Parameter()][string] $ClassName,
         [Parameter()][string[]] $ClassNames,
-        # Emit only these methods of -ClassName. A body that uses an omitted
-        # method fails with an error naming it.
+        # Select these methods of -ClassName and retain their bound method dependencies.
         [Parameter()][string[]] $MethodNames,
         [Parameter(Mandatory)][string] $OutputPath,
         [switch] $Deterministic = $true,
@@ -8158,7 +8434,7 @@ function Export-LoweredAssembly {
         # The script as a program: its function class, with Main, is the target (Get-ScriptFunctionClass -Program).
         if ($null -eq $SourceAst) { throw '-Program compiles -SourceAst.' }
         $null = Get-ScriptFunctionClass -Root $SourceAst -Program
-        $parsed = [pscustomobject]@{ Ast = $SourceAst; ClassAst = $null }
+        $parsed = [PscLoweringSource]@{ Ast = $SourceAst; ClassAst = $null }
     }
     elseif ($null -ne $SourceAst) {
         if ($SourcePath) { throw 'Supply SourcePath or SourceAst, not both.' }
@@ -8167,7 +8443,7 @@ function Export-LoweredAssembly {
         if ($target.Count -ne 1) { throw 'SourceAst must contain exactly one target class.' }
         # The caller may compose class copies from independently parsed sources. Extent.Text is provenance,
         # not a serialization of that composed tree. Get-ClassModel and body admission validate the live nodes.
-        $parsed = [pscustomobject]@{ Ast = $SourceAst; ClassAst = $target[0] }
+        $parsed = [PscLoweringSource]@{ Ast = $SourceAst; ClassAst = $target[0] }
     } else {
     $fullSourcePath = if ([IO.Path]::IsPathFullyQualified($SourcePath)) {
         [IO.Path]::GetFullPath($SourcePath)
@@ -8185,10 +8461,10 @@ function Export-LoweredAssembly {
     # Script variables used only as records are lowered as their classes.
     $typedRoot = ConvertTo-PscRecordSource -Root $parsed.Ast
     if (-not [object]::ReferenceEquals($typedRoot, $parsed.Ast)) {
-        if ($Program) { $null = Get-ScriptFunctionClass -Root $typedRoot -Program; $parsed = [pscustomobject]@{ Ast = $typedRoot; ClassAst = $null } }
+        if ($Program) { $null = Get-ScriptFunctionClass -Root $typedRoot -Program; $parsed = [PscLoweringSource]@{ Ast = $typedRoot; ClassAst = $null } }
         else {
             $targetName = $parsed.ClassAst.Name
-            $parsed = [pscustomobject]@{ Ast = $typedRoot; ClassAst = $typedRoot.Find({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.Name -eq $targetName }, $true) }
+            $parsed = [PscLoweringSource]@{ Ast = $typedRoot; ClassAst = $typedRoot.Find({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.Name -eq $targetName }, $true) }
         }
     }
     $targetClass = $parsed.ClassAst
@@ -8210,9 +8486,13 @@ function Export-LoweredAssembly {
         $classAsts = @($classAsts | Where-Object Name -in $ClassNames)
         if ($classAsts.Count -ne @($ClassNames | Sort-Object -Unique).Count -or $targetClass.Name -notin $ClassNames) { throw 'ClassNames must identify existing classes and include ClassName.' }
     }
+    Assert-PscInlineOverrides -Classes $classAsts
     $model = @(Get-ClassModel -ClassAsts $classAsts)
+    $sourceClasses = [System.Management.Automation.Language.TypeDefinitionAst[]]@($classAsts | Where-Object { -not [object]::ReferenceEquals($_, $functionClass) })
+    $null = Get-ClassMirrorType -Root $parsed.Ast -SelectedClassAst $sourceClasses
     Use-ClassMirror -Ast $parsed.Ast
     $mirror = @{} + $script:LoweringClassTypes
+    $requiredMethods = if ($MethodNames) { Get-RequiredClassMethods -Model $model -MethodMirror $mirror -ClassName $targetClass.Name -MethodNames $MethodNames } else { $null }
     $dataFields = @{}
     if ($null -eq $StaticData) { $StaticData = @{} }
     # One graph of instances per class with static data (PscStaticGraph).
@@ -8224,14 +8504,14 @@ function Export-LoweredAssembly {
         $field = $mirror[$parts[0]].GetField($parts[1], [Reflection.BindingFlags]'Public,Static,DeclaredOnly')
         if ($null -eq $field) { throw "Unknown static data field '$key'." }
         if (-not $graphs.ContainsKey($parts[0])) { $graphs[$parts[0]] = [PscStaticGraph]@{ Models = $models; Mirror = $mirror; Owners = $owners } }
-        $dataFields[$key] = [pscustomobject]@{ Field = $field; Expression = (ConvertTo-StaticDataExpression $StaticData[$key] $field.FieldType $graphs[$parts[0]]) }
+        $dataFields[$key] = [PscStaticDataField]@{ Field = $field; Expression = (ConvertTo-StaticDataExpression $StaticData[$key] $field.FieldType $graphs[$parts[0]]) }
     }
     foreach ($staticGraph in $graphs.Values) { Complete-PscStaticGraph $staticGraph }
 
     $assemblyName = [IO.Path]::GetFileNameWithoutExtension($OutputPath)
     $session = New-PersistedAssemblySession -AssemblyName $assemblyName
     $declared = [Reflection.BindingFlags]'Public,Static,Instance,DeclaredOnly'
-    $script:IlMap = @{ Types = @{}; Members = @{}; ImplicitConstructors = @{}; Semantics = [pscustomobject]@{ Session = $session; Methods = $null; Needed = [System.Collections.Generic.SortedSet[string]]::new([StringComparer]::Ordinal) } }
+    $script:IlMap = @{ Types = @{}; Members = @{}; ImplicitConstructors = @{}; Semantics = [PscSemanticsPlan]@{ Session = $session; Methods = $null; Needed = [System.Collections.Generic.SortedSet[string]]::new([StringComparer]::Ordinal) } }
     try {
         # 1. Output types, so every signature can name any of them. Enums are complete once their literals exist.
         foreach ($enumAst in @($parsed.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsEnum }, $true))) {
@@ -8263,7 +8543,7 @@ function Export-LoweredAssembly {
                     for ($i = 0; $i -lt $ctorAst.Parameters.Count; $i++) { $null = $cb.DefineParameter($i + 1, [Reflection.ParameterAttributes]::None, $ctorAst.Parameters[$i].Name.VariablePath.UserPath) }
                 }
                 $script:IlMap.Members[$mc] = $cb
-                [pscustomobject]@{ Ast = $ctorAst; Builder = $cb }
+                [PscMemberPlan]@{ Ast = $ctorAst; Builder = $cb }
             })
             foreach ($n in $c.NativeImports) {
                 $types = Get-ParameterTypes $n.Ast
@@ -8273,25 +8553,29 @@ function Export-LoweredAssembly {
                     -ReturnType (Get-IlType $mm.ReturnType) -ParameterTypes ([Type[]]@($types | ForEach-Object { Get-IlType $_ })) -ParameterNames $names -Persisted
             }
             $methods = @($c.Methods)
-            if ($MethodNames -and $c.Name -eq $targetClass.Name) { $methods = @($methods | Where-Object { $_.Name -in $MethodNames }) }
+            if ($null -ne $requiredMethods) { $methods = @($methods | Where-Object { $requiredMethods.Contains($_) }) }
             $methodPlans = foreach ($m in $methods) {
                 $types = Get-ParameterTypes $m
                 $mm = $mirrorType.GetMethod($m.Name, $declared, $null, $types, $null)
-                $mb = $tb.DefineMethod($mm.Name, $mm.Attributes, (Get-IlType $mm.ReturnType), [Type[]]@($types | ForEach-Object { Get-IlType $_ }))
+                $inline = Test-PscInlineMethod $m
+                $attributes = $mm.Attributes
+                if ($inline) { $attributes = $attributes -bor [Reflection.MethodAttributes]::Final }
+                $mb = $tb.DefineMethod($mm.Name, $attributes, (Get-IlType $mm.ReturnType), [Type[]]@($types | ForEach-Object { Get-IlType $_ }))
+                if ($inline) { $mb.SetImplementationFlags([Reflection.MethodImplAttributes]::AggressiveInlining) }
                 for ($i = 0; $i -lt $m.Parameters.Count; $i++) { $null = $mb.DefineParameter($i + 1, [Reflection.ParameterAttributes]::None, $m.Parameters[$i].Name.VariablePath.UserPath) }
                 Set-NativeCallbackAttribute -Builder $mb -Contract (Get-NativeMethodContract $m)
                 $script:IlMap.Members[$mm] = $mb
-                [pscustomobject]@{ Ast = $m; Builder = $mb }
+                [PscMemberPlan]@{ Ast = $m; Builder = $mb }
             }
             if (-not $c.Constructors.Count) {
                 $mc = $mirrorType.GetConstructor($declared, $null, [Type[]]@(), $null)
                 if (@($c.Properties | Where-Object { -not $_.IsStatic -and $_.InitialValue }).Count) {
                     $cb = $tb.DefineConstructor($mc.Attributes, [Reflection.CallingConventions]::Standard, [Type[]]@())
                     $script:IlMap.Members[$mc] = $cb
-                    $ctorPlans += [pscustomobject]@{ Ast = $null; Builder = $cb }
+                    $ctorPlans += [PscMemberPlan]@{ Ast = $null; Builder = $cb }
                 } else { $script:IlMap.ImplicitConstructors[$mc] = $tb }
             }
-            [pscustomobject]@{ Class = $c; Constructors = @($ctorPlans); Methods = @($methodPlans) }
+            [PscClassPlan]@{ Class = $c; Constructors = @($ctorPlans); Methods = @($methodPlans) }
         }
 
         # 3. Bodies.
@@ -8372,19 +8656,20 @@ function Export-LoweredAssembly {
         $script:PscCompilingProgram = $false
     }
 
-    [pscustomobject]@{
+    $compiled = [PscLoweredAssembly]@{
         OutputPath     = $saveResult.OutputPath
         Length         = $saveResult.Length
         SHA256         = $saveResult.SHA256
         ClassName      = $targetClass.Name
         Classes        = [string[]]@($model | ForEach-Object Name)
-        # The PowerShellSemantics helpers this compile switched on, because lowering needed them.
         Helpers        = $helpers
         EmittedMethods = $emittedMethods.ToArray()
         Deterministic  = $saveResult.Deterministic
-        EntryPoint     = $saveResult.EntryPoint
-        RuntimeConfig  = $saveResult.RuntimeConfig
     }
+    # A [string] property turns an assigned $null into ''; a library's stay $null, as they were.
+    if ($null -ne $saveResult.EntryPoint) { $compiled.EntryPoint = $saveResult.EntryPoint }
+    if ($null -ne $saveResult.RuntimeConfig) { $compiled.RuntimeConfig = $saveResult.RuntimeConfig }
+    $compiled
 }
 
 # Native AOT: the lowered assembly compiled to machine code by ILC (Microsoft's IL compiler, PSC's backend) and
@@ -8498,6 +8783,27 @@ function Export-NativeImage {
     [pscustomobject]@{ OutputPath = [IO.Path]::GetFullPath($OutputPath); Object = $object; ObjectLength = (Get-Item -LiteralPath $object).Length; ImageLength = (Get-Item -LiteralPath $OutputPath).Length; Image = $image }
 }
 
+class PscMethodInspection {
+    [string] $ClassName
+    [string] $Name
+    [Reflection.MethodAttributes] $Attributes
+    [Reflection.MethodImplAttributes] $Implementation
+    [byte[]] $IL
+    [int] $MetadataToken
+    [bool] $Prepared
+}
+
+class PscAssemblyInspection {
+    [string] $AssemblyPath
+    [long] $Length
+    [string] $SHA256
+    [string] $MVID
+    [string[]] $AssemblyReferences
+    [bool] $SmaReferenced
+    [bool] $ClrOnlyAdmitted
+    [PscMethodInspection[]] $Methods
+}
+
 function Test-LoweredAssembly {
     <#
     .SYNOPSIS
@@ -8505,7 +8811,9 @@ function Test-LoweredAssembly {
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string] $AssemblyPath
+        [Parameter(Mandatory)][string] $AssemblyPath,
+        [string] $ClassName,
+        [string[]] $MethodNames
     )
 
     $fullPath = [IO.Path]::GetFullPath($AssemblyPath)
@@ -8528,6 +8836,23 @@ function Test-LoweredAssembly {
             $refName = $meta.GetString($ref.Name)
             $assemblyRefs.Add($refName)
         }
+        $methods = [Collections.Generic.List[PscMethodInspection]]::new()
+        foreach ($typeHandle in $meta.TypeDefinitions) {
+            $definition = $meta.GetTypeDefinition($typeHandle)
+            $typeName = $meta.GetString($definition.Name)
+            if ($ClassName -and $typeName -cne $ClassName) { continue }
+            foreach ($methodHandle in $definition.GetMethods()) {
+                $methodDefinition = $meta.GetMethodDefinition($methodHandle)
+                $inspectedMethodName = $meta.GetString($methodDefinition.Name)
+                if ($MethodNames -and $inspectedMethodName -cnotin $MethodNames) { continue }
+                $method = [PscMethodInspection]::new()
+                $method.ClassName = $typeName; $method.Name = $inspectedMethodName
+                $method.Attributes = $methodDefinition.Attributes; $method.Implementation = $methodDefinition.ImplAttributes
+                $method.MetadataToken = [Reflection.Metadata.Ecma335.MetadataTokens]::GetToken([Reflection.Metadata.EntityHandle]$methodHandle)
+                if ($methodDefinition.RelativeVirtualAddress) { $method.IL = [Reflection.Metadata.PEReaderExtensions]::GetMethodBody($peReader, $methodDefinition.RelativeVirtualAddress).GetILBytes() }
+                $methods.Add($method)
+            }
+        }
     }
     finally {
         $peReader.Dispose()
@@ -8536,7 +8861,20 @@ function Test-LoweredAssembly {
 
     $smaReferenced = $assemblyRefs -contains 'System.Management.Automation'
 
-    [pscustomobject]@{
+    # Preparing explicitly selected managed methods lets the runtime's JIT diagnostics describe their code;
+    # no method body or program entry point is invoked.
+    if ($MethodNames -and -not $smaReferenced) {
+        $runtimeAssembly = [Reflection.Assembly]::LoadFrom($fullPath)
+        foreach ($method in $methods) {
+            if (-not $method.IL.Length) { continue }
+            $runtimeMethod = $runtimeAssembly.ManifestModule.ResolveMethod($method.MetadataToken)
+            if ($runtimeMethod.ContainsGenericParameters) { continue }
+            [Runtime.CompilerServices.RuntimeHelpers]::PrepareMethod($runtimeMethod.MethodHandle)
+            $method.Prepared = $true
+        }
+    }
+
+    [PscAssemblyInspection]@{
         AssemblyPath       = $fullPath
         Length             = $bytes.Length
         SHA256             = $sha256
@@ -8544,6 +8882,7 @@ function Test-LoweredAssembly {
         AssemblyReferences = $assemblyRefs.ToArray()
         SmaReferenced      = $smaReferenced
         ClrOnlyAdmitted    = (-not $smaReferenced)
+        Methods            = $methods.ToArray()
     }
 }
 
@@ -8553,6 +8892,212 @@ function Test-LoweredAssembly {
 # the order they are named or found, repeating until nothing new is pulled in. Reference: Microsoft PE/COFF
 # specification (pinned under the shared root as references\pe-coff-spec-*).
 # ---------------------------------------------------------------------------------------------------------------
+
+# An /OPTION[:value] directive from an object's .drectve section. Value is '' when the option has none.
+class PscCoffDirective {
+    [string] $Option
+    [string] $Value
+}
+
+# What defines a symbol: an object, an import, or the linker itself. Id is its position among a resolution's loaded
+# inputs, set when an image is written.
+class PscCoffInput {
+    [string] $Origin
+    [int] $Id
+}
+
+# The definer of the symbols the linker supplies while writing the image.
+class PscCoffLinkerDefined : PscCoffInput {}
+
+# A short import object: one symbol a DLL exports. Defines names the symbols it satisfies.
+class PscCoffImport : PscCoffInput {
+    [uint16] $Machine
+    [string] $Symbol
+    [string] $Dll
+    [string] $ImportKind
+    [int] $NameType
+    [string] $ImportName
+    [uint16] $OrdinalOrHint
+    [bool] $ByOrdinal
+    [string[]] $Defines
+}
+
+# A section header of an object. Number is 1-based, as symbols refer to it.
+class PscCoffSection {
+    [int] $Number
+    [string] $Name
+    [uint32] $Characteristics
+    [int] $RawSize
+    [int] $RawOffset
+    [int] $RelocationOffset
+    [int] $RelocationCount
+}
+
+# A symbol-table record of an object. AuxOffset is where its auxiliary records begin in the object's bytes.
+class PscCoffSymbol {
+    [int] $Index
+    [string] $Name
+    [uint32] $Value
+    [int] $Section
+    [uint16] $Type
+    [int] $StorageClass
+    [int] $AuxCount
+    [int] $AuxOffset
+}
+
+# A COFF object, regular or /bigobj. Symbols has a $null at each index an auxiliary record occupies.
+class PscCoffObject : PscCoffInput {
+    [byte[]] $Bytes
+    [uint16] $Machine
+    [bool] $BigObject
+    [int] $RecordSize
+    [PscCoffSection[]] $Sections
+    [PscCoffSymbol[]] $Symbols
+    [PscCoffDirective[]] $Directives
+}
+
+# A run of bytes inside an archive: a linker member or the long-names member.
+class PscCoffSpan {
+    [int] $Offset
+    [int] $Size
+}
+
+# An archive member's header: where it is and where its data is.
+class PscCoffArchiveMember {
+    [int] $HeaderOffset
+    [string] $Name
+    [int] $DataOffset
+    [int] $Size
+}
+
+# A .lib archive. MemberAt maps a header offset to its member; SymbolIndex maps a symbol to the header offset of the
+# member that defines it. LongNames is $null when the archive has no long-names member.
+class PscCoffArchive {
+    [string] $Path
+    [byte[]] $Bytes
+    [PscCoffArchiveMember[]] $Members
+    [hashtable] $MemberAt
+    [System.Collections.Generic.Dictionary[string, int]] $SymbolIndex
+    [PscCoffSpan] $LongNames
+}
+
+# An import a resolution uses, as it is reported.
+class PscCoffResolvedImport {
+    [string] $Dll
+    [string] $Name
+    [string] $Symbol
+    [string] $Kind
+    [bool] $ByOrdinal
+    [uint16] $Hint
+}
+
+# What Resolve-CoffLink found: the inputs loaded, what defines each symbol, and what stayed unresolved.
+class PscCoffResolution {
+    [string[]] $Objects
+    [string[]] $Libraries
+    [string[]] $MissingLibraries
+    [PscCoffResolvedImport[]] $Imports
+    [string[]] $Unresolved
+    [PscCoffInput[]] $Loaded
+    [System.Collections.Generic.Dictionary[string, PscCoffInput]] $Defined
+    [System.Collections.Generic.Dictionary[string, PscCoffSymbol]] $DefinedSymbol
+    [System.Collections.Generic.Dictionary[string, string]] $Alternate
+    [System.Collections.Generic.Dictionary[string, string]] $WeakDefault
+    [string] $Entry
+}
+
+# A section's section-definition auxiliary record: its COMDAT selection, the section it is associated with, and, for
+# a COMDAT, the symbol that leads it.
+class PscCoffSectionDefinition {
+    [int] $Selection
+    [int] $Associated
+    [PscCoffSymbol] $Leader
+}
+
+# One piece of an output section: a kept input section, or bytes the linker makes (Synthetic names which; Object,
+# Section and Children are then $null). Rva is -1 until layout.
+class PscCoffContribution {
+    [int] $Sequence
+    [PscCoffObject] $Object
+    [PscCoffSection] $Section
+    [string] $Name
+    [string] $Group
+    [string] $Output
+    [bool] $Comdat
+    [int] $Associated
+    [bool] $Code
+    [bool] $Uninitialized
+    [long] $Characteristics
+    [long] $Size
+    [int] $Align
+    [bool] $Live
+    [long] $Rva
+    [System.Collections.Generic.List[PscCoffContribution]] $Children
+    [string] $Synthetic
+}
+
+# What a symbol reference resolves to.
+enum PscCoffTargetKind {
+    Base
+    Absolute
+    Slot
+    Thunk
+    Section
+    Common
+    Unresolved
+}
+
+# The target of a symbol reference. Absolute has Value; Slot and Thunk have Import; Section has Contribution ($null
+# when its section was discarded), Offset and Name; Common has Name and Size; Unresolved has Name.
+class PscCoffTarget {
+    [PscCoffTargetKind] $Kind
+    [long] $Value
+    [PscCoffImport] $Import
+    [PscCoffContribution] $Contribution
+    [long] $Offset
+    [string] $Name
+    [long] $Size
+}
+
+# An output section of the image being written.
+class PscCoffOutputSection {
+    [string] $Name
+    [long] $Rva
+    [long] $VirtualSize
+    [long] $InitializedSize
+    [bool] $Code
+    [int] $Characteristics
+    [PscCoffContribution[]] $Members
+    [byte[]] $Data
+    [long] $FileOffset
+    [long] $RawSize
+}
+
+# A section and an import of a written image, as they are reported.
+class PscCoffImageSection {
+    [string] $Name
+    [long] $Rva
+    [long] $VirtualSize
+    [long] $RawSize
+}
+
+class PscCoffImageImport {
+    [string] $Dll
+    [string] $Name
+    [bool] $ByOrdinal
+    [uint16] $Hint
+}
+
+# What Write-CoffImage wrote.
+class PscCoffImage {
+    [string] $Path
+    [long] $Size
+    [PscCoffImageSection[]] $Sections
+    [PscCoffImageImport[]] $Imports
+    [int] $Kept
+    [int] $Discarded
+    [int] $BaseRelocations
+}
 
 function Read-CoffName([byte[]] $Bytes, [int] $Offset, [int] $Length) {
     $end = $Offset
@@ -8582,8 +9127,8 @@ function Split-CoffDirectives([string] $Text) {
     foreach ($token in $tokens) {
         if ($token.Length -lt 2 -or ($token[0] -ne [char]'/' -and $token[0] -ne [char]'-')) { continue }
         $colon = $token.IndexOf([char]':')
-        if ($colon -lt 0) { [pscustomobject]@{ Option = $token.Substring(1).ToUpperInvariant(); Value = '' } }
-        else { [pscustomobject]@{ Option = $token.Substring(1, $colon - 1).ToUpperInvariant(); Value = $token.Substring($colon + 1) } }
+        if ($colon -lt 0) { [PscCoffDirective]@{ Option = $token.Substring(1).ToUpperInvariant(); Value = '' } }
+        else { [PscCoffDirective]@{ Option = $token.Substring(1, $colon - 1).ToUpperInvariant(); Value = $token.Substring($colon + 1) } }
     }
 }
 
@@ -8598,8 +9143,8 @@ function Read-CoffImportObject([byte[]] $Bytes, [string] $Origin) {
     if ($nameType -ge 2) { $importName = $importName.TrimStart([char]'?', [char]'@', [char]'_') }
     if ($nameType -eq 3) { $at = $importName.IndexOf([char]'@'); if ($at -ge 0) { $importName = $importName.Substring(0, $at) } }
     $defined = [Collections.Generic.List[string]]::new(); $defined.Add('__imp_' + $symbol); if ($kind -eq 'Code') { $defined.Add($symbol) }
-    [pscustomobject]@{
-        Kind = 'Import'; Origin = $Origin; Machine = [BitConverter]::ToUInt16($Bytes, 6); Symbol = $symbol; Dll = $dll
+    [PscCoffImport]@{
+        Origin = $Origin; Machine = [BitConverter]::ToUInt16($Bytes, 6); Symbol = $symbol; Dll = $dll
         ImportKind = $kind; NameType = $nameType; ImportName = $importName; OrdinalOrHint = [BitConverter]::ToUInt16($Bytes, 16)
         ByOrdinal = ($nameType -eq 0); Defines = $defined.ToArray()
     }
@@ -8628,7 +9173,7 @@ function Read-CoffObject([byte[]] $Bytes, [string] $Origin) {
         $characteristics = [BitConverter]::ToUInt32($Bytes, $h + 36)
         $relocationCount = [int][BitConverter]::ToUInt16($Bytes, $h + 32); $relocations = [int][BitConverter]::ToUInt32($Bytes, $h + 24)
         if (($characteristics -band 0x01000000) -ne 0 -and $relocationCount -eq 0xFFFF) { $relocationCount = [int][BitConverter]::ToUInt32($Bytes, $relocations) - 1; $relocations += 10 }
-        $sections.Add([pscustomobject]@{
+        $sections.Add([PscCoffSection]@{
             Number = $i + 1; Name = $name; Characteristics = $characteristics
             RawSize = [int][BitConverter]::ToUInt32($Bytes, $h + 16); RawOffset = [int][BitConverter]::ToUInt32($Bytes, $h + 20)
             RelocationOffset = $relocations; RelocationCount = $relocationCount
@@ -8641,7 +9186,7 @@ function Read-CoffObject([byte[]] $Bytes, [string] $Origin) {
         $section = if ($big) { [BitConverter]::ToInt32($Bytes, $at + 12) } else { [int][BitConverter]::ToInt16($Bytes, $at + 12) }
         $typeAt = if ($big) { $at + 16 } else { $at + 14 }
         $auxCount = [int]$Bytes[$typeAt + 3]
-        $symbols[$i] = [pscustomobject]@{
+        $symbols[$i] = [PscCoffSymbol]@{
             Index = $i; Name = $name; Value = [BitConverter]::ToUInt32($Bytes, $at + 8); Section = $section
             Type = [BitConverter]::ToUInt16($Bytes, $typeAt); StorageClass = [int]$Bytes[$typeAt + 2]; AuxCount = $auxCount; AuxOffset = $at + $recordSize
         }
@@ -8654,8 +9199,8 @@ function Read-CoffObject([byte[]] $Bytes, [string] $Origin) {
             Split-CoffDirectives $text
         }
     })
-    [pscustomobject]@{
-        Kind = 'Object'; Origin = $Origin; Bytes = $Bytes; Machine = $machine; BigObject = $big; RecordSize = $recordSize
+    [PscCoffObject]@{
+        Origin = $Origin; Bytes = $Bytes; Machine = $machine; BigObject = $big; RecordSize = $recordSize
         Sections = $sections.ToArray(); Symbols = $symbols; Directives = $directives
     }
 }
@@ -8669,9 +9214,9 @@ function Read-CoffArchive([string] $Path) {
         $name = [Text.Encoding]::ASCII.GetString($bytes, $at, 16).TrimEnd()
         $size = [int]::Parse([Text.Encoding]::ASCII.GetString($bytes, $at + 48, 10).Trim())
         $data = $at + 60
-        if ($name -eq '/') { $linkerMembers++; if ($linkerMembers -eq 1) { $first = @{ Offset = $data; Size = $size } } else { $index = @{ Offset = $data; Size = $size } } }
-        elseif ($name -eq '//') { $longNames = @{ Offset = $data; Size = $size } }
-        else { $members.Add([pscustomobject]@{ HeaderOffset = $at; Name = $name; DataOffset = $data; Size = $size }) }
+        if ($name -eq '/') { $linkerMembers++; if ($linkerMembers -eq 1) { $first = [PscCoffSpan]@{ Offset = $data; Size = $size } } else { $index = [PscCoffSpan]@{ Offset = $data; Size = $size } } }
+        elseif ($name -eq '//') { $longNames = [PscCoffSpan]@{ Offset = $data; Size = $size } }
+        else { $members.Add([PscCoffArchiveMember]@{ HeaderOffset = $at; Name = $name; DataOffset = $data; Size = $size }) }
         $at = $data + $size; if (($at % 2) -ne 0) { $at++ }
     }
     $symbolToMember = [Collections.Generic.Dictionary[string, int]]::new([StringComparer]::Ordinal)
@@ -8689,7 +9234,7 @@ function Read-CoffArchive([string] $Path) {
         for ($i = 0; $i -lt $count; $i++) { $symbol = Read-CoffStringAt $bytes $p; $p += [Text.Encoding]::UTF8.GetByteCount($symbol) + 1; if (-not $symbolToMember.ContainsKey($symbol)) { $symbolToMember[$symbol] = $offsets[$i] } }
     }
     $byHeader = @{}; foreach ($m in $members) { $byHeader[$m.HeaderOffset] = $m }
-    [pscustomobject]@{ Kind = 'Archive'; Path = $Path; Bytes = $bytes; Members = $members.ToArray(); MemberAt = $byHeader; SymbolIndex = $symbolToMember; LongNames = $longNames }
+    [PscCoffArchive]@{ Path = $Path; Bytes = $bytes; Members = $members.ToArray(); MemberAt = $byHeader; SymbolIndex = $symbolToMember; LongNames = $longNames }
 }
 
 function Get-CoffArchiveMember($Archive, [int] $HeaderOffset) {
@@ -8714,8 +9259,8 @@ function Resolve-CoffLink {
     $ignoreAll = $IgnoredDefaultLibraries -contains '*'
     $ignored = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($name in $IgnoredDefaultLibraries) { if ($name -ne '*') { $null = $ignored.Add([IO.Path]::GetFileNameWithoutExtension($name)) } }
-    $defined = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
-    $definedSymbol = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $defined = [Collections.Generic.Dictionary[string, PscCoffInput]]::new([StringComparer]::Ordinal)
+    $definedSymbol = [Collections.Generic.Dictionary[string, PscCoffSymbol]]::new([StringComparer]::Ordinal)
     $referenced = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $weakDefault = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
     $alternate = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
@@ -8734,7 +9279,7 @@ function Resolve-CoffLink {
     $addObject = {
         param($object)
         $loaded.Add($object)
-        if ($object.Kind -eq 'Import') {
+        if ($object -is [PscCoffImport]) {
             foreach ($name in $object.Defines) { if (-not $defined.ContainsKey($name)) { $defined[$name] = $object } }
             return
         }
@@ -8759,7 +9304,7 @@ function Resolve-CoffLink {
     }
     $isResolved = { param([string] $name) $defined.ContainsKey($name) -or ($alternate.ContainsKey($name) -and $defined.ContainsKey($alternate[$name])) }
     # Symbols the linker itself defines while writing the image (PE/COFF: image base; load-configuration tables).
-    $linkerDefined = [pscustomobject]@{ Kind = 'Linker'; Origin = '(linker)' }
+    $linkerDefined = [PscCoffLinkerDefined]@{ Origin = '(linker)' }
     foreach ($name in '__ImageBase', '__guard_flags', '__guard_fids_table', '__guard_fids_count', '__guard_iat_table', '__guard_iat_count',
         '__guard_longjmp_table', '__guard_longjmp_count', '__guard_eh_cont_table', '__guard_eh_cont_count', '__dynamic_value_reloc_table', '__enclave_config', '__volatile_metadata') {
         $defined[$name] = $linkerDefined
@@ -8796,12 +9341,12 @@ function Resolve-CoffLink {
         $name
     })
     $unresolved = @($open | Sort-Object -Unique)
-    $imports = @($loaded | Where-Object { $_.Kind -eq 'Import' } | Where-Object { $referenced.Contains('__imp_' + $_.Symbol) -or $referenced.Contains($_.Symbol) })
-    [pscustomobject]@{
-        Objects = @($loaded | Where-Object { $_.Kind -eq 'Object' } | ForEach-Object { $_.Origin })
+    $imports = @($loaded | Where-Object { $_ -is [PscCoffImport] } | Where-Object { $referenced.Contains('__imp_' + $_.Symbol) -or $referenced.Contains($_.Symbol) })
+    [PscCoffResolution]@{
+        Objects = @($loaded | Where-Object { $_ -is [PscCoffObject] } | ForEach-Object { $_.Origin })
         Libraries = @($libraries | ForEach-Object { $_.Path })
         MissingLibraries = $missingLibraries.ToArray()
-        Imports = @($imports | Sort-Object Dll, ImportName | ForEach-Object { [pscustomobject]@{ Dll = $_.Dll; Name = $_.ImportName; Symbol = $_.Symbol; Kind = $_.ImportKind; ByOrdinal = $_.ByOrdinal; Hint = $_.OrdinalOrHint } })
+        Imports = @($imports | Sort-Object Dll, ImportName | ForEach-Object { [PscCoffResolvedImport]@{ Dll = $_.Dll; Name = $_.ImportName; Symbol = $_.Symbol; Kind = $_.ImportKind; ByOrdinal = $_.ByOrdinal; Hint = $_.OrdinalOrHint } })
         Unresolved = $unresolved
         Loaded = $loaded.ToArray()
         Defined = $defined; DefinedSymbol = $definedSymbol; Alternate = $alternate; WeakDefault = $weakDefault; Entry = $Entry
@@ -8821,7 +9366,7 @@ function Get-CoffSectionDefinitions($Object) {
             if ($symbol.StorageClass -eq 3 -and $symbol.Value -eq 0 -and $symbol.AuxCount -gt 0) {
                 $at = $symbol.AuxOffset
                 $number = [int][BitConverter]::ToUInt16($Object.Bytes, $at + 12) -bor ([int][BitConverter]::ToUInt16($Object.Bytes, $at + 16) -shl 16)
-                $definitions[$symbol.Section] = [pscustomobject]@{ Selection = [int]$Object.Bytes[$at + 14]; Associated = $number; Leader = $null }
+                $definitions[$symbol.Section] = [PscCoffSectionDefinition]@{ Selection = [int]$Object.Bytes[$at + 14]; Associated = $number; Leader = $null }
             }
             continue
         }
@@ -8839,8 +9384,8 @@ function Write-CoffImage {
     $imageBase = [long]0x140000000
     $fileAlignment = 0x200; $sectionAlignment = 0x1000
     $alignUp = { param([long] $value, [long] $alignment) [long]([Math]::Ceiling($value / $alignment) * $alignment) }
-    $objects = @($Resolution.Loaded | Where-Object { $_.Kind -eq 'Object' })
-    $id = 0; foreach ($o in $Resolution.Loaded) { $o | Add-Member -NotePropertyName Id -NotePropertyValue $id -Force; $id++ }
+    $objects = @($Resolution.Loaded | Where-Object { $_ -is [PscCoffObject] })
+    $id = 0; foreach ($o in $Resolution.Loaded) { $o.Id = $id; $id++ }
     $errors = [Collections.Generic.List[string]]::new()
 
     # Output-section names: link.exe's own merges, then the objects' directives, then the command line's.
@@ -8868,15 +9413,15 @@ function Write-CoffImage {
             $comdat = ($ch -band 0x1000) -ne 0
             if ($comdat -and $null -ne $definition -and $definition.Selection -ne 5 -and $null -ne $definition.Leader -and $definition.Leader.StorageClass -eq 2) {
                 $winner = $Resolution.Defined[$definition.Leader.Name]
-                if ($null -eq $winner -or $winner.Kind -ne 'Object' -or $winner.Id -ne $o.Id) { continue }
+                if ($null -eq $winner -or $winner -isnot [PscCoffObject] -or $winner.Id -ne $o.Id) { continue }
             }
             $alignBits = [int](($ch -shr 20) -band 0xF)
-            $list[$section.Number] = [pscustomobject]@{
+            $list[$section.Number] = [PscCoffContribution]@{
                 Sequence = $sequence++; Object = $o; Section = $section; Name = $section.Name; Group = $group; Output = (& $outputOf $group)
                 Comdat = $comdat; Associated = $(if ($comdat -and $null -ne $definition -and $definition.Selection -eq 5) { $definition.Associated } else { 0 })
                 Code = ($ch -band 0x20) -ne 0; Uninitialized = ($ch -band 0x80) -ne 0; Characteristics = $ch
                 Size = [long]$section.RawSize; Align = $(if ($alignBits -gt 0) { 1 -shl ($alignBits - 1) } else { 16 })
-                Live = $false; Rva = [long]-1; Children = [Collections.Generic.List[object]]::new(); Synthetic = $null
+                Live = $false; Rva = [long]-1; Children = [Collections.Generic.List[PscCoffContribution]]::new()
             }
         }
         foreach ($c in $list) {
@@ -8899,15 +9444,15 @@ function Write-CoffImage {
         $t = $null
         if ($Resolution.Defined.ContainsKey($n)) {
             $d = $Resolution.Defined[$n]
-            switch ($d.Kind) {
-                'Linker' { $t = if ($n -eq '__ImageBase') { [pscustomobject]@{ K = 'Base' } } else { [pscustomobject]@{ K = 'Absolute'; V = [long]$(if ($n -eq '__guard_flags') { 0x100 } else { 0 }) } } }
-                'Import' { $t = [pscustomobject]@{ K = $(if ($n.StartsWith('__imp_')) { 'Slot' } else { 'Thunk' }); Import = $d } }
-                'Object' {
-                    $s = $Resolution.DefinedSymbol[$n]
-                    if ($s.Section -gt 0) { $t = [pscustomobject]@{ K = 'Section'; C = $contributions[$d.Id][$s.Section]; Offset = [long]$s.Value; Name = $n } }
-                    elseif ($s.Section -eq -1) { $t = [pscustomobject]@{ K = 'Absolute'; V = [long]$s.Value } }
-                    else { $t = [pscustomobject]@{ K = 'Common'; Name = $n; Size = [long]$s.Value } }
-                }
+            if ($d -is [PscCoffLinkerDefined]) {
+                $t = if ($n -eq '__ImageBase') { [PscCoffTarget]@{ Kind = [PscCoffTargetKind]::Base } } else { [PscCoffTarget]@{ Kind = [PscCoffTargetKind]::Absolute; Value = [long]$(if ($n -eq '__guard_flags') { 0x100 } else { 0 }) } }
+            }
+            elseif ($d -is [PscCoffImport]) { $t = [PscCoffTarget]@{ Kind = $(if ($n.StartsWith('__imp_')) { [PscCoffTargetKind]::Slot } else { [PscCoffTargetKind]::Thunk }); Import = $d } }
+            elseif ($d -is [PscCoffObject]) {
+                $s = $Resolution.DefinedSymbol[$n]
+                if ($s.Section -gt 0) { $t = [PscCoffTarget]@{ Kind = [PscCoffTargetKind]::Section; Contribution = $contributions[$d.Id][$s.Section]; Offset = [long]$s.Value; Name = $n } }
+                elseif ($s.Section -eq -1) { $t = [PscCoffTarget]@{ Kind = [PscCoffTargetKind]::Absolute; Value = [long]$s.Value } }
+                else { $t = [PscCoffTarget]@{ Kind = [PscCoffTargetKind]::Common; Name = $n; Size = [long]$s.Value } }
             }
         }
         $nameTargets[$name] = $t
@@ -8922,9 +9467,9 @@ function Write-CoffImage {
             $t = & $resolveName $s.Name
             if ($null -eq $t) { $t = & $symbolTarget $o ([int][BitConverter]::ToUInt32($o.Bytes, $s.AuxOffset)) }
         } elseif ($s.StorageClass -eq 2) { $t = & $resolveName $s.Name }
-        elseif ($s.Section -gt 0) { $t = [pscustomobject]@{ K = 'Section'; C = $contributions[$o.Id][$s.Section]; Offset = [long]$s.Value; Name = $s.Name } }
-        elseif ($s.Section -eq -1) { $t = [pscustomobject]@{ K = 'Absolute'; V = [long]$s.Value } }
-        if ($null -eq $t) { $t = [pscustomobject]@{ K = 'Unresolved'; Name = $s.Name } }
+        elseif ($s.Section -gt 0) { $t = [PscCoffTarget]@{ Kind = [PscCoffTargetKind]::Section; Contribution = $contributions[$o.Id][$s.Section]; Offset = [long]$s.Value; Name = $s.Name } }
+        elseif ($s.Section -eq -1) { $t = [PscCoffTarget]@{ Kind = [PscCoffTargetKind]::Absolute; Value = [long]$s.Value } }
+        if ($null -eq $t) { $t = [PscCoffTarget]@{ Kind = [PscCoffTargetKind]::Unresolved; Name = $s.Name } }
         $cache[$index] = $t
         $t
     }
@@ -8937,12 +9482,12 @@ function Write-CoffImage {
     $work = [Collections.Generic.Stack[object]]::new()
     $markTarget = {
         param($t, [string] $where)
-        switch ($t.K) {
-            'Section' { if ($null -eq $t.C) { $errors.Add("$where references $($t.Name) in a discarded section.") } elseif (-not $t.C.Live) { $t.C.Live = $true; $work.Push($t.C) } }
-            'Slot' { $usedImports[$t.Import.Symbol] = $t.Import }
-            'Thunk' { $usedImports[$t.Import.Symbol] = $t.Import; $usedThunks[$t.Import.Symbol] = $t.Import }
-            'Common' { if (-not $usedCommon.ContainsKey($t.Name)) { $usedCommon[$t.Name] = $t } }
-            'Unresolved' { $errors.Add("$where references unresolved $($t.Name).") }
+        switch ($t.Kind) {
+            ([PscCoffTargetKind]::Section) { if ($null -eq $t.Contribution) { $errors.Add("$where references $($t.Name) in a discarded section.") } elseif (-not $t.Contribution.Live) { $t.Contribution.Live = $true; $work.Push($t.Contribution) } }
+            ([PscCoffTargetKind]::Slot) { $usedImports[$t.Import.Symbol] = $t.Import }
+            ([PscCoffTargetKind]::Thunk) { $usedImports[$t.Import.Symbol] = $t.Import; $usedThunks[$t.Import.Symbol] = $t.Import }
+            ([PscCoffTargetKind]::Common) { if (-not $usedCommon.ContainsKey($t.Name)) { $usedCommon[$t.Name] = $t } }
+            ([PscCoffTargetKind]::Unresolved) { $errors.Add("$where references unresolved $($t.Name).") }
         }
     }
     foreach ($c in $all) { if (-not $c.Comdat) { $c.Live = $true; $work.Push($c) } }
@@ -8974,7 +9519,7 @@ function Write-CoffImage {
     }
     $newSynthetic = {
         param([string] $kind, [string] $output, [long] $size, [int] $align, [bool] $code, [bool] $uninitialized)
-        $c = [pscustomobject]@{
+        $c = [PscCoffContribution]@{
             Sequence = $all.Count; Object = $null; Section = $null; Name = $output; Group = $output; Output = $output
             Comdat = $false; Associated = 0; Code = $code; Uninitialized = $uninitialized; Characteristics = [long]0
             Size = $size; Align = $align; Live = $true; Rva = [long]-1; Children = $null; Synthetic = $kind
@@ -9034,21 +9579,21 @@ function Write-CoffImage {
         $characteristics = if ($known.ContainsKey($name)) { [int]$known[$name] } else {
             $f = $flags -band 0xFE0000E0; if ($initializedEnd -gt 0) { $f = $f -band (-bnot 0x80) }; [BitConverter]::ToInt32([BitConverter]::GetBytes([uint32]$f), 0)
         }
-        $outputs.Add([pscustomobject]@{ Name = $name; Rva = $rva; VirtualSize = $offset; InitializedSize = $initializedEnd; Code = $code; Characteristics = $characteristics; Members = $members; Data = $null; FileOffset = [long]0; RawSize = [long]0 })
+        $outputs.Add([PscCoffOutputSection]@{ Name = $name; Rva = $rva; VirtualSize = $offset; InitializedSize = $initializedEnd; Code = $code; Characteristics = $characteristics; Members = $members; Data = $null; FileOffset = [long]0; RawSize = [long]0 })
         $rva = & $alignUp ($rva + [Math]::Max($offset, 1)) $sectionAlignment
     }
     $outputIndex = @{}; for ($i = 0; $i -lt $outputs.Count; $i++) { $outputIndex[$outputs[$i].Name] = $i }
     $outputOfRva = { param([long] $r) foreach ($s in $outputs) { if ($r -ge $s.Rva -and $r -lt $s.Rva + [Math]::Max($s.VirtualSize, 1)) { return $s } }; $null }
     $targetRva = {
         param($t)
-        switch ($t.K) {
-            'Section' { return $t.C.Rva + $t.Offset }
-            'Slot' { return $iat.Rva + $slotOffset[$t.Import.Symbol] }
-            'Thunk' { return $thunks.Rva + $thunkOffset[$t.Import.Symbol] }
-            'Common' { return $commonContribution[$t.Name].Rva }
-            'Base' { return [long]0 }
+        switch ($t.Kind) {
+            ([PscCoffTargetKind]::Section) { return $t.Contribution.Rva + $t.Offset }
+            ([PscCoffTargetKind]::Slot) { return $iat.Rva + $slotOffset[$t.Import.Symbol] }
+            ([PscCoffTargetKind]::Thunk) { return $thunks.Rva + $thunkOffset[$t.Import.Symbol] }
+            ([PscCoffTargetKind]::Common) { return $commonContribution[$t.Name].Rva }
+            ([PscCoffTargetKind]::Base) { return [long]0 }
         }
-        throw "no address for target kind $($t.K)."
+        throw "no address for target kind $($t.Kind)."
     }
 
     # 6. Section contents and relocations.
@@ -9072,8 +9617,8 @@ function Write-CoffImage {
                 if ($type -eq 0) { continue }
                 $t = & $symbolTarget $o ([int][BitConverter]::ToUInt32($bytes, $at + 4))
                 $place = $c.Rva + $offset; $here = [int]($place - $s.Rva)
-                $absolute = $t.K -eq 'Absolute'
-                $targetAddress = if ($absolute) { $t.V } else { & $targetRva $t }
+                $absolute = $t.Kind -eq [PscCoffTargetKind]::Absolute
+                $targetAddress = if ($absolute) { $t.Value } else { & $targetRva $t }
                 switch ($type) {
                     1 { # ADDR64
                         $value = [BitConverter]::ToInt64($data, $here) + $(if ($absolute) { $targetAddress } else { $imageBase + $targetAddress })
@@ -9096,7 +9641,7 @@ function Write-CoffImage {
                         [BitConverter]::GetBytes([uint16]($outputIndex[$owner.Name] + 1)).CopyTo($data, $here)
                     }
                     11 { # SECREL: from the TLS template's start for thread-local data, else from the output section's
-                        $origin = if ($t.K -eq 'Section' -and $t.C.Group -eq '.tls') { $tlsStart } else { (& $outputOfRva $targetAddress).Rva }
+                        $origin = if ($t.Kind -eq [PscCoffTargetKind]::Section -and $t.Contribution.Group -eq '.tls') { $tlsStart } else { (& $outputOfRva $targetAddress).Rva }
                         $value = [long][BitConverter]::ToInt32($data, $here) + $targetAddress - $origin
                         [Array]::Copy([BitConverter]::GetBytes([long]$value), 0, $data, $here, 4)
                     }
@@ -9163,7 +9708,7 @@ function Write-CoffImage {
     }
     $relocWriter.Flush()
     if ($relocStream.Length) {
-        $outputs.Add([pscustomobject]@{ Name = '.reloc'; Rva = $rva; VirtualSize = $relocStream.Length; InitializedSize = $relocStream.Length; Code = $false; Characteristics = 0x42000040; Members = @(); Data = $relocStream.ToArray(); FileOffset = [long]0; RawSize = [long]0 })
+        $outputs.Add([PscCoffOutputSection]@{ Name = '.reloc'; Rva = $rva; VirtualSize = $relocStream.Length; InitializedSize = $relocStream.Length; Code = $false; Characteristics = 0x42000040; Members = @(); Data = $relocStream.ToArray(); FileOffset = [long]0; RawSize = [long]0 })
         $rva = & $alignUp ($rva + $relocStream.Length) $sectionAlignment
     }
 
@@ -9218,9 +9763,9 @@ function Write-CoffImage {
     foreach ($s in $outputs) { if ($s.RawSize) { $w.Write($s.Data); $w.Write([byte[]]::new($s.RawSize - $s.Data.Length)) } }
     $w.Flush()
     [IO.File]::WriteAllBytes($Path, $stream.ToArray())
-    [pscustomobject]@{
-        Path = $Path; Size = $stream.Length; Sections = @($outputs | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Rva = $_.Rva; VirtualSize = $_.VirtualSize; RawSize = $_.RawSize } })
-        Imports = @($usedImports.Values | ForEach-Object { [pscustomobject]@{ Dll = $_.Dll; Name = $_.ImportName; ByOrdinal = $_.ByOrdinal; Hint = $_.OrdinalOrHint } })
+    [PscCoffImage]@{
+        Path = $Path; Size = $stream.Length; Sections = @($outputs | ForEach-Object { [PscCoffImageSection]@{ Name = $_.Name; Rva = $_.Rva; VirtualSize = $_.VirtualSize; RawSize = $_.RawSize } })
+        Imports = @($usedImports.Values | ForEach-Object { [PscCoffImageImport]@{ Dll = $_.Dll; Name = $_.ImportName; ByOrdinal = $_.ByOrdinal; Hint = $_.OrdinalOrHint } })
         Kept = $live.Count; Discarded = ($all.Count - $live.Count); BaseRelocations = $sorted.Count
     }
 }
@@ -10516,9 +11061,9 @@ process {
             if ($null -eq $MethodAst) { throw 'Expression requires -MethodAst.' }
             ConvertTo-TypedExpression -MethodAst $MethodAst
         }
-        'Inspect' { Test-LoweredAssembly -AssemblyPath $AssemblyPath }
+        'Inspect' { Test-LoweredAssembly -AssemblyPath $AssemblyPath -ClassName $ClassName -MethodNames $MethodNames }
         'Capability' { Get-LoweringCapability }
-        'Describe' { Get-SmaDescription $(if ($ProjectPath) { $ProjectPath } else { $PSScriptRoot }) }
+        'Graph' { Get-SmaGraph $(if ($ProjectPath) { $ProjectPath } else { $PSScriptRoot }) }
         'Lint' {
             $targets = if ($LintFiles) { $LintFiles } else { foreach ($project in Get-Projects) { foreach ($relative in $project.Files) { Join-Path $project.Path $relative } } }
             $findings = @(foreach ($file in $targets) { if (Test-Path -LiteralPath $file) { Get-SmaLint ([IO.Path]::GetFullPath($file)) } })
@@ -10539,7 +11084,7 @@ process {
             $profiled = Import-Clixml -LiteralPath $ProfilePath
             Get-SmaReport @(Get-SmaUnits $profiled) $profiled
         }
-        'Verify' { Test-SmaDescription }
+        'Verify' { Test-SmaGraph }
         'Consolidate' {
             if (-not $SourcePath -or -not $OutputPath) { throw 'Consolidate requires -SourcePath (the entry script) and -OutputPath (the single script to write).' }
             ConvertTo-PscSingleScript -Path $SourcePath -OutputPath $OutputPath
