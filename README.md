@@ -2,7 +2,7 @@
 
 | Synopsis | Script | SourceSha512 | DefaultMode | Environment |
 |---|---|---|---|---|
-| A Pwsh script designed to amortize. | C:\dev\psc\Invoke-PSC.ps1 | D26DE2469E35C27387A74908D3517D408E731718A43570EADBC2F535D5C2B6DF8FC9B7EB83DFCFD4F6E49648B1360890CF096C7C077711FFD51AE7EE180E7EDA | Compile | PscEnvironment |
+| A Pwsh script designed to amortize. | C:\dev\psc\Invoke-PSC.ps1 | 34DE9BE5583ABEC63680FBAE1E2F56EA795A693AB8BD324CDEFBBBF884401CF0D620EC76B55AA67188743019B6B783810D1C9945E05FBB87ED9D091DA7C0A597 | Compile | PscEnvironment |
 
 ## Modes
 
@@ -71,7 +71,7 @@
 | C:\dev\psc\Invoke-PSC.ps1 | InvokeExpressionCommands | 0 |
 | C:\dev\psc\Invoke-PSC.ps1 | ScriptBlockCreateCalls | 0 |
 | C:\dev\psc\Invoke-PSC.ps1 | HereStrings | 1 |
-| C:\dev\psc\Invoke-PSC.ps1 | ScriptBlockExpressions | 358 |
+| C:\dev\psc\Invoke-PSC.ps1 | ScriptBlockExpressions | 360 |
 | C:\dev\psc\Invoke-PSC.ps1 | CommandsNamedByVariable | 108 |
 | C:\dev\psc\Invoke-PSC.ps1 | ScriptBlockLiteralsInvoked | 0 |
 | C:\dev\psc\Invoke-PSC.ps1 | CommandsNamedByOtherExpression | 4 |
@@ -79,7 +79,7 @@
 | C:\dev\psc\Invoke-PSC.ps1 | HashtableLiterals | 205 |
 | C:\dev\psc\Invoke-PSC.ps1 | HashtableRecords | 78 |
 | C:\dev\psc\Invoke-PSC.ps1 | QuotedTextConstants | 1641 |
-| C:\dev\psc\Invoke-PSC.ps1 | ExpandableTexts | 144 |
+| C:\dev\psc\Invoke-PSC.ps1 | ExpandableTexts | 145 |
 | C:\dev\psc\Invoke-PSC.ps1 | NamespaceUsings | 0 |
 | C:\dev\psc\Invoke-PSC.ps1 | RegexUses | 20 |
 

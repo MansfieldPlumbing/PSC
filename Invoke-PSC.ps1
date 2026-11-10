@@ -1904,6 +1904,48 @@ function Measure-PscOutputStatement {
         else { $null = $outcomes.Add("F$Written") }
         return [string[]]@($outcomes)
     }
+    # A switch over one scalar value with distinct constant labels runs at most one clause, or its default when none
+    # matches: its outcomes are those of its clauses (and of falling through when it has no default). Counted only
+    # without -regex, -wildcard or -file, with labels distinct as switch compares them (ignoring case unless
+    # -casesensitive), and over a variable declared a scalar type, which switch does not enumerate.
+    if ($Statement -is [System.Management.Automation.Language.SwitchStatementAst]) {
+        $flags = [System.Management.Automation.Language.SwitchFlags]
+        if ($Statement.Flags -band ($flags::Regex -bor $flags::Wildcard -bor $flags::File)) { return $null }
+        $subject = $Statement.Condition
+        if ($subject -isnot [System.Management.Automation.Language.PipelineAst] -or $subject.PipelineElements.Count -ne 1 -or
+            $subject.PipelineElements[0] -isnot [System.Management.Automation.Language.CommandExpressionAst] -or
+            $subject.PipelineElements[0].Expression -isnot [System.Management.Automation.Language.VariableExpressionAst]) { return $null }
+        $name = $subject.PipelineElements[0].Expression.VariablePath.UserPath
+        $declared = $null
+        for ($p = $Statement.Parent; $null -ne $p; $p = $p.Parent) {
+            $parameters = $null
+            if ($p -is [System.Management.Automation.Language.FunctionDefinitionAst]) { $parameters = @(if ($p.Body.ParamBlock) { $p.Body.ParamBlock.Parameters } elseif ($p.Parameters) { $p.Parameters }) }
+            elseif ($p -is [System.Management.Automation.Language.FunctionMemberAst]) { $parameters = @($p.Parameters) }
+            if ($null -eq $parameters) { continue }
+            $match = @($parameters | Where-Object { $_.Name.VariablePath.UserPath -eq $name }) | Select-Object -First 1
+            if ($null -ne $match) { $declared = @($match.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.TypeConstraintAst] }) | Select-Object -First 1 }
+            break
+        }
+        if ($null -eq $declared) { return $null }
+        $subjectType = Resolve-AstType $declared.TypeName
+        if (-not (Test-PscWrittenWhole $subjectType)) { return $null }
+        $comparer = if ($Statement.Flags -band $flags::CaseSensitive) { [StringComparer]::Ordinal } else { [StringComparer]::OrdinalIgnoreCase }
+        $labels = [System.Collections.Generic.HashSet[string]]::new($comparer)
+        $outcomes = [System.Collections.Generic.HashSet[string]]::new()
+        foreach ($clause in $Statement.Clauses) {
+            if ($clause.Item1 -isnot [System.Management.Automation.Language.ConstantExpressionAst] -or -not $labels.Add([string]$clause.Item1.Value)) { return $null }
+            $branch = Measure-PscOutputPaths -Statements @($clause.Item2.Statements) -Written $Written -Terminals $Terminals
+            if ($null -eq $branch) { return $null }
+            foreach ($outcome in $branch) { $null = $outcomes.Add($outcome) }
+        }
+        if ($null -ne $Statement.Default) {
+            $branch = Measure-PscOutputPaths -Statements @($Statement.Default.Statements) -Written $Written -Terminals $Terminals
+            if ($null -eq $branch) { return $null }
+            foreach ($outcome in $branch) { $null = $outcomes.Add($outcome) }
+        }
+        else { $null = $outcomes.Add("F$Written") }
+        return [string[]]@($outcomes)
+    }
     # A loop counts only when its body writes nothing on every pass.
     if ($Statement -is [System.Management.Automation.Language.LoopStatementAst]) {
         $inner = [System.Collections.Generic.List[System.Management.Automation.Language.Ast]]::new()
