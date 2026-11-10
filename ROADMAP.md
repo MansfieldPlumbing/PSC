@@ -68,8 +68,10 @@ and 10); the reusable Fluent framework (item 14) after it.
    window and frame captures, pixel and geometry measurement, input replay, and comparison of the same against a
    reference app. They serve the planned ports of HTML/TypeScript/JavaScript apps and the Photos, Paint and
    Terminal counterparts as much as Notepad.
-8. Compile a script, not only classes. Notepad's 28 classes compile together into one assembly (58,368 bytes,
-   2026-11-09). What remains, in order:
+8. Compile a script, not only classes. Notepad's 33 classes compile together into one assembly (78,848 bytes,
+   2026-11-09) that references System.Private.CoreLib alone (the CoreLib-only target, Scott): its icons are typed
+   geometry (no SVG, XML or font), undo history a List, colour text read without a regular expression. The
+   functions still use -match in Command, Paint-Modal and Set-ColorPickerText. What remains, in order:
    - The function class: Compile already folds the script's functions into one class (`Notepad`) when
      `-ClassNames` lists it, but `-ClassName` must name a class written in the source, and the functions must
      lower (36 refused today).
@@ -80,9 +82,9 @@ and 10); the reusable Fluent framework (item 14) after it.
      test program the native exe and pwsh agree on 9 of 11 command lines; the other two: `-Switch:false` is
      accepted (a native command line passes text), and a missing argument's message lacks the type. Still to do:
      a PSBinder (Scott): the binder as its own CoreLib-only component with typed parameter descriptors (today
-     parallel name and switch arrays), which needs PSC's helper emission to carry more than one class; top-level
-     exception handling (today an uncaught exception ends the exe with .NET's unhandled-exception report, where
-     pwsh prints the error and exits 1).
+     parallel name and switch arrays), which needs PSC's helper emission to carry more than one class. A compiled
+     program behaves as CoreCLR does, not as pwsh would (Scott): an uncaught exception ends it as CoreCLR ends a
+     process, and pwsh's error formatting is not reproduced.
    - Development-only code out of the native build (decided by Scott): `$api.FixParameters` fixes chosen script
      parameters as constants, drops the branches they decide and the statements after one that always leaves,
      and leaves out functions nothing reachable calls. On Notepad, fixing its 14 development switches leaves 61 of
@@ -254,6 +256,9 @@ Not acquired: the Student (`student\Invoke-Student.ps1`, 5,582 lines) and anythi
 - Lowering refuses a class deriving from another class (adb.ps1 and PSC itself).
 - `[string]` conversion of a `[bool]` is not lowered.
 - `-join` with a typed array (`[double[]]`) on the left is refused.
+- `$api.Interpret` does not find a class's explicit constructor when another class in the same source calls it
+  ("does not contain a method named '.ctor'"); such comparisons run in plain pwsh instead.
+- A compile check that fails when the output references more than CoreLib is to be added (today measured by hand).
 - A parameter named `$Input` is not modelled: SMA's automatic `$input` overrides it inside the function; lowering
   reads the parameter. Admission should refuse or model it.
 - A run-time `$null` of static type `[string]` (from a .NET call) assigned to a typed `[string]` stays `$null`

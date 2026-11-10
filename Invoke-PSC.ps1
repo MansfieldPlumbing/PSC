@@ -3259,7 +3259,35 @@ function Resolve-MatchingConstructor {
                 break
             }
         }
-        if ($match) { return $candidate }
+        if ($match) { return [System.Reflection.ConstructorInfo]$candidate }
+    }
+
+    # 3. As for methods (Resolve-MatchingMethod): the one constructor reachable by PowerShell's argument conversion, a
+    # number converting to any numeric parameter and an [object] argument to the parameter's type when the call runs;
+    # of several, the closest. The call site converts each argument with ConvertTo-PowerShellType.
+    $numeric = [Type[]]@($script:IntegralTypes + $script:FloatingTypes)
+    $reachable = @($all | Where-Object {
+        $params = $_.GetParameters()
+        for ($i = 0; $i -lt $params.Length; $i++) {
+            $wanted = $params[$i].ParameterType
+            $given = $ArgumentTypes[$i]
+            if (-not $wanted.IsAssignableFrom($given) -and -not ($wanted -in $numeric -and $given -in $numeric) -and $given -ne [object] -and -not ($wanted -eq [char] -and $given -eq [string])) { return $false }
+        }
+        $true
+    })
+    if ($reachable.Count -eq 1) { return [System.Reflection.ConstructorInfo]$reachable[0] }
+    if ($reachable.Count -gt 1) {
+        $ranked = foreach ($candidate in $reachable) {
+            $score = 0
+            $params = $candidate.GetParameters()
+            for ($i = 0; $i -lt $params.Length; $i++) {
+                if ($params[$i].ParameterType -eq $ArgumentTypes[$i]) { $score += 2 }
+                elseif ($params[$i].ParameterType.IsAssignableFrom($ArgumentTypes[$i])) { $score += 1 }
+            }
+            [pscustomobject]@{ Constructor = $candidate; Score = $score }
+        }
+        $best = @($ranked | Sort-Object Score -Descending)
+        if ($best[0].Score -gt $best[1].Score) { return [System.Reflection.ConstructorInfo]$best[0].Constructor }
     }
 
     throw "Could not resolve constructor with argument types ($($ArgumentTypes -join ', ')) on '$($TargetType.FullName)'."
