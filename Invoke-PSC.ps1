@@ -101,6 +101,12 @@ param(
     [string[]] $MethodNames,
     [string] $OutputPath,
     [string] $EntryPoint,
+    # Compile: SourcePath as a program, its top-level statements the entry point Main, its parameters bound from the
+    # command line.
+    [switch] $Program,
+    # Compile -Program: script parameters fixed to these values for the build; the branches they decide and the
+    # functions no longer reachable are left out ($api.FixParameters).
+    [hashtable] $FixedParameters,
     # Compile: produce a native executable at OutputPath (lowered, then ILC, then PSC's linker). Needs EntryPoint.
     [switch] $Native,
     [switch] $Deterministic = $true,
@@ -1689,9 +1695,12 @@ function Get-ClassMirrorType {
             $classes = @($Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true) | Where-Object { -not (Test-AttributeClass $_) })
             $enums = @($Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsEnum }, $true))
             $script:LoweringClassTypes = @{} + $Resolving
-            $mirror = New-ClassMirror -Model @(Get-ClassModel -ClassAsts $classes) -Enums $enums
             $types = @{}
-            foreach ($name in $mirror.Keys) { $types[$name] = $mirror[$name] }
+            # A source without classes or enums of its own (a program of functions alone) mirrors none.
+            if ($classes.Count -or $enums.Count) {
+                $mirror = New-ClassMirror -Model @(if ($classes.Count) { Get-ClassModel -ClassAsts $classes }) -Enums $enums
+                foreach ($name in $mirror.Keys) { $types[$name] = $mirror[$name] }
+            }
             $script:ClassMirrorCache.Add($Root, $types)
         }
         finally { $script:LoweringClassTypes = $inProgress }
@@ -1737,16 +1746,22 @@ function Add-PscSemanticsToSession {
 # FunctionMemberAst returning [object[]], its output. The class is named for the source file and has a root of its
 # own; its methods resolve the source's classes and enums (Use-ClassMirror). $null when the source has no functions.
 function Get-ScriptFunctionClass {
-    param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Root)
+    param(
+        [Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Root,
+        # The script compiled as a program: its top-level statements become the class's static Main([string[]]),
+        # which binds the script's parameters from the command line first (New-LoweredBody).
+        [switch] $Program
+    )
     $class = $null
     if ($script:ScriptFunctionClasses.TryGetValue($Root, [ref]$class)) { return $class }
+    if ($script:PscCompilingProgram) { $Program = [switch]$true }
     $functions = @($Root.FindAll({ param($n)
         if ($n -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { return $false }
         for ($p = $n.Parent; $null -ne $p; $p = $p.Parent) {
             if ($p -is [System.Management.Automation.Language.FunctionDefinitionAst] -or $p -is [System.Management.Automation.Language.TypeDefinitionAst]) { return $false }
         }
         $true }, $true))
-    if ($functions.Count -eq 0) { $script:ScriptFunctionClasses[$Root] = $null; return $null }
+    if ($functions.Count -eq 0 -and -not $Program) { $script:ScriptFunctionClasses[$Root] = $null; return $null }
     $stem = [IO.Path]::GetFileNameWithoutExtension([string]$Root.Extent.File)
     $name = -join @($stem.ToCharArray() | Where-Object { [char]::IsLetterOrDigit($_) -or $_ -eq [char]'_' })
     if (-not $name -or [char]::IsDigit($name[0])) { $name = 'Script' + $name }
@@ -1766,6 +1781,18 @@ function Get-ScriptFunctionClass {
         [System.Management.Automation.Language.FunctionMemberAst]::new($function.Extent, $definition, $objectArray.Copy(),
             [System.Management.Automation.Language.AttributeAst[]]@(), [System.Management.Automation.Language.MethodAttributes]'Public,Static')
     })
+    if ($Program) {
+        $topLevel = @($Root.EndBlock.Statements | Where-Object { $_ -isnot [System.Management.Automation.Language.FunctionDefinitionAst] -and $_ -isnot [System.Management.Automation.Language.TypeDefinitionAst] } | ForEach-Object { $_.Copy() })
+        $body = [System.Management.Automation.Language.ScriptBlockAst]::new($Root.EndBlock.Extent, $null,
+            [System.Management.Automation.Language.StatementBlockAst]::new($Root.EndBlock.Extent, [System.Management.Automation.Language.StatementAst[]]$topLevel, [System.Management.Automation.Language.TrapStatementAst[]]@()), $false)
+        $lineType = [System.Management.Automation.Language.TypeConstraintAst]::new($Root.Extent, [System.Management.Automation.Language.ReflectionTypeName]::new([string[]]))
+        $line = [System.Management.Automation.Language.ParameterAst]::new($Root.Extent,
+            [System.Management.Automation.Language.VariableExpressionAst]::new($Root.Extent, 'CommandLine', $false), [System.Management.Automation.Language.AttributeBaseAst[]]@($lineType), $null)
+        $entry = [System.Management.Automation.Language.FunctionDefinitionAst]::new($Root.Extent, $false, $false, 'Main', [System.Management.Automation.Language.ParameterAst[]]@($line), $body)
+        $voidType = [System.Management.Automation.Language.TypeConstraintAst]::new($Root.Extent, [System.Management.Automation.Language.ReflectionTypeName]::new([void]))
+        $members += [System.Management.Automation.Language.FunctionMemberAst]::new($Root.Extent, $entry, $voidType,
+            [System.Management.Automation.Language.AttributeAst[]]@(), [System.Management.Automation.Language.MethodAttributes]'Public,Static')
+    }
     $type = [System.Management.Automation.Language.TypeDefinitionAst]::new($Root.Extent, $name, [System.Management.Automation.Language.AttributeAst[]]@(),
         [System.Management.Automation.Language.MemberAst[]]@($members), [System.Management.Automation.Language.TypeAttributes]::Class,
         [System.Management.Automation.Language.TypeConstraintAst[]]@())
@@ -1774,6 +1801,10 @@ function Get-ScriptFunctionClass {
     $class = $functionRoot.Find({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] }, $true)
     $script:ScriptFunctionClasses[$Root] = $class
     $script:ScriptFunctionSources[$functionRoot] = $Root
+    if ($Program) {
+        $main = @($class.Members | Where-Object { $_ -is [System.Management.Automation.Language.FunctionMemberAst] -and $_.Name -eq 'Main' })[-1]
+        $script:PscProgramEntries[$main] = $Root.ParamBlock
+    }
     $class
 }
 
@@ -2225,6 +2256,19 @@ function Get-ScriptVariable {
     foreach ($reference in $Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.IsScript }, $true)) {
         $name = Get-VariableName $reference.VariablePath
         if (-not $sma.Contains($name) -and -not $assignments.ContainsKey($name)) { $assignments[$name] = [System.Collections.Generic.List[object]]::new() }
+    }
+    # The script's own parameters are script variables of their declared types (a switch is a [bool]).
+    if ($null -ne $Root.ParamBlock) {
+        foreach ($parameter in $Root.ParamBlock.Parameters) {
+            $name = $parameter.Name.VariablePath.UserPath
+            if ($assignments.ContainsKey($name)) { continue }
+            $constraint = @($parameter.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.TypeConstraintAst] }) | Select-Object -First 1
+            $typeName = if ($null -eq $constraint) { [System.Management.Automation.Language.ReflectionTypeName]::new([object]) }
+                elseif ((Resolve-AstType $constraint.TypeName) -eq [System.Management.Automation.SwitchParameter]) { [System.Management.Automation.Language.ReflectionTypeName]::new([bool]) }
+                else { $constraint.TypeName }
+            $assignments[$name] = [System.Collections.Generic.List[object]]::new()
+            $assignments[$name].Add([pscustomobject]@{ Declared = $typeName; Value = $null })
+        }
     }
     foreach ($name in $assignments.Keys) {
         $all = $assignments[$name]
@@ -2968,6 +3012,32 @@ function New-MemberAccess {
     [Linq.Expressions.Expression]::Field($Target, $member)
 }
 
+function Read-PowerShellSource {
+    <#
+    .SYNOPSIS
+        Parses PowerShell source with SMA's parser; keywords the source declares are taught to the parser first.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $Source,
+        [Parameter()][string] $SourceFile = ''
+    )
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($Source, $SourceFile, [ref]$tokens, [ref]$errors)
+    # Keywords the source declares are taught to SMA's parser, and the source is parsed again with them.
+    $keywords = @(Get-LoweringKeywords $ast)
+    if ($keywords.Count) {
+        Enter-LoweringKeywords $keywords
+        try { $ast = [System.Management.Automation.Language.Parser]::ParseInput($Source, $SourceFile, [ref]$tokens, [ref]$errors) }
+        finally { [System.Management.Automation.Language.DynamicKeyword]::Pop() }
+    }
+    if ($errors -and $errors.Count -gt 0) {
+        $messages = ($errors | ForEach-Object { $_.Message }) -join "`n"
+        throw "PowerShell syntax parse error:`n$messages"
+    }
+    $ast
+}
+
 function Read-PowerShellClass {
     <#
     .SYNOPSIS
@@ -2979,27 +3049,7 @@ function Read-PowerShellClass {
         [Parameter()][string] $SourceFile = ''
     )
 
-    $tokens = $null
-    $errors = $null
-    $ast = [System.Management.Automation.Language.Parser]::ParseInput(
-        $Source,
-        $SourceFile,
-        [ref]$tokens,
-        [ref]$errors
-    )
-
-    # Keywords the source declares are taught to SMA's parser, and the source is parsed again with them.
-    $keywords = @(Get-LoweringKeywords $ast)
-    if ($keywords.Count) {
-        Enter-LoweringKeywords $keywords
-        try { $ast = [System.Management.Automation.Language.Parser]::ParseInput($Source, [ref]$tokens, [ref]$errors) }
-        finally { [System.Management.Automation.Language.DynamicKeyword]::Pop() }
-    }
-
-    if ($errors -and $errors.Count -gt 0) {
-        $messages = ($errors | ForEach-Object { $_.Message }) -join "`n"
-        throw "PowerShell syntax parse error:`n$messages"
-    }
+    $ast = Read-PowerShellSource -Source $Source -SourceFile $SourceFile
 
     $classes = @($ast.FindAll({
         param($n)
@@ -3407,6 +3457,69 @@ class PowerShellSemantics {
         if ($dividend - $quotient * $divisor -eq [uint64]0) { return [double]$quotient }
         return [double]$dividend / [double]$divisor
     }
+
+    # A script's parameters bound from a program's command line, as PowerShell binds a script's: -Name value or
+    # -Name:value, a name by any unique prefix (an exact name wins); a switch by -Name alone or -Name:true/false
+    # (with or without $); a token that is not a parameter name (it does not start with - and a letter or _) binds by
+    # position to the parameters that are not switches and were not named, in declaration order. Returns each
+    # parameter's text in declaration order, $null where it was not given, True or False for a given switch. Errors
+    # carry PowerShell's messages.
+    static [string[]] BindScriptArguments([string[]] $line, [string[]] $names, [bool[]] $switches) {
+        $bound = [string[]]::new($names.Length)
+        $positional = [System.Collections.Generic.List[string]]::new()
+        $i = 0
+        while ($i -lt $line.Length) {
+            $token = $line[$i]
+            $i = $i + 1
+            $named = $token.Length -ge 2 -and $token.StartsWith('-', [StringComparison]::Ordinal) -and ([char]::IsLetter($token, 1) -or $token.Substring(1, 1) -eq '_')
+            if (-not $named) { $positional.Add($token); continue }
+            $name = $token.Substring(1)
+            $given = ''
+            $hasValue = $false
+            $colon = $name.IndexOf(':')
+            if ($colon -ge 0) { $given = $name.Substring($colon + 1); $hasValue = $true; $name = $name.Substring(0, $colon) }
+            $match = -1
+            $candidates = [System.Collections.Generic.List[string]]::new()
+            for ($k = 0; $k -lt $names.Length; $k++) {
+                if ([string]::Equals($names[$k], $name, [StringComparison]::OrdinalIgnoreCase)) { $match = $k; $candidates.Clear(); break }
+                if ($names[$k].StartsWith($name, [StringComparison]::OrdinalIgnoreCase)) { $match = $k; $candidates.Add('-' + $names[$k]) }
+            }
+            if ($match -lt 0) { throw [ArgumentException]::new("A parameter cannot be found that matches parameter name '" + $name + "'.") }
+            if ($candidates.Count -gt 1) {
+                throw [ArgumentException]::new("Parameter cannot be processed because the parameter name '" + $name + "' is ambiguous. Possible matches include: " + [string]::Join(' ', $candidates.ToArray()) + '.')
+            }
+            if ($null -ne $bound[$match]) { throw [ArgumentException]::new("Cannot bind parameter because parameter '" + $names[$match] + "' is specified more than once.") }
+            if ($switches[$match]) {
+                if (-not $hasValue) { $bound[$match] = 'True'; continue }
+                # A switch takes a Boolean or a number, as PowerShell's switch parameters do: true or 1, false or 0.
+                $flag = $given.TrimStart('$')
+                if ([string]::Equals($flag, 'true', [StringComparison]::OrdinalIgnoreCase) -or $flag -eq '1') { $bound[$match] = 'True'; continue }
+                if ([string]::Equals($flag, 'false', [StringComparison]::OrdinalIgnoreCase) -or $flag -eq '0') { $bound[$match] = 'False'; continue }
+                throw [ArgumentException]::new("Cannot process argument transformation on parameter '" + $names[$match] + "'. Cannot convert value """ + $given + """ to type ""System.Management.Automation.SwitchParameter"". Boolean parameters accept only Boolean values and numbers, such as `$True, `$False, 1 or 0.")
+            }
+            if (-not $hasValue) {
+                if ($i -ge $line.Length) { throw [ArgumentException]::new("Missing an argument for parameter '" + $names[$match] + "'.") }
+                $given = $line[$i]
+                $i = $i + 1
+            }
+            $bound[$match] = $given
+        }
+        $next = 0
+        foreach ($argument in $positional) {
+            while ($next -lt $names.Length -and ($switches[$next] -or $null -ne $bound[$next])) { $next = $next + 1 }
+            if ($next -ge $names.Length) { throw [ArgumentException]::new("A positional parameter cannot be found that accepts argument '" + $argument + "'.") }
+            $bound[$next] = $argument
+            $next = $next + 1
+        }
+        return $bound
+    }
+
+    # A bound value checked against a parameter's ValidateSet, ignoring case as PowerShell does; the value is kept as
+    # given.
+    static [string] ValidateSet([string] $name, [string] $value, [string[]] $set) {
+        foreach ($member in $set) { if ([string]::Equals($member, $value, [StringComparison]::OrdinalIgnoreCase)) { return $value } }
+        throw [ArgumentException]::new("Cannot validate argument on parameter '" + $name + "'. The argument """ + $value + """ does not belong to the set """ + [string]::Join(',', $set) + """ specified by the ValidateSet attribute. Supply an argument that is in the set and then try the command again.")
+    }
 }
 
 # A lowering decision PSC asks its environment for at the moment it lowers. The newest binding for a target wins and
@@ -3530,6 +3643,11 @@ $script:PscStringFormat = $null
 # Each source's function class (or $null when it has none), and each function class's root to its source's root.
 $script:ScriptFunctionClasses = [System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast, System.Management.Automation.Language.TypeDefinitionAst]]::new()
 $script:ScriptFunctionSources = [System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast, System.Management.Automation.Language.Ast]]::new()
+# A program's Main (Get-ScriptFunctionClass -Program) and the param block whose parameters it binds; $null for none.
+$script:PscProgramEntries = [System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast, System.Management.Automation.Language.ParamBlockAst]]::new()
+# True while Export-LoweredAssembly compiles a program: every function class built meanwhile (the source's, and a
+# rewritten source's) has its Main.
+$script:PscCompilingProgram = $false
 # The names of the variables SMA defines in a new session, read on first use.
 $script:SmaVariableNames = $null
 
@@ -4563,7 +4681,9 @@ function Convert-AstStatement {
         # $script:x = value writes the script's variable; an unqualified assignment in a function makes a local, as in
         # PowerShell.
         $leftVariable = if ($leftNode -is [System.Management.Automation.Language.VariableExpressionAst]) { $leftNode } else { $leftNode.Child }
-        if ($leftVariable.VariablePath.IsScript) {
+        # At a program's top level (its Main), an unqualified assignment is at script scope and writes the script's
+        # variable.
+        if ($leftVariable.VariablePath.IsScript -or ($Scope['ScriptBody'] -and $leftVariable.VariablePath.IsUnqualified)) {
             $scriptField = Get-ScriptField -Scope $Scope -Path $leftVariable.VariablePath
             if ($null -ne $scriptField) {
                 $value = Convert-AstExpressionAs -Node $Statement.Right -Type $(if ($explicitType) { $explicitType } else { $scriptField.FieldType }) -Scope $Scope
@@ -5115,10 +5235,13 @@ function Convert-MethodAstToLambda {
     }
 
     $thisParam = if ($MethodAst.IsStatic) { $null } else { [Linq.Expressions.Expression]::Parameter($classType, 'this') }
+    # A program's Main is the script's top level: it writes no output and binds the script's parameters first.
+    $isProgram = $script:PscProgramEntries.ContainsKey($MethodAst)
     New-LoweredBody -Name $MethodAst.Name -ReturnType $retType -This $thisParam -Parameters $paramExprList -ParameterMap $paramMap `
         -Initializers $Initializers -Statements @($(if ($MethodAst.Body -and $MethodAst.Body.EndBlock) { $MethodAst.Body.EndBlock.Statements })) `
-        -IsStatic ([bool]$MethodAst.IsStatic) -IsConstructor ([bool]$MethodAst.IsConstructor) -Output:$isFunction `
-        -ScriptClass $(if ($isFunction) { $classType } else { $null })
+        -IsStatic ([bool]$MethodAst.IsStatic) -IsConstructor ([bool]$MethodAst.IsConstructor) -Output:($isFunction -and -not $isProgram) `
+        -ScriptClass $(if ($isFunction) { $classType } else { $null }) -Program:$isProgram `
+        -ProgramParameters $(if ($isProgram) { $script:PscProgramEntries[$MethodAst] } else { $null })
 }
 
 function Convert-InitializersToLambda {
@@ -5149,7 +5272,11 @@ function New-LoweredBody {
         # A script function: what its statements write is collected and returned as [object[]].
         [switch] $Output,
         # A script function's class, whose static fields are the script's variables.
-        [Type] $ScriptClass
+        [Type] $ScriptClass,
+        # A program's Main: the script's top level, whose unqualified assignments write the script's variables; it
+        # first binds -ProgramParameters, the script's param block, from its [string[]] parameter.
+        [switch] $Program,
+        [System.Management.Automation.Language.ParamBlockAst] $ProgramParameters
     )
 
     $returnTarget = [Linq.Expressions.Expression]::Label($ReturnType, 'returnTarget')
@@ -5169,6 +5296,7 @@ function New-LoweredBody {
         This           = $This
         Output         = $outputList
         ScriptClass    = $ScriptClass
+        ScriptBody     = [bool]$Program
     }
 
     $body = [System.Collections.Generic.List[Linq.Expressions.Expression]]::new()
@@ -5183,6 +5311,52 @@ function New-LoweredBody {
         $value = Convert-AstExpressionAs -Node $p.InitialValue -Type $field.FieldType -Scope $scope
         $target = if ($field.IsStatic) { $null } else { $This }
         $body.Add([Linq.Expressions.Expression]::Assign([Linq.Expressions.Expression]::Field($target, $field), $value))
+    }
+    if ($Program -and $null -ne $ProgramParameters -and $ProgramParameters.Parameters.Count -gt 0) {
+        # Only an advanced script ([CmdletBinding()] or a [Parameter()] attribute) binds as BindScriptArguments does:
+        # a simple script puts arguments that bind to no parameter into $args, which is not lowered.
+        $advanced = @($ProgramParameters.Attributes | Where-Object { $_.TypeName.Name -eq 'CmdletBinding' }).Count -gt 0 -or
+            @($ProgramParameters.Parameters | Where-Object { @($_.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.AttributeAst] -and $_.TypeName.Name -eq 'Parameter' }).Count }).Count -gt 0
+        if (-not $advanced) {
+            throw "[$($ProgramParameters.Extent.StartLineNumber):$($ProgramParameters.Extent.StartColumnNumber)] A program's param block is to be advanced ([CmdletBinding()]): a simple script collects arguments no parameter takes into `$args, which is not lowered."
+        }
+        # Each of the script's parameters from the command line (PowerShellSemantics.BindScriptArguments): its text
+        # converted to its type, a ValidateSet checked first; one not given takes its default, or '' for [string], or
+        # its type's default, as PowerShell leaves an unbound parameter.
+        $et = [Linq.Expressions.Expression]
+        $scriptParameters = @($ProgramParameters.Parameters)
+        $names = [Linq.Expressions.Expression[]]@(foreach ($parameter in $scriptParameters) { $et::Constant($parameter.Name.VariablePath.UserPath, [string]) })
+        $isSwitch = [Linq.Expressions.Expression[]]@(foreach ($parameter in $scriptParameters) { $et::Constant(((Get-ParameterType $parameter $false) -eq [System.Management.Automation.SwitchParameter]), [bool]) })
+        $bound = $et::Variable([string[]], 'boundArguments')
+        $declaredLocals.Add($bound)
+        $body.Add($et::Assign($bound, $et::Call((Get-PscSemanticsMethod -Name BindScriptArguments -ParameterTypes ([string[]], [string[]], [bool[]])),
+            $Parameters[0], $et::NewArrayInit([string], $names), $et::NewArrayInit([bool], $isSwitch))))
+        for ($i = 0; $i -lt $scriptParameters.Count; $i++) {
+            $parameter = $scriptParameters[$i]
+            $parameterName = $parameter.Name.VariablePath.UserPath
+            $field = $ScriptClass.GetField($parameterName, [Reflection.BindingFlags]'Public,Static,IgnoreCase')
+            if ($null -eq $field) { throw "The script parameter `$$parameterName has no script field." }
+            $text = $et::ArrayIndex($bound, $et::Constant($i))
+            $given = $null
+            if ((Get-ParameterType $parameter $false) -eq [System.Management.Automation.SwitchParameter]) {
+                $given = $et::Call([bool].GetMethod('Parse', [Type[]]@([string])), $text)
+            }
+            else {
+                $checked = [Linq.Expressions.Expression]$text
+                $set = @($parameter.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.AttributeAst] -and $_.TypeName.Name -eq 'ValidateSet' }) | Select-Object -First 1
+                if ($null -ne $set) {
+                    $members = [Linq.Expressions.Expression[]]@(foreach ($member in $set.PositionalArguments) { $et::Constant([string]$member.Value, [string]) })
+                    $checked = $et::Call((Get-PscSemanticsMethod -Name ValidateSet -ParameterTypes ([string], [string], [string[]])), $et::Constant($parameterName, [string]), $text, $et::NewArrayInit([string], $members))
+                }
+                $given = ConvertTo-PowerShellType -Expression $checked -Type $field.FieldType
+            }
+            $default = if ($null -ne $parameter.DefaultValue) { Convert-AstExpressionAs -Node $parameter.DefaultValue -Type $field.FieldType -Scope $scope }
+                elseif ($field.FieldType -eq [string]) { $et::Constant('', [string]) }
+                else { $et::Default($field.FieldType) }
+            if ($given.Type -ne $field.FieldType) { $given = ConvertTo-PowerShellType -Expression $given -Type $field.FieldType }
+            if ($default.Type -ne $field.FieldType) { $default = ConvertTo-PowerShellType -Expression $default -Type $field.FieldType }
+            $body.Add($et::Assign($et::Field($null, $field), $et::Condition($et::NotEqual($text, $et::Constant($null, [string])), $given, $default)))
+        }
     }
     foreach ($stmt in $Statements) {
         if ($null -eq $stmt) { continue }
@@ -6279,8 +6453,9 @@ function Write-IlExpression {
         if ($Expr.Type -eq [void]) { Write-IlDiscarded -IL $IL -Expr $Expr.IfTrue -Context $Context }
         else { Write-IlExpression -IL $IL -Expr $Expr.IfTrue -Context $Context }
 
-        $hasFalseBranch = ($Expr.IfFalse -and $Expr.IfFalse.NodeType -ne [Linq.Expressions.ExpressionType]::Default -and $Expr.IfFalse.Type -ne [void]) -or
-                          ($Expr.IfFalse -and $Expr.IfFalse.NodeType -ne [Linq.Expressions.ExpressionType]::Default)
+        # Only a void default (an if without else) has nothing to emit; a conditional with a value always produces one on
+        # its false branch, a default value included.
+        $hasFalseBranch = $null -ne $Expr.IfFalse -and -not ($Expr.IfFalse.NodeType -eq [Linq.Expressions.ExpressionType]::Default -and $Expr.IfFalse.Type -eq [void])
 
         if ($hasFalseBranch) {
             $IL.Emit([Reflection.Emit.OpCodes]::Br, $lblEnd)
@@ -7494,10 +7669,21 @@ function Export-LoweredAssembly {
         # return [int] or [void] and take no parameters or one [string[]].
         # The output is then an executable with a runtime configuration
         # beside it, runnable with `dotnet <OutputPath>`.
-        [Parameter()][string] $EntryPoint
+        [Parameter()][string] $EntryPoint,
+
+        # Compile -SourceAst as a program: its classes, its functions as one class, and its top-level statements as
+        # that class's Main([string[]]), the entry point, which binds the script's parameters from the command line.
+        [switch] $Program
     )
 
-    if ($null -ne $SourceAst) {
+    $script:PscCompilingProgram = [bool]$Program
+    if ($Program) {
+        # The script as a program: its function class, with Main, is the target (Get-ScriptFunctionClass -Program).
+        if ($null -eq $SourceAst) { throw '-Program compiles -SourceAst.' }
+        $null = Get-ScriptFunctionClass -Root $SourceAst -Program
+        $parsed = [pscustomobject]@{ Ast = $SourceAst; ClassAst = $null }
+    }
+    elseif ($null -ne $SourceAst) {
         if ($SourcePath) { throw 'Supply SourcePath or SourceAst, not both.' }
         $classes = @($SourceAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true))
         $target = @(if ($ClassName) { $classes | Where-Object Name -eq $ClassName } else { $classes | Select-Object -First 1 })
@@ -7522,13 +7708,17 @@ function Export-LoweredAssembly {
     # Script variables used only as records are lowered as their classes.
     $typedRoot = ConvertTo-PscRecordSource -Root $parsed.Ast
     if (-not [object]::ReferenceEquals($typedRoot, $parsed.Ast)) {
-        $targetName = $parsed.ClassAst.Name
-        $parsed = [pscustomobject]@{ Ast = $typedRoot; ClassAst = $typedRoot.Find({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.Name -eq $targetName }, $true) }
+        if ($Program) { $null = Get-ScriptFunctionClass -Root $typedRoot -Program; $parsed = [pscustomobject]@{ Ast = $typedRoot; ClassAst = $null } }
+        else {
+            $targetName = $parsed.ClassAst.Name
+            $parsed = [pscustomobject]@{ Ast = $typedRoot; ClassAst = $typedRoot.Find({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.Name -eq $targetName }, $true) }
+        }
     }
     $targetClass = $parsed.ClassAst
     $classAsts = @($parsed.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true) | Where-Object { -not (Test-AttributeClass $_) })
     # The source's functions, as one class of static methods, when this compile selects it.
-    $functionClass = Get-ScriptFunctionClass -Root $parsed.Ast
+    $functionClass = Get-ScriptFunctionClass -Root $parsed.Ast -Program:$Program
+    if ($Program) { $targetClass = $functionClass }
     if ($null -ne $functionClass) {
         if (-not $ClassNames -or $functionClass.Name -in $ClassNames) { $classAsts += $functionClass }
         else {
@@ -7682,7 +7872,7 @@ function Export-LoweredAssembly {
             throw "No matching methods found in class '$($targetClass.Name)' to export."
         }
         if ($EntryPoint -and -not $entryBuilder) {
-            throw "Entry point '$EntryPoint' is not an exported method of class '$($targetClass.Name)'."
+            throw "Entry point '$EntryPoint' is not an exported method of class '$($targetClass.Name)' (it exports: $($emittedMethods -join ', '))."
         }
 
         # 4. Save.
@@ -7691,6 +7881,7 @@ function Export-LoweredAssembly {
     finally {
         $script:IlMap = @{ Types = @{}; Members = @{} }
         $script:LoweringKeywords = @{}
+        $script:PscCompilingProgram = $false
     }
 
     [pscustomobject]@{
@@ -9810,6 +10001,20 @@ process {
             $compileParameters = @{}
             foreach ($name in 'SourcePath', 'SourceAst', 'StaticData', 'ClassName', 'ClassNames', 'MethodNames', 'OutputPath', 'EntryPoint', 'Deterministic') {
                 if ($PSBoundParameters.ContainsKey($name)) { $compileParameters[$name] = $PSBoundParameters[$name] }
+            }
+            if ($Program) {
+                # The script parsed (with the keywords it declares taught to SMA's parser), its fixed parameters applied,
+                # and compiled as a program with Main as its entry point.
+                $programAst = $SourceAst
+                if ($null -eq $programAst) {
+                    $programPath = [IO.Path]::GetFullPath($SourcePath)
+                    $programAst = Read-PowerShellSource -Source ([IO.File]::ReadAllText($programPath)) -SourceFile $programPath
+                }
+                if ($null -ne $FixedParameters -and $FixedParameters.Count) { $programAst = [PscReachability]::Prune([PscFixedParameters]::new($FixedParameters).Fix($programAst)) }
+                $null = $compileParameters.Remove('SourcePath')
+                $compileParameters['SourceAst'] = $programAst
+                $compileParameters['Program'] = $true
+                if (-not $EntryPoint) { $compileParameters['EntryPoint'] = 'Main'; $EntryPoint = 'Main' }
             }
             if (-not $Native) { return Export-LoweredAssembly @compileParameters }
             if (-not $EntryPoint) { throw 'A native executable needs -EntryPoint.' }

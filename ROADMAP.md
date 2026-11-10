@@ -73,9 +73,16 @@ and 10); the reusable Fluent framework (item 14) after it.
    - The function class: Compile already folds the script's functions into one class (`Notepad`) when
      `-ClassNames` lists it, but `-ClassName` must name a class written in the source, and the functions must
      lower (36 refused today).
-   - The entry point: the script's top-level statements as `Main(string[])`, its `param()` block bound from the
-     command line as PowerShell binds a script's parameters (named, positional, switches, `ValidateSet`), script
-     variables as the function class's static fields.
+   - The entry point (2026-11-09: works on a test program, natively): `-Program` compiles the script's top-level
+     statements as `Main(string[])`, its parameters as the function class's static fields, bound from the command
+     line by `PowerShellSemantics.BindScriptArguments` (named by unique prefix, `-Name:value`, switches,
+     positional in declaration order, `ValidateSet`, PowerShell's error messages; an advanced script only). On the
+     test program the native exe and pwsh agree on 9 of 11 command lines; the other two: `-Switch:false` is
+     accepted (a native command line passes text), and a missing argument's message lacks the type. Still to do:
+     a PSBinder (Scott): the binder as its own CoreLib-only component with typed parameter descriptors (today
+     parallel name and switch arrays), which needs PSC's helper emission to carry more than one class; top-level
+     exception handling (today an uncaught exception ends the exe with .NET's unhandled-exception report, where
+     pwsh prints the error and exits 1).
    - Development-only code out of the native build (decided by Scott): `$api.FixParameters` fixes chosen script
      parameters as constants, drops the branches they decide and the statements after one that always leaves,
      and leaves out functions nothing reachable calls. On Notepad, fixing its 14 development switches leaves 61 of
