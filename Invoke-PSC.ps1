@@ -1336,6 +1336,7 @@ Entry
     $checks.GraphSharedReferences = (Compare-SmaRuntimeGraph ([object[]]@($shared,$shared)) ([object[]]@($copy,$copy))).Equal
     $checks.GraphSplitReferencesRejected = -not (Compare-SmaRuntimeGraph ([object[]]@($shared,$shared)) ([object[]]@([int[]]@(4,5),[int[]]@(4,5)))).Equal
     Test-PscInline -Directory $directory
+    Test-PscTypedArrayAssignment -Directory $directory
     Test-PscProgramMetadata -Directory $directory
     foreach ($key in $checks.Keys) {
         [pscustomobject]@{ Test = $key; Passed = [bool]$checks[$key]; Evidence = $project }
@@ -1506,7 +1507,7 @@ function Get-ProgramIcon {
     $icon = $null
     if ($null -ne $Root.ParamBlock) {
         foreach ($attribute in $Root.ParamBlock.Attributes) {
-            if ($attribute.TypeName.Name -ne [ApplicationIcon].Name) { continue }
+            if ($attribute.TypeName.GetReflectionAttributeType() -ne [ApplicationIcon]) { continue }
             if ($null -ne $icon -or $attribute.NamedArguments.Count -or $attribute.PositionalArguments.Count -ne 1 -or
                 $attribute.PositionalArguments[0] -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) {
                 throw 'ApplicationIcon requires one literal relative ICO path and may occur only once.'
@@ -1526,7 +1527,7 @@ function Set-ProgramEntryAttributes {
     if ($null -eq $parameters) { return }
     $marked = $false
     foreach ($attribute in $parameters.Attributes) {
-        if ($attribute.TypeName.Name -ne [SingleThreadedApartment].Name) { continue }
+        if ($attribute.TypeName.GetReflectionAttributeType() -ne [SingleThreadedApartment]) { continue }
         if ($marked -or $attribute.PositionalArguments.Count -or $attribute.NamedArguments.Count) { throw 'SingleThreadedApartment takes no arguments and may occur only once.' }
         $marked = $true
     }
@@ -1561,7 +1562,8 @@ class PscEntryFixture {
 }
 
 function New-PscEntryFixtureAst {
-    param([string] $Directory, [switch] $Apartment, [string] $Icon)
+    # The program's class is named for its source file (Get-ScriptFunctionClass), so -SourceFileName is part of its bytes.
+    param([string] $Directory, [switch] $Apartment, [string] $IconFileName, [string] $SourceFileName = 'EntryFixture.ps1')
     $source = $MyInvocation.MyCommand.ScriptBlock.Ast
     while ($null -ne $source.Parent) { $source = $source.Parent }
     $fixture = $null
@@ -1569,13 +1571,13 @@ function New-PscEntryFixtureAst {
         if ($statement -is [System.Management.Automation.Language.TypeDefinitionAst] -and $statement.Name -eq [PscEntryFixture].Name) { $fixture = $statement }
     }
     if ($null -eq $fixture) { throw 'Entry fixture declaration is missing.' }
-    $position = [System.Management.Automation.Language.ScriptPosition]::new([IO.Path]::Join($Directory, 'EntryFixture.ps1'), 1, 1, '')
+    $position = [System.Management.Automation.Language.ScriptPosition]::new([IO.Path]::Join($Directory, $SourceFileName), 1, 1, '')
     $extent = [System.Management.Automation.Language.ScriptExtent]::new($position, $position)
     $attributes = [Collections.Generic.List[System.Management.Automation.Language.AttributeAst]]::new()
     $attributes.Add([System.Management.Automation.Language.AttributeAst]::new($extent, [System.Management.Automation.Language.ReflectionTypeName]::new([System.Management.Automation.CmdletBindingAttribute]), [System.Management.Automation.Language.ExpressionAst[]]@(), [System.Management.Automation.Language.NamedAttributeArgumentAst[]]@()))
     if ($Apartment) { $attributes.Add([System.Management.Automation.Language.AttributeAst]::new($extent, [System.Management.Automation.Language.ReflectionTypeName]::new([SingleThreadedApartment]), [System.Management.Automation.Language.ExpressionAst[]]@(), [System.Management.Automation.Language.NamedAttributeArgumentAst[]]@())) }
-    if ($Icon) {
-        $argument = [System.Management.Automation.Language.StringConstantExpressionAst]::new($extent, $Icon, [System.Management.Automation.Language.StringConstantType]::SingleQuoted)
+    if ($IconFileName) {
+        $argument = [System.Management.Automation.Language.StringConstantExpressionAst]::new($extent, $IconFileName,[System.Management.Automation.Language.StringConstantType]::SingleQuoted)
         $attributes.Add([System.Management.Automation.Language.AttributeAst]::new($extent, [System.Management.Automation.Language.ReflectionTypeName]::new([ApplicationIcon]), [System.Management.Automation.Language.ExpressionAst[]]@($argument), [System.Management.Automation.Language.NamedAttributeArgumentAst[]]@()))
     }
     $parameters = [System.Management.Automation.Language.ParamBlockAst]::new($extent, $attributes.ToArray(), [System.Management.Automation.Language.ParameterAst[]]@())
@@ -1603,81 +1605,158 @@ function Get-PscPeResourceBytes {
     } finally { $reader.Dispose(); $stream.Dispose() }
 }
 
+class PscPeResource {
+    [uint32] $Id
+    [byte[]] $Data
+}
+
+# Every resource of one type in a PE image, by ID, read from the image's resource directory (PE/COFF specification
+# section 6.9): the type's ID entry, each name's ID entry, its first language's data entry, and the bytes it names.
+function Get-PscPeResource {
+    param([string] $Path, [PscResourceType] $Type)
+    $stream = [IO.File]::OpenRead($Path)
+    $reader = [Reflection.PortableExecutable.PEReader]::new($stream)
+    try {
+        $directory = $reader.PEHeaders.PEHeader.ResourceTableDirectory
+        $found = [Collections.Generic.List[PscPeResource]]::new()
+        if ($directory.Size -eq 0) { return ,$found.ToArray() }
+        [byte[]] $bytes = $reader.GetSectionData($directory.RelativeVirtualAddress).GetContent(0, $directory.Size)
+        $root = 0
+        $rootEntries = [BitConverter]::ToUInt16($bytes, $root + 12) + [BitConverter]::ToUInt16($bytes, $root + 14)
+        for ($typeIndex = 0; $typeIndex -lt $rootEntries; $typeIndex++) {
+            $typeEntry = $root + 16 + 8 * $typeIndex
+            if ([BitConverter]::ToUInt32($bytes, $typeEntry) -ne [uint32]$Type) { continue }
+            $names = [int]([BitConverter]::ToUInt32($bytes, $typeEntry + 4) -band 0x7fffffffL)
+            $nameEntries = [BitConverter]::ToUInt16($bytes, $names + 12) + [BitConverter]::ToUInt16($bytes, $names + 14)
+            for ($nameIndex = 0; $nameIndex -lt $nameEntries; $nameIndex++) {
+                $nameEntry = $names + 16 + 8 * $nameIndex
+                $languages = [int]([BitConverter]::ToUInt32($bytes, $nameEntry + 4) -band 0x7fffffffL)
+                $dataEntry = [int][BitConverter]::ToUInt32($bytes, $languages + 20)
+                $resource = [PscPeResource]::new()
+                $resource.Id = [BitConverter]::ToUInt32($bytes, $nameEntry)
+                [byte[]] $data = $reader.GetSectionData([int][BitConverter]::ToUInt32($bytes, $dataEntry)).GetContent(0, [int][BitConverter]::ToUInt32($bytes, $dataEntry + 4))
+                $resource.Data = $data
+                $found.Add($resource)
+            }
+        }
+        return ,$found.ToArray()
+    } finally { $reader.Dispose(); $stream.Dispose() }
+}
+
 function Test-PscProgramMetadata {
     param([string] $Directory)
+    # The executable PSC built from a program with neither marker before program markers existed: [CmdletBinding()]
+    # and an empty param block, as Unmarked.exe. A program with neither marker still builds to exactly these bytes.
+    $unmarkedImageSha256 = '323AC739D8C1C54C61CD90376DAA3A3EADF637D4EFCDC105139FCF61A6626AB4'
+    # The fixture icon: three 32-bit images of 1, 2 and 3 pixels square, each a DIB with its AND mask, every byte
+    # written here, so what the executable carries is compared against the test's own bytes, not PscIcon's reading.
     $iconPath = [IO.Path]::Join($Directory, 'EntryFixture.ico')
+    $fixtureImages = [Collections.Generic.List[byte[]]]::new()
+    foreach ($side in 1, 2, 3) {
+        $imageStream = [IO.MemoryStream]::new()
+        $imageWriter = [IO.BinaryWriter]::new($imageStream)
+        try {
+            $imageWriter.Write([uint32]40); $imageWriter.Write([int]$side); $imageWriter.Write([int](2 * $side))
+            $imageWriter.Write([uint16]1); $imageWriter.Write([uint16]32); $imageWriter.Write([uint32]0); $imageWriter.Write([uint32](4 * $side * $side))
+            $imageWriter.Write([byte[]]::new(16))
+            for ($pixel = 0; $pixel -lt $side * $side; $pixel++) { $imageWriter.Write([byte](16 * $side + $pixel)); $imageWriter.Write([byte]$side); $imageWriter.Write([byte]$pixel); $imageWriter.Write([byte]0xff) }
+            $imageWriter.Write([byte[]]::new(4 * $side))
+            $imageWriter.Flush()
+            $fixtureImages.Add($imageStream.ToArray())
+        } finally { $imageWriter.Dispose(); $imageStream.Dispose() }
+    }
+    $fixtureEntries = [Collections.Generic.List[byte[]]]::new()
     $stream = [IO.MemoryStream]::new()
     $writer = [IO.BinaryWriter]::new($stream)
     try {
-        $writer.Write([uint16]0); $writer.Write([uint16]1); $writer.Write([uint16]1)
-        $writer.Write([byte]1); $writer.Write([byte]1); $writer.Write([byte]0); $writer.Write([byte]0)
-        $writer.Write([uint16]1); $writer.Write([uint16]32); $writer.Write([uint32]48); $writer.Write([uint32]22)
-        $writer.Write([uint32]40); $writer.Write([int]1); $writer.Write([int]2)
-        $writer.Write([uint16]1); $writer.Write([uint16]32); $writer.Write([uint32]0); $writer.Write([uint32]4)
-        $writer.Write([byte[]]::new(16)); $writer.Write([uint32]0xff0000ffL); $writer.Write([uint32]0)
+        $writer.Write([uint16]0); $writer.Write([uint16]1); $writer.Write([uint16]$fixtureImages.Count)
+        $imageOffset = 6 + 16 * $fixtureImages.Count
+        for ($index = 0; $index -lt $fixtureImages.Count; $index++) {
+            $entryStart = $stream.Position
+            $writer.Write([byte]($index + 1)); $writer.Write([byte]($index + 1)); $writer.Write([byte]0); $writer.Write([byte]0)
+            $writer.Write([uint16]1); $writer.Write([uint16]32); $writer.Write([uint32]$fixtureImages[$index].Length); $writer.Write([uint32]$imageOffset)
+            $writer.Flush()
+            $entry = [byte[]]::new(12)
+            [Array]::Copy($stream.GetBuffer(), $entryStart, $entry, 0, 12)
+            $fixtureEntries.Add($entry)
+            $imageOffset += $fixtureImages[$index].Length
+        }
+        foreach ($image in $fixtureImages) { $writer.Write($image) }
         $writer.Flush()
         [IO.File]::WriteAllBytes($iconPath, $stream.ToArray())
     } finally { $writer.Dispose(); $stream.Dispose() }
-    $plainAst = New-PscEntryFixtureAst -Directory $Directory
-    $plainPath = [IO.Path]::Join($Directory, 'EntryPlain.dll')
+    $checks = [ordered]@{}
+    $plainDirectory = [IO.Directory]::CreateDirectory([IO.Path]::Join($Directory, 'Unmarked')).FullName
+    $plainAst = New-PscEntryFixtureAst -Directory $plainDirectory -SourceFileName 'Unmarked.ps1'
+    $plainPath = [IO.Path]::Join($plainDirectory, 'Unmarked.dll')
     $plain = Export-LoweredAssembly -SourceAst $plainAst -Program -EntryPoint Main -OutputPath $plainPath
     $plainAgain = Export-LoweredAssembly -SourceAst $plainAst -Program -EntryPoint Main -OutputPath $plainPath
-    if ($plain.SHA256 -cne $plainAgain.SHA256) { throw 'Unmarked program bytes are not deterministic.' }
-    $plainImage = Export-NativeImage -AssemblyPath $plainPath -OutputPath ([IO.Path]::Join($Directory, 'EntryPlain.exe'))
-    if ((Get-PscPeResourceBytes -Path $plainImage.OutputPath).Length -ne 0) { throw 'Unmarked program gained a resource directory.' }
-    $markedAst = New-PscEntryFixtureAst -Directory $Directory -Apartment -Icon ([IO.Path]::GetFileName($iconPath))
+    $checks.ProgramUnmarkedDeterministic = $plain.SHA256 -ceq $plainAgain.SHA256
+    $plainImage = Export-NativeImage -AssemblyPath $plainPath -OutputPath ([IO.Path]::Join($plainDirectory, 'Unmarked.exe'))
+    $plainImageHash = (Get-FileHash -LiteralPath $plainImage.OutputPath -Algorithm SHA256).Hash
+    $checks.ProgramUnmarkedImageUnchanged = $plainImageHash -ceq $unmarkedImageSha256
+    $checks.ProgramUnmarkedResourcesUnchanged = (Get-PscPeResourceBytes -Path $plainImage.OutputPath).Length -eq 0
+    $markedAst = New-PscEntryFixtureAst -Directory $Directory -Apartment -IconFileName ([IO.Path]::GetFileName($iconPath))
     $marked = Export-LoweredAssembly -SourceAst $markedAst -Program -EntryPoint Main -OutputPath ([IO.Path]::Join($Directory, 'EntryMarked.dll'))
     $markedImage = Export-NativeImage -AssemblyPath $marked.OutputPath -OutputPath ([IO.Path]::Join($Directory, 'EntryMarked.exe')) -ApplicationIcon $marked.ApplicationIcon
-    $resourceBytes = Get-PscPeResourceBytes -Path $markedImage.OutputPath
-    if ([BitConverter]::ToUInt16($resourceBytes, 14) -ne 2 -or [BitConverter]::ToUInt32($resourceBytes, 16) -ne [uint32][PscResourceType]::Icon -or
-        [BitConverter]::ToUInt32($resourceBytes, 24) -ne [uint32][PscResourceType]::GroupIcon) { throw 'Fixture icon resource types differ.' }
-    $iconDirectory = [int]([BitConverter]::ToUInt32($resourceBytes, 20) -band 0x7fffffff)
-    $language = [int]([BitConverter]::ToUInt32($resourceBytes, $iconDirectory + 20) -band 0x7fffffff)
-    $dataEntry = [int][BitConverter]::ToUInt32($resourceBytes, $language + 20)
-    $peStream = [IO.File]::OpenRead($markedImage.OutputPath)
-    $peReader = [Reflection.PortableExecutable.PEReader]::new($peStream)
-    try { $resourceRva = $peReader.PEHeaders.PEHeader.ResourceTableDirectory.RelativeVirtualAddress }
-    finally { $peReader.Dispose(); $peStream.Dispose() }
-    $dataOffset = [int]([BitConverter]::ToUInt32($resourceBytes, $dataEntry) - $resourceRva)
-    $dataSize = [int][BitConverter]::ToUInt32($resourceBytes, $dataEntry + 4)
-    if ($dataSize -ne $marked.ApplicationIcon.Images[0].Data.Length) { throw 'Fixture icon image length differs.' }
-    for ($index = 0; $index -lt $dataSize; $index++) {
-        if ($resourceBytes[$dataOffset + $index] -ne $marked.ApplicationIcon.Images[0].Data[$index]) { throw 'Fixture icon image bytes differ.' }
+    # Image for image: icon N is the fixture's Nth image, byte for byte; the one icon group lists every image with the
+    # fixture's directory entry and that icon's ID.
+    $icons = Get-PscPeResource -Path $markedImage.OutputPath -Type ([PscResourceType]::Icon)
+    $groups = Get-PscPeResource -Path $markedImage.OutputPath -Type ([PscResourceType]::GroupIcon)
+    $iconsMatch = $icons.Count -eq $fixtureImages.Count
+    for ($index = 0; $iconsMatch -and $index -lt $icons.Count; $index++) {
+        $iconsMatch = $icons[$index].Id -eq $index + 1 -and [Linq.Enumerable]::SequenceEqual($icons[$index].Data, $fixtureImages[$index])
     }
+    $groupMatch = $groups.Count -eq 1 -and $groups[0].Data.Length -eq 6 + 14 * $fixtureImages.Count -and
+        [BitConverter]::ToUInt16($groups[0].Data, 2) -eq 1 -and [BitConverter]::ToUInt16($groups[0].Data, 4) -eq $fixtureImages.Count
+    for ($index = 0; $groupMatch -and $index -lt $fixtureImages.Count; $index++) {
+        $groupEntry = [byte[]]::new(12)
+        [Array]::Copy($groups[0].Data, 6 + 14 * $index, $groupEntry, 0, 12)
+        $groupMatch = [Linq.Enumerable]::SequenceEqual($groupEntry, $fixtureEntries[$index]) -and [BitConverter]::ToUInt16($groups[0].Data, 18 + 14 * $index) -eq $index + 1
+    }
+    $checks.ProgramIconImages = $iconsMatch
+    $checks.ProgramIconGroup = $groupMatch
     $stdout = [IO.Path]::Join($Directory, 'EntryMarked.stdout.log')
     $stderr = [IO.Path]::Join($Directory, 'EntryMarked.stderr.log')
     $process = Start-Process -FilePath $markedImage.OutputPath -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
     if (-not $process.WaitForExit(10000)) { $process.Kill(); throw 'Marked entry fixture did not exit.' }
     $process.WaitForExit()
     $report = [IO.File]::ReadAllLines($stdout)
-    if ($process.ExitCode -ne 0 -or $report.Count -ne 2 -or $report[0] -ne [Threading.ApartmentState]::STA.ToString() -or $report[1] -ne '0') {
-        throw ('Marked entry fixture failed: ' + [IO.File]::ReadAllText($stderr))
+    $reported = $process.ExitCode -eq 0 -and $report.Count -eq 2
+    $checks.ProgramEntrySta = $reported -and $report[0] -eq [Threading.ApartmentState]::STA.ToString()
+    $checks.ProgramEntryComInitialized = $reported -and $report[1] -eq '0'
+    # Truncated inside the first directory entry, and inside the last image.
+    $fixtureBytes = [IO.File]::ReadAllBytes($iconPath)
+    $truncatedRejected = $true
+    foreach ($length in 10, ($fixtureBytes.Length - 1)) {
+        $truncated = [byte[]]::new($length)
+        [Array]::Copy($fixtureBytes, $truncated, $length)
+        $badPath = [IO.Path]::Join($Directory, 'EntryTruncated.ico')
+        [IO.File]::WriteAllBytes($badPath, $truncated)
+        $rejected = $false
+        try { $null = [PscIcon]::Read($badPath) } catch { $rejected = $true }
+        $truncatedRejected = $truncatedRejected -and $rejected
     }
-    $truncated = [byte[]]::new(10)
-    [Array]::Copy([IO.File]::ReadAllBytes($iconPath), $truncated, 10)
-    $badPath = [IO.Path]::Join($Directory, 'EntryTruncated.ico')
-    [IO.File]::WriteAllBytes($badPath, $truncated)
-    $rejected = $false
-    try { $null = [PscIcon]::Read($badPath) } catch { $rejected = $true }
-    if (-not $rejected) { throw 'Truncated ICO was admitted.' }
-    foreach ($name in 'ProgramUnmarkedDeterministic', 'ProgramUnmarkedResourcesUnchanged', 'ProgramEntrySta', 'ProgramEntryComInitialized', 'ProgramIconImages', 'ProgramTruncatedIconRejected') {
+    $checks.ProgramTruncatedIconRejected = $truncatedRejected
+    foreach ($name in $checks.Keys) {
         $verdict = [PscProgramMetadataVerdict]::new()
         $verdict.Test = $name
-        $verdict.Passed = $true
-        $verdict.FixtureHash = $plain.SHA256
-        $verdict.Apartment = $report[0]
-        $verdict.ComStatus = [int]$report[1]
-        $verdict.IconImages = $marked.ApplicationIcon.Images.Count
+        $verdict.Passed = $checks[$name]
+        $verdict.UnmarkedImageHash = $plainImageHash
+        $verdict.Apartment = if ($report.Count -gt 0) { $report[0] } else { [IO.File]::ReadAllText($stderr) }
+        $verdict.ComStatus = if ($report.Count -gt 1) { $report[1] } else { $process.ExitCode }
+        $verdict.IconImages = $icons.Count
         $verdict
     }
+    if ($checks.Values -contains $false) { throw 'Program metadata fixture failed.' }
 }
 
 class PscProgramMetadataVerdict {
     [string] $Test
     [bool] $Passed
-    [string] $FixtureHash
+    [string] $UnmarkedImageHash
     [string] $Apartment
-    [int] $ComStatus
+    [string] $ComStatus
     [int] $IconImages
 }
 
@@ -1710,6 +1789,70 @@ function Assert-PscInlineOverrides([System.Management.Automation.Language.TypeDe
             }
         }
     }
+}
+
+# A typed variable assigned an array of hashtable literals converts each hashtable to the element class and each value
+# to its member's type, as PowerShell does: [PscTableElement[]] $items = @(@{ Width = 44 }) holds a [double] 44, whether
+# the hashtables are one array literal or one statement each.
+function Test-PscTypedArrayAssignment([string] $Directory) {
+    $fixture = {
+        class PscTableElement {
+            [string] $Name
+            [double] $Width
+        }
+        class PscTableAssignment {
+            static [double] Run() {
+                [PscTableElement[]] $items = @(@{ Name = 'first'; Width = 44 }, @{ Name = 'second'; Width = 2 })
+                $total = 0.0
+                foreach ($item in $items) { $total += $item.Width }
+                [PscTableElement[]] $lines = @(
+                    @{ Name = 'third'; Width = 3 }
+                    @{ Name = 'fourth'; Width = 5 }
+                )
+                foreach ($item in $lines) { $total += $item.Width }
+                return $total
+            }
+            static [double] Elements() {
+                $data = @{ Rect = @(1.5, 2.5, 3, 4) }
+                [double[]] $rect = $data.Rect
+                return $rect[0] + $rect[1] + $rect[2] + $rect[3]
+            }
+            static [bool] Identity() {
+                [double[]] $first = 1.0, 2.0
+                [object] $boxed = $first
+                [double[]] $second = $boxed
+                return [object]::ReferenceEquals($first, $second)
+            }
+        }
+    }.Ast
+    $root = [System.Management.Automation.Language.ScriptBlockAst]::new($fixture.Extent, $null,
+        [System.Management.Automation.Language.StatementBlockAst]::new($fixture.Extent, [System.Management.Automation.Language.StatementAst[]]@($fixture.EndBlock.Statements | ForEach-Object { $_.Copy() }), $null), $false)
+    $output = Join-Path $Directory 'PscTableAssignment.dll'
+    $null = Export-LoweredAssembly -SourceAst $root -ClassName PscTableAssignment -ClassNames PscTableElement, PscTableAssignment -OutputPath $output
+    $assembly = [Reflection.Assembly]::Load([IO.File]::ReadAllBytes($output))
+    $type = $assembly.GetType('PscTableAssignment', $true)
+    $verdict = [PscTypedArrayVerdict]::new()
+    $verdict.Test = 'TypedArrayAssignmentConvertsTables'
+    $verdict.Total = $type.GetMethod('Run').CreateDelegate([Func[double]]).Invoke()
+    $verdict.Passed = $verdict.Total -eq 54.0
+    $verdict
+    # An object holding an object[] converts to [double[]] element by element; one holding a [double[]] is that array.
+    $elements = [PscTypedArrayVerdict]::new()
+    $elements.Test = 'ObjectToTypedArrayConvertsElements'
+    $elements.Total = $type.GetMethod('Elements').CreateDelegate([Func[double]]).Invoke()
+    $elements.Passed = $elements.Total -eq 11.0
+    $elements
+    $identity = [PscTypedArrayVerdict]::new()
+    $identity.Test = 'ObjectToTypedArrayKeepsIdentity'
+    $identity.Passed = $type.GetMethod('Identity').CreateDelegate([Func[bool]]).Invoke()
+    $identity
+    if (-not ($verdict.Passed -and $elements.Passed -and $identity.Passed)) { throw 'Typed array conversion differs.' }
+}
+
+class PscTypedArrayVerdict {
+    [string] $Test
+    [bool] $Passed
+    [double] $Total
 }
 
 function Test-PscInline([string] $Directory) {
@@ -3174,6 +3317,18 @@ function ConvertTo-PowerShellType {
         }
         return [Linq.Expressions.Expression]::Call((Get-PscSemanticsMethod -Name 'Text' -ParameterTypes @([object])), [Linq.Expressions.Expression]::Convert($Expression, [object]))
     }
+    # An [object] to an array type, decided at run time with CoreCLR's own type tests: a value already of the array type
+    # is that array (its identity kept); an object[] (what @() writes) is converted element by element as the
+    # array-to-array conversion below does; anything else is cast, which throws as CoreCLR's cast does.
+    if ($from -eq [object] -and $Type.IsArray -and $Type.GetArrayRank() -eq 1 -and $Type -ne [object[]]) {
+        $et = [Linq.Expressions.Expression]
+        $value = $et::Variable([object], 'convertValue')
+        $elements = ConvertTo-PowerShellType -Expression ($et::Convert($value, [object[]])) -Type $Type
+        return $et::Block($Type, [Linq.Expressions.ParameterExpression[]]@($value), [Linq.Expressions.Expression[]]@(
+            $et::Assign($value, $Expression),
+            $et::Condition($et::TypeIs($value, $Type), $et::Convert($value, $Type),
+                $et::Condition($et::TypeIs($value, [object[]]), $elements, $et::Convert($value, $Type)))))
+    }
     # An array to an array of another element type, as PowerShell converts it: each element converted in order; $null
     # stays $null.
     if ($Type.IsArray -and $Type.GetArrayRank() -eq 1 -and $from.IsArray -and $from.GetArrayRank() -eq 1) {
@@ -3577,14 +3732,18 @@ function New-TypedArrayLiteral {
     $elements = $null
     if ($Node -is [System.Management.Automation.Language.ArrayLiteralAst]) { $elements = @($Node.Elements) }
     elseif ($Node -is [System.Management.Automation.Language.ArrayExpressionAst] -and $null -eq $Node.SubExpression.Traps) {
-        $statements = @($Node.SubExpression.Statements)
-        if ($statements.Count -eq 0) { $elements = @() }
-        elseif ($statements.Count -eq 1 -and $statements[0] -is [System.Management.Automation.Language.PipelineAst] -and $statements[0].PipelineElements.Count -eq 1 -and
-                $statements[0].PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst]) {
-            $only = $statements[0].PipelineElements[0].Expression
-            if ($only -is [System.Management.Automation.Language.ArrayLiteralAst]) { $elements = @($only.Elements) }
-            elseif (Test-PscWrittenWhole (Convert-AstExpression -Node $only -Scope $Scope).Type) { $elements = @($only) }
+        # Each statement writes its value in order: an array literal each of its elements, a value written whole itself.
+        # Any other statement leaves the array to the general conversion.
+        $written = [System.Collections.Generic.List[System.Management.Automation.Language.ExpressionAst]]::new()
+        foreach ($statement in $Node.SubExpression.Statements) {
+            if ($statement -isnot [System.Management.Automation.Language.PipelineAst] -or $statement.PipelineElements.Count -ne 1 -or
+                $statement.PipelineElements[0] -isnot [System.Management.Automation.Language.CommandExpressionAst]) { $written = $null; break }
+            $only = $statement.PipelineElements[0].Expression
+            if ($only -is [System.Management.Automation.Language.ArrayLiteralAst]) { $written.AddRange($only.Elements) }
+            elseif (Test-PscWrittenWhole (Convert-AstExpression -Node $only -Scope $Scope).Type) { $written.Add($only) }
+            else { $written = $null; break }
         }
+        if ($null -ne $written) { $elements = @($written) }
     }
     if ($null -eq $elements) { return $null }
     $items = [System.Collections.Generic.List[Linq.Expressions.Expression]]::new()
@@ -3673,6 +3832,8 @@ function Convert-AstExpressionAs {
            $inner.PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst]) {
         $inner = $inner.PipelineElements[0].Expression
     }
+    # An assignment's right side is a command expression with no pipeline around it ([T[]] $x = @(@{...})).
+    if ($inner -is [System.Management.Automation.Language.CommandExpressionAst] -and $inner.Redirections.Count -eq 0) { $inner = $inner.Expression }
     if ($Type.IsArray -and $Type.GetArrayRank() -eq 1) {
         $built = New-TypedArrayLiteral -Node $inner -ElementType $Type.GetElementType() -Scope $Scope
         if ($null -ne $built) { return $built }
