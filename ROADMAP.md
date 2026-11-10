@@ -133,7 +133,8 @@ and 10); the reusable Fluent framework (item 14) after it.
     Metro are design languages over it (their controls' look, metrics, motion and theme). First piece: theming (the palette and colour lookup), hit testing (the node and its
     collections) and `Button`, each a framework class taking its surface, theme and input state as arguments;
     Notepad then uses them, checked by its own runs (model, graphics, diagnostics equal). The other controls, the
-    window and drawing follow. Order, set by Scott: after a native Notepad.exe.
+    window and drawing follow. Order, set by Scott: after a native Notepad.exe. The first app to reuse it is PSNES
+    (Scott): a Fluent settings menu, its UI lowered with it; its emulator core already compiles natively.
 15. Acrylic in an unfocused window. DWM's system backdrops (`DWMWA_SYSTEMBACKDROP_TYPE`, which Notepad uses) fall
     back to a solid colour when the window is inactive. Windows Terminal keeps acrylic unfocused
     (`compatibility.enableUnfocusedAcrylic`): its terminal background is a XAML `AcrylicBrush`, `HostBackdrop`
