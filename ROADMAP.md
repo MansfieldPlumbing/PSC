@@ -69,7 +69,20 @@ and 10); the reusable Fluent framework (item 14) after it.
    reference app. They serve the planned ports of HTML/TypeScript/JavaScript apps and the Photos, Paint and
    Terminal counterparts as much as Notepad.
 8. Compile a script, not only classes. Notepad's 28 classes compile together into one assembly (58,368 bytes,
-   2026-11-09). PSC's Compile mode takes classes; a script's function class, its script
+   2026-11-09). What remains, in order:
+   - The function class: Compile already folds the script's functions into one class (`Notepad`) when
+     `-ClassNames` lists it, but `-ClassName` must name a class written in the source, and the functions must
+     lower (36 refused today).
+   - The entry point: the script's top-level statements as `Main(string[])`, its `param()` block bound from the
+     command line as PowerShell binds a script's parameters (named, positional, switches, `ValidateSet`), script
+     variables as the function class's static fields.
+   - Development-only code (the Verify functions, `Invoke-NotepadComparison`, `-Compare`, `-DiagnosticPath`)
+     out of the native build. Proposed: the build fixes those switches to their defaults as compile-time
+     constants, the branches they guard are pruned, and functions no longer reachable from the entry point are
+     not compiled. Scott to decide.
+   - `Invoke-Design`'s `data { }` section: a data section admits only literals, so it lowers as the hashtables and
+     arrays it builds (static data today takes only numbers, strings and their arrays).
+   PSC's Compile mode takes classes; a script's function class, its script
    variables and its top-level statements (the entry point) are lowered member by member by Investigate but not
    yet emitted into an assembly. Development-only code (`Invoke-NotepadComparison`, the Verify functions) is to be
    left out of the native build.
