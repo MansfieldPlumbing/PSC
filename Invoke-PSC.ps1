@@ -88,6 +88,7 @@ param(
     [string] $Mode = 'Compile',
     # Run: the parameters the source is run with, by name.
     [hashtable] $RunParameters = @{},
+    $BindingEnvironment,
     [string] $ArchivePath,
     [string] $ProjectPath,
     [string[]] $LintFiles,
@@ -111,6 +112,8 @@ param(
     # Compile -Program: script parameters fixed to these values for the build; the branches they decide and the
     # functions no longer reachable are left out ($api.FixParameters).
     [hashtable] $FixedParameters,
+    # Compile -Program: fixed parameter values serialized as CLIXML data for process invocation.
+    [string] $FixedParametersPath,
     # Compile: produce a native executable at OutputPath (lowered, then ILC, then PSC's linker). Needs EntryPoint.
     [switch] $Native,
     [switch] $Deterministic = $true,
@@ -1333,6 +1336,7 @@ Entry
     $checks.GraphSharedReferences = (Compare-SmaRuntimeGraph ([object[]]@($shared,$shared)) ([object[]]@($copy,$copy))).Equal
     $checks.GraphSplitReferencesRejected = -not (Compare-SmaRuntimeGraph ([object[]]@($shared,$shared)) ([object[]]@([int[]]@(4,5),[int[]]@(4,5)))).Equal
     Test-PscInline -Directory $directory
+    Test-PscProgramMetadata -Directory $directory
     foreach ($key in $checks.Keys) {
         [pscustomobject]@{ Test = $key; Passed = [bool]$checks[$key]; Evidence = $project }
     }
@@ -1381,6 +1385,300 @@ function Test-AttributeClass([System.Management.Automation.Language.TypeDefiniti
 [AttributeUsage([AttributeTargets]::Method)]
 class PscInline : Attribute {
     PscInline() {}
+}
+
+[AttributeUsage([AttributeTargets]::All)]
+class SingleThreadedApartment : Attribute {
+    SingleThreadedApartment() {}
+}
+
+[AttributeUsage([AttributeTargets]::All)]
+class ApplicationIcon : Attribute {
+    [string] $Path
+    ApplicationIcon([string] $path) { $this.Path = $path }
+}
+
+class PscIconImage {
+    [byte[]] $DirectoryEntry
+    [byte[]] $Data
+    [int] $Width
+    [int] $Height
+}
+
+enum PscResourceType { Icon = 3; GroupIcon = 14 }
+
+class PscIcon {
+    [PscIconImage[]] $Images
+
+    static [PscIcon] Read([string] $path) {
+        $bytes = [IO.File]::ReadAllBytes($path)
+        if ($bytes.Length -lt 6 -or [BitConverter]::ToUInt16($bytes, 0) -ne 0 -or [BitConverter]::ToUInt16($bytes, 2) -ne 1) {
+            throw 'Application icon must be an ICO file.'
+        }
+        $count = [int][BitConverter]::ToUInt16($bytes, 4)
+        $header = 6L + 16L * $count
+        if ($count -eq 0 -or $header -gt $bytes.LongLength) { throw 'Application icon directory is empty or truncated.' }
+        $imageList = [Collections.Generic.List[PscIconImage]]::new()
+        for ($index = 0; $index -lt $count; $index++) {
+            $entry = 6 + 16 * $index
+            $length = [long][BitConverter]::ToUInt32($bytes, $entry + 8)
+            $offset = [long][BitConverter]::ToUInt32($bytes, $entry + 12)
+            if ($bytes[$entry + 3] -ne 0 -or $length -eq 0 -or $offset -lt $header -or $offset + $length -gt $bytes.LongLength) {
+                throw 'Application icon image is invalid or truncated.'
+            }
+            $image = [PscIconImage]::new()
+            $image.DirectoryEntry = [byte[]]::new(12)
+            [Array]::Copy($bytes, $entry, $image.DirectoryEntry, 0, 12)
+            $image.Data = [byte[]]::new($length)
+            [Array]::Copy($bytes, $offset, $image.Data, 0, $length)
+            $image.Width = if ($bytes[$entry]) { $bytes[$entry] } else { 256 }
+            $image.Height = if ($bytes[$entry + 1]) { $bytes[$entry + 1] } else { 256 }
+            $imageList.Add($image)
+        }
+        $icon = [PscIcon]::new()
+        $icon.Images = $imageList.ToArray()
+        return $icon
+    }
+
+    hidden static [void] Directory([IO.BinaryWriter] $writer, [long] $offset, [int] $count) {
+        $writer.BaseStream.Position = $offset
+        $writer.Write([uint32]0); $writer.Write([uint32]0)
+        $writer.Write([uint16]0); $writer.Write([uint16]0)
+        $writer.Write([uint16]0); $writer.Write([uint16]$count)
+    }
+
+    hidden static [void] Entry([IO.BinaryWriter] $writer, [long] $offset, [uint32] $id, [long] $target, [bool] $directory) {
+        $writer.BaseStream.Position = $offset
+        $writer.Write($id)
+        $writer.Write([uint32]($target -bor $(if ($directory) { 0x80000000L } else { 0L })))
+    }
+
+    [byte[]] Resources([uint32] $baseRva) {
+        $count = $this.Images.Count
+        $iconDirectory = 32
+        $groupDirectory = $iconDirectory + 16 + 8 * $count
+        $languages = $groupDirectory + 24
+        $dataEntries = $languages + 24 * ($count + 1)
+        $groupData = $dataEntries + 16 * ($count + 1)
+        $groupLength = 6 + 14 * $count
+        $dataOffset = ($groupData + $groupLength + 3) -band -4
+        $stream = [IO.MemoryStream]::new()
+        $writer = [IO.BinaryWriter]::new($stream)
+        try {
+            [PscIcon]::Directory($writer, 0, 2)
+            [PscIcon]::Entry($writer, 16, [uint32][PscResourceType]::Icon, $iconDirectory, $true)
+            [PscIcon]::Entry($writer, 24, [uint32][PscResourceType]::GroupIcon, $groupDirectory, $true)
+            [PscIcon]::Directory($writer, $iconDirectory, $count)
+            [PscIcon]::Directory($writer, $groupDirectory, 1)
+            [PscIcon]::Entry($writer, $groupDirectory + 16, 1, $languages + 24 * $count, $true)
+            for ($index = 0; $index -le $count; $index++) {
+                $language = $languages + 24 * $index
+                [PscIcon]::Directory($writer, $language, 1)
+                [PscIcon]::Entry($writer, $language + 16, 0, $dataEntries + 16 * $index, $false)
+                $writer.BaseStream.Position = $dataEntries + 16 * $index
+                if ($index -eq $count) {
+                    $writer.Write([uint32]($baseRva + $groupData)); $writer.Write([uint32]$groupLength)
+                } else {
+                    $image = $this.Images[$index]
+                    $writer.Write([uint32]($baseRva + $dataOffset)); $writer.Write([uint32]$image.Data.Length)
+                    [PscIcon]::Entry($writer, $iconDirectory + 16 + 8 * $index, [uint32]($index + 1), $language, $true)
+                    $writer.BaseStream.Position = $dataOffset
+                    $writer.Write($image.Data)
+                    $dataOffset = ($dataOffset + $image.Data.Length + 3) -band -4
+                    $writer.BaseStream.Position = $dataEntries + 16 * $index + 8
+                }
+                $writer.Write([uint32]0); $writer.Write([uint32]0)
+            }
+            $writer.BaseStream.Position = $groupData
+            $writer.Write([uint16]0); $writer.Write([uint16]1); $writer.Write([uint16]$count)
+            for ($index = 0; $index -lt $count; $index++) {
+                $writer.Write($this.Images[$index].DirectoryEntry)
+                $writer.Write([uint16]($index + 1))
+            }
+            $writer.Flush()
+            return $stream.ToArray()
+        } finally { $writer.Dispose(); $stream.Dispose() }
+    }
+}
+
+function Get-ProgramIcon {
+    param([System.Management.Automation.Language.ScriptBlockAst] $Root)
+    $icon = $null
+    if ($null -ne $Root.ParamBlock) {
+        foreach ($attribute in $Root.ParamBlock.Attributes) {
+            if ($attribute.TypeName.Name -ne [ApplicationIcon].Name) { continue }
+            if ($null -ne $icon -or $attribute.NamedArguments.Count -or $attribute.PositionalArguments.Count -ne 1 -or
+                $attribute.PositionalArguments[0] -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                throw 'ApplicationIcon requires one literal relative ICO path and may occur only once.'
+            }
+            $path = $attribute.PositionalArguments[0].Value
+            if ([IO.Path]::IsPathRooted($path) -or [string]::IsNullOrEmpty($Root.Extent.File)) { throw 'ApplicationIcon requires a source file and a relative path.' }
+            $icon = [PscIcon]::Read([IO.Path]::GetFullPath([IO.Path]::Combine([IO.Path]::GetDirectoryName($Root.Extent.File), $path)))
+        }
+    }
+    $icon
+}
+
+function Set-ProgramEntryAttributes {
+    param([System.Management.Automation.Language.FunctionMemberAst] $Method, [Reflection.Emit.MethodBuilder] $Builder)
+    if (-not $script:PscProgramEntries.ContainsKey($Method)) { return }
+    $parameters = $script:PscProgramEntries[$Method]
+    if ($null -eq $parameters) { return }
+    $marked = $false
+    foreach ($attribute in $parameters.Attributes) {
+        if ($attribute.TypeName.Name -ne [SingleThreadedApartment].Name) { continue }
+        if ($marked -or $attribute.PositionalArguments.Count -or $attribute.NamedArguments.Count) { throw 'SingleThreadedApartment takes no arguments and may occur only once.' }
+        $marked = $true
+    }
+    if ($marked) {
+        $Builder.SetCustomAttribute([Reflection.Emit.CustomAttributeBuilder]::new([STAThreadAttribute].GetConstructor([Type[]]@()), [object[]]@()))
+    }
+}
+
+class PscEntryFixture {
+    [System.Runtime.InteropServices.LibraryImport('ole32.dll')]
+    static [int] CoCreateInstance([IntPtr] $classId, [IntPtr] $outer, [uint] $context, [IntPtr] $interfaceId, [IntPtr] $result) { throw 'native' }
+
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [Runtime.CompilerServices.CallConvStdcall])]
+    static [uint] Release([IntPtr] $address, [IntPtr] $instance) { throw 'native' }
+
+    static [void] Probe() {
+        if ([Threading.Thread]::CurrentThread.ApartmentState -ne [Threading.ApartmentState]::STA) { throw 'Marked entry thread is not STA.' }
+        $memory = [Runtime.InteropServices.Marshal]::AllocHGlobal(40)
+        try {
+            [Runtime.InteropServices.Marshal]::Copy([Guid]::new('cacaf262-9370-4615-a13b-9f5539da4c0a').ToByteArray(), 0, $memory, 16)
+            [Runtime.InteropServices.Marshal]::Copy([Guid]::new('00000000-0000-0000-c000-000000000046').ToByteArray(), 0, [IntPtr]::Add($memory, 16), 16)
+            $status = [PscEntryFixture]::CoCreateInstance($memory, [IntPtr]::Zero, 1, [IntPtr]::Add($memory, 16), [IntPtr]::Add($memory, 32))
+            if ($status -lt 0) { throw [InvalidOperationException]::new('CoCreateInstance failed: ' + $status) }
+            $instance = [Runtime.InteropServices.Marshal]::ReadIntPtr($memory, 32)
+            try { [Console]::WriteLine([Threading.Thread]::CurrentThread.ApartmentState.ToString()); [Console]::WriteLine($status) }
+            finally {
+                $vtable = [Runtime.InteropServices.Marshal]::ReadIntPtr($instance)
+                $null = [PscEntryFixture]::Release([Runtime.InteropServices.Marshal]::ReadIntPtr($vtable, 2 * [IntPtr]::Size), $instance)
+            }
+        } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($memory) }
+    }
+}
+
+function New-PscEntryFixtureAst {
+    param([string] $Directory, [switch] $Apartment, [string] $Icon)
+    $source = $MyInvocation.MyCommand.ScriptBlock.Ast
+    while ($null -ne $source.Parent) { $source = $source.Parent }
+    $fixture = $null
+    foreach ($statement in $source.BeginBlock.Statements) {
+        if ($statement -is [System.Management.Automation.Language.TypeDefinitionAst] -and $statement.Name -eq [PscEntryFixture].Name) { $fixture = $statement }
+    }
+    if ($null -eq $fixture) { throw 'Entry fixture declaration is missing.' }
+    $position = [System.Management.Automation.Language.ScriptPosition]::new([IO.Path]::Join($Directory, 'EntryFixture.ps1'), 1, 1, '')
+    $extent = [System.Management.Automation.Language.ScriptExtent]::new($position, $position)
+    $attributes = [Collections.Generic.List[System.Management.Automation.Language.AttributeAst]]::new()
+    $attributes.Add([System.Management.Automation.Language.AttributeAst]::new($extent, [System.Management.Automation.Language.ReflectionTypeName]::new([System.Management.Automation.CmdletBindingAttribute]), [System.Management.Automation.Language.ExpressionAst[]]@(), [System.Management.Automation.Language.NamedAttributeArgumentAst[]]@()))
+    if ($Apartment) { $attributes.Add([System.Management.Automation.Language.AttributeAst]::new($extent, [System.Management.Automation.Language.ReflectionTypeName]::new([SingleThreadedApartment]), [System.Management.Automation.Language.ExpressionAst[]]@(), [System.Management.Automation.Language.NamedAttributeArgumentAst[]]@())) }
+    if ($Icon) {
+        $argument = [System.Management.Automation.Language.StringConstantExpressionAst]::new($extent, $Icon, [System.Management.Automation.Language.StringConstantType]::SingleQuoted)
+        $attributes.Add([System.Management.Automation.Language.AttributeAst]::new($extent, [System.Management.Automation.Language.ReflectionTypeName]::new([ApplicationIcon]), [System.Management.Automation.Language.ExpressionAst[]]@($argument), [System.Management.Automation.Language.NamedAttributeArgumentAst[]]@()))
+    }
+    $parameters = [System.Management.Automation.Language.ParamBlockAst]::new($extent, $attributes.ToArray(), [System.Management.Automation.Language.ParameterAst[]]@())
+    $statements = [Collections.Generic.List[System.Management.Automation.Language.StatementAst]]::new()
+    if ($Apartment) {
+        $statements.Add($fixture.Copy())
+        $type = [System.Management.Automation.Language.TypeExpressionAst]::new($extent, [System.Management.Automation.Language.TypeName]::new($extent, $fixture.Name))
+        $member = [System.Management.Automation.Language.StringConstantExpressionAst]::new($extent, 'Probe', [System.Management.Automation.Language.StringConstantType]::BareWord)
+        $call = [System.Management.Automation.Language.InvokeMemberExpressionAst]::new($extent, $type, $member, [System.Management.Automation.Language.ExpressionAst[]]@(), $true)
+        $statements.Add([System.Management.Automation.Language.PipelineAst]::new($extent, [System.Management.Automation.Language.CommandExpressionAst]::new($extent, $call, [System.Management.Automation.Language.RedirectionAst[]]@())))
+    }
+    $body = [System.Management.Automation.Language.StatementBlockAst]::new($extent, $statements.ToArray(), [System.Management.Automation.Language.TrapStatementAst[]]@())
+    [System.Management.Automation.Language.ScriptBlockAst]::new($extent, $parameters, $body, $false)
+}
+
+function Get-PscPeResourceBytes {
+    param([string] $Path)
+    $stream = [IO.File]::OpenRead($Path)
+    $reader = [Reflection.PortableExecutable.PEReader]::new($stream)
+    try {
+        $directory = $reader.PEHeaders.PEHeader.ResourceTableDirectory
+        if ($directory.Size -eq 0) { return ,([byte[]]@()) }
+        [byte[]] $bytes = $reader.GetSectionData($directory.RelativeVirtualAddress).GetContent(0, $directory.Size)
+        return ,$bytes
+    } finally { $reader.Dispose(); $stream.Dispose() }
+}
+
+function Test-PscProgramMetadata {
+    param([string] $Directory)
+    $iconPath = [IO.Path]::Join($Directory, 'EntryFixture.ico')
+    $stream = [IO.MemoryStream]::new()
+    $writer = [IO.BinaryWriter]::new($stream)
+    try {
+        $writer.Write([uint16]0); $writer.Write([uint16]1); $writer.Write([uint16]1)
+        $writer.Write([byte]1); $writer.Write([byte]1); $writer.Write([byte]0); $writer.Write([byte]0)
+        $writer.Write([uint16]1); $writer.Write([uint16]32); $writer.Write([uint32]48); $writer.Write([uint32]22)
+        $writer.Write([uint32]40); $writer.Write([int]1); $writer.Write([int]2)
+        $writer.Write([uint16]1); $writer.Write([uint16]32); $writer.Write([uint32]0); $writer.Write([uint32]4)
+        $writer.Write([byte[]]::new(16)); $writer.Write([uint32]0xff0000ffL); $writer.Write([uint32]0)
+        $writer.Flush()
+        [IO.File]::WriteAllBytes($iconPath, $stream.ToArray())
+    } finally { $writer.Dispose(); $stream.Dispose() }
+    $plainAst = New-PscEntryFixtureAst -Directory $Directory
+    $plainPath = [IO.Path]::Join($Directory, 'EntryPlain.dll')
+    $plain = Export-LoweredAssembly -SourceAst $plainAst -Program -EntryPoint Main -OutputPath $plainPath
+    $plainAgain = Export-LoweredAssembly -SourceAst $plainAst -Program -EntryPoint Main -OutputPath $plainPath
+    if ($plain.SHA256 -cne $plainAgain.SHA256) { throw 'Unmarked program bytes are not deterministic.' }
+    $plainImage = Export-NativeImage -AssemblyPath $plainPath -OutputPath ([IO.Path]::Join($Directory, 'EntryPlain.exe'))
+    if ((Get-PscPeResourceBytes -Path $plainImage.OutputPath).Length -ne 0) { throw 'Unmarked program gained a resource directory.' }
+    $markedAst = New-PscEntryFixtureAst -Directory $Directory -Apartment -Icon ([IO.Path]::GetFileName($iconPath))
+    $marked = Export-LoweredAssembly -SourceAst $markedAst -Program -EntryPoint Main -OutputPath ([IO.Path]::Join($Directory, 'EntryMarked.dll'))
+    $markedImage = Export-NativeImage -AssemblyPath $marked.OutputPath -OutputPath ([IO.Path]::Join($Directory, 'EntryMarked.exe')) -ApplicationIcon $marked.ApplicationIcon
+    $resourceBytes = Get-PscPeResourceBytes -Path $markedImage.OutputPath
+    if ([BitConverter]::ToUInt16($resourceBytes, 14) -ne 2 -or [BitConverter]::ToUInt32($resourceBytes, 16) -ne [uint32][PscResourceType]::Icon -or
+        [BitConverter]::ToUInt32($resourceBytes, 24) -ne [uint32][PscResourceType]::GroupIcon) { throw 'Fixture icon resource types differ.' }
+    $iconDirectory = [int]([BitConverter]::ToUInt32($resourceBytes, 20) -band 0x7fffffff)
+    $language = [int]([BitConverter]::ToUInt32($resourceBytes, $iconDirectory + 20) -band 0x7fffffff)
+    $dataEntry = [int][BitConverter]::ToUInt32($resourceBytes, $language + 20)
+    $peStream = [IO.File]::OpenRead($markedImage.OutputPath)
+    $peReader = [Reflection.PortableExecutable.PEReader]::new($peStream)
+    try { $resourceRva = $peReader.PEHeaders.PEHeader.ResourceTableDirectory.RelativeVirtualAddress }
+    finally { $peReader.Dispose(); $peStream.Dispose() }
+    $dataOffset = [int]([BitConverter]::ToUInt32($resourceBytes, $dataEntry) - $resourceRva)
+    $dataSize = [int][BitConverter]::ToUInt32($resourceBytes, $dataEntry + 4)
+    if ($dataSize -ne $marked.ApplicationIcon.Images[0].Data.Length) { throw 'Fixture icon image length differs.' }
+    for ($index = 0; $index -lt $dataSize; $index++) {
+        if ($resourceBytes[$dataOffset + $index] -ne $marked.ApplicationIcon.Images[0].Data[$index]) { throw 'Fixture icon image bytes differ.' }
+    }
+    $stdout = [IO.Path]::Join($Directory, 'EntryMarked.stdout.log')
+    $stderr = [IO.Path]::Join($Directory, 'EntryMarked.stderr.log')
+    $process = Start-Process -FilePath $markedImage.OutputPath -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+    if (-not $process.WaitForExit(10000)) { $process.Kill(); throw 'Marked entry fixture did not exit.' }
+    $process.WaitForExit()
+    $report = [IO.File]::ReadAllLines($stdout)
+    if ($process.ExitCode -ne 0 -or $report.Count -ne 2 -or $report[0] -ne [Threading.ApartmentState]::STA.ToString() -or $report[1] -ne '0') {
+        throw ('Marked entry fixture failed: ' + [IO.File]::ReadAllText($stderr))
+    }
+    $truncated = [byte[]]::new(10)
+    [Array]::Copy([IO.File]::ReadAllBytes($iconPath), $truncated, 10)
+    $badPath = [IO.Path]::Join($Directory, 'EntryTruncated.ico')
+    [IO.File]::WriteAllBytes($badPath, $truncated)
+    $rejected = $false
+    try { $null = [PscIcon]::Read($badPath) } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Truncated ICO was admitted.' }
+    foreach ($name in 'ProgramUnmarkedDeterministic', 'ProgramUnmarkedResourcesUnchanged', 'ProgramEntrySta', 'ProgramEntryComInitialized', 'ProgramIconImages', 'ProgramTruncatedIconRejected') {
+        $verdict = [PscProgramMetadataVerdict]::new()
+        $verdict.Test = $name
+        $verdict.Passed = $true
+        $verdict.FixtureHash = $plain.SHA256
+        $verdict.Apartment = $report[0]
+        $verdict.ComStatus = [int]$report[1]
+        $verdict.IconImages = $marked.ApplicationIcon.Images.Count
+        $verdict
+    }
+}
+
+class PscProgramMetadataVerdict {
+    [string] $Test
+    [bool] $Passed
+    [string] $FixtureHash
+    [string] $Apartment
+    [int] $ComStatus
+    [int] $IconImages
 }
 
 function Test-PscInlineMethod([System.Management.Automation.Language.FunctionMemberAst] $Method) {
@@ -2680,9 +2978,40 @@ function ConvertTo-PscRecordSource {
     [PscRecordRewrite]::new($Root, $records).Rebuild($Root)
 }
 
+$script:PscInferTypeOf = $null
+
+# The one type SMA's own type inference (AstTypeInference.InferTypeOf, a class SMA does not make public) gives each of
+# -AssignedValues, when every value infers exactly one type and all of them the same; $null otherwise. A type is a .NET
+# type, or one of the source's own classes, which stays a name so the source's mirror resolves it.
+function Get-PscInferredTypeName {
+    param(
+        [Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Root,
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Management.Automation.Language.Ast[]] $AssignedValues
+    )
+    if ($AssignedValues.Count -eq 0) { return $null }
+    if ($null -eq $script:PscInferTypeOf) {
+        $script:PscInferTypeOf = [System.Management.Automation.PowerShell].Assembly.GetType('System.Management.Automation.AstTypeInference').GetMethod('InferTypeOf', [Type[]]@([System.Management.Automation.Language.Ast]))
+    }
+    $classes = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($definition in $Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] }, $true)) { $null = $classes.Add($definition.Name) }
+    [System.Management.Automation.PSTypeName] $found = $null
+    foreach ($value in $AssignedValues) {
+        $names = [System.Collections.Generic.Dictionary[string, System.Management.Automation.PSTypeName]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($inferred in $script:PscInferTypeOf.Invoke($null, [object[]]@($value))) { $names[$inferred.Name] = $inferred }
+        if ($names.Count -ne 1) { return $null }
+        $one = @($names.Values)[0]
+        if ($null -eq $one.Type -and -not $classes.Contains($one.Name)) { return $null }
+        if ($null -eq $found) { $found = $one }
+        elseif (-not [string]::Equals($found.Name, $one.Name, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+    }
+    if ($null -ne $found.Type) { return [System.Management.Automation.Language.ReflectionTypeName]::new($found.Type) }
+    [System.Management.Automation.Language.TypeName]::new($Root.Extent, $found.Name)
+}
+
 # A source's script variables: each variable its top-level code assigns, and each $script: variable anywhere, except
-# SMA's own. Its type is the one an assignment declares, [hashtable] when every assignment is a hashtable literal,
-# and [object] otherwise, as a PowerShell variable holds whatever is assigned to it.
+# SMA's own. Its type is the one an assignment declares, [hashtable] when every assignment is a hashtable literal, the
+# one type SMA infers for every value assigned when each assignment is a plain = (Get-PscInferredTypeName), and
+# [object] otherwise, as a PowerShell variable holds whatever is assigned to it.
 function Get-ScriptVariable {
     param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Root)
     $sma = Get-SmaVariableName
@@ -2722,7 +3051,13 @@ function Get-ScriptVariable {
         # A declared type stays a name: it may be one of the source's own classes, which the source's mirror resolves.
         $typeName = if ($declared.Count) { $declared[0].Declared }
             elseif ($all.Count -and @($all | Where-Object { $_.Value -isnot [System.Management.Automation.Language.CommandExpressionAst] -or $_.Value.Expression -isnot [System.Management.Automation.Language.HashtableAst] }).Count -eq 0) { [System.Management.Automation.Language.ReflectionTypeName]::new([hashtable]) }
-            else { [System.Management.Automation.Language.ReflectionTypeName]::new([object]) }
+            else {
+                $inferred = $null
+                if (@($all | Where-Object { $_.Value.Parent.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals }).Count -eq 0) {
+                    $inferred = Get-PscInferredTypeName -Root $Root -AssignedValues ([System.Management.Automation.Language.Ast[]]@($all | ForEach-Object { $_.Value }))
+                }
+                if ($null -ne $inferred) { $inferred } else { [System.Management.Automation.Language.ReflectionTypeName]::new([object]) }
+            }
         [pscustomobject]@{ Name = $name; TypeName = $typeName }
     }
 }
@@ -2798,7 +3133,31 @@ function ConvertTo-PowerShellType {
     )
     $from = $Expression.Type
     if ($from -eq $Type) { return $Expression }
+    if ($Type.IsEnum -and $from -eq [string]) {
+        if ($Expression -is [Linq.Expressions.ConstantExpression]) {
+            return [Linq.Expressions.Expression]::Constant([System.Management.Automation.LanguagePrimitives]::ConvertTo($Expression.Value, $Type), $Type)
+        }
+        $parseEnum = [Func[Type,string,bool,object]][Enum]::Parse
+        return [Linq.Expressions.Expression]::Convert([Linq.Expressions.Expression]::Call($parseEnum.Method,
+            [Linq.Expressions.Expression]::Constant($Type, [Type]), $Expression, [Linq.Expressions.Expression]::Constant($true)), $Type)
+    }
     if ($Type -eq [void]) { return [Linq.Expressions.Expression]::Block($Expression, [Linq.Expressions.Expression]::Empty()) }
+    $underlying = [Nullable]::GetUnderlyingType($Type)
+    if ($null -ne $underlying) {
+        $et = [Linq.Expressions.Expression]
+        if ($Expression -is [Linq.Expressions.ConstantExpression] -and $null -eq $Expression.Value) { return $et::Default($Type) }
+        $sourceUnderlying = [Nullable]::GetUnderlyingType($from)
+        if ($null -ne $sourceUnderlying -or -not $from.IsValueType) {
+            $source = $et::Variable($from, 'nullableSource')
+            $present = if ($null -ne $sourceUnderlying) { $et::Property($source, 'HasValue') } else { $et::NotEqual($source, $et::Constant($null, $from)) }
+            $value = if ($null -ne $sourceUnderlying) { $et::Property($source, 'Value') } else { $source }
+            $converted = ConvertTo-PowerShellType -Expression $value -Type $underlying
+            return $et::Block($Type, [Linq.Expressions.ParameterExpression[]]@($source), [Linq.Expressions.Expression[]]@(
+                $et::Assign($source, $Expression),
+                $et::Condition($present, $et::Convert($converted, $Type), $et::Default($Type))))
+        }
+        return $et::Convert((ConvertTo-PowerShellType -Expression $Expression -Type $underlying), $Type)
+    }
     # To text as PowerShell's [string] cast gives it (PowerShellSemantics.Text): a value type that is not a list
     # formats with the invariant culture at compile-time-known type; anything else is decided at run time.
     if ($Type -eq [string]) {
@@ -2898,6 +3257,22 @@ function New-PowerShellStringComparison {
         [Linq.Expressions.Expression]::Constant($options, [Globalization.CompareOptions]))
 }
 
+# An ordering operator (-lt, -le, -gt, -ge, either case) on two operands of one numeric type.
+function New-PscOrderingComparison {
+    param(
+        [Parameter(Mandatory)][System.Management.Automation.Language.TokenKind] $Operator,
+        [Parameter(Mandatory)][Linq.Expressions.Expression] $Left,
+        [Parameter(Mandatory)][Linq.Expressions.Expression] $Right
+    )
+    switch ($Operator) {
+        { $_ -in [System.Management.Automation.Language.TokenKind]::Ilt, [System.Management.Automation.Language.TokenKind]::Clt } { return [Linq.Expressions.Expression]::LessThan($Left, $Right) }
+        { $_ -in [System.Management.Automation.Language.TokenKind]::Ile, [System.Management.Automation.Language.TokenKind]::Cle } { return [Linq.Expressions.Expression]::LessThanOrEqual($Left, $Right) }
+        { $_ -in [System.Management.Automation.Language.TokenKind]::Igt, [System.Management.Automation.Language.TokenKind]::Cgt } { return [Linq.Expressions.Expression]::GreaterThan($Left, $Right) }
+        { $_ -in [System.Management.Automation.Language.TokenKind]::Ige, [System.Management.Automation.Language.TokenKind]::Cge } { return [Linq.Expressions.Expression]::GreaterThanOrEqual($Left, $Right) }
+    }
+    throw "'$Operator' is not an ordering operator."
+}
+
 function New-PowerShellArithmetic {
     <#
     .SYNOPSIS
@@ -2954,7 +3329,7 @@ function ConvertTo-IntegralQuotient {
         break
     }
     if ($inner -isnot [System.Management.Automation.Language.BinaryExpressionAst] -or $inner.Operator -ne [System.Management.Automation.Language.TokenKind]::Divide) { return $null }
-    $bound = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Arithmetic,
+    $bound = $script:PscEnvironment.Get([PscBindingTarget]::NumericOperands).Bind([PscOperatorKind]::Arithmetic,
         (Convert-AstExpression -Node $inner.Left -Scope $Scope), (Convert-AstExpression -Node $inner.Right -Scope $Scope))
     if ($null -eq $bound -or $bound.Left.Type -notin [int], [uint32]) { return $null }
     $rounded = [Linq.Expressions.Expression]::Call((Get-PscSemanticsMethod -Name RoundedQuotient -ParameterTypes ([long], [long])),
@@ -3614,7 +3989,7 @@ function Resolve-MatchingMethod {
             $wanted = $params[$i].ParameterType
             $given = $ArgumentTypes[$i]
             # A one-character string converts to [char], as PowerShell converts '#' for TrimStart.
-            if (-not $wanted.IsAssignableFrom($given) -and -not ($wanted -in $numeric -and $given -in $numeric) -and $given -ne [object] -and -not ($wanted -eq [char] -and $given -eq [string])) { return $false }
+            if (-not $wanted.IsAssignableFrom($given) -and -not ($wanted -in $numeric -and $given -in $numeric) -and $given -ne [object] -and -not (($wanted -eq [char] -or $wanted.IsEnum) -and $given -eq [string])) { return $false }
         }
         $true
     })
@@ -4008,27 +4383,101 @@ class PowerShellSemantics {
 
 # A lowering decision PSC asks its environment for at the moment it lowers. The newest binding for a target wins and
 # keeps the binding it replaced, so how PSC came to lower a construct stays in the runspace with it.
+enum PscBindingTarget { NumericOperands; CharacterLiteral }
+enum PscMutationState { Pending; Active; Expired }
+
 class PscBinding {
-    [string] $Target
+    [PscBindingTarget] $Target
     [string] $Reason
     [PscBinding] $Previous
 }
 
 # The bindings in force, by target, and every binding set, in order. The API object Invoke-PSC.ps1 returns holds the
 # environment, so it lives as long as the caller keeps that object; a binding set through it is the next one used.
+class PscCharacterLiteral : PscBinding {
+    [Collections.Generic.Dictionary[char,char]] $Characters = [Collections.Generic.Dictionary[char,char]]::new()
+
+    PscCharacterLiteral() { $this.Target = [PscBindingTarget]::CharacterLiteral }
+
+    [char] Resolve([char] $character) {
+        [char] $replacement = 0
+        if ($this.Characters.TryGetValue($character, [ref] $replacement)) { return $replacement }
+        return $character
+    }
+}
+
+class PscMutation {
+    [PscBinding] $Binding
+    [long] $ActivationBoundary
+    [Nullable[long]] $ExpirationBoundary
+    [long] $Order
+    [PscMutationState] $State
+}
+
 class PscEnvironment {
-    [Collections.Generic.Dictionary[string, PscBinding]] $Current = [Collections.Generic.Dictionary[string, PscBinding]]::new([StringComparer]::Ordinal)
+    [Collections.Generic.Dictionary[PscBindingTarget, PscBinding]] $Current = [Collections.Generic.Dictionary[PscBindingTarget, PscBinding]]::new()
     [Collections.Generic.List[PscBinding]] $History = [Collections.Generic.List[PscBinding]]::new()
+    [Collections.Generic.List[PscMutation]] $Mutations = [Collections.Generic.List[PscMutation]]::new()
+    [Collections.Generic.List[PscMutation]] $Active = [Collections.Generic.List[PscMutation]]::new()
+    [long] $Boundary
 
     [PscBinding] Set([PscBinding] $binding) {
-        [PscBinding] $replaced = $null
-        if ($this.Current.TryGetValue($binding.Target, [ref] $replaced)) { $binding.Previous = $replaced }
-        $this.Current[$binding.Target] = $binding
-        $this.History.Add($binding)
-        return $binding
+        return $this.Schedule($binding, $this.Boundary, $null).Binding
     }
 
-    [PscBinding] Get([string] $target) {
+    [PscMutation] Schedule([PscBinding] $binding, [long] $activationBoundary, [Nullable[long]] $expirationBoundary) {
+        if ($null -eq $binding) { throw [ArgumentNullException]::new('A mutation needs a binding.') }
+        if (-not [Enum]::IsDefined($binding.Target)) { throw [ArgumentException]::new('A mutation needs a defined binding target.') }
+        if ($activationBoundary -lt $this.Boundary) { throw [ArgumentOutOfRangeException]::new('A mutation cannot activate before the current boundary.') }
+        if ($null -ne $expirationBoundary -and $expirationBoundary -le $activationBoundary) { throw [ArgumentOutOfRangeException]::new('A mutation must expire after its activation boundary.') }
+        $mutation = [PscMutation]@{
+            Binding = $binding
+            ActivationBoundary = $activationBoundary
+            ExpirationBoundary = $expirationBoundary
+            Order = $this.Mutations.Count
+        }
+        $this.Mutations.Add($mutation)
+        $this.History.Add($binding)
+        $this.Refresh()
+        return $mutation
+    }
+
+    [void] Advance([long] $boundary) {
+        if ($boundary -lt $this.Boundary) { throw [ArgumentOutOfRangeException]::new('Mutation boundaries cannot move backwards.') }
+        $this.Boundary = $boundary
+        $this.Refresh()
+    }
+
+    [void] Advance() {
+        if ($this.Boundary -eq [long]::MaxValue) { throw [InvalidOperationException]::new('There is no next mutation boundary.') }
+        $this.Advance($this.Boundary + 1)
+    }
+
+    hidden [void] Refresh() {
+        $this.Current.Clear()
+        $this.Active.Clear()
+        foreach ($mutation in $this.Mutations) {
+            if ($this.Boundary -lt $mutation.ActivationBoundary) {
+                $mutation.State = [PscMutationState]::Pending
+            }
+            elseif ($null -ne $mutation.ExpirationBoundary -and $this.Boundary -ge $mutation.ExpirationBoundary) {
+                $mutation.State = [PscMutationState]::Expired
+            }
+            else {
+                if ($mutation.State -eq [PscMutationState]::Pending) {
+                    [PscBinding] $replaced = $null
+                    if ($this.Current.TryGetValue($mutation.Binding.Target, [ref] $replaced) -and -not [object]::ReferenceEquals($mutation.Binding, $replaced)) {
+                        $mutation.Binding.Previous = $replaced
+                    }
+                }
+                $mutation.State = [PscMutationState]::Active
+                $this.Current[$mutation.Binding.Target] = $mutation.Binding
+                $this.Active.Add($mutation)
+            }
+        }
+    }
+
+    [PscBinding] Get([PscBindingTarget] $target) {
         [PscBinding] $binding = $null
         if (-not $this.Current.TryGetValue($target, [ref] $binding)) { throw [InvalidOperationException]::new("No binding for '$target' in this environment.") }
         return $binding
@@ -4068,7 +4517,7 @@ class PowerShellNumericOperands : PscOperandBinding {
     static [Type[]] $Ranks = @([int], [uint32], [long], [uint64], [double], [decimal])
 
     PowerShellNumericOperands() {
-        $this.Target = 'NumericOperands'
+        $this.Target = [PscBindingTarget]::NumericOperands
         $this.Reason = "PowerShell's operand conversions, measured on SMA"
     }
 
@@ -4116,8 +4565,12 @@ class PowerShellNumericOperands : PscOperandBinding {
     }
 }
 
-$script:PscEnvironment = [PscEnvironment]::new()
-[void] $script:PscEnvironment.Set([PowerShellNumericOperands]::new())
+[PscEnvironment] $script:PscEnvironment = $BindingEnvironment
+if ($null -eq $script:PscEnvironment) {
+    $script:PscEnvironment = [PscEnvironment]::new()
+    [void] $script:PscEnvironment.Set([PowerShellNumericOperands]::new())
+    [void] $script:PscEnvironment.Set([PscCharacterLiteral]::new())
+}
 # PowerShellSemantics' definition from this script's AST, read on the first compile.
 $script:PscSemanticsAst = $null
 # SMA's type inference method, found on first use.
@@ -4253,7 +4706,7 @@ function Convert-AstExpression {
         for ($i = $clauses.Count - 1; $i -ge 0; $i--) {
             $test = New-PredicateTruth (Convert-AstExpression -Node $clauses[$i].Item1 -Scope $Scope)
             $whenTrue = Convert-AstExpression -Node $clauses[$i].Item2.Statements[0] -Scope $Scope
-            $widened = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Conditional, $whenTrue, $result)
+            $widened = $script:PscEnvironment.Get([PscBindingTarget]::NumericOperands).Bind([PscOperatorKind]::Conditional, $whenTrue, $result)
             if ($widened) { $whenTrue = $widened.Left; $result = $widened.Right }
             if ($whenTrue.Type -ne $result.Type) { return & $collected }
             $result = [Linq.Expressions.Expression]::Condition($test, $whenTrue, $result)
@@ -4268,7 +4721,7 @@ function Convert-AstExpression {
         $test = New-PredicateTruth (Convert-AstExpression -Node $Node.Condition -Scope $Scope)
         $whenTrue = Convert-AstExpression -Node $Node.IfTrue -Scope $Scope
         $whenFalse = Convert-AstExpression -Node $Node.IfFalse -Scope $Scope
-        $widened = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Conditional, $whenTrue, $whenFalse)
+        $widened = $script:PscEnvironment.Get([PscBindingTarget]::NumericOperands).Bind([PscOperatorKind]::Conditional, $whenTrue, $whenFalse)
         if ($widened) { $whenTrue = $widened.Left; $whenFalse = $widened.Right }
         if ($whenTrue.Type -ne $whenFalse.Type) {
             throw "[{0}:{1}] Ternary arms require identical types, got '{2}' and '{3}'." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $whenTrue.Type.FullName, $whenFalse.Type.FullName
@@ -4404,13 +4857,13 @@ function Convert-AstExpression {
                 $Scope.DeclaredLocals.Add($slot)
                 $operand = [Linq.Expressions.Expression]::Block($target.Type.GetGenericArguments()[0], [Linq.Expressions.Expression[]]@(
                     [Linq.Expressions.Expression]::Assign($slot, $target), [Linq.Expressions.Expression]::Call($slot, $target.Type.GetMethod('GetValueOrDefault', [Type[]]@()))))
-                $widened = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Arithmetic, $operand, $one)
+                $widened = $script:PscEnvironment.Get([PscBindingTarget]::NumericOperands).Bind([PscOperatorKind]::Arithmetic, $operand, $one)
                 if ($widened) { $operand = $widened.Left; $one = $widened.Right } else { $one = [Linq.Expressions.Expression]::Constant([Convert]::ChangeType(1, $operand.Type), $operand.Type) }
                 $operator = if ($Node.TokenKind -in 'PostfixPlusPlus', 'PrefixPlusPlus') { [System.Management.Automation.Language.TokenKind]::Plus } else { [System.Management.Automation.Language.TokenKind]::Minus }
                 $stepped = ConvertTo-PowerShellType -Expression (New-PowerShellArithmetic -Operator $operator -Left $operand -Right $one) -Type $target.Type.GetGenericArguments()[0]
                 return [Linq.Expressions.Expression]::Assign($target, [Linq.Expressions.Expression]::Convert($stepped, $target.Type))
             }
-            $widened = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Arithmetic, $target, $one)
+            $widened = $script:PscEnvironment.Get([PscBindingTarget]::NumericOperands).Bind([PscOperatorKind]::Arithmetic, $target, $one)
             if ($widened) { $operand = $widened.Left; $one = $widened.Right } else { $one = [Linq.Expressions.Expression]::Constant([Convert]::ChangeType(1, $target.Type), $target.Type) }
             $operator = if ($Node.TokenKind -in 'PostfixPlusPlus', 'PrefixPlusPlus') { [System.Management.Automation.Language.TokenKind]::Plus } else { [System.Management.Automation.Language.TokenKind]::Minus }
             return [Linq.Expressions.Expression]::Assign($target, (ConvertTo-PowerShellType -Expression (New-PowerShellArithmetic -Operator $operator -Left $operand -Right $one) -Type $target.Type))
@@ -4451,7 +4904,7 @@ function Convert-AstExpression {
         $left = Convert-AstExpression -Node $Node.Left -Scope $Scope
         # A number -in a list of numeric constants: PowerShell tests item -eq value for each item; lowered as that
         # comparison, the value evaluated once.
-        if ($Node.Operator -in [System.Management.Automation.Language.TokenKind]::Iin, [System.Management.Automation.Language.TokenKind]::Inotin, [System.Management.Automation.Language.TokenKind]::Cin, [System.Management.Automation.Language.TokenKind]::Cnotin -and ($left.Type -in $script:IntegralTypes -or $left.Type -in $script:FloatingTypes)) {
+        if ($Node.Operator -in [System.Management.Automation.Language.TokenKind]::Iin, [System.Management.Automation.Language.TokenKind]::Inotin, [System.Management.Automation.Language.TokenKind]::Cin, [System.Management.Automation.Language.TokenKind]::Cnotin -and ($left.Type -in $script:IntegralTypes -or $left.Type -in $script:FloatingTypes -or $left.Type.IsEnum)) {
             $listed = $Node.Right
             if ($listed -is [System.Management.Automation.Language.ArrayExpressionAst] -and $null -eq $listed.SubExpression.Traps -and $listed.SubExpression.Statements.Count -eq 1 -and
                 $listed.SubExpression.Statements[0] -is [System.Management.Automation.Language.PipelineAst] -and $listed.SubExpression.Statements[0].PipelineElements.Count -eq 1 -and
@@ -4461,7 +4914,7 @@ function Convert-AstExpression {
             $items = if ($listed -is [System.Management.Automation.Language.ArrayLiteralAst]) { @($listed.Elements) } else { @($listed) }
             $numeric = @($items | Where-Object { $_ -is [System.Management.Automation.Language.ConstantExpressionAst] -and $_ -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -and
                 ($_.StaticType -in $script:IntegralTypes -or $_.StaticType -in $script:FloatingTypes) })
-            if ($numeric.Count -ne $items.Count) {
+            if (-not $left.Type.IsEnum -and $numeric.Count -ne $items.Count) {
                 throw "[$($Node.Extent.StartLineNumber):$($Node.Extent.StartColumnNumber)] Membership of a number is lowered only in a list of numeric constants."
             }
             $et = [Linq.Expressions.Expression]
@@ -4469,9 +4922,10 @@ function Convert-AstExpression {
             $Scope.DeclaredLocals.Add($value)
             [Linq.Expressions.Expression] $found = $et::Constant($false)
             foreach ($item in $items) {
-                $element = $et::Constant($item.Value, $item.StaticType)
+                $element = if ($left.Type.IsEnum) { Convert-AstExpression -Node $item -Scope $Scope } else { $et::Constant($item.Value, $item.StaticType) }
+                if ($left.Type.IsEnum -and ($element -isnot [Linq.Expressions.ConstantExpression] -or $element.Type -ne $left.Type)) { throw 'Enum membership requires constants of the same enum type.' }
                 $compared = $value
-                $widened = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Comparison, $element, $compared)
+                $widened = $script:PscEnvironment.Get([PscBindingTarget]::NumericOperands).Bind([PscOperatorKind]::Comparison, $element, $compared)
                 if ($widened) { $element = $widened.Left; $compared = $widened.Right }
                 if ($element.Type -ne $compared.Type) {
                     throw "[{0}:{1}] Membership has no common type for '{2}' and '{3}'." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $item.StaticType.FullName, $left.Type.FullName
@@ -4572,10 +5026,29 @@ function Convert-AstExpression {
 
         # $null compared with a reference is a null of that reference's type.
         if ($Node.Operator -in [System.Management.Automation.Language.TokenKind]::Ieq, [System.Management.Automation.Language.TokenKind]::Ine, [System.Management.Automation.Language.TokenKind]::Ceq, [System.Management.Automation.Language.TokenKind]::Cne) {
+            if ($left.Type.IsEnum -and $Node.Right -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                [object] $enumValue = $null
+                if ([Enum]::TryParse($left.Type, $Node.Right.Value, $true, [ref] $enumValue)) {
+                    $right = [Linq.Expressions.Expression]::Constant($enumValue, $left.Type)
+                }
+                else {
+                    $unequal = $Node.Operator -in [System.Management.Automation.Language.TokenKind]::Ine, [System.Management.Automation.Language.TokenKind]::Cne
+                    return [Linq.Expressions.Expression]::Block($left, [Linq.Expressions.Expression]::Constant($unequal))
+                }
+            }
+            if ($left.Type -eq [char] -and $Node.Right -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $Node.Right.Value.Length -eq 1) {
+                $character = $script:PscEnvironment.Get([PscBindingTarget]::CharacterLiteral).Resolve($Node.Right.Value[0])
+                if ($Node.Operator -in [System.Management.Automation.Language.TokenKind]::Ieq, [System.Management.Automation.Language.TokenKind]::Ine) {
+                    $upper = [Func[char,char]][char]::ToUpperInvariant
+                    $left = [Linq.Expressions.Expression]::Call($upper.Method, $left)
+                    $character = [char]::ToUpperInvariant($character)
+                }
+                $right = [Linq.Expressions.Expression]::Constant($character, [char])
+            }
             if ($left -is [Linq.Expressions.ConstantExpression] -and $null -eq $left.Value -and -not $right.Type.IsValueType) { $left = [Linq.Expressions.Expression]::Constant($null, $right.Type) }
             if ($right -is [Linq.Expressions.ConstantExpression] -and $null -eq $right.Value -and -not $left.Type.IsValueType) { $right = [Linq.Expressions.Expression]::Constant($null, $left.Type) }
-            # A Nullable[T] against a T or $null compares lifted: $null equals only $null, as in PowerShell. (Ordering
-            # differs: PowerShell orders $null first, a lifted comparison is false; it is not lowered.)
+            # A Nullable[T] against a T or $null compares lifted: $null equals only $null, as in PowerShell (ordering is
+            # lowered below, after these).
             # Built as HasValue tests rather than a lifted operator: against $null, no value; against a T, a value equal
             # to it.
             $nullable = { param([Type] $t) $t.IsGenericType -and $t.GetGenericTypeDefinition() -eq [Nullable`1] }
@@ -4598,11 +5071,49 @@ function Convert-AstExpression {
                 }
             }
         }
-        # + and - with a numeric Nullable[T] and a number: a $null Nullable acts as zero of the other operand's type, a
-        # held value as T (measured on SMA). Lowered as the value or zero when both give one type; when they do not
-        # ($null + 5 is Int32 for a Nullable[double]), the type depends on the value and the operation is refused below.
-        # *, / and % with a $null give $null, 0, Infinity, NaN or throw by side and are not lowered.
-        if ($Node.Operator -in [System.Management.Automation.Language.TokenKind]::Plus, [System.Management.Automation.Language.TokenKind]::Minus) {
+        # A numeric Nullable[T] and a number, ordered (-lt, -le, -gt, -ge): a held value compares as T; a $null orders
+        # as zero of the other operand's type, just below it, so above every negative and below zero and every positive
+        # (measured on SMA, every operator and side: $null -ge 0 and 0 -lt $null are false, $null -gt -1 is true).
+        $ordering = [System.Management.Automation.Language.TokenKind[]]@(
+            [System.Management.Automation.Language.TokenKind]::Ilt, [System.Management.Automation.Language.TokenKind]::Ile, [System.Management.Automation.Language.TokenKind]::Igt, [System.Management.Automation.Language.TokenKind]::Ige,
+            [System.Management.Automation.Language.TokenKind]::Clt, [System.Management.Automation.Language.TokenKind]::Cle, [System.Management.Automation.Language.TokenKind]::Cgt, [System.Management.Automation.Language.TokenKind]::Cge)
+        if ($Node.Operator -in $ordering) {
+            $nullableNumber = { param([Type] $t) $t.IsGenericType -and $t.GetGenericTypeDefinition() -eq [Nullable`1] -and ($t.GetGenericArguments()[0] -in $script:IntegralTypes -or $t.GetGenericArguments()[0] -in $script:FloatingTypes) }
+            $number = { param([Type] $t) $t -in $script:IntegralTypes -or $t -in $script:FloatingTypes }
+            $heldLeft = (& $nullableNumber $left.Type) -and (& $number $right.Type)
+            $heldRight = (& $nullableNumber $right.Type) -and (& $number $left.Type)
+            if ($heldLeft -or $heldRight) {
+                $et = [Linq.Expressions.Expression]
+                $nullable = if ($heldLeft) { $left } else { $right }
+                $other = if ($heldLeft) { $right } else { $left }
+                $slot = $et::Variable($nullable.Type, 'ordered' + $Scope.DeclaredLocals.Count)
+                $Scope.DeclaredLocals.Add($slot)
+                $value = $et::Call($slot, $nullable.Type.GetMethod('GetValueOrDefault', [Type[]]@()))
+                $operands = $script:PscEnvironment.Get([PscBindingTarget]::NumericOperands)
+                $pair = if ($heldLeft) { $operands.Bind([PscOperatorKind]::Comparison, $value, $other) } else { $operands.Bind([PscOperatorKind]::Comparison, $other, $value) }
+                $withValue = if ($pair) { New-PscOrderingComparison -Operator $Node.Operator -Left $pair.Left -Right $pair.Right }
+                    elseif ($value.Type -eq $other.Type) { if ($heldLeft) { New-PscOrderingComparison -Operator $Node.Operator -Left $value -Right $other } else { New-PscOrderingComparison -Operator $Node.Operator -Left $other -Right $value } }
+                    else { $null }
+                # $null on the left is greater only than a negative; on the right, less only than zero or a positive.
+                $zero = $operands.Bind([PscOperatorKind]::Comparison, $other, $et::Default($other.Type))
+                $zeroLeft = if ($zero) { $zero.Left } else { $other }
+                $zeroRight = if ($zero) { $zero.Right } else { $et::Default($other.Type) }
+                $greater = $Node.Operator -in [System.Management.Automation.Language.TokenKind]::Igt, [System.Management.Automation.Language.TokenKind]::Ige, [System.Management.Automation.Language.TokenKind]::Cgt, [System.Management.Automation.Language.TokenKind]::Cge
+                $withNull = if ($heldLeft -eq $greater) { $et::LessThan($zeroLeft, $zeroRight) } else { $et::GreaterThanOrEqual($zeroLeft, $zeroRight) }
+                if ($null -ne $withValue) {
+                    return $et::Block([bool], [Linq.Expressions.Expression[]]@($et::Assign($slot, $nullable), $et::Condition($et::Property($slot, 'HasValue'), $withValue, $withNull)))
+                }
+            }
+        }
+        # +, -, / and % with a numeric Nullable[T] and a number, and * with the Nullable on the right: a $null Nullable
+        # acts as zero of the other operand's type, a held value as T (measured on SMA, every operator and side:
+        # 5.5 / $null is Infinity, [int]3 / $null throws, $null % 5.5 is 0). Lowered as the value or zero when both give
+        # one type; when they do not ($null + 5 is Int32 for a Nullable[double]), the type depends on the value and the
+        # operation is refused below. $null * x is $null (the left operand chooses the operation, and $null has none),
+        # which no number gives, and is not lowered.
+        $zeroed = [System.Management.Automation.Language.TokenKind]::Plus, [System.Management.Automation.Language.TokenKind]::Minus, [System.Management.Automation.Language.TokenKind]::Divide, [System.Management.Automation.Language.TokenKind]::Rem
+        $nullableLeft = $left.Type.IsGenericType -and $left.Type.GetGenericTypeDefinition() -eq [Nullable`1]
+        if ($Node.Operator -in $zeroed -or ($Node.Operator -eq [System.Management.Automation.Language.TokenKind]::Multiply -and -not $nullableLeft)) {
             $nullableNumber = { param([Type] $t) $t.IsGenericType -and $t.GetGenericTypeDefinition() -eq [Nullable`1] -and ($t.GetGenericArguments()[0] -in $script:IntegralTypes -or $t.GetGenericArguments()[0] -in $script:FloatingTypes) }
             $number = { param([Type] $t) $t -in $script:IntegralTypes -or $t -in $script:FloatingTypes }
             $heldLeft = (& $nullableNumber $left.Type) -and (& $number $right.Type)
@@ -4611,7 +5122,7 @@ function Convert-AstExpression {
                 $et = [Linq.Expressions.Expression]
                 $other = if ($heldLeft) { $right.Type } else { $left.Type }
                 $held = if ($heldLeft) { $left.Type.GetGenericArguments()[0] } else { $right.Type.GetGenericArguments()[0] }
-                $operands = $script:PscEnvironment.Get('NumericOperands')
+                $operands = $script:PscEnvironment.Get([PscBindingTarget]::NumericOperands)
                 $withValue = if ($heldLeft) { $operands.Bind([PscOperatorKind]::Arithmetic, $et::Default($held), $et::Default($other)) } else { $operands.Bind([PscOperatorKind]::Arithmetic, $et::Default($other), $et::Default($held)) }
                 $withNull = $operands.Bind([PscOperatorKind]::Arithmetic, $et::Default($other), $et::Default($other))
                 $valueType = if ($withValue) { $withValue.Left.Type } elseif ($held -eq $other) { $held } else { $null }
@@ -4631,7 +5142,7 @@ function Convert-AstExpression {
             $resultEnum = if ($left.Type.IsEnum) { $left.Type } else { $null }
             if ($left.Type.IsEnum) { $left = [Linq.Expressions.Expression]::Convert($left, [Enum]::GetUnderlyingType($left.Type)) }
             if ($right.Type.IsEnum) { $right = [Linq.Expressions.Expression]::Convert($right, [Enum]::GetUnderlyingType($right.Type)) }
-            $widened = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Bitwise, $left, $right)
+            $widened = $script:PscEnvironment.Get([PscBindingTarget]::NumericOperands).Bind([PscOperatorKind]::Bitwise, $left, $right)
             if ($widened) { $left = $widened.Left; $right = $widened.Right }
             if ($left.Type -ne $right.Type -or $left.Type -notin $script:IntegralTypes) {
                 throw "[{0}:{1}] -{2} has no common integral type for '{3}' and '{4}'." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $Node.Operator.ToString().ToLowerInvariant(), $left.Type.FullName, $right.Type.FullName
@@ -4651,8 +5162,12 @@ function Convert-AstExpression {
         $kind = if ($Node.Operator -in [System.Management.Automation.Language.TokenKind]::Band, [System.Management.Automation.Language.TokenKind]::Bor, [System.Management.Automation.Language.TokenKind]::Bxor) { [PscOperatorKind]::Bitwise }
             elseif ($Node.Operator -in [System.Management.Automation.Language.TokenKind]::Plus, [System.Management.Automation.Language.TokenKind]::Minus, [System.Management.Automation.Language.TokenKind]::Multiply, [System.Management.Automation.Language.TokenKind]::Divide, [System.Management.Automation.Language.TokenKind]::Rem) { [PscOperatorKind]::Arithmetic }
             else { [PscOperatorKind]::Comparison }
-        $widened = $script:PscEnvironment.Get('NumericOperands').Bind($kind, $left, $right)
+        $widened = $script:PscEnvironment.Get([PscBindingTarget]::NumericOperands).Bind($kind, $left, $right)
         if ($widened) { $left = $widened.Left; $right = $widened.Right }
+        if ($kind -eq [PscOperatorKind]::Arithmetic -and $left.Type -notin ($script:IntegralTypes + $script:FloatingTypes) -and $right.Type -notin ($script:IntegralTypes + $script:FloatingTypes)) {
+            if ([Nullable]::GetUnderlyingType($right.Type) -eq $left.Type) { $right = [Linq.Expressions.Expression]::Property($right, 'Value') }
+            elseif ([Nullable]::GetUnderlyingType($left.Type) -eq $right.Type) { $left = [Linq.Expressions.Expression]::Property($left, 'Value') }
+        }
         if ($left.Type -ne $right.Type) {
             throw "[{0}:{1}] Binary operator '{2}' requires identical operand types, got '{3}' and '{4}'." -f `
                 $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $Node.Operator, $left.Type.FullName, $right.Type.FullName
@@ -4947,12 +5462,14 @@ function Convert-PredicateSwitch {
         throw "[$($Statement.Extent.StartLineNumber):$($Statement.Extent.StartColumnNumber)] Predicate switch admits exact matching only."
     }
     $inputValue = Convert-AstExpression -Node $Statement.Condition -Scope $Scope
-    if ($inputValue.Type -ne [string] -and $inputValue.Type -ne [string[]]) {
-        throw "[$($Statement.Extent.StartLineNumber):$($Statement.Extent.StartColumnNumber)] Predicate switch input must be string or string[]."
+    if ($inputValue.Type -ne [string] -and $inputValue.Type -ne [string[]] -and $inputValue.Type -notin ($script:IntegralTypes + $script:FloatingTypes)) {
+        throw "[$($Statement.Extent.StartLineNumber):$($Statement.Extent.StartColumnNumber)] Predicate switch input must be text or a numeric scalar."
     }
+    $elementType = if ($inputValue.Type -eq [string[]]) { [string] } else { $inputValue.Type }
+    $valuesType = $elementType.MakeArrayType()
     $id = $Scope.DeclaredLocals.Count
-    $values = $et::Variable([string[]], "switchValues$id")
-    $item = $et::Variable([string], "switchItem$id")
+    $values = $et::Variable($valuesType, "switchValues$id")
+    $item = $et::Variable($elementType, "switchItem$id")
     $index = $et::Variable([int], "switchIndex$id")
     $matched = $et::Variable([bool], "switchMatched$id")
     foreach ($local in @($values, $item, $index, $matched)) { $Scope.DeclaredLocals.Add($local) }
@@ -4985,9 +5502,11 @@ function Convert-PredicateSwitch {
                 $condition = $et::Block($et::Assign($result, $value), (New-PredicateTruth $result))
             } else {
                 $constant = Convert-AstExpression -Node $clause.Item1 -Scope $Scope
-                if ($constant.Type -ne [string]) { throw 'Mixed predicate switch clauses must be string constants.' }
+                if ($constant.Type -ne [string] -and $constant.Type -notin ($script:IntegralTypes + $script:FloatingTypes)) { throw 'Mixed predicate switch clauses must be text or numeric constants.' }
+                $constant = ConvertTo-PowerShellType -Expression $constant -Type ([string])
                 # Switch exact matching treats null as the empty string.
-                $text = $et::Condition($et::Equal($item, $et::Constant($null, [string])), $et::Constant(''), $item)
+                $text = if ($elementType -eq [string]) { $et::Condition($et::Equal($item, $et::Constant($null, [string])), $et::Constant(''), $item) }
+                    else { ConvertTo-PowerShellType -Expression $item -Type ([string]) }
                 $comparison = New-PowerShellStringComparison -Left $text -Right $constant -CaseSensitive ([bool]($flags -band $caseSensitive))
                 $condition = $et::Equal($comparison, $et::Constant(0))
             }
@@ -5007,10 +5526,10 @@ function Convert-PredicateSwitch {
     $chain.Add($et::Empty())
     $loop = $et::Loop($et::IfThenElse($et::LessThan($index, $et::ArrayLength($values)),
         $et::Block([Linq.Expressions.Expression[]]$chain.ToArray()), $et::Break($breakLabel)), $breakLabel)
-    $arrayValue = if ($inputValue.Type -eq [string]) { $et::NewArrayInit([string], [Linq.Expressions.Expression[]]@($inputValue)) } else { $inputValue }
+    $arrayValue = if ($inputValue.Type -eq [string[]]) { $inputValue } else { $et::NewArrayInit($elementType, [Linq.Expressions.Expression[]]@($inputValue)) }
     return $et::Block($et::Assign($values, $arrayValue),
-        $et::IfThen($et::Equal($values, $et::Constant($null, [string[]])),
-            $et::Block($et::Assign($values, $et::NewArrayInit([string], [Linq.Expressions.Expression[]]@($et::Constant($null, [string])))), $et::Empty())),
+        $et::IfThen($et::Equal($values, $et::Constant($null, $valuesType)),
+            $et::Block($et::Assign($values, $et::NewArrayInit($elementType, [Linq.Expressions.Expression[]]@($et::Default($elementType)))), $et::Empty())),
         $et::Assign($index, $et::Constant(0)), $loop, $et::Empty())
 }
 
@@ -5064,7 +5583,7 @@ function Convert-AstStatement {
                 $element = New-PowerShellArrayIndex -Array $arrayExpr -Index (Convert-AstExpression -Node $leftNode.Index -Scope $Scope) -Scope $Scope
                 $right = Convert-AstExpression -Node $Statement.Right -Scope $Scope
                 $operandLeft = $element.Access
-                $widened = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Arithmetic, $operandLeft, $right)
+                $widened = $script:PscEnvironment.Get([PscBindingTarget]::NumericOperands).Bind([PscOperatorKind]::Arithmetic, $operandLeft, $right)
                 if ($widened) { $operandLeft = $widened.Left; $right = $widened.Right }
                 if ($right.Type -ne $operandLeft.Type) {
                     throw "[{0}:{1}] Compound assignment '{2}' requires identical operand types, got '{3}' and '{4}'." -f `
@@ -5088,7 +5607,7 @@ function Convert-AstStatement {
             $target = Convert-AstExpression -Node $leftNode -Scope $Scope
             $right = Convert-AstExpression -Node $Statement.Right -Scope $Scope
             $operandLeft = $target
-            $widened = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Arithmetic, $operandLeft, $right)
+            $widened = $script:PscEnvironment.Get([PscBindingTarget]::NumericOperands).Bind([PscOperatorKind]::Arithmetic, $operandLeft, $right)
             if ($widened) { $operandLeft = $widened.Left; $right = $widened.Right }
             if ($right.Type -ne $operandLeft.Type) {
                 throw "[{0}:{1}] Compound assignment '{2}' requires identical operand types, got '{3}' and '{4}'." -f `
@@ -5457,6 +5976,12 @@ function Convert-AstStatement {
             }
         }
         $value = Convert-AstExpression -Node $Statement -Scope $Scope
+        # $i++ and $i-- as statements write nothing (Measure-PscOutputStatement counts them so).
+        $element = $Statement.PipelineElements[0]
+        if ($Statement.PipelineElements.Count -eq 1 -and $element -is [System.Management.Automation.Language.CommandExpressionAst] -and $element.Redirections.Count -eq 0 -and
+            $element.Expression -is [System.Management.Automation.Language.UnaryExpressionAst] -and
+            $element.Expression.TokenKind -in [System.Management.Automation.Language.TokenKind]::PostfixPlusPlus, [System.Management.Automation.Language.TokenKind]::PlusPlus,
+                [System.Management.Automation.Language.TokenKind]::PostfixMinusMinus, [System.Management.Automation.Language.TokenKind]::MinusMinus) { return $value }
         # Get-PscFunctionOutputType reads the static type of what each expression statement writes.
         if ($null -ne $script:PscOutputWatch) { $script:PscOutputWatch[$Statement] = $value.Type }
         if ($null -ne $Scope['Output']) { return New-OutputWrite -Value $value -Scope $Scope }
@@ -5666,7 +6191,7 @@ function Convert-AstStatement {
                 $right = Convert-AstExpression -Node $clause.Item1 -Scope $Scope
                 if ($left.Type.IsEnum -and $right.Type -ne $left.Type) { $left = [Linq.Expressions.Expression]::Convert($left, [Enum]::GetUnderlyingType($left.Type)) }
                 if ($right.Type.IsEnum -and $right.Type -ne $left.Type) { $right = [Linq.Expressions.Expression]::Convert($right, [Enum]::GetUnderlyingType($right.Type)) }
-                $widened = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Comparison, $left, $right)
+                $widened = $script:PscEnvironment.Get([PscBindingTarget]::NumericOperands).Bind([PscOperatorKind]::Comparison, $left, $right)
                 if ($widened) { $left = $widened.Left; $right = $widened.Right }
                 if ($left.Type -ne $right.Type) {
                     throw "[{0}:{1}] switch clause type '{2}' does not match the value's type '{3}'." -f $clause.Item1.Extent.StartLineNumber, $clause.Item1.Extent.StartColumnNumber, $right.Type.FullName, $value.Type.FullName
@@ -6731,15 +7256,23 @@ function Write-IlExpression {
             $Context.Labels[$target] = $IL.DefineLabel()
         }
         $label = $Context.Labels[$target]
-        $IL.MarkLabel($label)
 
         if ($Expr.Target.Name -eq 'returnTarget') {
+            # Falling through to the return label returns its value: stored before the label, so a return that jumps
+            # there keeps the value it stored. The return local starts as its type's default, which a default value
+            # leaves in place.
+            if ($Context.ReturnLocal -and $Expr.DefaultValue -and $Expr.DefaultValue -isnot [Linq.Expressions.DefaultExpression]) {
+                Write-IlExpression -IL $IL -Expr $Expr.DefaultValue -Context $Context
+                Write-IlLocalStore -IL $IL -Loc $Context.ReturnLocal
+            }
+            $IL.MarkLabel($label)
             if ($Context.ReturnLocal) {
                 Write-IlLocalLoad -IL $IL -Loc $Context.ReturnLocal
             }
             return
         }
 
+        $IL.MarkLabel($label)
         if ($Expr.DefaultValue) {
             Write-IlExpression -IL $IL -Expr $Expr.DefaultValue -Context $Context
         }
@@ -6755,7 +7288,11 @@ function Write-IlExpression {
         if ($Expr.Type -eq [long]) { $IL.Emit([Reflection.Emit.OpCodes]::Ldc_I8, [long]0); return }
         if ($Expr.Type -eq [double]) { $IL.Emit([Reflection.Emit.OpCodes]::Ldc_R8, [double]0.0); return }
         if (-not $Expr.Type.IsValueType) { $IL.Emit([Reflection.Emit.OpCodes]::Ldnull); return }
-        throw "Unsupported default value type '$($Expr.Type.FullName)'."
+        $defaultValue = $IL.DeclareLocal((Get-IlType $Expr.Type))
+        $IL.Emit([Reflection.Emit.OpCodes]::Ldloca, $defaultValue)
+        $IL.Emit([Reflection.Emit.OpCodes]::Initobj, (Get-IlType $Expr.Type))
+        $IL.Emit([Reflection.Emit.OpCodes]::Ldloc, $defaultValue)
+        return
     }
 
     # 7. Unary Convert
@@ -7844,9 +8381,11 @@ class PscReachability {
     static [System.Management.Automation.Language.ScriptBlockAst] Prune([System.Management.Automation.Language.ScriptBlockAst] $root) {
         $reached = [PscReachability]::Functions($root)
         $kept = [System.Collections.Generic.List[System.Management.Automation.Language.StatementAst]]::new()
+        # Copied by PscAstRebuild: SMA's Copy() makes a constructor's base() call a plain member invocation.
+        $copy = [PscAstRebuild]::new()
         foreach ($statement in $root.EndBlock.Statements) {
             if ($statement -is [System.Management.Automation.Language.FunctionDefinitionAst] -and -not $reached.Contains($statement.Name)) { continue }
-            $kept.Add([System.Management.Automation.Language.StatementAst]$statement.Copy())
+            $kept.Add([System.Management.Automation.Language.StatementAst]$copy.Rebuild($statement))
         }
         $end = $root.EndBlock
         [System.Management.Automation.Language.TrapStatementAst[]] $traps = $null
@@ -8392,6 +8931,7 @@ class PscLoweredAssembly {
     [bool] $Deterministic
     [string] $EntryPoint
     [string] $RuntimeConfig
+    [PscIcon] $ApplicationIcon
 }
 
 function Export-LoweredAssembly {
@@ -8467,6 +9007,7 @@ function Export-LoweredAssembly {
             $parsed = [PscLoweringSource]@{ Ast = $typedRoot; ClassAst = $typedRoot.Find({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.Name -eq $targetName }, $true) }
         }
     }
+    $programIcon = if ($Program) { Get-ProgramIcon -Root $parsed.Ast } else { $null }
     $targetClass = $parsed.ClassAst
     $classAsts = @($parsed.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true) | Where-Object { -not (Test-AttributeClass $_) })
     # The source's functions, as one class of static methods, when this compile selects it.
@@ -8564,6 +9105,7 @@ function Export-LoweredAssembly {
                 if ($inline) { $mb.SetImplementationFlags([Reflection.MethodImplAttributes]::AggressiveInlining) }
                 for ($i = 0; $i -lt $m.Parameters.Count; $i++) { $null = $mb.DefineParameter($i + 1, [Reflection.ParameterAttributes]::None, $m.Parameters[$i].Name.VariablePath.UserPath) }
                 Set-NativeCallbackAttribute -Builder $mb -Contract (Get-NativeMethodContract $m)
+                Set-ProgramEntryAttributes -Method $m -Builder $mb
                 $script:IlMap.Members[$mm] = $mb
                 [PscMemberPlan]@{ Ast = $m; Builder = $mb }
             }
@@ -8669,6 +9211,7 @@ function Export-LoweredAssembly {
     # A [string] property turns an assigned $null into ''; a library's stay $null, as they were.
     if ($null -ne $saveResult.EntryPoint) { $compiled.EntryPoint = $saveResult.EntryPoint }
     if ($null -ne $saveResult.RuntimeConfig) { $compiled.RuntimeConfig = $saveResult.RuntimeConfig }
+    $compiled.ApplicationIcon = $programIcon
     $compiled
 }
 
@@ -8738,7 +9281,8 @@ function Export-NativeImage {
     param(
         [Parameter(Mandatory)][string] $AssemblyPath,
         [Parameter(Mandatory)][string] $OutputPath,
-        [ValidateSet('Console', 'Windows')][string] $Subsystem = 'Console'
+        [ValidateSet('Console', 'Windows')][string] $Subsystem = 'Console',
+        [PscIcon] $ApplicationIcon
     )
     $toolset = Get-NativeToolset
     $managed = Join-Path $toolset.Runtime 'runtimes\win-x64\lib\net11.0'
@@ -8779,7 +9323,7 @@ function Export-NativeImage {
     $libraries = @((Join-Path $toolset.Msvc 'lib\x64'), (Join-Path $toolset.Sdk 'ucrt\x64'), (Join-Path $toolset.Sdk 'um\x64'))
     $resolution = Resolve-CoffLink -Inputs $inputs.ToArray() -LibraryDirectories $libraries -DefaultLibraries @('ucrt.lib') -IgnoredDefaultLibraries @('libucrt.lib') -Entry 'wmainCRTStartup'
     if ($resolution.Unresolved.Count) { throw ("Native link: unresolved external symbols:`n" + ($resolution.Unresolved -join "`n")) }
-    $image = Write-CoffImage -Resolution $resolution -Path ([IO.Path]::GetFullPath($OutputPath)) -Merges @('.managedcode=.text', 'hydrated=.bss') -Subsystem $(if ($Subsystem -eq 'Windows') { 2 } else { 3 }) -StackReserve 1572864
+    $image = Write-CoffImage -Resolution $resolution -Path ([IO.Path]::GetFullPath($OutputPath)) -Merges @('.managedcode=.text', 'hydrated=.bss') -Subsystem $(if ($Subsystem -eq 'Windows') { 2 } else { 3 }) -StackReserve 1572864 -ApplicationIcon $ApplicationIcon
     [pscustomobject]@{ OutputPath = [IO.Path]::GetFullPath($OutputPath); Object = $object; ObjectLength = (Get-Item -LiteralPath $object).Length; ImageLength = (Get-Item -LiteralPath $OutputPath).Length; Image = $image }
 }
 
@@ -9380,7 +9924,7 @@ function Write-CoffImage {
     # output sections by name before '$' with the suffix as the sort key, builds the import table and jump thunks,
     # applies AMD64 relocations, sorts the function table and writes base relocations. Reference: PE/COFF
     # specification sections 3, 4, 5 and 6.
-    param($Resolution, [string] $Path, [string[]] $Merges = @(), [int] $Subsystem = 3, [long] $StackReserve = 0x100000)
+    param($Resolution, [string] $Path, [string[]] $Merges = @(), [int] $Subsystem = 3, [long] $StackReserve = 0x100000, [PscIcon] $ApplicationIcon)
     $imageBase = [long]0x140000000
     $fileAlignment = 0x200; $sectionAlignment = 0x1000
     $alignUp = { param([long] $value, [long] $alignment) [long]([Math]::Ceiling($value / $alignment) * $alignment) }
@@ -9712,6 +10256,21 @@ function Write-CoffImage {
         $rva = & $alignUp ($rva + $relocStream.Length) $sectionAlignment
     }
 
+    $resourceSection = $null
+    if ($null -ne $ApplicationIcon) {
+        foreach ($outputSection in $outputs) { if ($outputSection.Name -eq '.rsrc') { throw 'An application icon cannot replace existing resource contributions.' } }
+        $resourceSection = [PscCoffOutputSection]::new()
+        $resourceSection.Name = '.rsrc'
+        $resourceSection.Rva = $rva
+        $resourceSection.Data = $ApplicationIcon.Resources([uint32]$rva)
+        $resourceSection.VirtualSize = $resourceSection.Data.Length
+        $resourceSection.InitializedSize = $resourceSection.Data.Length
+        $resourceSection.Characteristics = 0x40000040
+        $resourceSection.Members = @()
+        $outputs.Add($resourceSection)
+        $rva = [long]([Math]::Ceiling(($rva + $resourceSection.VirtualSize) / $sectionAlignment) * $sectionAlignment)
+    }
+
     # 10. File layout, debug directory, headers.
     $headerSize = & $alignUp (0x40 + 4 + 20 + 240 + 40 * $outputs.Count) $fileAlignment
     $fileOffset = $headerSize
@@ -9730,12 +10289,14 @@ function Write-CoffImage {
     $loadConfigRva = & $directoryOf '_load_config_used'
     $loadConfigSize = [long]0
     if ($loadConfigRva) { $owner = & $outputOfRva $loadConfigRva; $loadConfigSize = [BitConverter]::ToUInt32($owner.Data, [int]($loadConfigRva - $owner.Rva)) }
-    $reloc = if ($outputIndex.Count -lt $outputs.Count) { $outputs[$outputs.Count - 1] } else { $null }
+    $reloc = $null
+    foreach ($outputSection in $outputs) { if ($outputSection.Name -eq '.reloc') { $reloc = $outputSection } }
     $directories = @(
         @(0, 0), @(($importData.Rva), $descriptorSize), @(0, 0), @($exceptionRva, $exceptionSize), @(0, 0),
         @($(if ($reloc) { $reloc.Rva } else { 0 }), $(if ($reloc) { $reloc.VirtualSize } else { 0 })),
         @($debug.Rva, 28), @(0, 0), @(0, 0), @($tlsRva, $(if ($tlsRva) { 0x28 } else { 0 })), @($loadConfigRva, $loadConfigSize),
         @(0, 0), @($iat.Rva, $iatSize), @(0, 0), @(0, 0), @(0, 0))
+    if ($null -ne $resourceSection) { $directories[2] = @($resourceSection.Rva, $resourceSection.VirtualSize) }
     $codeSize = [long]0; $dataSize = [long]0
     foreach ($s in $outputs) { if ($s.Code) { $codeSize += $s.RawSize } else { $dataSize += $s.RawSize } }
 
@@ -11031,6 +11592,12 @@ process {
         'Api' { Get-PscApi }
         'PowerShell' { Get-PinnedPowerShell -ArchivePath $ArchivePath }
         'Compile' {
+            if ($FixedParametersPath) {
+                if ($null -ne $FixedParameters) { throw 'Supply FixedParameters or FixedParametersPath, not both.' }
+                $fixedData = Import-Clixml -LiteralPath $FixedParametersPath
+                if ($fixedData -isnot [hashtable]) { throw 'FixedParametersPath must contain a CLIXML hashtable of fixed parameter values.' }
+                $FixedParameters = $fixedData
+            }
             $compileParameters = @{}
             foreach ($name in 'SourcePath', 'SourceAst', 'StaticData', 'ClassName', 'ClassNames', 'MethodNames', 'OutputPath', 'EntryPoint', 'Deterministic') {
                 if ($PSBoundParameters.ContainsKey($name)) { $compileParameters[$name] = $PSBoundParameters[$name] }
@@ -11054,7 +11621,7 @@ process {
             # The lowered assembly sits beside the executable, named for it; ILC and the linker take it from there.
             $compileParameters['OutputPath'] = [IO.Path]::ChangeExtension([IO.Path]::GetFullPath($OutputPath), '.dll')
             $lowered = Export-LoweredAssembly @compileParameters
-            $image = Export-NativeImage -AssemblyPath $lowered.OutputPath -OutputPath $OutputPath -Subsystem $Subsystem
+            $image = Export-NativeImage -AssemblyPath $lowered.OutputPath -OutputPath $OutputPath -Subsystem $Subsystem -ApplicationIcon $lowered.ApplicationIcon
             [pscustomobject]@{ Assembly = $lowered; Native = $image }
         }
         'Expression' {
