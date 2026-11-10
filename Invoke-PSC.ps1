@@ -84,13 +84,17 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Compile', 'Api', 'Expression', 'Inspect', 'Capability', 'Link', 'PowerShell', 'Describe', 'Lint', 'Profile', 'Report', 'Verify', 'Readme', 'Investigate', 'Consolidate', 'Records', 'Run')]
+    [ValidateSet('Compile', 'Api', 'Expression', 'Inspect', 'Capability', 'Link', 'PowerShell', 'Describe', 'Lint', 'Guard', 'Profile', 'Report', 'Verify', 'Readme', 'Investigate', 'Consolidate', 'Records', 'Run')]
     [string] $Mode = 'Compile',
     # Run: the parameters the source is run with, by name.
     [hashtable] $RunParameters = @{},
     [string] $ArchivePath,
     [string] $ProjectPath,
     [string[]] $LintFiles,
+    # Lint: apply the edits the findings carry instead of listing the findings.
+    [switch] $LintEdit,
+    # Guard: the checker hash kept outside this machine; a running checker with another hash fails every file.
+    [string] $CheckerHash,
     [string[]] $InvestigatePath,
     [string] $ProfilePath,
     [string] $SourcePath,
@@ -190,7 +194,7 @@ function Get-UnitProfile($project, [string] $file, $node) {
     foreach ($command in $node.Body.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true)) {
         $commandName = $command.GetCommandName()
         if ($commandName) { $null = $calls.Add($commandName.Replace('global:', '').Replace('script:', '')) }
-        elseif ($command.InvocationOperator -ne 'Unknown') { $null = $effects.Add('process') }
+        elseif ($command.InvocationOperator -ne [System.Management.Automation.Language.TokenKind]::Unknown) { $null = $effects.Add('process') }
     }
     $types = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($t in $node.Body.FindAll({ $args[0] -is [System.Management.Automation.Language.TypeExpressionAst] -or $args[0] -is [System.Management.Automation.Language.TypeConstraintAst] }, $true)) { $null = $types.Add($t.TypeName.FullName) }
@@ -234,7 +238,7 @@ function Get-UnitProfile($project, [string] $file, $node) {
         if ($kinds.Count -ge 12) { $null = $subtrees.Add([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($kinds -join ' '))).Substring(0, 16)) }
     }
     $tokens = $errors = $null; $null = [System.Management.Automation.Language.Parser]::ParseInput($node.Extent.Text, [ref]$tokens, [ref]$errors)
-    $shape = ($tokens | Where-Object { $_.Kind -notin 'NewLine','Comment','EndOfInput' } | ForEach-Object { if ($_.Kind -eq 'Variable') { 'v' } else { $_.Kind.ToString() + ':' + $_.Text } }) -join ' '
+    $shape = ($tokens | Where-Object { $_.Kind -notin [System.Management.Automation.Language.TokenKind]::NewLine, [System.Management.Automation.Language.TokenKind]::Comment, [System.Management.Automation.Language.TokenKind]::EndOfInput } | ForEach-Object { if ($_.Kind -eq [System.Management.Automation.Language.TokenKind]::Variable) { 'v' } else { $_.Kind.ToString() + ':' + $_.Text } }) -join ' '
     [pscustomobject]@{
         Project = $project.Project; Remote = $project.Remote; File = $file; Name = $name; Kind = $kind; Line = $node.Extent.StartLineNumber
         Lines = $node.Extent.EndLineNumber - $node.Extent.StartLineNumber + 1; Parameters = $parameters; Calls = @($calls); Types = @($types)
@@ -395,11 +399,18 @@ function Get-SmaReport {
 #                       the comma binds first, so the operator receives an array.
 #   CaselessSymbol      a case-insensitive comparison against a literal containing letters, in a file that also
 #                       uses case-sensitive operators, so case matters to its author there.
+#   EnumNameAsString    a string literal compared with, or switched over, an enum-typed property: the member's name
+#                       in place of the member. The finding carries the edit when exactly one enum fits.
+#   EnumNameByPattern   a regex or wildcard matched against an enum-typed property's name.
+#   EnumNameUnknown     a string compared with an enum-typed value that names no member of the enum: never equal.
 function Get-SmaLint {
-    param([string] $file)
+    # With $text, the findings are of that text, reported under $file's name (Guard: the committed version).
+    [PscChecker()]
+    param([string] $file, [string] $text)
     $tokens = $errors = $null
-    $ast = [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$tokens, [ref]$errors)
-    $finding = { param([string] $rule, $node, [string] $detail) [pscustomobject]@{ File = $file; Line = $node.Extent.StartLineNumber; Rule = $rule; Detail = $detail } }
+    $ast = if ($PSBoundParameters.ContainsKey('text')) { [System.Management.Automation.Language.Parser]::ParseInput($text, $file, [ref]$tokens, [ref]$errors) }
+        else { [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$tokens, [ref]$errors) }
+    $finding = { param([string] $rule, $node, [string] $detail, [object[]] $edits = @()) [pscustomobject]@{ File = $file; Line = $node.Extent.StartLineNumber; Rule = $rule; Detail = $detail; Edits = $edits } }
     $variables = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.VariableExpressionAst] }, $true))
     foreach ($group in $variables | Where-Object { -not $_.VariablePath.IsDriveQualified } | Group-Object { $_.VariablePath.UserPath.ToLowerInvariant() }) {
         $spellings = @($group.Group | ForEach-Object { $_.VariablePath.UserPath } | Sort-Object -Unique -CaseSensitive)
@@ -426,7 +437,7 @@ function Get-SmaLint {
         }
     }
     # A script's parameters share one case-insensitive namespace with every variable in the file.
-    $scriptParameters = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+    $scriptParameters = @(if ($null -ne $ast.ParamBlock) { $ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath } })
     foreach ($parameter in $scriptParameters) {
         $others = @($variables | Where-Object { $_.VariablePath.UserPath -ieq $parameter -and $_.VariablePath.UserPath -cne $parameter })
         if ($others.Count) { & $finding 'CaseSpelledTwoWays' $others[0] "script parameter `$$parameter also written `$$($others[0].VariablePath.UserPath)" }
@@ -442,7 +453,8 @@ function Get-SmaLint {
     foreach ($fn in $definitions) {
         $body = $fn.Body
         $loopOf = { param($n) $found = $null; $p = $n.Parent; while ($null -ne $p -and $p -ne $body) { if ($p -is [System.Management.Automation.Language.FunctionDefinitionAst] -or $p -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) { return 'nested' }; if (& $isLoop $p) { $found = $p }; $p = $p.Parent }; $found }
-        $assigned = @{}
+        # A dictionary, not a hashtable: a hashtable answers .Keys with the entry of a variable named keys.
+        $assigned = [Collections.Generic.Dictionary[string, Collections.Generic.List[object]]]::new()
         foreach ($a in $body.FindAll({ $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) {
             # Only a direct rebinding counts ($x = ..., [T] $x = ...); $x[i] = ... and $x.P = ... change the object, not the variable.
             $left = $a.Left; while ($left -is [System.Management.Automation.Language.ConvertExpressionAst]) { $left = $left.Child }
@@ -450,7 +462,7 @@ function Get-SmaLint {
                 $name = $target.VariablePath.UserPath.ToLowerInvariant(); $loop = & $loopOf $a
                 if ($loop -eq 'nested') { continue }
                 # An accumulator ($t += x, $t = $t + x) carries its own value forward; that is not a clobber.
-                if ($null -ne $loop -and ($a.Operator -ne 'Equals' -or @($a.Right.FindAll({ param($x) $x -is [System.Management.Automation.Language.VariableExpressionAst] -and $x.VariablePath.UserPath -ieq $name }, $true)).Count)) { continue }
+                if ($null -ne $loop -and ($a.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals -or @($a.Right.FindAll({ param($x) $x -is [System.Management.Automation.Language.VariableExpressionAst] -and $x.VariablePath.UserPath -ieq $name }, $true)).Count)) { continue }
                 if (-not $assigned.ContainsKey($name)) { $assigned[$name] = [Collections.Generic.List[object]]::new() }
                 $assigned[$name].Add([pscustomobject]@{ Node = $a; Loop = $loop; Offset = $a.Extent.StartOffset })
             }
@@ -500,9 +512,9 @@ function Get-SmaLint {
         if ($second -is [System.Management.Automation.Language.ParenExpressionAst] -and $second.Extent.StartOffset -eq $c.CommandElements[0].Extent.EndOffset -and $null -ne $second.Pipeline.Find({ $args[0] -is [System.Management.Automation.Language.ArrayLiteralAst] }, $true)) { & $finding 'MethodSyntaxCall' $c $c.Extent.Text.Split("`n")[0] }
     }
     foreach ($b in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.BinaryExpressionAst] }, $true)) {
-        if ($b.Operator -in 'Comma') { continue }
+        if ($b.Operator -in [System.Management.Automation.Language.TokenKind]::Comma) { continue }
         foreach ($side in $b.Left, $b.Right) {
-            if ($side -is [System.Management.Automation.Language.ArrayLiteralAst] -and $side.Elements.Count -gt 1 -and $b.Operator -notin 'Format', 'Join', 'Iin', 'Cin', 'Inotin', 'Cnotin', 'Icontains', 'Ccontains', 'Inotcontains', 'Cnotcontains', 'Ireplace', 'Creplace') { & $finding 'CommaBindsFirst' $b $b.Extent.Text.Split("`n")[0] }
+            if ($side -is [System.Management.Automation.Language.ArrayLiteralAst] -and $side.Elements.Count -gt 1 -and $b.Operator -notin [System.Management.Automation.Language.TokenKind]::Format, [System.Management.Automation.Language.TokenKind]::Join, [System.Management.Automation.Language.TokenKind]::Iin, [System.Management.Automation.Language.TokenKind]::Cin, [System.Management.Automation.Language.TokenKind]::Inotin, [System.Management.Automation.Language.TokenKind]::Cnotin, [System.Management.Automation.Language.TokenKind]::Icontains, [System.Management.Automation.Language.TokenKind]::Ccontains, [System.Management.Automation.Language.TokenKind]::Inotcontains, [System.Management.Automation.Language.TokenKind]::Cnotcontains, [System.Management.Automation.Language.TokenKind]::Ireplace, [System.Management.Automation.Language.TokenKind]::Creplace) { & $finding 'CommaBindsFirst' $b $b.Extent.Text.Split("`n")[0] }
         }
     }
     # Literals that exist in this file in more than one casing ('A' and 'a'): case distinguishes them here.
@@ -512,12 +524,242 @@ function Get-SmaLint {
         if (@($group.Group.Value | Sort-Object -Unique -CaseSensitive).Count -gt 1) { $null = $cased.Add($group.Name) }
     }
     if ($cased.Count) {
-        foreach ($b in $ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.BinaryExpressionAst] -and $x.Operator -in 'Ieq', 'Ine', 'Ilike', 'Inotlike', 'Iin', 'Inotin', 'Icontains', 'Inotcontains', 'Imatch', 'Inotmatch', 'Ireplace', 'Isplit' }, $true)) {
+        foreach ($b in $ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.BinaryExpressionAst] -and $x.Operator -in [System.Management.Automation.Language.TokenKind]::Ieq, [System.Management.Automation.Language.TokenKind]::Ine, [System.Management.Automation.Language.TokenKind]::Ilike, [System.Management.Automation.Language.TokenKind]::Inotlike, [System.Management.Automation.Language.TokenKind]::Iin, [System.Management.Automation.Language.TokenKind]::Inotin, [System.Management.Automation.Language.TokenKind]::Icontains, [System.Management.Automation.Language.TokenKind]::Inotcontains, [System.Management.Automation.Language.TokenKind]::Imatch, [System.Management.Automation.Language.TokenKind]::Inotmatch, [System.Management.Automation.Language.TokenKind]::Ireplace, [System.Management.Automation.Language.TokenKind]::Isplit }, $true)) {
             $operands = @(foreach ($side in $b.Left, $b.Right) { if ($side -is [System.Management.Automation.Language.ArrayLiteralAst]) { $side.Elements } else { $side } })
             $hits = @($operands | Where-Object { $_ -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $cased.Contains($_.Value) } | ForEach-Object Value)
             if ($hits.Count) { & $finding 'CaselessSymbol' $b ("'" + ($hits -join "','") + "' exists here in another casing: " + $b.Extent.Text.Split("`n")[0]) }
         }
     }
+    # Enum members written as strings. A property's enum types are read from SMA's own language types and from this
+    # file's classes. A literal compared with such a property, or a switch clause over it, names a member of the one
+    # enum that has every literal written there; the finding carries the edits that write the members instead.
+    $enumsByProperty = [Collections.Generic.Dictionary[string, Collections.Generic.Dictionary[string, string[]]]]::new([StringComparer]::OrdinalIgnoreCase)
+    $otherProperties = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $addEnum = {
+        param([string] $property, [string] $typeText, [string[]] $members)
+        if (-not $enumsByProperty.ContainsKey($property)) { $enumsByProperty[$property] = [Collections.Generic.Dictionary[string, string[]]]::new([StringComparer]::OrdinalIgnoreCase) }
+        $enumsByProperty[$property][$typeText] = $members
+    }
+    # SMA's language types, and every type this file names.
+    $reflectedTypes = [Collections.Generic.HashSet[type]]::new()
+    foreach ($type in [System.Management.Automation.Language.Ast].Assembly.GetExportedTypes()) { if ($type.Namespace -eq [System.Management.Automation.Language.Ast].Namespace) { $null = $reflectedTypes.Add($type) } }
+    foreach ($named in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.TypeExpressionAst] -or $args[0] -is [System.Management.Automation.Language.TypeConstraintAst] }, $true)) {
+        $type = $named.TypeName.GetReflectionType()
+        if ($null -ne $type) { $null = $reflectedTypes.Add($type) }
+    }
+    foreach ($type in $reflectedTypes) {
+        foreach ($property in $type.GetProperties()) { if ($property.PropertyType.IsEnum) { & $addEnum $property.Name $property.PropertyType.FullName ([Enum]::GetNames($property.PropertyType)) } }
+    }
+    $fileEnums = [Collections.Generic.Dictionary[string, string[]]]::new([StringComparer]::OrdinalIgnoreCase)
+    $fileTypes = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.TypeDefinitionAst] }, $true))
+    foreach ($type in $fileTypes) { if ($type.IsEnum) { $fileEnums[$type.Name] = [string[]]@($type.Members | ForEach-Object Name) } }
+    foreach ($type in $fileTypes) {
+        if (-not $type.IsClass) { continue }
+        foreach ($member in $type.Members) {
+            if ($member -isnot [System.Management.Automation.Language.PropertyMemberAst]) { continue }
+            $declared = if ($null -ne $member.PropertyType) { $member.PropertyType.TypeName } else { $null }
+            $reflected = if ($null -ne $declared) { $declared.GetReflectionType() } else { $null }
+            if ($null -ne $declared -and $fileEnums.ContainsKey($declared.Name)) { & $addEnum $member.Name $declared.Name $fileEnums[$declared.Name] }
+            elseif ($null -ne $reflected -and $reflected.IsEnum) { & $addEnum $member.Name $reflected.FullName ([Enum]::GetNames($reflected)) }
+            else { $null = $otherProperties.Add($member.Name) }
+        }
+    }
+    # The enum a type name names, or an array of it.
+    $enumNamed = {
+        param([System.Management.Automation.Language.ITypeName] $typeName)
+        if ($typeName -is [System.Management.Automation.Language.ArrayTypeName]) { $typeName = $typeName.ElementType }
+        $enums = [Collections.Generic.Dictionary[string, string[]]]::new([StringComparer]::OrdinalIgnoreCase)
+        $reflected = $typeName.GetReflectionType()
+        if ($fileEnums.ContainsKey($typeName.Name)) { $enums[$typeName.Name] = $fileEnums[$typeName.Name] }
+        elseif ($null -ne $reflected -and $reflected.IsEnum) { $enums[$reflected.FullName] = [Enum]::GetNames($reflected) }
+        else { return }
+        [pscustomobject]@{ Enums = $enums; Declared = $false }
+    }
+    # The string literals an expression is made of: one, a comma list, or either inside ( ) or @( ).
+    $literalsOf = {
+        param($node)
+        while ($node -is [System.Management.Automation.Language.ParenExpressionAst] -or $node -is [System.Management.Automation.Language.ArrayExpressionAst]) {
+            $statements = @(if ($node -is [System.Management.Automation.Language.ParenExpressionAst]) { $node.Pipeline } else { $node.SubExpression.Statements })
+            if ($statements.Count -ne 1 -or $statements[0] -isnot [System.Management.Automation.Language.PipelineAst]) { return }
+            $node = $statements[0].GetPureExpression()
+        }
+        $operands = @(if ($node -is [System.Management.Automation.Language.ArrayLiteralAst]) { $node.Elements } else { $node })
+        $operands | Where-Object { $_ -is [System.Management.Automation.Language.StringConstantExpressionAst] }
+    }
+    # The enums an expression's value can be, read from what it is: a property by its name, a parameter by its
+    # declared type, $_ in a switch clause's condition block by the switch's value. Declared says the name is also
+    # declared here with a type that is not an enum, so the name alone does not decide.
+    $enumsOf = {
+        param($node)
+        if ($node -is [System.Management.Automation.Language.MemberExpressionAst] -and $node -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+            $node.Member -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $enumsByProperty.ContainsKey($node.Member.Value)) {
+            return [pscustomobject]@{ Enums = $enumsByProperty[$node.Member.Value]; Declared = $otherProperties.Contains($node.Member.Value) }
+        }
+        if ($node -isnot [System.Management.Automation.Language.VariableExpressionAst]) { return }
+        $name = $node.VariablePath.UserPath
+        for ($scope = $node.Parent; $null -ne $scope; $scope = $scope.Parent) {
+            if ($name -eq '_') {
+                if ($scope -isnot [System.Management.Automation.Language.ScriptBlockExpressionAst]) { continue }
+                if ($scope.Parent -is [System.Management.Automation.Language.SwitchStatementAst] -and @($scope.Parent.Clauses | Where-Object { $_.Item1 -eq $scope }).Count) { return & $enumsOf $scope.Parent.Condition.GetPureExpression() }
+                return
+            }
+            $parameters = if ($scope -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $null -ne $scope.Parameters) { $scope.Parameters }
+                elseif ($scope -is [System.Management.Automation.Language.FunctionMemberAst]) { $scope.Parameters }
+                elseif ($scope -is [System.Management.Automation.Language.ScriptBlockAst] -and $null -ne $scope.ParamBlock) { $scope.ParamBlock.Parameters }
+            foreach ($parameter in $parameters) {
+                if ($parameter.Name.VariablePath.UserPath -ne $name) { continue }
+                $typeName = @($parameter.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.TypeConstraintAst] } | ForEach-Object TypeName)
+                if ($typeName.Count -ne 1) { return }
+                return & $enumNamed $typeName[0]
+            }
+            if ($scope -is [System.Management.Automation.Language.FunctionDefinitionAst] -or $scope -is [System.Management.Automation.Language.FunctionMemberAst]) { return }
+        }
+    }
+    # The edits that write each literal as a member of the one enum that has them all.
+    $memberEdits = {
+        param($source, [System.Management.Automation.Language.StringConstantExpressionAst[]] $literals, [bool] $parenthesized)
+        $enums = $source.Enums
+        $having = @($enums.Keys | Where-Object { $members = $enums[$_]; @($literals | Where-Object { $_.Value -notin $members }).Count -eq 0 })
+        if ($having.Count -ne 1 -or $source.Declared) { return [pscustomobject]@{ Enums = $having; Edits = @() } }
+        $edits = foreach ($literal in $literals) {
+            $member = '[{0}]::{1}' -f $having[0], @($enums[$having[0]] | Where-Object { $_ -eq $literal.Value })[0]
+            [pscustomobject]@{ Start = $literal.Extent.StartOffset; End = $literal.Extent.EndOffset; Text = $(if ($parenthesized) { "($member)" } else { $member }) }
+        }
+        [pscustomobject]@{ Enums = $having; Edits = @($edits) }
+    }
+    $describeEdits = {
+        param($resolved, [string] $text)
+        if ($resolved.Edits.Count) { '{0}: {1}' -f $resolved.Enums[0], $text }
+        else { 'no edit ({0} enums fit, or a class here declares the property as another type): {1}' -f $resolved.Enums.Count, $text }
+    }
+    $equalityOperators = [System.Management.Automation.Language.TokenKind[]]@(
+        [System.Management.Automation.Language.TokenKind]::Ieq, [System.Management.Automation.Language.TokenKind]::Ine,
+        [System.Management.Automation.Language.TokenKind]::Ceq, [System.Management.Automation.Language.TokenKind]::Cne,
+        [System.Management.Automation.Language.TokenKind]::Iin, [System.Management.Automation.Language.TokenKind]::Inotin,
+        [System.Management.Automation.Language.TokenKind]::Cin, [System.Management.Automation.Language.TokenKind]::Cnotin,
+        [System.Management.Automation.Language.TokenKind]::Icontains, [System.Management.Automation.Language.TokenKind]::Inotcontains,
+        [System.Management.Automation.Language.TokenKind]::Ccontains, [System.Management.Automation.Language.TokenKind]::Cnotcontains)
+    $patternOperators = [System.Management.Automation.Language.TokenKind[]]@(
+        [System.Management.Automation.Language.TokenKind]::Imatch, [System.Management.Automation.Language.TokenKind]::Inotmatch,
+        [System.Management.Automation.Language.TokenKind]::Cmatch, [System.Management.Automation.Language.TokenKind]::Cnotmatch,
+        [System.Management.Automation.Language.TokenKind]::Ilike, [System.Management.Automation.Language.TokenKind]::Inotlike,
+        [System.Management.Automation.Language.TokenKind]::Clike, [System.Management.Automation.Language.TokenKind]::Cnotlike)
+    foreach ($b in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.BinaryExpressionAst] }, $true)) {
+        $source = & $enumsOf $b.Left; $other = $b.Right
+        if ($null -eq $source) { $source = & $enumsOf $b.Right; $other = $b.Left }
+        if ($null -eq $source) { continue }
+        $literals = [System.Management.Automation.Language.StringConstantExpressionAst[]]@(& $literalsOf $other)
+        if ($literals.Count -eq 0) { continue }
+        if ($b.Operator -in $patternOperators) { & $finding 'EnumNameByPattern' $b $b.Extent.Text.Split("`n")[0]; continue }
+        if ($b.Operator -notin $equalityOperators) { continue }
+        $resolved = & $memberEdits $source $literals $false
+        if ($resolved.Enums.Count) { & $finding 'EnumNameAsString' $b (& $describeEdits $resolved $b.Extent.Text.Split("`n")[0]) $resolved.Edits; continue }
+        # No enum the operand can be has every name: a name that is in none of them never compares equal.
+        $unknown = @($literals | Where-Object { $value = $_.Value; @($source.Enums.Keys | Where-Object { $value -in $source.Enums[$_] }).Count -eq 0 } | ForEach-Object Value)
+        if ($unknown.Count -and -not $source.Declared) { & $finding 'EnumNameUnknown' $b ('{0} in no member of {1}: {2}' -f ($unknown -join ', '), ($source.Enums.Keys -join ', '), $b.Extent.Text.Split("`n")[0]) }
+    }
+    # Literals an enum type converts: the operand of a cast, a parameter's default value.
+    $converted = @(
+        foreach ($cast in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.ConvertExpressionAst] }, $true)) { [pscustomobject]@{ Node = $cast; TypeName = $cast.Type.TypeName; Value = $cast.Child } }
+        foreach ($parameter in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.ParameterAst] -and $null -ne $args[0].DefaultValue }, $true)) {
+            $typeName = @($parameter.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.TypeConstraintAst] } | ForEach-Object TypeName)
+            if ($typeName.Count -eq 1) { [pscustomobject]@{ Node = $parameter; TypeName = $typeName[0]; Value = $parameter.DefaultValue } }
+        })
+    foreach ($conversion in $converted) {
+        $source = & $enumNamed $conversion.TypeName
+        if ($null -eq $source) { continue }
+        $literals = [System.Management.Automation.Language.StringConstantExpressionAst[]]@(& $literalsOf $conversion.Value)
+        if ($literals.Count -eq 0) { continue }
+        $resolved = & $memberEdits $source $literals $false
+        if ($resolved.Enums.Count) { & $finding 'EnumNameAsString' $conversion.Node (& $describeEdits $resolved $conversion.Node.Extent.Text.Split("`n")[0]) $resolved.Edits }
+    }
+    foreach ($s in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.SwitchStatementAst] }, $true)) {
+        $source = & $enumsOf $s.Condition.GetPureExpression()
+        if ($null -eq $source) { continue }
+        $literals = [System.Management.Automation.Language.StringConstantExpressionAst[]]@($s.Clauses | ForEach-Object Item1 | Where-Object { $_ -is [System.Management.Automation.Language.StringConstantExpressionAst] })
+        if ($literals.Count -eq 0) { continue }
+        $byPattern = [System.Management.Automation.Language.SwitchFlags]::Regex -bor [System.Management.Automation.Language.SwitchFlags]::Wildcard
+        if ($s.Flags -band $byPattern) { & $finding 'EnumNameByPattern' $s ('switch ({0}) over {1}' -f $s.Condition.Extent.Text, (($literals | ForEach-Object Value) -join ' ')); continue }
+        # A switch clause is parsed as a command argument, where a bare type expression would be a word: the member is parenthesized.
+        $resolved = & $memberEdits $source $literals $true
+        if ($resolved.Enums.Count) { & $finding 'EnumNameAsString' $s (& $describeEdits $resolved ('switch ({0}) over {1}' -f $s.Condition.Extent.Text, (($literals | ForEach-Object Value) -join ' '))) $resolved.Edits }
+    }
+}
+
+# Applies the edits lint findings carry, file by file, each file written only if SMA parses the result without errors.
+function Edit-SmaLintFinding {
+    [PscChecker()]
+    param([object[]] $findings)
+    foreach ($group in @($findings | Where-Object { $_.Edits.Count }) | Group-Object File) {
+        $text = [IO.File]::ReadAllText($group.Name)
+        $edits = @($group.Group | ForEach-Object Edits | Sort-Object Start -Descending)
+        foreach ($edit in $edits) { $text = $text.Substring(0, $edit.Start) + $edit.Text + $text.Substring($edit.End) }
+        $tokens = $errors = $null
+        $null = [System.Management.Automation.Language.Parser]::ParseInput($text, $group.Name, [ref]$tokens, [ref]$errors)
+        if ($errors.Count) { throw ('{0}: the edited text has {1} parse errors, first at line {2}: {3}' -f $group.Name, $errors.Count, $errors[0].Extent.StartLineNumber, $errors[0].Message) }
+        [IO.File]::WriteAllText($group.Name, $text, [Text.UTF8Encoding]::new($false))
+        [pscustomobject]@{ File = $group.Name; Edits = $edits.Count }
+    }
+}
+
+# Marks a function as part of the checker: the functions that decide whether a file is accepted.
+class PscChecker : Attribute {}
+
+# Guard's answer for one file. CheckerChanged names the checker functions of the file whose text differs from the
+# committed one. CheckerHash is the SHA-256 of the checker functions of the script that is running, for comparison
+# with a copy kept elsewhere.
+class PscGuardVerdict {
+    [string] $File
+    [bool] $Passed
+    [string[]] $Reasons
+    [string[]] $CheckerChanged
+    [string] $CheckerHash
+}
+
+# The functions of a script marked [PscChecker()].
+function Get-SmaChecker {
+    [PscChecker()]
+    param([System.Management.Automation.Language.Ast] $ast)
+    $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $null -ne $node.Body.ParamBlock -and
+        @($node.Body.ParamBlock.Attributes | Where-Object { $_.TypeName.Name -eq [PscChecker].Name }).Count }, $true)
+}
+
+# Guard: one file against its committed version. The file fails when SMA reports parse errors, or when a lint rule has
+# more findings than the file has at HEAD. A file with no version at HEAD is held to no findings.
+function Test-SmaGuard {
+    [PscChecker()]
+    param([string] $file, [string] $expectedHash)
+    $tokens = $errors = $committedErrors = $null
+    $text = [IO.File]::ReadAllLines($file) -join "`n"
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($text, $file, [ref]$tokens, [ref]$errors)
+    $reasons = [Collections.Generic.List[string]]::new()
+    foreach ($problem in $errors) { $reasons.Add(('parse error at line {0}: {1}' -f $problem.Extent.StartLineNumber, $problem.Message)) }
+    $committedLines = @(git -C (Split-Path -Parent $file) show ('HEAD:./' + (Split-Path -Leaf $file)) 2>$null)
+    $committed = $LASTEXITCODE -eq 0
+    $committedText = $committedLines -join "`n"
+    $before = @(if ($committed) { Get-SmaLint $file $committedText })
+    $after = @(Get-SmaLint $file $text)
+    foreach ($rule in $after | Group-Object Rule) {
+        $was = @($before | Where-Object Rule -EQ $rule.Name)
+        $known = @($was | ForEach-Object Detail)
+        $new = @($rule.Group | Where-Object Detail -NotIn $known | ForEach-Object Line)
+        if ($rule.Count -le $was.Count) { continue }
+        $reasons.Add(('{0}: {1} findings, {2} at HEAD; new at lines {3}' -f $rule.Name, $rule.Count, $was.Count, ($new -join ', ')))
+    }
+    $changed = @(if ($committed) {
+        $committedAst = [System.Management.Automation.Language.Parser]::ParseInput($committedText, [ref]$tokens, [ref]$committedErrors)
+        $now = @(Get-SmaChecker $ast)
+        foreach ($function in Get-SmaChecker $committedAst) {
+            $current = @($now | Where-Object Name -EQ $function.Name)
+            if ($current.Count -ne 1 -or $current[0].Extent.Text -cne $function.Extent.Text) { $function.Name }
+        }
+    })
+    $running = [System.Management.Automation.Language.Parser]::ParseInput(([IO.File]::ReadAllLines($PSCommandPath) -join "`n"), [ref]$tokens, [ref]$committedErrors)
+    $checkerText = @(Get-SmaChecker $running | ForEach-Object { $_.Extent.Text }) -join "`n"
+    $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($checkerText)))
+    foreach ($name in $changed) { $reasons.Add(('checker function {0} differs from HEAD' -f $name)) }
+    if ($expectedHash -and $expectedHash -ne $hash) { $reasons.Add(('checker hash {0} is not the expected {1}' -f $hash, $expectedHash)) }
+    [PscGuardVerdict]@{ File = $file; Passed = $reasons.Count -eq 0; Reasons = $reasons; CheckerChanged = $changed; CheckerHash = $hash }
 }
 
 # Describe: one project as live objects, built only from its parsed source. Every fact carries where it was read
@@ -737,7 +979,7 @@ function Add-SmaDescribedSource($project, [string] $relative, $ast, [bool] $embe
         if ($node -is [System.Management.Automation.Language.CommandAst]) {
             $edge.Kind = 'command'; $edge.To = $node.GetCommandName()
             if (-not $edge.To) { $edge.To = $node.CommandElements[0].Extent.Text; $edge.Kind = 'dynamic-command' }
-            if ($node.InvocationOperator -eq 'Dot') { $edge.Kind = 'dot-source' }
+            if ($node.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Dot) { $edge.Kind = 'dot-source' }
             if ($edge.To -in 'Import-Module','Add-Type','Invoke-Expression') { $edge.Kind = 'import-or-evaluation' }
             if ($owner.Kind -eq 'script') { $project.EntryCalls.Add($edge) }
         } elseif ($node -is [System.Management.Automation.Language.UsingStatementAst]) {
@@ -904,7 +1146,7 @@ function Get-SmaDescription {
                 $project.Sources.Add([SmaSource]@{ Identity = $innerIdentity; File = $relative; Sha256 = $innerHash; Ast = $inner
                     ParseErrors = @($innerErrors); Embedded = $true; Container = $literal; ParentIdentity = $identity; Boundary = $record.Boundary })
                 $offset=$literal.Extent.StartLineNumber-1
-                if($literal.StringConstantType -in 'SingleQuotedHereString','DoubleQuotedHereString'){$offset++}
+                if($literal.StringConstantType -in [System.Management.Automation.Language.StringConstantType]::SingleQuotedHereString,[System.Management.Automation.Language.StringConstantType]::DoubleQuotedHereString){$offset++}
                 Add-SmaDescribedSource $project $relative $inner $true $offset $innerIdentity
             } else { $project.Foreign.Add($record) }
         }
@@ -1392,7 +1634,7 @@ function Get-NativeImport {
     $parameterTypes = Get-ParameterTypes $Function
     foreach ($type in $parameterTypes) {
         if ($type -eq [string]) {
-            if (-not $stringMarshallingSet -or $import.StringMarshalling -notin 'Utf8', 'Utf16') {
+            if (-not $stringMarshallingSet -or $import.StringMarshalling -notin [System.Runtime.InteropServices.StringMarshalling]::Utf8, [System.Runtime.InteropServices.StringMarshalling]::Utf16) {
                 throw (& $where '[string] parameters need StringMarshalling Utf8 or Utf16.')
             }
             continue
@@ -1411,7 +1653,7 @@ function Add-NativeImportMethod {
     # runtime ab19415702aa8139d5369e47c73edb47343c34ad). The mirror's imports
     # are only call targets during lowering, so they never carry it.
     param([Reflection.Emit.TypeBuilder] $TypeBuilder, [string] $Name, $Import, [Type] $ReturnType, [Type[]] $ParameterTypes, [string[]] $ParameterNames, [switch] $Persisted)
-    $charSet = if ($Import.StringMarshalling -eq 'Utf16') { [Runtime.InteropServices.CharSet]::Unicode } else { [Runtime.InteropServices.CharSet]::Ansi }
+    $charSet = if ($Import.StringMarshalling -eq [System.Runtime.InteropServices.StringMarshalling]::Utf16) { [Runtime.InteropServices.CharSet]::Unicode } else { [Runtime.InteropServices.CharSet]::Ansi }
     $method = $TypeBuilder.DefinePInvokeMethod($Name, $Import.Library, $Import.EntryPoint,
         [Reflection.MethodAttributes]'Public,Static,HideBySig,PinvokeImpl', [Reflection.CallingConventions]::Standard,
         $ReturnType, $ParameterTypes, [Runtime.InteropServices.CallingConvention]::Winapi, $charSet)
@@ -1425,7 +1667,7 @@ function Add-NativeImportMethod {
     $marshalAs = [Runtime.InteropServices.MarshalAsAttribute].GetConstructor([Type[]]@([Runtime.InteropServices.UnmanagedType]))
     for ($i = 0; $i -lt $ParameterTypes.Length; $i++) {
         $parameter = $method.DefineParameter($i + 1, [Reflection.ParameterAttributes]::None, $ParameterNames[$i])
-        if ($ParameterTypes[$i] -eq [string] -and $Import.StringMarshalling -eq 'Utf8') {
+        if ($ParameterTypes[$i] -eq [string] -and $Import.StringMarshalling -eq [System.Runtime.InteropServices.StringMarshalling]::Utf8) {
             $parameter.SetCustomAttribute([Reflection.Emit.CustomAttributeBuilder]::new($marshalAs, [object[]]@([Runtime.InteropServices.UnmanagedType]::LPUTF8Str)))
         }
     }
@@ -2503,22 +2745,22 @@ function New-PowerShellArithmetic {
         zero divisor. Floating arithmetic is plain IEEE 754.
     #>
     param(
-        [Parameter(Mandatory)][string] $Operator,
+        [Parameter(Mandatory)][System.Management.Automation.Language.TokenKind] $Operator,
         [Parameter(Mandatory)][Linq.Expressions.Expression] $Left,
         [Parameter(Mandatory)][Linq.Expressions.Expression] $Right
     )
     if ($Left.Type -eq [string]) {
-        if ($Operator -ne 'Plus') { throw "Operator '$Operator' is not defined for strings." }
+        if ($Operator -ne [System.Management.Automation.Language.TokenKind]::Plus) { throw "Operator '$Operator' is not defined for strings." }
         $concat = [string].GetMethod('Concat', [Type[]]@([string], [string]))
         return [Linq.Expressions.Expression]::Call($concat, $Left, $Right)
     }
     $integral = $Left.Type -in $script:IntegralTypes
     switch ($Operator) {
-        'Plus'     { if ($integral) { return [Linq.Expressions.Expression]::AddChecked($Left, $Right) }; return [Linq.Expressions.Expression]::Add($Left, $Right) }
-        'Minus'    { if ($integral) { return [Linq.Expressions.Expression]::SubtractChecked($Left, $Right) }; return [Linq.Expressions.Expression]::Subtract($Left, $Right) }
-        'Multiply' { if ($integral) { return [Linq.Expressions.Expression]::MultiplyChecked($Left, $Right) }; return [Linq.Expressions.Expression]::Multiply($Left, $Right) }
-        'Rem'      { return [Linq.Expressions.Expression]::Modulo($Left, $Right) }
-        'Divide' {
+        ([System.Management.Automation.Language.TokenKind]::Plus)     { if ($integral) { return [Linq.Expressions.Expression]::AddChecked($Left, $Right) }; return [Linq.Expressions.Expression]::Add($Left, $Right) }
+        ([System.Management.Automation.Language.TokenKind]::Minus)    { if ($integral) { return [Linq.Expressions.Expression]::SubtractChecked($Left, $Right) }; return [Linq.Expressions.Expression]::Subtract($Left, $Right) }
+        ([System.Management.Automation.Language.TokenKind]::Multiply) { if ($integral) { return [Linq.Expressions.Expression]::MultiplyChecked($Left, $Right) }; return [Linq.Expressions.Expression]::Multiply($Left, $Right) }
+        ([System.Management.Automation.Language.TokenKind]::Rem)      { return [Linq.Expressions.Expression]::Modulo($Left, $Right) }
+        ([System.Management.Automation.Language.TokenKind]::Divide) {
             if (-not $integral) { return [Linq.Expressions.Expression]::Divide($Left, $Right) }
             # PowerShellSemantics.Quotient: the integer quotient when exact, the Double quotient otherwise.
             $operandType = if ($Left.Type -eq [uint64]) { [uint64] } else { [long] }
@@ -2549,7 +2791,7 @@ function ConvertTo-IntegralQuotient {
             $inner.PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst]) { $inner = $inner.PipelineElements[0].Expression; continue }
         break
     }
-    if ($inner -isnot [System.Management.Automation.Language.BinaryExpressionAst] -or $inner.Operator -ne 'Divide') { return $null }
+    if ($inner -isnot [System.Management.Automation.Language.BinaryExpressionAst] -or $inner.Operator -ne [System.Management.Automation.Language.TokenKind]::Divide) { return $null }
     $bound = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Arithmetic,
         (Convert-AstExpression -Node $inner.Left -Scope $Scope), (Convert-AstExpression -Node $inner.Right -Scope $Scope))
     if ($null -eq $bound -or $bound.Left.Type -notin [int], [uint32]) { return $null }
@@ -2866,6 +3108,9 @@ function Get-KeyIndexer([Type] $Type, [Type] $IndexType) {
         $parameterType = $property.GetIndexParameters()[0].ParameterType
         if ($parameterType -in $script:IntegralTypes -and $IndexType -in $script:IntegralTypes) { return $property }
     }
+    # An [object] key, whose type PowerShell learns when the index runs, converts to the one indexer's key type then;
+    # the call sites convert it (ConvertTo-PowerShellType).
+    if ($IndexType -eq [object] -and $candidates.Count -eq 1) { return $candidates[0] }
     $null
 }
 
@@ -3039,6 +3284,13 @@ function New-MemberAccess {
     # $target.Name or [Type]::Name as a field or property expression. On a dictionary or an [object] value, PowerShell's
     # own binding: PowerShellSemantics.Member, given whether strict mode is in force at the node.
     param([Linq.Expressions.Expression] $Target, [Type] $Type, [string] $Name, [System.Management.Automation.Language.Ast] $Node)
+    # A property the dictionary's type declares ($dictionary.Count, .Keys) binds to that property, as CoreCLR binds it;
+    # PowerShell would read a key of that name first. Other names are keys, read as PowerShell reads them.
+    $declared = $null
+    if ($null -ne $Target -and $Type -ne [object] -and (Test-PscDynamicMemberTarget $Type)) {
+        $declared = @($Type.GetProperties([Reflection.BindingFlags]'Public,Instance') | Where-Object { $_.Name -eq $Name -and $_.GetIndexParameters().Count -eq 0 }) | Select-Object -First 1
+    }
+    if ($null -ne $declared) { return [Linq.Expressions.Expression]::Property($Target, [Reflection.PropertyInfo]$declared) }
     if ($null -ne $Target -and (Test-PscDynamicMemberTarget $Type)) {
         $strict = if ($Node) { Test-PscStrictMode -Node $Node } else { $false }
         return [Linq.Expressions.Expression]::Call(
@@ -3152,7 +3404,7 @@ function Resolve-MatchingMethod {
         [System.Management.Automation.Language.IScriptExtent] $SourceExtent
     )
 
-    $flags = [Reflection.BindingFlags]'Public'
+    $flags = [Reflection.BindingFlags]::Public
     if ($IsStatic) {
         $flags = $flags -bor [Reflection.BindingFlags]::Static
     } else {
@@ -3358,7 +3610,7 @@ function Resolve-MatchingMember {
 
     # PowerShell binds member names ignoring case. An interface's members include those of the interfaces it extends,
     # which reflection on the interface itself does not return.
-    $flags = [Reflection.BindingFlags]'Public' -bor [Reflection.BindingFlags]::IgnoreCase
+    $flags = [Reflection.BindingFlags]::Public -bor [Reflection.BindingFlags]::IgnoreCase
     if ($IsStatic) {
         $flags = $flags -bor [Reflection.BindingFlags]::Static
     } else {
@@ -3781,6 +4033,20 @@ function Convert-AstExpression {
         $scriptField = Get-ScriptField -Scope $Scope -Path $Node.VariablePath
         if ($null -ne $scriptField) { return [Linq.Expressions.Expression]::Field($null, $scriptField) }
 
+        # Automatic variables a compiled program has, in CoreCLR's terms: $PSScriptRoot is the program's directory
+        # (AppContext.BaseDirectory, without the separator it ends in, as $PSScriptRoot has none), $PSCommandPath the
+        # program's file (Environment.ProcessPath), and $IsWindows, $IsLinux and $IsMacOS the running system's.
+        switch ($varName.ToLowerInvariant()) {
+            'psscriptroot' {
+                $base = [Linq.Expressions.Expression]::Property($null, [AppContext].GetProperty('BaseDirectory'))
+                return [Linq.Expressions.Expression]::Call([IO.Path].GetMethod('TrimEndingDirectorySeparator', [Type[]]@([string])), $base)
+            }
+            'pscommandpath' { return [Linq.Expressions.Expression]::Property($null, [Environment].GetProperty('ProcessPath')) }
+            'iswindows' { return [Linq.Expressions.Expression]::Call([OperatingSystem].GetMethod('IsWindows', [Type[]]@())) }
+            'islinux' { return [Linq.Expressions.Expression]::Call([OperatingSystem].GetMethod('IsLinux', [Type[]]@())) }
+            'ismacos' { return [Linq.Expressions.Expression]::Call([OperatingSystem].GetMethod('IsMacOS', [Type[]]@())) }
+        }
+
         throw "[{0}:{1}] Unresolved variable `$$varName." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber
     }
 
@@ -3978,31 +4244,31 @@ function Convert-AstExpression {
                     [Linq.Expressions.Expression]::Assign($slot, $target), [Linq.Expressions.Expression]::Call($slot, $target.Type.GetMethod('GetValueOrDefault', [Type[]]@()))))
                 $widened = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Arithmetic, $operand, $one)
                 if ($widened) { $operand = $widened.Left; $one = $widened.Right } else { $one = [Linq.Expressions.Expression]::Constant([Convert]::ChangeType(1, $operand.Type), $operand.Type) }
-                $operator = if ($Node.TokenKind -in 'PostfixPlusPlus', 'PrefixPlusPlus') { 'Plus' } else { 'Minus' }
+                $operator = if ($Node.TokenKind -in 'PostfixPlusPlus', 'PrefixPlusPlus') { [System.Management.Automation.Language.TokenKind]::Plus } else { [System.Management.Automation.Language.TokenKind]::Minus }
                 $stepped = ConvertTo-PowerShellType -Expression (New-PowerShellArithmetic -Operator $operator -Left $operand -Right $one) -Type $target.Type.GetGenericArguments()[0]
                 return [Linq.Expressions.Expression]::Assign($target, [Linq.Expressions.Expression]::Convert($stepped, $target.Type))
             }
             $widened = $script:PscEnvironment.Get('NumericOperands').Bind([PscOperatorKind]::Arithmetic, $target, $one)
             if ($widened) { $operand = $widened.Left; $one = $widened.Right } else { $one = [Linq.Expressions.Expression]::Constant([Convert]::ChangeType(1, $target.Type), $target.Type) }
-            $operator = if ($Node.TokenKind -in 'PostfixPlusPlus', 'PrefixPlusPlus') { 'Plus' } else { 'Minus' }
+            $operator = if ($Node.TokenKind -in 'PostfixPlusPlus', 'PrefixPlusPlus') { [System.Management.Automation.Language.TokenKind]::Plus } else { [System.Management.Automation.Language.TokenKind]::Minus }
             return [Linq.Expressions.Expression]::Assign($target, (ConvertTo-PowerShellType -Expression (New-PowerShellArithmetic -Operator $operator -Left $operand -Right $one) -Type $target.Type))
         }
 
         $operand = Convert-AstExpression -Node $Node.Child -Scope $Scope
         switch ($Node.TokenKind) {
-            'Minus'   {
+            ([System.Management.Automation.Language.TokenKind]::Minus)   {
                 if ($operand.Type -in $script:IntegralTypes) { return [Linq.Expressions.Expression]::NegateChecked($operand) }
                 return [Linq.Expressions.Expression]::Negate($operand)
             }
-            'Plus'    { return $operand }
-            'Not'     { return [Linq.Expressions.Expression]::Not((New-PredicateTruth $operand)) }
-            'Bnot'    {
+            ([System.Management.Automation.Language.TokenKind]::Plus)    { return $operand }
+            ([System.Management.Automation.Language.TokenKind]::Not)     { return [Linq.Expressions.Expression]::Not((New-PredicateTruth $operand)) }
+            ([System.Management.Automation.Language.TokenKind]::Bnot)    {
                 if ($operand.Type -notin $script:IntegralTypes) {
                     throw "[{0}:{1}] -bnot requires an integral operand, got '{2}'." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $operand.Type.FullName
                 }
                 return [Linq.Expressions.Expression]::Not($operand)
             }
-            'Exclaim' { return [Linq.Expressions.Expression]::Not((New-PredicateTruth $operand)) }
+            ([System.Management.Automation.Language.TokenKind]::Exclaim) { return [Linq.Expressions.Expression]::Not((New-PredicateTruth $operand)) }
             default {
                 throw "[{0}:{1}] Unsupported unary operator '{2}'." -f `
                     $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $Node.TokenKind
@@ -4013,17 +4279,17 @@ function Convert-AstExpression {
     # 8. Binary arithmetic and comparison expressions
     if ($Node -is [System.Management.Automation.Language.BinaryExpressionAst]) {
         # $value -is [T] and -isnot [T]: whether the value is an instance of T ($null never is), as SMA tests it.
-        if ($Node.Operator -in 'Is', 'IsNot' -and $Node.Right -is [System.Management.Automation.Language.TypeExpressionAst]) {
+        if ($Node.Operator -in [System.Management.Automation.Language.TokenKind]::Is, [System.Management.Automation.Language.TokenKind]::IsNot -and $Node.Right -is [System.Management.Automation.Language.TypeExpressionAst]) {
             $tested = Convert-AstExpression -Node $Node.Left -Scope $Scope
             if ($tested.Type.IsValueType) { $tested = [Linq.Expressions.Expression]::Convert($tested, [object]) }
             $instance = [Linq.Expressions.Expression]::TypeIs($tested, (Resolve-AstType $Node.Right.TypeName))
-            if ($Node.Operator -eq 'IsNot') { return [Linq.Expressions.Expression]::Not($instance) }
+            if ($Node.Operator -eq [System.Management.Automation.Language.TokenKind]::IsNot) { return [Linq.Expressions.Expression]::Not($instance) }
             return $instance
         }
         $left = Convert-AstExpression -Node $Node.Left -Scope $Scope
         # A number -in a list of numeric constants: PowerShell tests item -eq value for each item; lowered as that
         # comparison, the value evaluated once.
-        if ($Node.Operator -in 'Iin', 'Inotin', 'Cin', 'Cnotin' -and ($left.Type -in $script:IntegralTypes -or $left.Type -in $script:FloatingTypes)) {
+        if ($Node.Operator -in [System.Management.Automation.Language.TokenKind]::Iin, [System.Management.Automation.Language.TokenKind]::Inotin, [System.Management.Automation.Language.TokenKind]::Cin, [System.Management.Automation.Language.TokenKind]::Cnotin -and ($left.Type -in $script:IntegralTypes -or $left.Type -in $script:FloatingTypes)) {
             $listed = $Node.Right
             if ($listed -is [System.Management.Automation.Language.ArrayExpressionAst] -and $null -eq $listed.SubExpression.Traps -and $listed.SubExpression.Statements.Count -eq 1 -and
                 $listed.SubExpression.Statements[0] -is [System.Management.Automation.Language.PipelineAst] -and $listed.SubExpression.Statements[0].PipelineElements.Count -eq 1 -and
@@ -4050,10 +4316,10 @@ function Convert-AstExpression {
                 }
                 $found = if ($found -is [Linq.Expressions.ConstantExpression]) { $et::Equal($element, $compared) } else { $et::OrElse($found, $et::Equal($element, $compared)) }
             }
-            $result = if ($Node.Operator -in 'Inotin', 'Cnotin') { $et::Not($found) } else { $found }
+            $result = if ($Node.Operator -in [System.Management.Automation.Language.TokenKind]::Inotin, [System.Management.Automation.Language.TokenKind]::Cnotin) { $et::Not($found) } else { $found }
             return $et::Block([bool], [Linq.Expressions.Expression[]]@($et::Assign($value, $left), $result))
         }
-        if ($Node.Operator -in 'Iin', 'Inotin', 'Cin', 'Cnotin') {
+        if ($Node.Operator -in [System.Management.Automation.Language.TokenKind]::Iin, [System.Management.Automation.Language.TokenKind]::Inotin, [System.Management.Automation.Language.TokenKind]::Cin, [System.Management.Automation.Language.TokenKind]::Cnotin) {
             $right = Convert-AstExpressionAs -Node $Node.Right -Type ([string[]]) -Scope $Scope
             if ($left.Type -ne [string]) {
                 throw "[$($Node.Extent.StartLineNumber):$($Node.Extent.StartColumnNumber)] Membership requires a string value and string[] collection."
@@ -4072,7 +4338,7 @@ function Convert-AstExpression {
                     $et::Block($et::Assign($found, $et::Constant($true)), $et::Break($done))),
                     $et::Assign($index, $et::Add($index, $et::Constant(1))), $et::Empty()),
                 $et::Break($done)), $done)
-            $result = if ($Node.Operator -in 'Inotin', 'Cnotin') { $et::Not($found) } else { $found }
+            $result = if ($Node.Operator -in [System.Management.Automation.Language.TokenKind]::Inotin, [System.Management.Automation.Language.TokenKind]::Cnotin) { $et::Not($found) } else { $found }
             return $et::Block($et::Assign($value, $left), $et::Assign($array, $right),
                 $et::Assign($index, $et::Constant(0)), $et::Assign($found, $et::Constant($false)),
                 $et::IfThen($et::NotEqual($array, $et::Constant($null, [string[]])), $loop), $result)
@@ -4080,13 +4346,13 @@ function Convert-AstExpression {
         $right = Convert-AstExpression -Node $Node.Right -Scope $Scope
 
         # -and and -or test each operand as a condition, and the right only when the left does not decide.
-        if ($Node.Operator -eq 'And') { return [Linq.Expressions.Expression]::AndAlso((New-PredicateTruth $left), (New-PredicateTruth $right)) }
-        if ($Node.Operator -eq 'Or') { return [Linq.Expressions.Expression]::OrElse((New-PredicateTruth $left), (New-PredicateTruth $right)) }
+        if ($Node.Operator -eq [System.Management.Automation.Language.TokenKind]::And) { return [Linq.Expressions.Expression]::AndAlso((New-PredicateTruth $left), (New-PredicateTruth $right)) }
+        if ($Node.Operator -eq [System.Management.Automation.Language.TokenKind]::Or) { return [Linq.Expressions.Expression]::OrElse((New-PredicateTruth $left), (New-PredicateTruth $right)) }
 
         # -match, -cmatch, -notmatch, -cnotmatch on a value written whole: its text against the pattern, ignoring case
         # with the current culture unless case-sensitive (measured on SMA). A collection on the left filters in
         # PowerShell and is refused; so is a function that reads $Matches, which the lowered match does not set.
-        if ($Node.Operator -in 'Imatch', 'Cmatch', 'Inotmatch', 'Cnotmatch') {
+        if ($Node.Operator -in [System.Management.Automation.Language.TokenKind]::Imatch, [System.Management.Automation.Language.TokenKind]::Cmatch, [System.Management.Automation.Language.TokenKind]::Inotmatch, [System.Management.Automation.Language.TokenKind]::Cnotmatch) {
             if (-not (Test-PscWrittenWhole $left.Type) -and -not ($left -is [Linq.Expressions.ConstantExpression] -and $null -eq $left.Value)) {
                 throw "[{0}:{1}] -{2} on a '{3}', which may be a collection, is not lowered." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $Node.Operator.ToString().ToLowerInvariant(), $left.Type.FullName
             }
@@ -4095,19 +4361,19 @@ function Convert-AstExpression {
             if ($null -ne $owner -and $null -ne $owner.Find({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.UserPath -eq 'Matches' }, $true)) {
                 throw "[{0}:{1}] -{2} in a function that reads `$Matches is not lowered." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $Node.Operator.ToString().ToLowerInvariant()
             }
-            $options = if ($Node.Operator -in 'Imatch', 'Inotmatch') { [System.Text.RegularExpressions.RegexOptions]::IgnoreCase } else { [System.Text.RegularExpressions.RegexOptions]::None }
+            $options = if ($Node.Operator -in [System.Management.Automation.Language.TokenKind]::Imatch, [System.Management.Automation.Language.TokenKind]::Inotmatch) { [System.Text.RegularExpressions.RegexOptions]::IgnoreCase } else { [System.Text.RegularExpressions.RegexOptions]::None }
             # A [string] may still be $null from .NET; as text it is empty, as PowerShell matches it.
             $asText = { param($operand) if ($operand.Type -eq [string]) { [Linq.Expressions.Expression]::Call((Get-PscSemanticsMethod -Name 'Text' -ParameterTypes @([object])), [Linq.Expressions.Expression]::Convert($operand, [object])) } else { ConvertTo-PowerShellType -Expression $operand -Type ([string]) } }
             $isMatch = [Linq.Expressions.Expression]::Call([regex].GetMethod('IsMatch', [Type[]]@([string], [string], [System.Text.RegularExpressions.RegexOptions])),
                 (& $asText $left), (& $asText $right),
                 [Linq.Expressions.Expression]::Constant($options, [System.Text.RegularExpressions.RegexOptions]))
-            if ($Node.Operator -in 'Inotmatch', 'Cnotmatch') { return [Linq.Expressions.Expression]::Not($isMatch) }
+            if ($Node.Operator -in [System.Management.Automation.Language.TokenKind]::Inotmatch, [System.Management.Automation.Language.TokenKind]::Cnotmatch) { return [Linq.Expressions.Expression]::Not($isMatch) }
             return $isMatch
         }
 
         # -f formats with the current culture (measured on SMA); an [object[]] on the right is the arguments, any other
         # value one argument; an array literal on the right is its elements.
-        if ($Node.Operator -eq 'Format') {
+        if ($Node.Operator -eq [System.Management.Automation.Language.TokenKind]::Format) {
             $et = [Linq.Expressions.Expression]
             $arguments = if ($Node.Right -is [System.Management.Automation.Language.ArrayLiteralAst]) {
                 $et::NewArrayInit([object], [Linq.Expressions.Expression[]]@($Node.Right.Elements | ForEach-Object { $et::Convert((Convert-AstExpression -Node $_ -Scope $Scope), [object]) }))
@@ -4120,30 +4386,30 @@ function Convert-AstExpression {
         }
 
         # A string on the left of + appends the right operand as text, as PowerShell's [string] cast gives it.
-        if ($Node.Operator -eq 'Plus' -and $left.Type -eq [string]) {
+        if ($Node.Operator -eq [System.Management.Automation.Language.TokenKind]::Plus -and $left.Type -eq [string]) {
             return [Linq.Expressions.Expression]::Call([string].GetMethod('Concat', [Type[]]@([string], [string])), $left, (ConvertTo-PowerShellType -Expression $right -Type ([string])))
         }
 
-        if ($Node.Operator -in 'Shl', 'Shr') {
+        if ($Node.Operator -in [System.Management.Automation.Language.TokenKind]::Shl, [System.Management.Automation.Language.TokenKind]::Shr) {
             # The shift count is an Int32 in PowerShell and the CLR. A narrower left operand keeps its own type in
             # PowerShell ([byte] -shl 8 loses the high bits), so it shifts as an Int32 and truncates back.
             if ($right.Type -in $script:IntegralTypes -and $right.Type -ne [int]) { $right = ConvertTo-PowerShellType -Expression $right -Type ([int]) }
             if ($left.Type -in [sbyte], [byte], [short], [ushort]) {
                 $narrow = $left.Type
                 $wide = [Linq.Expressions.Expression]::Convert($left, [int])
-                $shifted = if ($Node.Operator -eq 'Shl') { [Linq.Expressions.Expression]::LeftShift($wide, $right) } else { [Linq.Expressions.Expression]::RightShift($wide, $right) }
+                $shifted = if ($Node.Operator -eq [System.Management.Automation.Language.TokenKind]::Shl) { [Linq.Expressions.Expression]::LeftShift($wide, $right) } else { [Linq.Expressions.Expression]::RightShift($wide, $right) }
                 return [Linq.Expressions.Expression]::Convert($shifted, $narrow)
             }
             if ($left.Type -notin $script:IntegralTypes -or $right.Type -ne [int]) {
                 throw "[{0}:{1}] -{2} requires an integral left operand and an [int] shift count, got '{3}' and '{4}'." -f `
                     $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $Node.Operator.ToString().ToLowerInvariant(), $left.Type.FullName, $right.Type.FullName
             }
-            if ($Node.Operator -eq 'Shl') { return [Linq.Expressions.Expression]::LeftShift($left, $right) }
+            if ($Node.Operator -eq [System.Management.Automation.Language.TokenKind]::Shl) { return [Linq.Expressions.Expression]::LeftShift($left, $right) }
             return [Linq.Expressions.Expression]::RightShift($left, $right)
         }
 
         # $null compared with a reference is a null of that reference's type.
-        if ($Node.Operator -in 'Ieq', 'Ine', 'Ceq', 'Cne') {
+        if ($Node.Operator -in [System.Management.Automation.Language.TokenKind]::Ieq, [System.Management.Automation.Language.TokenKind]::Ine, [System.Management.Automation.Language.TokenKind]::Ceq, [System.Management.Automation.Language.TokenKind]::Cne) {
             if ($left -is [Linq.Expressions.ConstantExpression] -and $null -eq $left.Value -and -not $right.Type.IsValueType) { $left = [Linq.Expressions.Expression]::Constant($null, $right.Type) }
             if ($right -is [Linq.Expressions.ConstantExpression] -and $null -eq $right.Value -and -not $left.Type.IsValueType) { $right = [Linq.Expressions.Expression]::Constant($null, $left.Type) }
             # A Nullable[T] against a T or $null compares lifted: $null equals only $null, as in PowerShell. (Ordering
@@ -4165,7 +4431,7 @@ function Convert-AstExpression {
                     $equal = $et::AndAlso($hasValue, $et::Equal($et::Call($value, $held.Type.GetMethod('GetValueOrDefault', [Type[]]@())), $other))
                 }
                 if ($null -ne $equal) {
-                    if ($Node.Operator -in 'Ine', 'Cne') { $equal = $et::Not($equal) }
+                    if ($Node.Operator -in [System.Management.Automation.Language.TokenKind]::Ine, [System.Management.Automation.Language.TokenKind]::Cne) { $equal = $et::Not($equal) }
                     return $et::Block([bool], [Linq.Expressions.Expression[]]@($et::Assign($value, $held), $equal))
                 }
             }
@@ -4174,7 +4440,7 @@ function Convert-AstExpression {
         # held value as T (measured on SMA). Lowered as the value or zero when both give one type; when they do not
         # ($null + 5 is Int32 for a Nullable[double]), the type depends on the value and the operation is refused below.
         # *, / and % with a $null give $null, 0, Infinity, NaN or throw by side and are not lowered.
-        if ($Node.Operator -in 'Plus', 'Minus') {
+        if ($Node.Operator -in [System.Management.Automation.Language.TokenKind]::Plus, [System.Management.Automation.Language.TokenKind]::Minus) {
             $nullableNumber = { param([Type] $t) $t.IsGenericType -and $t.GetGenericTypeDefinition() -eq [Nullable`1] -and ($t.GetGenericArguments()[0] -in $script:IntegralTypes -or $t.GetGenericArguments()[0] -in $script:FloatingTypes) }
             $number = { param([Type] $t) $t -in $script:IntegralTypes -or $t -in $script:FloatingTypes }
             $heldLeft = (& $nullableNumber $left.Type) -and (& $number $right.Type)
@@ -4199,7 +4465,7 @@ function Convert-AstExpression {
         }
         # Bitwise operators on enums, as SMA gives them: computed on the enums' underlying integral types; the result is
         # the left operand's enum type when the left operand is an enum, and the integral type when it is an integer.
-        if ($Node.Operator -in 'Band', 'Bor', 'Bxor' -and ($left.Type.IsEnum -or $right.Type.IsEnum)) {
+        if ($Node.Operator -in [System.Management.Automation.Language.TokenKind]::Band, [System.Management.Automation.Language.TokenKind]::Bor, [System.Management.Automation.Language.TokenKind]::Bxor -and ($left.Type.IsEnum -or $right.Type.IsEnum)) {
             $resultEnum = if ($left.Type.IsEnum) { $left.Type } else { $null }
             if ($left.Type.IsEnum) { $left = [Linq.Expressions.Expression]::Convert($left, [Enum]::GetUnderlyingType($left.Type)) }
             if ($right.Type.IsEnum) { $right = [Linq.Expressions.Expression]::Convert($right, [Enum]::GetUnderlyingType($right.Type)) }
@@ -4209,9 +4475,9 @@ function Convert-AstExpression {
                 throw "[{0}:{1}] -{2} has no common integral type for '{3}' and '{4}'." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $Node.Operator.ToString().ToLowerInvariant(), $left.Type.FullName, $right.Type.FullName
             }
             $combined = switch ($Node.Operator) {
-                'Band' { [Linq.Expressions.Expression]::And($left, $right) }
-                'Bor'  { [Linq.Expressions.Expression]::Or($left, $right) }
-                'Bxor' { [Linq.Expressions.Expression]::ExclusiveOr($left, $right) }
+                ([System.Management.Automation.Language.TokenKind]::Band) { [Linq.Expressions.Expression]::And($left, $right) }
+                ([System.Management.Automation.Language.TokenKind]::Bor)  { [Linq.Expressions.Expression]::Or($left, $right) }
+                ([System.Management.Automation.Language.TokenKind]::Bxor) { [Linq.Expressions.Expression]::ExclusiveOr($left, $right) }
             }
             if ($null -ne $resultEnum) {
                 if ($combined.Type -ne [Enum]::GetUnderlyingType($resultEnum)) { $combined = [Linq.Expressions.Expression]::Convert($combined, [Enum]::GetUnderlyingType($resultEnum)) }
@@ -4220,8 +4486,8 @@ function Convert-AstExpression {
             return $combined
         }
         # Narrow integers have no CLR arithmetic of their own, even when both sides match.
-        $kind = if ($Node.Operator -in 'Band', 'Bor', 'Bxor') { [PscOperatorKind]::Bitwise }
-            elseif ($Node.Operator -in 'Plus', 'Minus', 'Multiply', 'Divide', 'Rem') { [PscOperatorKind]::Arithmetic }
+        $kind = if ($Node.Operator -in [System.Management.Automation.Language.TokenKind]::Band, [System.Management.Automation.Language.TokenKind]::Bor, [System.Management.Automation.Language.TokenKind]::Bxor) { [PscOperatorKind]::Bitwise }
+            elseif ($Node.Operator -in [System.Management.Automation.Language.TokenKind]::Plus, [System.Management.Automation.Language.TokenKind]::Minus, [System.Management.Automation.Language.TokenKind]::Multiply, [System.Management.Automation.Language.TokenKind]::Divide, [System.Management.Automation.Language.TokenKind]::Rem) { [PscOperatorKind]::Arithmetic }
             else { [PscOperatorKind]::Comparison }
         $widened = $script:PscEnvironment.Get('NumericOperands').Bind($kind, $left, $right)
         if ($widened) { $left = $widened.Left; $right = $widened.Right }
@@ -4230,37 +4496,38 @@ function Convert-AstExpression {
                 $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $Node.Operator, $left.Type.FullName, $right.Type.FullName
         }
 
-        if ($left.Type -eq [string] -and $Node.Operator -match '^[IC](eq|ne|lt|le|gt|ge)$') {
-            $compared = New-PowerShellStringComparison -Left $left -Right $right -CaseSensitive ([string]$Node.Operator).StartsWith('C', [StringComparison]::Ordinal)
+        $caseSensitive = $Node.Operator -in [System.Management.Automation.Language.TokenKind]::Ceq, [System.Management.Automation.Language.TokenKind]::Cne, [System.Management.Automation.Language.TokenKind]::Clt, [System.Management.Automation.Language.TokenKind]::Cle, [System.Management.Automation.Language.TokenKind]::Cgt, [System.Management.Automation.Language.TokenKind]::Cge
+        if ($left.Type -eq [string] -and ($caseSensitive -or $Node.Operator -in [System.Management.Automation.Language.TokenKind]::Ieq, [System.Management.Automation.Language.TokenKind]::Ine, [System.Management.Automation.Language.TokenKind]::Ilt, [System.Management.Automation.Language.TokenKind]::Ile, [System.Management.Automation.Language.TokenKind]::Igt, [System.Management.Automation.Language.TokenKind]::Ige)) {
+            $compared = New-PowerShellStringComparison -Left $left -Right $right -CaseSensitive $caseSensitive
             $zero = [Linq.Expressions.Expression]::Constant(0)
-            switch -Regex ($Node.Operator) {
-                'eq$' { return [Linq.Expressions.Expression]::Equal($compared, $zero) }
-                'ne$' { return [Linq.Expressions.Expression]::NotEqual($compared, $zero) }
-                'lt$' { return [Linq.Expressions.Expression]::LessThan($compared, $zero) }
-                'le$' { return [Linq.Expressions.Expression]::LessThanOrEqual($compared, $zero) }
-                'gt$' { return [Linq.Expressions.Expression]::GreaterThan($compared, $zero) }
-                'ge$' { return [Linq.Expressions.Expression]::GreaterThanOrEqual($compared, $zero) }
+            switch ($Node.Operator) {
+                { $_ -in [System.Management.Automation.Language.TokenKind]::Ieq, [System.Management.Automation.Language.TokenKind]::Ceq } { return [Linq.Expressions.Expression]::Equal($compared, $zero) }
+                { $_ -in [System.Management.Automation.Language.TokenKind]::Ine, [System.Management.Automation.Language.TokenKind]::Cne } { return [Linq.Expressions.Expression]::NotEqual($compared, $zero) }
+                { $_ -in [System.Management.Automation.Language.TokenKind]::Ilt, [System.Management.Automation.Language.TokenKind]::Clt } { return [Linq.Expressions.Expression]::LessThan($compared, $zero) }
+                { $_ -in [System.Management.Automation.Language.TokenKind]::Ile, [System.Management.Automation.Language.TokenKind]::Cle } { return [Linq.Expressions.Expression]::LessThanOrEqual($compared, $zero) }
+                { $_ -in [System.Management.Automation.Language.TokenKind]::Igt, [System.Management.Automation.Language.TokenKind]::Cgt } { return [Linq.Expressions.Expression]::GreaterThan($compared, $zero) }
+                { $_ -in [System.Management.Automation.Language.TokenKind]::Ige, [System.Management.Automation.Language.TokenKind]::Cge } { return [Linq.Expressions.Expression]::GreaterThanOrEqual($compared, $zero) }
             }
         }
 
         switch ($Node.Operator) {
-            { $_ -in 'Plus', 'Minus', 'Multiply', 'Divide', 'Rem' } { return New-PowerShellArithmetic -Operator $Node.Operator -Left $left -Right $right }
-            { $_ -in 'Band', 'Bor', 'Bxor' } {
+            { $_ -in [System.Management.Automation.Language.TokenKind]::Plus, [System.Management.Automation.Language.TokenKind]::Minus, [System.Management.Automation.Language.TokenKind]::Multiply, [System.Management.Automation.Language.TokenKind]::Divide, [System.Management.Automation.Language.TokenKind]::Rem } { return New-PowerShellArithmetic -Operator $Node.Operator -Left $left -Right $right }
+            { $_ -in [System.Management.Automation.Language.TokenKind]::Band, [System.Management.Automation.Language.TokenKind]::Bor, [System.Management.Automation.Language.TokenKind]::Bxor } {
                 if ($left.Type -notin $script:IntegralTypes) {
                     throw "[{0}:{1}] -{2} requires integral operands, got '{3}'." -f $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $Node.Operator.ToString().ToLowerInvariant(), $left.Type.FullName
                 }
                 switch ($Node.Operator) {
-                    'Band' { return [Linq.Expressions.Expression]::And($left, $right) }
-                    'Bor'  { return [Linq.Expressions.Expression]::Or($left, $right) }
-                    'Bxor' { return [Linq.Expressions.Expression]::ExclusiveOr($left, $right) }
+                    ([System.Management.Automation.Language.TokenKind]::Band) { return [Linq.Expressions.Expression]::And($left, $right) }
+                    ([System.Management.Automation.Language.TokenKind]::Bor)  { return [Linq.Expressions.Expression]::Or($left, $right) }
+                    ([System.Management.Automation.Language.TokenKind]::Bxor) { return [Linq.Expressions.Expression]::ExclusiveOr($left, $right) }
                 }
             }
-            { $_ -in 'Ieq', 'Ceq' } { return [Linq.Expressions.Expression]::Equal($left, $right) }
-            { $_ -in 'Ine', 'Cne' } { return [Linq.Expressions.Expression]::NotEqual($left, $right) }
-            { $_ -in 'Ilt', 'Clt' } { return [Linq.Expressions.Expression]::LessThan($left, $right) }
-            { $_ -in 'Ile', 'Cle' } { return [Linq.Expressions.Expression]::LessThanOrEqual($left, $right) }
-            { $_ -in 'Igt', 'Cgt' } { return [Linq.Expressions.Expression]::GreaterThan($left, $right) }
-            { $_ -in 'Ige', 'Cge' } { return [Linq.Expressions.Expression]::GreaterThanOrEqual($left, $right) }
+            { $_ -in [System.Management.Automation.Language.TokenKind]::Ieq, [System.Management.Automation.Language.TokenKind]::Ceq } { return [Linq.Expressions.Expression]::Equal($left, $right) }
+            { $_ -in [System.Management.Automation.Language.TokenKind]::Ine, [System.Management.Automation.Language.TokenKind]::Cne } { return [Linq.Expressions.Expression]::NotEqual($left, $right) }
+            { $_ -in [System.Management.Automation.Language.TokenKind]::Ilt, [System.Management.Automation.Language.TokenKind]::Clt } { return [Linq.Expressions.Expression]::LessThan($left, $right) }
+            { $_ -in [System.Management.Automation.Language.TokenKind]::Ile, [System.Management.Automation.Language.TokenKind]::Cle } { return [Linq.Expressions.Expression]::LessThanOrEqual($left, $right) }
+            { $_ -in [System.Management.Automation.Language.TokenKind]::Igt, [System.Management.Automation.Language.TokenKind]::Cgt } { return [Linq.Expressions.Expression]::GreaterThan($left, $right) }
+            { $_ -in [System.Management.Automation.Language.TokenKind]::Ige, [System.Management.Automation.Language.TokenKind]::Cge } { return [Linq.Expressions.Expression]::GreaterThanOrEqual($left, $right) }
             default {
                 throw "[{0}:{1}] Unsupported binary operator '{2}'." -f `
                     $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $Node.Operator
@@ -4615,8 +4882,14 @@ function Convert-AstStatement {
         }
 
         if ($Statement.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals) {
-            $compound = @{ PlusEquals = 'Plus'; MinusEquals = 'Minus'; MultiplyEquals = 'Multiply'; DivideEquals = 'Divide'; RemainderEquals = 'Rem' }[[string]$Statement.Operator]
-            if (-not $compound) {
+            $compound = switch ($Statement.Operator) {
+                ([System.Management.Automation.Language.TokenKind]::PlusEquals) { [System.Management.Automation.Language.TokenKind]::Plus }
+                ([System.Management.Automation.Language.TokenKind]::MinusEquals) { [System.Management.Automation.Language.TokenKind]::Minus }
+                ([System.Management.Automation.Language.TokenKind]::MultiplyEquals) { [System.Management.Automation.Language.TokenKind]::Multiply }
+                ([System.Management.Automation.Language.TokenKind]::DivideEquals) { [System.Management.Automation.Language.TokenKind]::Divide }
+                ([System.Management.Automation.Language.TokenKind]::RemainderEquals) { [System.Management.Automation.Language.TokenKind]::Rem }
+            }
+            if ($null -eq $compound) {
                 throw "[{0}:{1}] Unsupported assignment operator '{2}'." -f $Statement.Extent.StartLineNumber, $Statement.Extent.StartColumnNumber, $Statement.Operator
             }
             if ($leftNode -is [System.Management.Automation.Language.IndexExpressionAst]) {
@@ -6621,29 +6894,29 @@ function Write-IlExpression {
         $isUnsigned = $Expr.Left.Type -in [byte], [ushort], [uint], [ulong]
 
         switch ($Expr.NodeType) {
-            'Add'      { $IL.Emit([Reflection.Emit.OpCodes]::Add); return }
-            'Subtract' { $IL.Emit([Reflection.Emit.OpCodes]::Sub); return }
-            'Multiply' { $IL.Emit([Reflection.Emit.OpCodes]::Mul); return }
-            'AddChecked'      { $IL.Emit($(if ($isUnsigned) { [Reflection.Emit.OpCodes]::Add_Ovf_Un } else { [Reflection.Emit.OpCodes]::Add_Ovf })); return }
-            'SubtractChecked' { $IL.Emit($(if ($isUnsigned) { [Reflection.Emit.OpCodes]::Sub_Ovf_Un } else { [Reflection.Emit.OpCodes]::Sub_Ovf })); return }
-            'MultiplyChecked' { $IL.Emit($(if ($isUnsigned) { [Reflection.Emit.OpCodes]::Mul_Ovf_Un } else { [Reflection.Emit.OpCodes]::Mul_Ovf })); return }
-            'Divide'   { $IL.Emit($(if ($isUnsigned) { [Reflection.Emit.OpCodes]::Div_Un } else { [Reflection.Emit.OpCodes]::Div })); return }
-            'And'         { $IL.Emit([Reflection.Emit.OpCodes]::And); return }
-            'Or'          { $IL.Emit([Reflection.Emit.OpCodes]::Or); return }
-            'ExclusiveOr' { $IL.Emit([Reflection.Emit.OpCodes]::Xor); return }
-            'LeftShift'   { $IL.Emit([Reflection.Emit.OpCodes]::Shl); return }
-            'RightShift'  { $IL.Emit($(if ($isUnsigned) { [Reflection.Emit.OpCodes]::Shr_Un } else { [Reflection.Emit.OpCodes]::Shr })); return }
-            'Modulo'   { $IL.Emit($(if ($isUnsigned) { [Reflection.Emit.OpCodes]::Rem_Un } else { [Reflection.Emit.OpCodes]::Rem })); return }
-            'Equal'    { $IL.Emit([Reflection.Emit.OpCodes]::Ceq); return }
-            'NotEqual' {
+            ([System.Linq.Expressions.ExpressionType]::Add)      { $IL.Emit([Reflection.Emit.OpCodes]::Add); return }
+            ([System.Linq.Expressions.ExpressionType]::Subtract) { $IL.Emit([Reflection.Emit.OpCodes]::Sub); return }
+            ([System.Linq.Expressions.ExpressionType]::Multiply) { $IL.Emit([Reflection.Emit.OpCodes]::Mul); return }
+            ([System.Linq.Expressions.ExpressionType]::AddChecked)      { $IL.Emit($(if ($isUnsigned) { [Reflection.Emit.OpCodes]::Add_Ovf_Un } else { [Reflection.Emit.OpCodes]::Add_Ovf })); return }
+            ([System.Linq.Expressions.ExpressionType]::SubtractChecked) { $IL.Emit($(if ($isUnsigned) { [Reflection.Emit.OpCodes]::Sub_Ovf_Un } else { [Reflection.Emit.OpCodes]::Sub_Ovf })); return }
+            ([System.Linq.Expressions.ExpressionType]::MultiplyChecked) { $IL.Emit($(if ($isUnsigned) { [Reflection.Emit.OpCodes]::Mul_Ovf_Un } else { [Reflection.Emit.OpCodes]::Mul_Ovf })); return }
+            ([System.Linq.Expressions.ExpressionType]::Divide)   { $IL.Emit($(if ($isUnsigned) { [Reflection.Emit.OpCodes]::Div_Un } else { [Reflection.Emit.OpCodes]::Div })); return }
+            ([System.Linq.Expressions.ExpressionType]::And)         { $IL.Emit([Reflection.Emit.OpCodes]::And); return }
+            ([System.Linq.Expressions.ExpressionType]::Or)          { $IL.Emit([Reflection.Emit.OpCodes]::Or); return }
+            ([System.Linq.Expressions.ExpressionType]::ExclusiveOr) { $IL.Emit([Reflection.Emit.OpCodes]::Xor); return }
+            ([System.Linq.Expressions.ExpressionType]::LeftShift)   { $IL.Emit([Reflection.Emit.OpCodes]::Shl); return }
+            ([System.Linq.Expressions.ExpressionType]::RightShift)  { $IL.Emit($(if ($isUnsigned) { [Reflection.Emit.OpCodes]::Shr_Un } else { [Reflection.Emit.OpCodes]::Shr })); return }
+            ([System.Linq.Expressions.ExpressionType]::Modulo)   { $IL.Emit($(if ($isUnsigned) { [Reflection.Emit.OpCodes]::Rem_Un } else { [Reflection.Emit.OpCodes]::Rem })); return }
+            ([System.Linq.Expressions.ExpressionType]::Equal)    { $IL.Emit([Reflection.Emit.OpCodes]::Ceq); return }
+            ([System.Linq.Expressions.ExpressionType]::NotEqual) {
                 $IL.Emit([Reflection.Emit.OpCodes]::Ceq)
                 $IL.Emit([Reflection.Emit.OpCodes]::Ldc_I4_0)
                 $IL.Emit([Reflection.Emit.OpCodes]::Ceq)
                 return
             }
-            'LessThan' { $IL.Emit($(if ($isUnsigned) { [Reflection.Emit.OpCodes]::Clt_Un } else { [Reflection.Emit.OpCodes]::Clt })); return }
-            'GreaterThan' { $IL.Emit($(if ($isUnsigned) { [Reflection.Emit.OpCodes]::Cgt_Un } else { [Reflection.Emit.OpCodes]::Cgt })); return }
-            'LessThanOrEqual' {
+            ([System.Linq.Expressions.ExpressionType]::LessThan) { $IL.Emit($(if ($isUnsigned) { [Reflection.Emit.OpCodes]::Clt_Un } else { [Reflection.Emit.OpCodes]::Clt })); return }
+            ([System.Linq.Expressions.ExpressionType]::GreaterThan) { $IL.Emit($(if ($isUnsigned) { [Reflection.Emit.OpCodes]::Cgt_Un } else { [Reflection.Emit.OpCodes]::Cgt })); return }
+            ([System.Linq.Expressions.ExpressionType]::LessThanOrEqual) {
                 if ($isFloat -or $isUnsigned) {
                     $IL.Emit([Reflection.Emit.OpCodes]::Cgt_Un)
                 } else {
@@ -6653,7 +6926,7 @@ function Write-IlExpression {
                 $IL.Emit([Reflection.Emit.OpCodes]::Ceq)
                 return
             }
-            'GreaterThanOrEqual' {
+            ([System.Linq.Expressions.ExpressionType]::GreaterThanOrEqual) {
                 if ($isFloat -or $isUnsigned) {
                     $IL.Emit([Reflection.Emit.OpCodes]::Clt_Un)
                 } else {
@@ -7229,14 +7502,14 @@ class PscFixedParameters : PscAstRebuild {
             return $null
         }
         if ($node -is [System.Management.Automation.Language.ConstantExpressionAst]) { return [System.Management.Automation.LanguagePrimitives]::IsTrue($node.Value) }
-        if ($node -is [System.Management.Automation.Language.UnaryExpressionAst] -and $node.TokenKind -in 'Not', 'Exclaim') {
+        if ($node -is [System.Management.Automation.Language.UnaryExpressionAst] -and $node.TokenKind -in [System.Management.Automation.Language.TokenKind]::Not, [System.Management.Automation.Language.TokenKind]::Exclaim) {
             $child = $this.Truth($node.Child)
             if ($null -eq $child) { return $null }
             return -not $child
         }
-        if ($node -is [System.Management.Automation.Language.BinaryExpressionAst] -and $node.Operator -in 'And', 'Or') {
+        if ($node -is [System.Management.Automation.Language.BinaryExpressionAst] -and $node.Operator -in [System.Management.Automation.Language.TokenKind]::And, [System.Management.Automation.Language.TokenKind]::Or) {
             $left = $this.Truth($node.Left)
-            $decides = $node.Operator -eq 'Or'
+            $decides = $node.Operator -eq [System.Management.Automation.Language.TokenKind]::Or
             if ($null -ne $left -and $left -eq $decides) { return $decides }
             $right = $this.Truth($node.Right)
             if ($null -eq $left -or $null -eq $right) { return $null }
@@ -9045,7 +9318,7 @@ class NamespaceUsings : PscMeasurementMethod {
 
 class RegexUses : PscMeasurementMethod {
     [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]] Locate([PscSource] $source) {
-        $kinds = [System.Management.Automation.Language.TokenKind[]]@('Imatch', 'Cmatch', 'Inotmatch', 'Cnotmatch', 'Ireplace', 'Creplace', 'Isplit', 'Csplit')
+        $kinds = [System.Management.Automation.Language.TokenKind[]]@([System.Management.Automation.Language.TokenKind]::Imatch, [System.Management.Automation.Language.TokenKind]::Cmatch, [System.Management.Automation.Language.TokenKind]::Inotmatch, [System.Management.Automation.Language.TokenKind]::Cnotmatch, [System.Management.Automation.Language.TokenKind]::Ireplace, [System.Management.Automation.Language.TokenKind]::Creplace, [System.Management.Automation.Language.TokenKind]::Isplit, [System.Management.Automation.Language.TokenKind]::Csplit)
         $found = [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]]::new()
         foreach ($node in $source.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.BinaryExpressionAst] -or $n -is [System.Management.Automation.Language.UnaryExpressionAst] }, $true)) {
             $kind = if ($node -is [System.Management.Automation.Language.BinaryExpressionAst]) { $node.Operator } else { $node.TokenKind }
@@ -9665,7 +9938,7 @@ function Compare-PscOperandBinding {
     [OutputType([PscBindingEvaluation])]
     param(
         [Parameter(Mandatory)][PscOperandBinding] $Binding,
-        [System.Management.Automation.Language.TokenKind[]] $Operator = @('Plus', 'Minus', 'Multiply', 'Divide', 'Rem', 'Band', 'Bor', 'Bxor', 'Ieq', 'Ilt'),
+        [System.Management.Automation.Language.TokenKind[]] $Operator = @([System.Management.Automation.Language.TokenKind]::Plus, [System.Management.Automation.Language.TokenKind]::Minus, [System.Management.Automation.Language.TokenKind]::Multiply, [System.Management.Automation.Language.TokenKind]::Divide, [System.Management.Automation.Language.TokenKind]::Rem, [System.Management.Automation.Language.TokenKind]::Band, [System.Management.Automation.Language.TokenKind]::Bor, [System.Management.Automation.Language.TokenKind]::Bxor, [System.Management.Automation.Language.TokenKind]::Ieq, [System.Management.Automation.Language.TokenKind]::Ilt),
         [type[]] $Type = @([sbyte], [byte], [int16], [uint16], [int], [uint32], [long], [uint64], [single], [double], [decimal])
     )
     $position = [System.Management.Automation.Language.ScriptPosition]::new('Compare-PscOperandBinding', 1, 1, '')
@@ -9676,8 +9949,8 @@ function Compare-PscOperandBinding {
         [System.Management.Automation.Language.ParameterAst]::new($extent, $a.Copy(), [System.Management.Automation.Language.AttributeBaseAst[]]@(), $null),
         [System.Management.Automation.Language.ParameterAst]::new($extent, $b.Copy(), [System.Management.Automation.Language.AttributeBaseAst[]]@(), $null))
     foreach ($token in $Operator) {
-        $kind = if ($token -in 'Band', 'Bor', 'Bxor') { [PscOperatorKind]::Bitwise }
-            elseif ($token -in 'Plus', 'Minus', 'Multiply', 'Divide', 'Rem') { [PscOperatorKind]::Arithmetic }
+        $kind = if ($token -in [System.Management.Automation.Language.TokenKind]::Band, [System.Management.Automation.Language.TokenKind]::Bor, [System.Management.Automation.Language.TokenKind]::Bxor) { [PscOperatorKind]::Bitwise }
+            elseif ($token -in [System.Management.Automation.Language.TokenKind]::Plus, [System.Management.Automation.Language.TokenKind]::Minus, [System.Management.Automation.Language.TokenKind]::Multiply, [System.Management.Automation.Language.TokenKind]::Divide, [System.Management.Automation.Language.TokenKind]::Rem) { [PscOperatorKind]::Arithmetic }
             else { [PscOperatorKind]::Comparison }
         foreach ($leftType in $Type) {
             foreach ($rightType in $Type) {
@@ -10104,8 +10377,16 @@ process {
         'Lint' {
             $targets = if ($LintFiles) { $LintFiles } else { foreach ($project in Get-Projects) { foreach ($relative in $project.Files) { Join-Path $project.Path $relative } } }
             $findings = @(foreach ($file in $targets) { if (Test-Path -LiteralPath $file) { Get-SmaLint ([IO.Path]::GetFullPath($file)) } })
+            if ($LintEdit) { return Edit-SmaLintFinding -Findings $findings }
             $findings | Group-Object Rule | Sort-Object Count -Descending | ForEach-Object { '{0,-20} {1,5}' -f $_.Name, $_.Count }
             $findings | Sort-Object Rule, File, Line | ForEach-Object { '{0,-20} {1}:{2}  {3}' -f $_.Rule, $_.File, $_.Line, $_.Detail }
+        }
+        'Guard' {
+            if (-not $LintFiles) { throw 'Guard requires -LintFiles.' }
+            $verdicts = @(foreach ($file in $LintFiles) { Test-SmaGuard ([IO.Path]::GetFullPath($file)) $CheckerHash })
+            $verdicts
+            $failed = @($verdicts | Where-Object { -not $_.Passed })
+            if ($failed.Count) { throw ('Guard: {0}' -f (@($failed | ForEach-Object { '{0}: {1}' -f $_.File, ($_.Reasons -join '; ') }) -join ' | ')) }
         }
         'Profile' { Invoke-SmaProfile }
         'Report' {
