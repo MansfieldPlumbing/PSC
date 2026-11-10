@@ -1677,6 +1677,8 @@ function Add-NativeImportMethod {
 # Native expressions retain typed plans for the existing IL emitter.
 # No runtime helper or implementation dependency is emitted.
 $script:NativeExpressions = [Runtime.CompilerServices.ConditionalWeakTable[object, object]]::new()
+# Static data arrays held as field data (PscFieldData), keyed by the expression that stands for the array.
+$script:FieldDataArrays = [Runtime.CompilerServices.ConditionalWeakTable[Linq.Expressions.Expression, PscFieldData]]::new()
 
 function Get-NativeMethodContract {
     param([System.Management.Automation.Language.FunctionMemberAst] $Function)
@@ -6495,6 +6497,12 @@ function Write-IlExpression {
         return
     }
 
+    $fieldData = $null
+    if ($script:FieldDataArrays.TryGetValue($Expr, [ref]$fieldData)) {
+        Write-IlFieldDataArray -IL $IL -Stored $fieldData -Context $Context
+        return
+    }
+
     # 1. Constant
     if ($Expr -is [Linq.Expressions.ConstantExpression]) {
         Write-IlConstant -IL $IL -Expr $Expr
@@ -6942,6 +6950,32 @@ function Write-IlExpression {
     throw "Emitter encountered unhandled expression node type '$($Expr.GetType().FullName)' ($($Expr.NodeType))."
 }
 
+# A new array holding PscFieldData's elements: each chunk of its bytes becomes a field of the method's type, copied
+# from the image into its place in the array.
+function Write-IlFieldDataArray {
+    param([Parameter(Mandatory)][Reflection.Emit.ILGenerator] $IL, [Parameter(Mandatory)][PscFieldData] $Stored, [Parameter(Mandatory)][hashtable] $Context)
+    if ($null -eq $Context.DataType) { throw 'Field data needs the type whose method copies it.' }
+    $array = $IL.DeclareLocal($Stored.ElementType.MakeArrayType())
+    $IL.Emit([Reflection.Emit.OpCodes]::Ldc_I4, $Stored.Length)
+    $IL.Emit([Reflection.Emit.OpCodes]::Newarr, $Stored.ElementType)
+    $IL.Emit([Reflection.Emit.OpCodes]::Stloc, $array)
+    for ($offset = 0; $offset -lt $Stored.Bytes.Length; $offset += [PscFieldData]::ChunkBytes) {
+        $length = [Math]::Min([PscFieldData]::ChunkBytes, $Stored.Bytes.Length - $offset)
+        # A field holds more than one byte; a one-byte chunk is stored in two and copied as one.
+        $chunk = [byte[]]::new([Math]::Max($length, 2))
+        [Array]::Copy($Stored.Bytes, $offset, $chunk, 0, $length)
+        $field = $Context.DataType.DefineInitializedData(('FieldData{0}' -f $Context.FieldDataCount), $chunk, ([Reflection.FieldAttributes]::Private -bor [Reflection.FieldAttributes]::Static))
+        $Context.FieldDataCount++
+        $IL.Emit([Reflection.Emit.OpCodes]::Ldloc, $array)
+        $IL.Emit([Reflection.Emit.OpCodes]::Ldc_I4, [int]($offset / $Stored.ElementBytes))
+        $IL.Emit([Reflection.Emit.OpCodes]::Ldelema, $Stored.ElementType)
+        $IL.Emit([Reflection.Emit.OpCodes]::Ldsflda, [Reflection.FieldInfo]$field)
+        $IL.Emit([Reflection.Emit.OpCodes]::Ldc_I4, $length)
+        $IL.Emit([Reflection.Emit.OpCodes]::Cpblk)
+    }
+    $IL.Emit([Reflection.Emit.OpCodes]::Ldloc, $array)
+}
+
 function Write-IlMethodBody {
     <#
     .SYNOPSIS
@@ -6986,6 +7020,9 @@ function Write-IlMethodBody {
         ReturnType     = $Lambda.ReturnType
         ReturnLocal    = $retLocal
         ExceptionDepth = 0
+        # The type that holds field data this body copies (Write-IlFieldDataArray), and how many it has defined.
+        DataType       = $MethodBuilder.DeclaringType
+        FieldDataCount = 0
     }
 
     Write-IlExpression -IL $il -Expr $Lambda.Body -Context $context
@@ -7965,20 +8002,117 @@ function ConvertTo-TypedExpression {
     Convert-MethodAstToLambda -MethodAst $MethodAst
 }
 
+# A primitive array of static data held in the image as field data: its little-endian bytes go into private static
+# fields of the type whose initializer copies them into a new array (ldsflda, cpblk). A loader maps the image, so a
+# large array is not written as one IL constant per element.
+class PscFieldData {
+    # TypeBuilder.DefineInitializedData takes a field of more than 1 and fewer than 0x3F0000 bytes: the largest multiple
+    # of 8 (the widest primitive) below that bound.
+    static [int] $ChunkBytes = 0x3E0000
+    [Type] $ElementType
+    [int] $Length
+    [int] $ElementBytes
+    [byte[]] $Bytes
+}
+
+# The instances of this compile's classes reached from one class's static data. Each is made once, in the order it was
+# reached, by that class's type initializer and kept in Table, so shared references and cycles are kept; its fields are
+# assigned after every instance exists (Complete-PscStaticGraph).
+class PscStaticGraph {
+    [Linq.Expressions.ParameterExpression] $Table = [Linq.Expressions.Expression]::Variable([object[]], 'instances')
+    [Collections.Generic.Dictionary[object, int]] $Index = [Collections.Generic.Dictionary[object, int]]::new([Collections.Generic.ReferenceEqualityComparer]::Instance)
+    [Collections.Generic.List[object]] $Instances = [Collections.Generic.List[object]]::new()
+    [Collections.Generic.List[Type]] $Types = [Collections.Generic.List[Type]]::new()
+    [Collections.Generic.List[Linq.Expressions.Expression]] $Statements = [Collections.Generic.List[Linq.Expressions.Expression]]::new()
+    # The compile's class models and mirror types by name, and the graph each instance already belongs to.
+    [hashtable] $Models
+    [hashtable] $Mirror
+    [Collections.Generic.Dictionary[object, PscStaticGraph]] $Owners
+}
+
+# The instance a static data value is, as a read of the graph's table, or $null when the value is no instance of a class
+# of this compile.
+function Get-PscStaticInstance {
+    param([Parameter(Mandatory)][PscStaticGraph] $Graph, [Parameter(Mandatory)] $Value, [Parameter(Mandatory)][Type] $Type)
+    $name = $Value.GetType().Name
+    if (-not $Graph.Models.ContainsKey($name)) { return $null }
+    $target = $Graph.Mirror[$name]
+    if (-not $Type.IsAssignableFrom($target)) { throw "Static data of type $Type cannot hold an instance of $name." }
+    $owner = $null
+    if ($Graph.Owners.TryGetValue($Value, [ref]$owner) -and -not [object]::ReferenceEquals($owner, $Graph)) { throw "An instance of $name is reached from the static data of two classes; each class's type initializer makes its own instances." }
+    $index = 0
+    if (-not $Graph.Index.TryGetValue($Value, [ref]$index)) {
+        $index = $Graph.Instances.Count
+        $Graph.Index.Add($Value, $index); $Graph.Instances.Add($Value); $Graph.Types.Add($target); $Graph.Owners[$Value] = $Graph
+    }
+    [Linq.Expressions.Expression]::Convert([Linq.Expressions.Expression]::ArrayAccess($Graph.Table, [Linq.Expressions.Expression]::Constant($index)), $target)
+}
+
+# Assigns every field of every instance in the graph, including instances reached while doing so.
+function Complete-PscStaticGraph {
+    param([Parameter(Mandatory)][PscStaticGraph] $Graph)
+    $instanceFields = [Reflection.BindingFlags]::Public -bor [Reflection.BindingFlags]::NonPublic -bor [Reflection.BindingFlags]::Instance -bor [Reflection.BindingFlags]::DeclaredOnly
+    for ($i = 0; $i -lt $Graph.Instances.Count; $i++) {
+        $value = $Graph.Instances[$i]; $target = $Graph.Types[$i]
+        $instance = [Linq.Expressions.Expression]::Convert([Linq.Expressions.Expression]::ArrayAccess($Graph.Table, [Linq.Expressions.Expression]::Constant($i)), $target)
+        foreach ($property in @($Graph.Models[$target.Name].Properties | Where-Object { -not $_.IsStatic })) {
+            $field = $target.GetField($property.Name, $instanceFields)
+            $source = $value.GetType().GetProperty($property.Name)
+            if ($null -eq $field -or $null -eq $source) { throw "Static data instance of $($target.Name) has no property $($property.Name)." }
+            $Graph.Statements.Add([Linq.Expressions.Expression]::Assign([Linq.Expressions.Expression]::Field($instance, $field), (ConvertTo-StaticDataExpression $source.GetValue($value) $field.FieldType $Graph)))
+        }
+    }
+}
+
+# The statements a type initializer runs before its static data assignments: the table and every instance in it.
+function Get-PscStaticGraphPrologue {
+    param([Parameter(Mandatory)][PscStaticGraph] $Graph)
+    [Linq.Expressions.Expression]::Assign($Graph.Table, [Linq.Expressions.Expression]::NewArrayBounds([object], [Linq.Expressions.Expression]::Constant($Graph.Instances.Count)))
+    for ($i = 0; $i -lt $Graph.Instances.Count; $i++) {
+        $constructor = $Graph.Types[$i].GetConstructor([Type]::EmptyTypes)
+        if ($null -eq $constructor) { throw "Static data instances of $($Graph.Types[$i].Name) need a constructor with no parameters." }
+        $made = $script:ExpressionNewMethod.Invoke($null, [object[]]@($constructor, [Linq.Expressions.Expression[]]@()))
+        [Linq.Expressions.Expression]::Assign([Linq.Expressions.Expression]::ArrayAccess($Graph.Table, [Linq.Expressions.Expression]::Constant($i)),
+            [Linq.Expressions.Expression]::Convert($made, [object]))
+    }
+    $Graph.Statements
+}
+
 function ConvertTo-StaticDataExpression {
-    param($Value, [Type] $Type)
+    param($Value, [Type] $Type, [PscStaticGraph] $Graph)
     if ($Type -in [IntPtr],[UIntPtr]) { throw 'Native addresses are not durable static data.' }
     if ($null -eq $Value) {
-        if ($Type.IsValueType) { throw "Null is not valid for static data of type $Type." }
+        if ($Type.IsValueType -and $null -eq [Nullable]::GetUnderlyingType($Type)) { throw "Null is not valid for static data of type $Type." }
         return [Linq.Expressions.Expression]::Constant($null, $Type)
     }
     if ($Type.IsArray -and $Type.GetArrayRank() -eq 1) {
         if ($Value -isnot [Array]) { throw "Static data requires an array of $($Type.GetElementType())." }
+        $element = $Type.GetElementType()
+        if ($element.IsPrimitive -and $element -notin [IntPtr],[UIntPtr] -and $Value.Length -gt 0) {
+            # An array of the element type is taken as it is; any other array is checked element by element.
+            $typed = $Value
+            if ($Value.GetType().GetElementType() -ne $element) { $typed = [Array]::CreateInstance($element, $Value.Length); for ($i = 0; $i -lt $Value.Length; $i++) {
+                $item = $Value[$i]
+                if ($null -eq $item -or $item.GetType() -ne $element) { throw "Static data type mismatch: expected $element, received $(if ($null -eq $item) { 'null' } else { $item.GetType() })." }
+                $typed.SetValue($item, $i)
+            } }
+            $heldData = [PscFieldData]@{ ElementType = $element; Length = $typed.Length; ElementBytes = [Buffer]::ByteLength($typed) / $typed.Length; Bytes = [byte[]]::new([Buffer]::ByteLength($typed)) }
+            [Buffer]::BlockCopy($typed, 0, $heldData.Bytes, 0, $heldData.Bytes.Length)
+            $array = [Linq.Expressions.Expression]::NewArrayBounds($element, [Linq.Expressions.Expression]::Constant($typed.Length))
+            $script:FieldDataArrays.Add($array, $heldData)
+            return $array
+        }
         $items = [Collections.Generic.List[Linq.Expressions.Expression]]::new()
-        foreach ($item in $Value) { $items.Add((ConvertTo-StaticDataExpression $item $Type.GetElementType())) }
+        foreach ($item in $Value) { $items.Add((ConvertTo-StaticDataExpression $item $Type.GetElementType() $Graph)) }
         return [Linq.Expressions.Expression]::NewArrayInit($Type.GetElementType(), $items)
     }
-    if ($Type -ne [string] -and -not $Type.IsPrimitive) { throw "Static data supports primitive values, strings and their arrays, not $Type." }
+    if ($null -ne $Graph) {
+        $instance = Get-PscStaticInstance $Graph $Value $Type
+        if ($null -ne $instance) { return $instance }
+    }
+    $underlying = [Nullable]::GetUnderlyingType($Type)
+    if ($null -ne $underlying) { return [Linq.Expressions.Expression]::Convert((ConvertTo-StaticDataExpression $Value $underlying $Graph), $Type) }
+    if ($Type -ne [string] -and -not $Type.IsPrimitive) { throw "Static data supports primitive values, strings, their nullable forms, instances of this compile's classes and arrays of these, not $Type." }
     if ($Value.GetType() -ne $Type) { throw "Static data type mismatch: expected $Type, received $($Value.GetType())." }
     return [Linq.Expressions.Expression]::Constant($Value, $Type)
 }
@@ -8081,13 +8215,18 @@ function Export-LoweredAssembly {
     $mirror = @{} + $script:LoweringClassTypes
     $dataFields = @{}
     if ($null -eq $StaticData) { $StaticData = @{} }
+    # One graph of instances per class with static data (PscStaticGraph).
+    $graphs = @{}; $models = @{}; foreach ($c in $model) { $models[$c.Name] = $c }
+    $owners = [Collections.Generic.Dictionary[object, PscStaticGraph]]::new([Collections.Generic.ReferenceEqualityComparer]::Instance)
     foreach ($key in $StaticData.Keys) {
         $parts = ([string]$key).Split('.')
         if ($parts.Count -ne 2 -or $parts[0] -notin @($model.Name)) { throw "Unknown or unselected static data field '$key'." }
         $field = $mirror[$parts[0]].GetField($parts[1], [Reflection.BindingFlags]'Public,Static,DeclaredOnly')
         if ($null -eq $field) { throw "Unknown static data field '$key'." }
-        $dataFields[$key] = [pscustomobject]@{ Field = $field; Expression = (ConvertTo-StaticDataExpression $StaticData[$key] $field.FieldType) }
+        if (-not $graphs.ContainsKey($parts[0])) { $graphs[$parts[0]] = [PscStaticGraph]@{ Models = $models; Mirror = $mirror; Owners = $owners } }
+        $dataFields[$key] = [pscustomobject]@{ Field = $field; Expression = (ConvertTo-StaticDataExpression $StaticData[$key] $field.FieldType $graphs[$parts[0]]) }
     }
+    foreach ($staticGraph in $graphs.Values) { Complete-PscStaticGraph $staticGraph }
 
     $assemblyName = [IO.Path]::GetFileNameWithoutExtension($OutputPath)
     $session = New-PersistedAssemblySession -AssemblyName $assemblyName
@@ -8169,9 +8308,15 @@ function Export-LoweredAssembly {
                 if ($fieldInputs.Count) {
                 $body = [Collections.Generic.List[Linq.Expressions.Expression]]::new()
                 $body.Add($lowered.Lambda.Body)
+                $staticGraph = $graphs[$c.Name]
+                $variables = [Linq.Expressions.ParameterExpression[]]@()
+                if ($null -ne $staticGraph -and $staticGraph.Instances.Count) {
+                    foreach ($statement in @(Get-PscStaticGraphPrologue $staticGraph)) { $body.Add($statement) }
+                    $variables = [Linq.Expressions.ParameterExpression[]]@($staticGraph.Table)
+                }
                 foreach ($inputField in $fieldInputs) { $body.Add([Linq.Expressions.Expression]::Assign([Linq.Expressions.Expression]::Field($null, $inputField.Field), $inputField.Expression)) }
                 $body.Add([Linq.Expressions.Expression]::Empty())
-                $initializer = [Linq.Expressions.Expression]::Lambda([Linq.Expressions.Expression]::Block($body), [Linq.Expressions.ParameterExpression[]]@())
+                $initializer = [Linq.Expressions.Expression]::Lambda([Linq.Expressions.Expression]::Block($variables, $body), [Linq.Expressions.ParameterExpression[]]@())
                 }
                 Write-IlMethodBody -Lambda $initializer -MethodBuilder $session.Types[$c.Name].DefineTypeInitializer() -IsStatic
             }
