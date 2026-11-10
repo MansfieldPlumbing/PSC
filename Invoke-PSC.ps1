@@ -6938,6 +6938,207 @@ class PscRecord {
     hidden [System.Management.Automation.Language.HashtableAst] $Literal
 }
 
+# Rebuilds a script with chosen script parameters fixed to constant values, as a build that is not to carry them does:
+# each use of a fixed parameter becomes its value and the parameter leaves the param block; an if clause whose
+# condition folds to a constant is dropped when false and becomes the last clause, its condition $true, when true; a
+# statement list ends at a statement that always leaves it (return, throw, exit, or an if whose every way through
+# does). Truth is SMA's own (LanguagePrimitives.IsTrue); -not, !, -and, -or and parentheses fold, anything else is
+# left to run. Assigning to a fixed parameter is refused.
+class PscFixedParameters : PscAstRebuild {
+    [hashtable] $Values
+    hidden [System.Management.Automation.Language.ScriptBlockAst] $Script
+
+    PscFixedParameters([hashtable] $values) { $this.Values = $values }
+
+    # The script rebuilt with its parameters fixed; the fixed ones leave its own param block.
+    [System.Management.Automation.Language.ScriptBlockAst] Fix([System.Management.Automation.Language.ScriptBlockAst] $script) {
+        $this.Script = $script
+        return $this.Rebuild($script)
+    }
+
+    hidden [bool] IsFixed([System.Management.Automation.Language.VariableExpressionAst] $variable) {
+        $path = $variable.VariablePath
+        return ($path.IsUnqualified -or $path.IsScript) -and $this.Values.ContainsKey($path.UserPath)
+    }
+
+    hidden [System.Management.Automation.Language.ExpressionAst] Constant([System.Management.Automation.Language.IScriptExtent] $extent, [object] $value) {
+        if ($null -eq $value) { return [System.Management.Automation.Language.VariableExpressionAst]::new($extent, 'null', $false) }
+        if ($value -is [bool] -or $value -is [System.Management.Automation.SwitchParameter]) {
+            return [System.Management.Automation.Language.VariableExpressionAst]::new($extent, $(if ([bool]$value) { 'true' } else { 'false' }), $false)
+        }
+        if ($value -is [string]) { return [System.Management.Automation.Language.StringConstantExpressionAst]::new($extent, $value, [System.Management.Automation.Language.StringConstantType]::SingleQuoted) }
+        if ($value.GetType().IsPrimitive) { return [System.Management.Automation.Language.ConstantExpressionAst]::new($extent, $value) }
+        throw "A fixed parameter takes `$null, a Boolean, a number or text, not $($value.GetType())."
+    }
+
+    # The truth of a condition when it is fixed by constants alone; $null when it depends on anything else.
+    hidden [Nullable[bool]] Truth([System.Management.Automation.Language.Ast] $node) {
+        if ($node -is [System.Management.Automation.Language.PipelineAst]) {
+            if ($node.PipelineElements.Count -ne 1 -or $node.PipelineElements[0] -isnot [System.Management.Automation.Language.CommandExpressionAst]) { return $null }
+            return $this.Truth($node.PipelineElements[0].Expression)
+        }
+        if ($node -is [System.Management.Automation.Language.ParenExpressionAst]) { return $this.Truth($node.Pipeline) }
+        if ($node -is [System.Management.Automation.Language.VariableExpressionAst]) {
+            if ($node.VariablePath.UserPath -eq 'true') { return $true }
+            if ($node.VariablePath.UserPath -in 'false', 'null') { return $false }
+            return $null
+        }
+        if ($node -is [System.Management.Automation.Language.ConstantExpressionAst]) { return [System.Management.Automation.LanguagePrimitives]::IsTrue($node.Value) }
+        if ($node -is [System.Management.Automation.Language.UnaryExpressionAst] -and $node.TokenKind -in 'Not', 'Exclaim') {
+            $child = $this.Truth($node.Child)
+            if ($null -eq $child) { return $null }
+            return -not $child
+        }
+        if ($node -is [System.Management.Automation.Language.BinaryExpressionAst] -and $node.Operator -in 'And', 'Or') {
+            $left = $this.Truth($node.Left)
+            $decides = $node.Operator -eq 'Or'
+            if ($null -ne $left -and $left -eq $decides) { return $decides }
+            $right = $this.Truth($node.Right)
+            if ($null -eq $left -or $null -eq $right) { return $null }
+            return $right
+        }
+        return $null
+    }
+
+    hidden [bool] AlwaysLeaves([System.Management.Automation.Language.StatementAst] $statement) {
+        if ($statement -is [System.Management.Automation.Language.ReturnStatementAst] -or $statement -is [System.Management.Automation.Language.ThrowStatementAst] -or
+            $statement -is [System.Management.Automation.Language.ExitStatementAst]) { return $true }
+        if ($statement -isnot [System.Management.Automation.Language.IfStatementAst]) { return $false }
+        $unconditional = $null -ne $statement.ElseClause -or ($statement.Clauses.Count -eq 1 -and $this.Truth($statement.Clauses[0].Item1) -eq $true)
+        if (-not $unconditional) { return $false }
+        foreach ($clause in $statement.Clauses) { if (-not $this.BlockLeaves($clause.Item2)) { return $false } }
+        return $null -eq $statement.ElseClause -or $this.BlockLeaves($statement.ElseClause)
+    }
+
+    hidden [bool] BlockLeaves([System.Management.Automation.Language.StatementBlockAst] $block) {
+        foreach ($statement in $block.Statements) { if ($this.AlwaysLeaves($statement)) { return $true } }
+        return $false
+    }
+
+    # The statements up to and including the first that always leaves, copied for a new parent; $null when none does.
+    hidden [System.Management.Automation.Language.StatementAst[]] Reachable([System.Collections.ObjectModel.ReadOnlyCollection[System.Management.Automation.Language.StatementAst]] $statements) {
+        for ($i = 0; $i -lt $statements.Count; $i++) {
+            if ($this.AlwaysLeaves($statements[$i]) -and $i -lt $statements.Count - 1) {
+                $kept = [System.Collections.Generic.List[System.Management.Automation.Language.StatementAst]]::new()
+                for ($j = 0; $j -le $i; $j++) { $kept.Add([System.Management.Automation.Language.StatementAst]$statements[$j].Copy()) }
+                return $kept.ToArray()
+            }
+        }
+        return $null
+    }
+
+    [System.Management.Automation.Language.Ast] Edit([System.Management.Automation.Language.Ast] $original, [System.Management.Automation.Language.Ast] $rebuilt) {
+        if ($rebuilt -is [System.Management.Automation.Language.VariableExpressionAst] -and $this.IsFixed($rebuilt) -and
+            $original.Parent -isnot [System.Management.Automation.Language.ParameterAst]) {
+            if ($original.Parent -is [System.Management.Automation.Language.AssignmentStatementAst] -and $original.Parent.Left -eq $original) {
+                throw "[$($original.Extent.StartLineNumber):$($original.Extent.StartColumnNumber)] `$$($rebuilt.VariablePath.UserPath) is fixed by the build and cannot be assigned."
+            }
+            return $this.Constant($rebuilt.Extent, $this.Values[$rebuilt.VariablePath.UserPath])
+        }
+        if ($rebuilt -is [System.Management.Automation.Language.ParamBlockAst] -and $original.Parent -eq $this.Script) {
+            $kept = [System.Collections.Generic.List[System.Management.Automation.Language.ParameterAst]]::new()
+            foreach ($parameter in $rebuilt.Parameters) { if (-not $this.Values.ContainsKey($parameter.Name.VariablePath.UserPath)) { $kept.Add([System.Management.Automation.Language.ParameterAst]$parameter.Copy()) } }
+            $attributes = [System.Management.Automation.Language.AttributeAst[]]@(foreach ($attribute in $rebuilt.Attributes) { $attribute.Copy() })
+            return [System.Management.Automation.Language.ParamBlockAst]::new($rebuilt.Extent, $attributes, $kept.ToArray())
+        }
+        if ($rebuilt -is [System.Management.Automation.Language.IfStatementAst]) {
+            $clauses = [System.Collections.Generic.List[System.Tuple[System.Management.Automation.Language.PipelineBaseAst, System.Management.Automation.Language.StatementBlockAst]]]::new()
+            $decided = $false
+            foreach ($clause in $rebuilt.Clauses) {
+                $truth = $this.Truth($clause.Item1)
+                if ($truth -eq $false) { continue }
+                $condition = [System.Management.Automation.Language.PipelineBaseAst]$clause.Item1.Copy()
+                if ($truth -eq $true) {
+                    $condition = [System.Management.Automation.Language.PipelineAst]::new($clause.Item1.Extent, [System.Management.Automation.Language.CommandExpressionAst]::new($clause.Item1.Extent, $this.Constant($clause.Item1.Extent, $true), $null))
+                }
+                $clauses.Add([System.Tuple[System.Management.Automation.Language.PipelineBaseAst, System.Management.Automation.Language.StatementBlockAst]]::new($condition, [System.Management.Automation.Language.StatementBlockAst]$clause.Item2.Copy()))
+                if ($truth -eq $true) { $decided = $true; break }
+            }
+            if ($clauses.Count -eq $rebuilt.Clauses.Count -and -not $decided) { return $rebuilt }
+            $else = $null
+            if (-not $decided -and $null -ne $rebuilt.ElseClause) {
+                if ($clauses.Count -eq 0) {
+                    $always = [System.Management.Automation.Language.PipelineAst]::new($rebuilt.Extent, [System.Management.Automation.Language.CommandExpressionAst]::new($rebuilt.Extent, $this.Constant($rebuilt.Extent, $true), $null))
+                    $clauses.Add([System.Tuple[System.Management.Automation.Language.PipelineBaseAst, System.Management.Automation.Language.StatementBlockAst]]::new($always, [System.Management.Automation.Language.StatementBlockAst]$rebuilt.ElseClause.Copy()))
+                }
+                else { $else = [System.Management.Automation.Language.StatementBlockAst]$rebuilt.ElseClause.Copy() }
+            }
+            if ($clauses.Count -eq 0) {
+                $never = [System.Management.Automation.Language.PipelineAst]::new($rebuilt.Extent, [System.Management.Automation.Language.CommandExpressionAst]::new($rebuilt.Extent, $this.Constant($rebuilt.Extent, $false), $null))
+                $empty = [System.Management.Automation.Language.StatementBlockAst]::new($rebuilt.Extent, [System.Management.Automation.Language.StatementAst[]]@(), $null)
+                $clauses.Add([System.Tuple[System.Management.Automation.Language.PipelineBaseAst, System.Management.Automation.Language.StatementBlockAst]]::new($never, $empty))
+            }
+            return [System.Management.Automation.Language.IfStatementAst]::new($rebuilt.Extent, $clauses, $else)
+        }
+        if ($rebuilt -is [System.Management.Automation.Language.StatementBlockAst]) {
+            $kept = $this.Reachable($rebuilt.Statements)
+            if ($null -ne $kept) {
+                $traps = if ($null -ne $rebuilt.Traps) { [System.Management.Automation.Language.TrapStatementAst[]]@(foreach ($trap in $rebuilt.Traps) { $trap.Copy() }) } else { $null }
+                return [System.Management.Automation.Language.StatementBlockAst]::new($rebuilt.Extent, $kept, $traps)
+            }
+        }
+        if ($rebuilt -is [System.Management.Automation.Language.NamedBlockAst]) {
+            $kept = $this.Reachable($rebuilt.Statements)
+            if ($null -ne $kept) {
+                $traps = if ($null -ne $rebuilt.Traps) { [System.Management.Automation.Language.TrapStatementAst[]]@(foreach ($trap in $rebuilt.Traps) { $trap.Copy() }) } else { $null }
+                return [System.Management.Automation.Language.NamedBlockAst]::new($rebuilt.Extent, $rebuilt.BlockKind,
+                    [System.Management.Automation.Language.StatementBlockAst]::new($rebuilt.Extent, $kept, $traps), $rebuilt.Unnamed)
+            }
+        }
+        return $rebuilt
+    }
+}
+
+# Which of a script's functions a run of it can call: those its top-level statements and its classes name, and those
+# they name in turn. A call through & or . with a computed name is not followed. Prune leaves the others out.
+class PscReachability {
+    static [System.Collections.Generic.HashSet[string]] Functions([System.Management.Automation.Language.ScriptBlockAst] $root) {
+        $defined = [System.Collections.Generic.Dictionary[string, System.Management.Automation.Language.FunctionDefinitionAst]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($found in $root.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+            $function = [System.Management.Automation.Language.FunctionDefinitionAst]$found
+            $nested = $false
+            for ($p = $function.Parent; $null -ne $p; $p = $p.Parent) {
+                if ($p -is [System.Management.Automation.Language.FunctionDefinitionAst] -or $p -is [System.Management.Automation.Language.TypeDefinitionAst]) { $nested = $true; break }
+            }
+            if (-not $nested) { $defined[$function.Name] = $function }
+        }
+        $reached = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $pending = [System.Collections.Generic.Queue[System.Management.Automation.Language.Ast]]::new()
+        foreach ($statement in $root.EndBlock.Statements) { if ($statement -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $pending.Enqueue($statement) } }
+        while ($pending.Count -gt 0) {
+            $node = $pending.Dequeue()
+            foreach ($found in $node.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+                $name = ([System.Management.Automation.Language.CommandAst]$found).GetCommandName()
+                if ($null -ne $name -and $defined.ContainsKey($name) -and $reached.Add($name)) { $pending.Enqueue($defined[$name].Body) }
+            }
+        }
+        return $reached
+    }
+
+    static [System.Management.Automation.Language.ScriptBlockAst] Prune([System.Management.Automation.Language.ScriptBlockAst] $root) {
+        $reached = [PscReachability]::Functions($root)
+        $kept = [System.Collections.Generic.List[System.Management.Automation.Language.StatementAst]]::new()
+        foreach ($statement in $root.EndBlock.Statements) {
+            if ($statement -is [System.Management.Automation.Language.FunctionDefinitionAst] -and -not $reached.Contains($statement.Name)) { continue }
+            $kept.Add([System.Management.Automation.Language.StatementAst]$statement.Copy())
+        }
+        $end = $root.EndBlock
+        [System.Management.Automation.Language.TrapStatementAst[]] $traps = $null
+        if ($null -ne $end.Traps) { $traps = @(foreach ($trap in $end.Traps) { $trap.Copy() }) }
+        $block = [System.Management.Automation.Language.NamedBlockAst]::new($end.Extent, $end.BlockKind, [System.Management.Automation.Language.StatementBlockAst]::new($end.Extent, $kept.ToArray(), $traps), $end.Unnamed)
+        $param = $null; $begin = $null; $process = $null; $clean = $null; $dynamic = $null
+        if ($null -ne $root.ParamBlock) { $param = $root.ParamBlock.Copy() }
+        if ($null -ne $root.BeginBlock) { $begin = $root.BeginBlock.Copy() }
+        if ($null -ne $root.ProcessBlock) { $process = $root.ProcessBlock.Copy() }
+        if ($null -ne $root.CleanBlock) { $clean = $root.CleanBlock.Copy() }
+        if ($null -ne $root.DynamicParamBlock) { $dynamic = $root.DynamicParamBlock.Copy() }
+        return [System.Management.Automation.Language.ScriptBlockAst]::new($root.Extent,
+            [System.Management.Automation.Language.UsingStatementAst[]]@(foreach ($using in $root.UsingStatements) { $using.Copy() }),
+            [System.Management.Automation.Language.AttributeAst[]]@(foreach ($attribute in $root.Attributes) { $attribute.Copy() }),
+            $param, $begin, $process, $block, $clean, $dynamic)
+    }
+}
+
 # Rebuilds a script with each record's class first in its end block and the record's assignment declaring the class.
 class PscRecordRewrite : PscAstRebuild {
     [System.Management.Automation.Language.ScriptBlockAst] $Root
@@ -7059,6 +7260,12 @@ class PscApi {
     }
 
     # The source with each operator whose token is a key evaluated by its method, for SMA to run.
+    # The script with -Values' parameters fixed as constants, branches they decide pruned (PscFixedParameters), and
+    # functions no longer reachable left out (PscReachability).
+    [System.Management.Automation.Language.ScriptBlockAst] FixParameters([System.Management.Automation.Language.ScriptBlockAst] $source, [hashtable] $values) {
+        return [PscReachability]::Prune([PscFixedParameters]::new($values).Fix($source))
+    }
+
     [System.Management.Automation.Language.ScriptBlockAst] BindOperators([System.Management.Automation.Language.ScriptBlockAst] $source, [System.Collections.Generic.Dictionary[System.Management.Automation.Language.TokenKind, System.Reflection.MethodInfo]] $methods) {
         return [PscOperatorRebinding]::new($methods).Rebuild($source)
     }

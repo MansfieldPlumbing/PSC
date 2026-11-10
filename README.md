@@ -2,7 +2,7 @@
 
 | Synopsis | Script | SourceSha512 | DefaultMode | Environment |
 |---|---|---|---|---|
-| A Pwsh script designed to amortize. | C:\dev\psc\Invoke-PSC.ps1 | 9288C58F84F64AF00400B5626EC86F6EA1D89A14207D03A8D45C30F83E8A536AB09105385464151335FCB8A4C332955A1D3D36CA03A36ED797CDD847871577A4 | Compile | PscEnvironment |
+| A Pwsh script designed to amortize. | C:\dev\psc\Invoke-PSC.ps1 | CFB766CE2D6BF02EF2C6FC2158A02D0693AF1A660A52C756EB91C46D90A91C404343334CD4EB75E0EAC0D0F062A9CC56B5D000914B4726CF252D4F3193F135D7 | Compile | PscEnvironment |
 
 ## Modes
 
@@ -69,15 +69,15 @@
 | C:\dev\psc\Invoke-PSC.ps1 | InvokeExpressionCommands | 0 |
 | C:\dev\psc\Invoke-PSC.ps1 | ScriptBlockCreateCalls | 0 |
 | C:\dev\psc\Invoke-PSC.ps1 | HereStrings | 1 |
-| C:\dev\psc\Invoke-PSC.ps1 | ScriptBlockExpressions | 347 |
+| C:\dev\psc\Invoke-PSC.ps1 | ScriptBlockExpressions | 349 |
 | C:\dev\psc\Invoke-PSC.ps1 | CommandsNamedByVariable | 108 |
 | C:\dev\psc\Invoke-PSC.ps1 | ScriptBlockLiteralsInvoked | 0 |
 | C:\dev\psc\Invoke-PSC.ps1 | CommandsNamedByOtherExpression | 4 |
 | C:\dev\psc\Invoke-PSC.ps1 | MemberLookupsByText | 48 |
 | C:\dev\psc\Invoke-PSC.ps1 | HashtableLiterals | 201 |
 | C:\dev\psc\Invoke-PSC.ps1 | HashtableRecords | 78 |
-| C:\dev\psc\Invoke-PSC.ps1 | QuotedTextConstants | 1576 |
-| C:\dev\psc\Invoke-PSC.ps1 | ExpandableTexts | 140 |
+| C:\dev\psc\Invoke-PSC.ps1 | QuotedTextConstants | 1587 |
+| C:\dev\psc\Invoke-PSC.ps1 | ExpandableTexts | 142 |
 | C:\dev\psc\Invoke-PSC.ps1 | NamespaceUsings | 0 |
 | C:\dev\psc\Invoke-PSC.ps1 | RegexUses | 20 |
 
@@ -87,4 +87,4 @@ Get-ProjectRemote, Get-Projects, Test-DriveRooted, Get-UnitProfile, Invoke-SmaPr
 
 ## Classes
 
-SmaUnit, SmaEdge, SmaSource, SmaCoverage, SmaAbsence, SmaChange, SmaProject, PscDifferential, PowerShellSemantics, PscBinding, PscEnvironment, PscOperatorKind, PscBoundOperands, PscOperandBinding, PowerShellNumericOperands, PscParameter, PscOperation, PscAstRebuild, PscNativeEntry, PscNativeCalls, PscNativeStubFill, PscOperatorRebinding, PscRecordSlot, PscRecord, PscRecordRewrite, PscApi, PscMeasure, PscSource, PscMeasurementMethod, AddTypeCommands, AddTypeSourceText, InvokeExpressionCommands, ScriptBlockCreateCalls, HereStrings, ScriptBlockExpressions, CommandsNamedByVariable, ScriptBlockLiteralsInvoked, CommandsNamedByOtherExpression, MemberLookupsByText, HashtableLiterals, HashtableRecords, QuotedTextConstants, ExpandableTexts, NamespaceUsings, RegexUses, PscGuard, PscPredicateKind, PscOperandOrigin, PscOperand, PscPredicate, PscCondition, PscDerivedCheck, PscBlocked, PscObservation, PscInvestigation, PscInstrument, ParseInstrument, ParseErrorInstrument, MeasureInstrument, DerivedCheckInstrument, ReferenceInstrument, PscOutcome, PscRelation, PscComparison, PscNotExecuted, PscBindingEvaluation, PscIncludedScript, PscConsolidation, PscConsolidationState, PscMemberLowering, MemberLoweringInstrument, LowerInstrument, InterpretInstrument, CompareInstrument
+SmaUnit, SmaEdge, SmaSource, SmaCoverage, SmaAbsence, SmaChange, SmaProject, PscDifferential, PowerShellSemantics, PscBinding, PscEnvironment, PscOperatorKind, PscBoundOperands, PscOperandBinding, PowerShellNumericOperands, PscParameter, PscOperation, PscAstRebuild, PscNativeEntry, PscNativeCalls, PscNativeStubFill, PscOperatorRebinding, PscRecordSlot, PscRecord, PscFixedParameters, PscReachability, PscRecordRewrite, PscApi, PscMeasure, PscSource, PscMeasurementMethod, AddTypeCommands, AddTypeSourceText, InvokeExpressionCommands, ScriptBlockCreateCalls, HereStrings, ScriptBlockExpressions, CommandsNamedByVariable, ScriptBlockLiteralsInvoked, CommandsNamedByOtherExpression, MemberLookupsByText, HashtableLiterals, HashtableRecords, QuotedTextConstants, ExpandableTexts, NamespaceUsings, RegexUses, PscGuard, PscPredicateKind, PscOperandOrigin, PscOperand, PscPredicate, PscCondition, PscDerivedCheck, PscBlocked, PscObservation, PscInvestigation, PscInstrument, ParseInstrument, ParseErrorInstrument, MeasureInstrument, DerivedCheckInstrument, ReferenceInstrument, PscOutcome, PscRelation, PscComparison, PscNotExecuted, PscBindingEvaluation, PscIncludedScript, PscConsolidation, PscConsolidationState, PscMemberLowering, MemberLoweringInstrument, LowerInstrument, InterpretInstrument, CompareInstrument

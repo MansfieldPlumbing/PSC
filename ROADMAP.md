@@ -76,10 +76,13 @@ and 10); the reusable Fluent framework (item 14) after it.
    - The entry point: the script's top-level statements as `Main(string[])`, its `param()` block bound from the
      command line as PowerShell binds a script's parameters (named, positional, switches, `ValidateSet`), script
      variables as the function class's static fields.
-   - Development-only code (the Verify functions, `Invoke-NotepadComparison`, `-Compare`, `-DiagnosticPath`)
-     out of the native build. Proposed: the build fixes those switches to their defaults as compile-time
-     constants, the branches they guard are pruned, and functions no longer reachable from the entry point are
-     not compiled. Scott to decide.
+   - Development-only code out of the native build (decided by Scott): `$api.FixParameters` fixes chosen script
+     parameters as constants, drops the branches they decide and the statements after one that always leaves,
+     and leaves out functions nothing reachable calls. On Notepad, fixing its 14 development switches leaves 61 of
+     65 functions (the three Verify functions and `Invoke-NotepadComparison` go), the nine runtime parameters, and
+     `Write-ApplicationDiagnostic` as its `return`. Of the 36 refused members, 31 remain in the build (derived:
+     Investigate examines files, not a rebuilt AST, so it does not yet measure the build itself). Compile is to
+     take the fixed values.
    - `Invoke-Design`'s `data { }` section: a data section admits only literals, so it lowers as the hashtables and
      arrays it builds (static data today takes only numbers, strings and their arrays).
    PSC's Compile mode takes classes; a script's function class, its script
