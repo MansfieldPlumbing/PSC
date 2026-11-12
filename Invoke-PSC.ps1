@@ -9438,6 +9438,41 @@ $script:NativeFeatureSwitches = [ordered]@{
     'System.Linq.Expressions.CanEmitObjectArrayDelegate' = $false
 }
 
+# The runtime's own assemblies ILC initializes in every image, whatever the program references.
+$script:NativeInitialAssemblies = [string[]]@('System.Private.CoreLib', 'System.Private.StackTraceMetadata', 'System.Private.TypeLoader', 'System.Private.Reflection.Execution')
+
+# The simple names of the assemblies an assembly references, read from its metadata.
+function Get-AssemblyReferenceName {
+    param([Parameter(Mandatory)][string] $Path)
+    $stream = [IO.File]::OpenRead($Path)
+    $reader = [Reflection.PortableExecutable.PEReader]::new($stream)
+    try {
+        $metadata = [Reflection.Metadata.PEReaderExtensions]::GetMetadataReader($reader)
+        foreach ($handle in $metadata.AssemblyReferences) { $metadata.GetString($metadata.GetAssemblyReference($handle).Name) }
+    } finally { $reader.Dispose(); $stream.Dispose() }
+}
+
+# The assemblies ILC reads for one program: those the lowered assembly references and the runtime's initial
+# assemblies, with everything they reference in turn, found among the Native AOT runtime's assemblies. ILC compiles
+# only what is reachable from these, so the rest of the framework leaves the object unchanged (measured on Notepad:
+# 15 of 186 assemblies, byte-identical object). A name the runtime does not carry is left for ILC to report.
+function Get-NativeReferenceClosure {
+    param(
+        [Parameter(Mandatory)][string] $AssemblyPath,
+        [Parameter(Mandatory)][string[]] $Directory
+    )
+    $available = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in Get-ChildItem -LiteralPath $Directory -File -Filter *.dll) { $available[$file.BaseName] = $file.FullName }
+    $closure = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $pending = [Collections.Generic.Queue[string]]::new([string[]]@(@(Get-AssemblyReferenceName -Path $AssemblyPath) + $script:NativeInitialAssemblies))
+    while ($pending.Count) {
+        $name = $pending.Dequeue()
+        if (-not $available.ContainsKey($name) -or -not $closure.Add($available[$name])) { continue }
+        foreach ($reference in Get-AssemblyReferenceName -Path $available[$name]) { $pending.Enqueue($reference) }
+    }
+    [string[]]@($closure | Sort-Object)
+}
+
 function Export-NativeImage {
     param(
         [Parameter(Mandatory)][string] $AssemblyPath,
@@ -9455,10 +9490,10 @@ function Export-NativeImage {
     $arguments = [System.Collections.Generic.List[string]]::new()
     $arguments.Add($AssemblyPath)
     $arguments.Add('-o:' + $object)
-    foreach ($reference in Get-ChildItem -LiteralPath $managed, $native -File -Filter *.dll | Sort-Object FullName) { $arguments.Add('-r:' + $reference.FullName) }
+    foreach ($reference in Get-NativeReferenceClosure -AssemblyPath $AssemblyPath -Directory $managed, $native) { $arguments.Add('-r:' + $reference) }
+    foreach ($assembly in $script:NativeInitialAssemblies) { $arguments.Add('--initassembly:' + $assembly) }
     foreach ($option in '--targetos:win', '--targetarch:x64', '-O',
         '--export-dynamic-symbol:DotNetRuntimeDebugHeader,DATA', '--export-dynamic-symbol:DotNetRuntimeContractDescriptor,DATA',
-        '--initassembly:System.Private.CoreLib', '--initassembly:System.Private.StackTraceMetadata', '--initassembly:System.Private.TypeLoader', '--initassembly:System.Private.Reflection.Execution',
         '--directpinvoke:System.Globalization.Native', '--directpinvoke:System.IO.Compression.Native',
         ('--directpinvokelist:' + (Join-Path $toolset.Build 'build\WindowsAPIs.txt')),
         '--stacktracedata:frames', '--scanreflection', '--methodbodyfolding:generic', '--singlewarn', '--resilient',
