@@ -10,7 +10,7 @@
 
 **Declaration forms.** PowerShell classes cannot yet declare value types, generic types, interfaces, property accessors, events or real visibility (`hidden` is display, not access). Each is added as a form SMA's parser sees, through keywords registered with `DynamicKeyword` (as PSC does for methods marked `[Keyword()]`) or attributes, and lowered to its IL equivalent with lowering tests. Never rewrite source text or run a second parser.
 
-**One namespace, named at compile.** Source declares no namespaces and uses no `using namespace`; a program is one script. When PSC compiles a program it places every type the program declares in one namespace named for the program (Notepad.exe in `Notepad`; PSC itself, compiled to one managed assembly, in `PSC`), so a compiled program never collides with anything else. Today PSC emits into the global namespace; this is the target.
+**One namespace per program.** A program is one script, so its types share one namespace. Source may name it; when it does not, PSC names it for the program at compile (Notepad.exe in `Notepad`; PSC itself, compiled to one managed assembly, in `PSC`), so a compiled program does not collide with anything else. Today PSC emits into the global namespace; this is the target.
 
 **Structural integrity.** Never substitute strings for structured language constructs, typed references, semantic identities or executable bindings. Compiled assemblies and IL are read as input; C# is never authored, compiled, generated or kept as truth. Do not use scriptblocks to bypass typed compilation, semantic analysis or source-level accountability. Never use regular expressions to parse, interpret or transform programming-language syntax when SMA's tokenizer, AST or semantic facilities can do it.
 
