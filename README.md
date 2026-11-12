@@ -1,8 +1,10 @@
 # PSC
 
+The Treachery of Images. Magritte painted a pipe and wrote beneath it "Ceci n'est pas une pipe": the picture is not the pipe. PSC works by the same distinction. A handle is not what it identifies, #FF8000 is not the colour, a script's text is not its meaning, and a measurement is a picture of what happened, not what happened.
+
 | Synopsis | Script | SourceSha512 | DefaultMode | Environment |
 |---|---|---|---|---|
-| A Pwsh script designed to amortize. | C:\Dev\PSC\Invoke-PSC.ps1 | 67758B7CFFF80BA1DE0EEE764F813EF9F30931E63CB7E27756E899B1AE564DBED2A57660C14930D3B1DA3631FCC2B5A746B2EF54FDF1E1B427A408A03700E7CE | Compile | PscEnvironment |
+| A Pwsh script designed to amortize. | C:\Dev\PSC\Invoke-PSC.ps1 | CEF736ED670ACF2B9CC3C85D87D9C428E7EC579D8666E970E856947D32A22354503DFF775D60A334FB63649433EBADF41126782872A00AF56837E55979C5F21D | Compile | PscEnvironment |
 
 ## Modes
 
@@ -76,14 +78,14 @@
 | C:\Dev\PSC\Invoke-PSC.ps1 | InvokeExpressionCommands | 0 |
 | C:\Dev\PSC\Invoke-PSC.ps1 | ScriptBlockCreateCalls | 0 |
 | C:\Dev\PSC\Invoke-PSC.ps1 | HereStrings | 1 |
-| C:\Dev\PSC\Invoke-PSC.ps1 | ScriptBlockExpressions | 414 |
+| C:\Dev\PSC\Invoke-PSC.ps1 | ScriptBlockExpressions | 415 |
 | C:\Dev\PSC\Invoke-PSC.ps1 | CommandsNamedByVariable | 135 |
 | C:\Dev\PSC\Invoke-PSC.ps1 | ScriptBlockLiteralsInvoked | 0 |
 | C:\Dev\PSC\Invoke-PSC.ps1 | CommandsNamedByOtherExpression | 5 |
 | C:\Dev\PSC\Invoke-PSC.ps1 | MemberLookupsByText | 64 |
 | C:\Dev\PSC\Invoke-PSC.ps1 | HashtableLiterals | 224 |
 | C:\Dev\PSC\Invoke-PSC.ps1 | HashtableRecords | 80 |
-| C:\Dev\PSC\Invoke-PSC.ps1 | QuotedTextConstants | 1556 |
+| C:\Dev\PSC\Invoke-PSC.ps1 | QuotedTextConstants | 1559 |
 | C:\Dev\PSC\Invoke-PSC.ps1 | ExpandableTexts | 152 |
 | C:\Dev\PSC\Invoke-PSC.ps1 | NamespaceUsings | 0 |
 | C:\Dev\PSC\Invoke-PSC.ps1 | RegexUses | 19 |

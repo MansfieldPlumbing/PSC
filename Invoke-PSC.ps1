@@ -81,6 +81,10 @@
     & ./Invoke-PSC.ps1 -Mode Capability
 .EXAMPLE
     $pwsh = & ./Invoke-PSC.ps1 -Mode PowerShell
+.NOTES
+    The Treachery of Images. Magritte painted a pipe and wrote beneath it "Ceci n'est pas une pipe": the picture is not
+    the pipe. PSC works by the same distinction. A handle is not what it identifies, #FF8000 is not the colour, a
+    script's text is not its meaning, and a measurement is a picture of what happened, not what happened.
 #>
 [CmdletBinding()]
 param(
@@ -8620,6 +8624,8 @@ class PscApi {
     [string[]] $Functions
     [string[]] $Classes
     [PscEnvironment] $Environment
+    # The script help's notes as one paragraph; the README prints it as prose, not as a table column.
+    hidden [string] $Notes
     hidden [System.Management.Automation.Language.ScriptBlockAst] $Ast
 
     # Sets a binding in this API's environment; the newest binding for its target wins.
@@ -8743,6 +8749,7 @@ function Get-PscApi {
     $help = $ast.GetHelpContent()
     $api = [PscApi]::new()
     $api.Synopsis = if ($help) { $help.Synopsis.Trim() } else { $null }
+    $api.Notes = if ($help -and $help.Notes) { [string]::Join(' ', [string[]]@($help.Notes.Split("`n").Trim() | Where-Object { $_ })) } else { $null }
     $api.Script = $PSCommandPath
     $api.SourceSha512 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA512).Hash
     $api.DefaultMode = $scriptParameters['Mode'].DefaultValue.SafeGetValue()
@@ -8822,6 +8829,7 @@ function ConvertTo-PscReadme {
     param([Parameter(Mandatory)][PscApi] $Api)
     '# PSC'
     ''
+    if ($Api.Notes) { $Api.Notes; '' }
     $presented = @(Get-PscPresentedProperty -Type ([PscApi]))
     ConvertTo-PscMarkdownTable -Columns @($presented | Where-Object { -not $_.PropertyType.IsArray }) -Rows @($Api)
     foreach ($property in $presented | Where-Object { $_.PropertyType.IsArray }) {
