@@ -1,0 +1,40 @@
+name: PSC CS2PS acquisition
+on:
+  push:
+    branches: [integrate-cs2ps-semantics]
+  workflow_dispatch:
+jobs:
+  semantic-acquisition:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Parse, admit and reject C# sources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tokens = $null; $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+              (Join-Path $PWD 'Invoke-PSC.ps1'), [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw "PSC parse failed: $($errors -join '; ')" }
+          $api = & ./Invoke-PSC.ps1 -Mode Api
+          if ('CSharp' -notin $api.Modes.Mode) { throw 'CSharp mode is not discoverable.' }
+          @'
+          public class Redline {
+              public static int Multiply(int x, int y) { return x * y; }
+          }
+          '@ | Set-Content -Path ./positive.cs
+          $ok = & ./Invoke-PSC.ps1 -Mode CSharp -SourcePath ./positive.cs -OutputPath ./positive.ps1 -CSharpClassOnly
+          if (-not $ok.Admitted -or -not $ok.PowerShellAst -or -not $ok.CSharpModel) {
+              throw ("CSharp positive case was not admitted: " + ($ok.Diagnostics | Out-String))
+          }
+          if (-not (Test-Path ./positive.ps1)) { throw 'Admitted output was not written.' }
+          @'
+          public class Generic<T> {
+              public T Identity(T value) { return value; }
+          }
+          '@ | Set-Content -Path ./rejected.cs
+          $negative = & ./Invoke-PSC.ps1 -Mode CSharp -SourcePath ./rejected.cs -OutputPath ./rejected.ps1 -CSharpClassOnly
+          if ($negative.Admitted -or $negative.Diagnostics.Count -eq 0 -or (Test-Path ./rejected.ps1)) {
+              throw 'Unsupported generics must fail closed without writing code.'
+          }
+          "PSC+CS2PS smoke passed: methods=$($ok.Methods.Count), rejected=$($negative.Diagnostics.Count)"
