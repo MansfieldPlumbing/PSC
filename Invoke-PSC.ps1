@@ -11796,11 +11796,42 @@ class CompareInstrument : PscInstrument {
 
 # CS2PS is folded into PSC: no external implementation source at runtime.
 # The private invocation scope isolates its functions from PSC's function table.
+# Roslyn symbol references remain the identities. The labels emitted by
+# ToDisplayString are not used as keys or as authorities for type compatibility.
+class PscCSharpTypeBearing {
+    [object] $Syntax
+    [object] $Symbol
+    [object] $DefinitionSymbol
+    [object[]] $ArgumentSymbols
+    [object[]] $ParameterSymbols
+    [object[]] $ConstraintSymbols
+    [bool] $Closed
+}
+class PscCSharpCallBearing {
+    [object] $Syntax
+    [object] $Symbol
+    [object] $DefinitionSymbol
+    [object] $OwnerSymbol
+    [object[]] $ParameterSymbols
+    [object[]] $MethodArgumentSymbols
+    [object] $ReturnSymbol
+}
+class PscCSharpBoundEvidence {
+    [PscCSharpTypeBearing[]] $Types
+    [PscCSharpCallBearing[]] $Calls
+}
+
 class PscCSharpAcquisition {
     [string] $Source
     [string] $PowerShell
     [string] $OutputPath
+    # Admitted means source was emitted as valid SMA; RoslynAdmitted
+    # independently means the original C# passed semantic compilation.
     [bool] $Admitted
+    [bool] $RoslynAdmitted
+    [object[]] $RoslynDiagnostics
+    [PscCSharpTypeBearing[]] $BoundTypes
+    [PscCSharpCallBearing[]] $BoundCalls
     [object[]] $Diagnostics
     [object[]] $Methods
     [object[]] $Types
@@ -13617,6 +13648,69 @@ function Convert-Increment($e, [bool] $postfix) {
 }
 
 
+
+    # Structural and nominal relations are retained separately. A closed
+    # specialization cannot be inferred from its formatted name: test nested
+    # type arguments recursively, including generic types nested in another.
+    function Test-PscCSharpClosedType([object] $Symbol) {
+        if ($null -eq $Symbol) { return $false }
+        if ($Symbol -is [Microsoft.CodeAnalysis.ITypeParameterSymbol]) { return $false }
+        if ($Symbol -is [Microsoft.CodeAnalysis.IArrayTypeSymbol]) {
+            return Test-PscCSharpClosedType $Symbol.ElementType
+        }
+        if ($Symbol -is [Microsoft.CodeAnalysis.IPointerTypeSymbol]) {
+            return Test-PscCSharpClosedType $Symbol.PointedAtType
+        }
+        if ($Symbol -is [Microsoft.CodeAnalysis.INamedTypeSymbol]) {
+            if ($null -ne $Symbol.ContainingType -and -not (Test-PscCSharpClosedType $Symbol.ContainingType)) {
+                return $false
+            }
+            foreach ($argument in $Symbol.TypeArguments) {
+                if (-not (Test-PscCSharpClosedType $argument)) { return $false }
+            }
+        }
+        return $true
+    }
+
+    function Get-PscCSharpBoundEvidence([object] $SemanticModel) {
+        $typeBearings = [Collections.Generic.List[PscCSharpTypeBearing]]::new()
+        $callBearings = [Collections.Generic.List[PscCSharpCallBearing]]::new()
+        foreach ($site in $SemanticModel.SyntaxTree.GetRoot().DescendantNodes()) {
+            if ($site -is [Microsoft.CodeAnalysis.CSharp.Syntax.GenericNameSyntax]) {
+                $symbol = $SemanticModel.GetTypeInfo($site).Type
+                if ($symbol -isnot [Microsoft.CodeAnalysis.INamedTypeSymbol] -or $symbol.TypeArguments.Length -eq 0) { continue }
+                $bearing = [PscCSharpTypeBearing]::new()
+                $bearing.Syntax = $site
+                $bearing.Symbol = $symbol
+                $bearing.DefinitionSymbol = $symbol.OriginalDefinition
+                $bearing.ArgumentSymbols = [object[]]@($symbol.TypeArguments)
+                $bearing.ParameterSymbols = [object[]]@($bearing.DefinitionSymbol.TypeParameters)
+                $bearing.ConstraintSymbols = [object[]]@($bearing.DefinitionSymbol.TypeParameters | ForEach-Object { $_.ConstraintTypes })
+                $bearing.Closed = Test-PscCSharpClosedType $symbol
+                $typeBearings.Add($bearing)
+                continue
+            }
+            if ($site -isnot [Microsoft.CodeAnalysis.CSharp.Syntax.InvocationExpressionSyntax] -and
+                $site -isnot [Microsoft.CodeAnalysis.CSharp.Syntax.ObjectCreationExpressionSyntax] -and
+                $site -isnot [Microsoft.CodeAnalysis.CSharp.Syntax.ImplicitObjectCreationExpressionSyntax]) { continue }
+            $symbol = $SemanticModel.GetSymbolInfo($site).Symbol
+            if ($symbol -isnot [Microsoft.CodeAnalysis.IMethodSymbol]) { continue }
+            $bearing = [PscCSharpCallBearing]::new()
+            $bearing.Syntax = $site
+            $bearing.Symbol = $symbol
+            $bearing.DefinitionSymbol = $symbol.OriginalDefinition
+            $bearing.OwnerSymbol = $symbol.ContainingType
+            $bearing.ParameterSymbols = [object[]]@($symbol.Parameters | ForEach-Object { $_.Type })
+            $bearing.MethodArgumentSymbols = [object[]]@($symbol.TypeArguments)
+            $bearing.ReturnSymbol = $symbol.ReturnType
+            $callBearings.Add($bearing)
+        }
+        $evidence = [PscCSharpBoundEvidence]::new()
+        $evidence.Types = $typeBearings.ToArray()
+        $evidence.Calls = $callBearings.ToArray()
+        $evidence
+    }
+
     $sourceFullPath = [IO.Path]::GetFullPath($SourcePath)
     if (-not [IO.File]::Exists($sourceFullPath)) { throw "C# source not found: $sourceFullPath" }
     $translation = ConvertFrom-CSharp -Path $sourceFullPath -ClassOnly:$ClassOnly -Define $Define -ReferencePath $ReferencePath
@@ -13628,11 +13722,23 @@ function Convert-Increment($e, [bool] $postfix) {
     $result.Types = if ($null -ne $translation.Types) { [object[]]@($translation.Types) } else { [object[]]@() }
     $result.ApiCalls = if ($null -ne $translation.ApiCalls) { [object[]]@($translation.ApiCalls) } else { [object[]]@() }
     $result.CSharpModel = $script:Model
-    if ($null -ne $script:Model) { $result.CSharpSyntaxTree = $script:Model.SyntaxTree }
+    if ($null -ne $script:Model) {
+        $result.CSharpSyntaxTree = $script:Model.SyntaxTree
+        $result.RoslynDiagnostics = [object[]]@($script:Model.Compilation.GetDiagnostics() |
+            Where-Object { $_.Severity -eq [Microsoft.CodeAnalysis.DiagnosticSeverity]::Error })
+        $result.RoslynAdmitted = $result.RoslynDiagnostics.Length -eq 0
+        $evidence = Get-PscCSharpBoundEvidence $script:Model
+        $result.BoundTypes = $evidence.Types
+        $result.BoundCalls = $evidence.Calls
+    } else {
+        $result.RoslynDiagnostics = [object[]]@()
+        $result.BoundTypes = [PscCSharpTypeBearing[]]@()
+        $result.BoundCalls = [PscCSharpCallBearing[]]@()
+    }
     $tokens = $null; $parseErrors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseInput($result.PowerShell, $sourceFullPath, [ref]$tokens, [ref]$parseErrors)
     if ($parseErrors.Count -gt 0) { throw ("CS2PS emitted invalid SMA syntax: " + ($parseErrors -join '; ')) }
-    if ($result.Diagnostics.Length -eq 0) {
+    if ($result.RoslynAdmitted -and $result.Diagnostics.Length -eq 0) {
         $result.Admitted = $true
         $result.PowerShellAst = $ast
         if ($OutputPath) {
