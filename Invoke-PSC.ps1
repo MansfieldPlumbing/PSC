@@ -11830,6 +11830,7 @@ class PscCSharpAcquisition {
     [bool] $Admitted
     [bool] $RoslynAdmitted
     [object[]] $RoslynDiagnostics
+    [System.Management.Automation.ErrorRecord] $TranslationError
     [PscCSharpTypeBearing[]] $BoundTypes
     [PscCSharpCallBearing[]] $BoundCalls
     [object[]] $Diagnostics
@@ -13711,41 +13712,80 @@ function Convert-Increment($e, [bool] $postfix) {
         $evidence
     }
 
+
+    function Get-PscCSharpSemanticModel([string] $FullPath, [string[]] $Symbols, [string[]] $References) {
+        Initialize-Roslyn
+        $syntax = [Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree]::ParseText(
+            [IO.File]::ReadAllText($FullPath),
+            [Microsoft.CodeAnalysis.CSharp.CSharpParseOptions]::Default.WithPreprocessorSymbols($Symbols),
+            $FullPath)
+        $refs = [Collections.Generic.List[Microsoft.CodeAnalysis.MetadataReference]]::new()
+        $runtimeDir = [IO.Path]::GetDirectoryName([object].Assembly.Location)
+        foreach ($name in 'System.Private.CoreLib.dll','System.Runtime.dll','System.Collections.dll','System.Console.dll') {
+            $refs.Add([Microsoft.CodeAnalysis.MetadataReference]::CreateFromFile((Join-Path $runtimeDir $name)))
+        }
+        foreach ($reference in $References) {
+            $refs.Add([Microsoft.CodeAnalysis.MetadataReference]::CreateFromFile((Resolve-Path -LiteralPath $reference).Path))
+        }
+        $compilation = [Microsoft.CodeAnalysis.CSharp.CSharpCompilation]::Create(
+            'PSC.CSharpSemantic', [Microsoft.CodeAnalysis.SyntaxTree[]]@($syntax), $refs,
+            [Microsoft.CodeAnalysis.CSharp.CSharpCompilationOptions]::new(
+                [Microsoft.CodeAnalysis.OutputKind]::DynamicallyLinkedLibrary))
+        $compilation.GetSemanticModel($syntax)
+    }
+
     $sourceFullPath = [IO.Path]::GetFullPath($SourcePath)
     if (-not [IO.File]::Exists($sourceFullPath)) { throw "C# source not found: $sourceFullPath" }
-    $translation = ConvertFrom-CSharp -Path $sourceFullPath -ClassOnly:$ClassOnly -Define $Define -ReferencePath $ReferencePath
     $result = [PscCSharpAcquisition]::new()
     $result.Source = $sourceFullPath
-    $result.PowerShell = $translation.PowerShell
-    $result.Diagnostics = [object[]]@($translation.Diagnostics)
-    $result.Methods = if ($null -ne $translation.Methods) { [object[]]@($translation.Methods) } else { [object[]]@() }
-    $result.Types = if ($null -ne $translation.Types) { [object[]]@($translation.Types) } else { [object[]]@() }
-    $result.ApiCalls = if ($null -ne $translation.ApiCalls) { [object[]]@($translation.ApiCalls) } else { [object[]]@() }
-    $result.CSharpModel = $script:Model
-    if ($null -ne $script:Model) {
-        $result.CSharpSyntaxTree = $script:Model.SyntaxTree
-        $result.RoslynDiagnostics = [object[]]@($script:Model.Compilation.GetDiagnostics() |
-            Where-Object { $_.Severity -eq [Microsoft.CodeAnalysis.DiagnosticSeverity]::Error })
-        $result.RoslynAdmitted = $result.RoslynDiagnostics.Length -eq 0
-        $evidence = Get-PscCSharpBoundEvidence $script:Model
-        $result.BoundTypes = $evidence.Types
-        $result.BoundCalls = $evidence.Calls
-    } else {
-        $result.RoslynDiagnostics = [object[]]@()
-        $result.BoundTypes = [PscCSharpTypeBearing[]]@()
-        $result.BoundCalls = [PscCSharpCallBearing[]]@()
+
+    # Acquire independently: neither C#->PowerShell translation admission nor a
+    # translator exception can erase successfully bound Roslyn identities.
+    $model = Get-PscCSharpSemanticModel $sourceFullPath $Define $ReferencePath
+    $result.CSharpModel = $model
+    $result.CSharpSyntaxTree = $model.SyntaxTree
+    $result.RoslynDiagnostics = [object[]]@($model.Compilation.GetDiagnostics() |
+        Where-Object { $_.Severity -eq [Microsoft.CodeAnalysis.DiagnosticSeverity]::Error })
+    $result.RoslynAdmitted = $result.RoslynDiagnostics.Length -eq 0
+    $evidence = Get-PscCSharpBoundEvidence $model
+    $result.BoundTypes = $evidence.Types
+    $result.BoundCalls = $evidence.Calls
+
+    # Translation is a second admission gate. Its diagnostics are preserved,
+    # but they cannot revoke the semantic graph already acquired above.
+    $translation = $null
+    $result.Diagnostics = [object[]]@($result.RoslynDiagnostics)
+    if ($result.RoslynAdmitted) {
+        try {
+            $translation = ConvertFrom-CSharp -Path $sourceFullPath -ClassOnly:$ClassOnly -Define $Define -ReferencePath $ReferencePath
+            $result.PowerShell = $translation.PowerShell
+            $result.Diagnostics = [object[]]@($translation.Diagnostics)
+            $result.Methods = if ($null -ne $translation.Methods) { [object[]]@($translation.Methods) } else { [object[]]@() }
+            $result.Types = if ($null -ne $translation.Types) { [object[]]@($translation.Types) } else { [object[]]@() }
+            $result.ApiCalls = if ($null -ne $translation.ApiCalls) { [object[]]@($translation.ApiCalls) } else { [object[]]@() }
+        } catch {
+            $result.TranslationError = $_
+            $result.Diagnostics = [object[]]@($_)
+        }
     }
-    $tokens = $null; $parseErrors = $null
-    $ast = [System.Management.Automation.Language.Parser]::ParseInput($result.PowerShell, $sourceFullPath, [ref]$tokens, [ref]$parseErrors)
-    if ($parseErrors.Count -gt 0) { throw ("CS2PS emitted invalid SMA syntax: " + ($parseErrors -join '; ')) }
-    if ($result.RoslynAdmitted -and $result.Diagnostics.Length -eq 0) {
-        $result.Admitted = $true
-        $result.PowerShellAst = $ast
-        if ($OutputPath) {
-            $fullOutput = [IO.Path]::GetFullPath($OutputPath)
-            [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($fullOutput))
-            [IO.File]::WriteAllText($fullOutput, $result.PowerShell, [Text.UTF8Encoding]::new($false))
-            $result.OutputPath = $fullOutput
+
+    # No executable result is admitted if conversion failed, Roslyn failed,
+    # or SMA rejects the generated syntax. Diagnostic-only results remain live.
+    if ($null -ne $translation -and $result.RoslynAdmitted -and $result.Diagnostics.Length -eq 0) {
+        $tokens = $null; $parseErrors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+            $result.PowerShell, $sourceFullPath, [ref]$tokens, [ref]$parseErrors)
+        if ($parseErrors.Count) {
+            $result.Diagnostics = [object[]]@($parseErrors)
+        } else {
+            $result.Admitted = $true
+            $result.PowerShellAst = $ast
+            if ($OutputPath) {
+                $fullOutput = [IO.Path]::GetFullPath($OutputPath)
+                [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($fullOutput))
+                [IO.File]::WriteAllText($fullOutput, $result.PowerShell, [Text.UTF8Encoding]::new($false))
+                $result.OutputPath = $fullOutput
+            }
         }
     }
     $result
