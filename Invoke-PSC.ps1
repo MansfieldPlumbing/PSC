@@ -46,11 +46,11 @@
 .PARAMETER SourcePath
     Source file containing typed PowerShell classes.
 .PARAMETER CSharpClassOnly
-    CSharp: emit eligible type declarations and class methods only; reject unsupported bodies.
+    CSharp: translate eligible C# class declarations and methods only.
 .PARAMETER CSharpDefine
-    CSharp: preprocessing symbols supplied to Roslyn.
+    CSharp: C# preprocessing symbols.
 .PARAMETER CSharpReferencePath
-    CSharp: explicit reference assembly paths supplied to Roslyn.
+    CSharp: explicit Roslyn reference assembly paths.
 .PARAMETER SourceAst
     Retained ScriptBlockAst to compile directly, as an alternative to SourcePath.
 .PARAMETER ClassNames
@@ -109,7 +109,7 @@ param(
     [string[]] $InvestigatePath,
     [string] $ProfilePath,
     [string] $SourcePath,
-    # CSharp: retain Roslyn's semantic model and the resulting SMA tree in one typed result.
+    # CSharp: preserve Roslyn's bound model alongside the SMA tree.
     [switch] $CSharpClassOnly,
     [string[]] $CSharpDefine = @(),
     [string[]] $CSharpReferencePath = @(),
@@ -11794,9 +11794,8 @@ class CompareInstrument : PscInstrument {
 }
 
 
-# C# acquisition is part of PSC's source, not a runtime dependency on another repository.
-# A private invocation scope prevents name collisions (notably Get-VariableName).
-# The returned Roslyn semantic model and parsed SMA source retain their object identities.
+# CS2PS is folded into PSC: no external implementation source at runtime.
+# The private invocation scope isolates its functions from PSC's function table.
 class PscCSharpAcquisition {
     [string] $Source
     [string] $PowerShell
@@ -11821,10 +11820,9 @@ function Invoke-PscCSharpAcquisition {
         [string[]] $Define = @(),
         [string[]] $ReferencePath = @()
     )
-    # The following source is compiled as local function declarations; it is
-    # not dot-sourced and cannot override PSC's own Get-VariableName.
+    # The three source units below declare invocation-local functions.
 
-# Upstream source: MansfieldPlumbing/cs2ps/src/DotNetApiCatalog.ps1
+# Upstream: MansfieldPlumbing/cs2ps/src/DotNetApiCatalog.ps1
 # Metadata discovery does not load or execute the assemblies being inventoried.
 function Get-CS2PSApiId($Symbol) {
     [Microsoft.CodeAnalysis.DocumentationCommentId]::CreateDeclarationId($Symbol.OriginalDefinition)
@@ -12035,7 +12033,7 @@ function Get-CS2PSApiDependencyClosure {
     [pscustomobject]@{Assemblies=@($visited | Sort-Object -CaseSensitive); Edges=@($edges); Missing=@($edges | Where-Object Status -CEQ 'Missing'); IdentityMismatches=@($edges | Where-Object Status -CEQ 'DifferentVersionOrIdentity'); ExactOnly=[bool]$ExactOnly; Scope='Assembly-reference discovery graph; not execution or per-method dependency closure'}
 }
 
-# Upstream source: MansfieldPlumbing/cs2ps/src/SemanticCorrespondence.ps1
+# Upstream: MansfieldPlumbing/cs2ps/src/SemanticCorrespondence.ps1
 # Call correspondence rules annotate Roslyn operations; they are not another IR.
 function ConvertTo-CS2PSExpressionAst([string] $Text) {
     $tokens = $null; $errors = $null
@@ -12154,7 +12152,7 @@ function Get-CS2PSInvocationCorrespondence($Method, $Expression, [string[]] $Val
     }
 }
 
-# Upstream source: MansfieldPlumbing/cs2ps/src/ConvertFrom-CSharp.ps1
+# Upstream: MansfieldPlumbing/cs2ps/src/ConvertFrom-CSharp.ps1
 <#
 .SYNOPSIS
     Translates C# static methods into typed, idiomatic PowerShell functions.
@@ -12829,7 +12827,7 @@ function Convert-TypeDeclaration($node) {
             if (-not (Test-SupportedValueType $f.Type)) { Add-Diagnostic $v 'unsupported field type' }
             $static = if ($f.IsStatic) { 'static ' } else { '' }
             $default = if (Test-SourceStruct $f.Type) { " = [$(Get-PsTypeName $f.Type)]::new()" } else { '' }
-            $text += "    $static[$(Get-StorageType $f.Type $f)] `$(Get-FieldName $f)$default`n"
+            $text += "    $static[$(Get-StorageType $f.Type $f)] `$$(Get-FieldName $f)$default`n"
             if ($f.IsStatic -and $v.Initializer) { Add-Diagnostic $v 'static field initializer' }
         }
     }
@@ -12840,7 +12838,7 @@ function Convert-TypeDeclaration($node) {
         $parameters = @($declared.Parameters | ForEach-Object {
             $storage = Get-StorageType $_.Type $_
             $note = if ((Test-String $_.Type) -and $storage -eq 'object') { ' <# Preserve C# null versus empty. #>' } else { '' }
-            "[$storage] `$(Get-VariableName $_)$note"
+            "[$storage] `$$(Get-VariableName $_)$note"
         })
         $static = if ($declared.IsStatic) { 'static ' } else { '' }
         $text += "    $static[$returnType] $($script:ClassMethods[$method.Span.Start])($($parameters -join ', ')) {`n"
@@ -12854,7 +12852,7 @@ function Convert-TypeDeclaration($node) {
     # Constructors execute on the actual PowerShell instance, preserving identity.
     foreach ($ctor in $symbol.InstanceConstructors) {
         foreach ($parameter in $ctor.Parameters) { if ($parameter.RefKind.ToString() -ne 'None' -or $parameter.IsParams -or $parameter.HasExplicitDefaultValue -or -not (Test-SupportedValueType $parameter.Type)) { Add-Diagnostic $node 'unsupported constructor parameter' } }
-        $parameters = @($ctor.Parameters | ForEach-Object { "[$(Get-StorageType $_.Type $_)] `$(Get-VariableName $_)" })
+        $parameters = @($ctor.Parameters | ForEach-Object { "[$(Get-StorageType $_.Type $_)] `$$(Get-VariableName $_)" })
         $text += "    $typeName($($parameters -join ', ')) {`n"
         $script:ClassContext = $true
         try {
@@ -13006,113 +13004,8 @@ function Convert-Method($type, $m) {
     $script:Methods.Add([pscustomobject]@{ Type = $symbol.ContainingType.ToString(); Method = $symbol.Name; Function = $(if ($script:ClassOnly -or ($classMethod -and -not $symbol.IsStatic)) { $null } else { $name }); ClassMethod = $classMethod; IsStatic = $symbol.IsStatic; Parameters = @($symbol.Parameters | ForEach-Object { Get-VariableName $_ }) })
     if ($script:ClassMethods.ContainsKey($m.Span.Start)) {
         if ($symbol.IsStatic) {
-            $parameters = @($symbol.Parameters | ForEach-Object { "[$(Get-StorageType $_.Type $_)] `$(Get-VariableName $_)" })
-            $arguments = @($symbol.Parameters | ForEach-Object { '    if ($Help) {
-        Get-Help -Name $PSCommandPath -Full
-        return
-    }
-    # With no arguments, the script describes itself instead of compiling nothing.
-    if ($PSBoundParameters.Count -eq 0) { return Get-PscApi }
-    switch ($Mode) {
-        'Api' { Get-PscApi }
-        'PowerShell' { Get-PinnedPowerShell -ArchivePath $ArchivePath }
-        'Compile' {
-            if ($FixedParametersPath) {
-                if ($null -ne $FixedParameters) { throw 'Supply FixedParameters or FixedParametersPath, not both.' }
-                $fixedData = Import-Clixml -LiteralPath $FixedParametersPath
-                if ($fixedData -isnot [hashtable]) { throw 'FixedParametersPath must contain a CLIXML hashtable of fixed parameter values.' }
-                $FixedParameters = $fixedData
-            }
-            $compileParameters = @{}
-            foreach ($name in 'SourcePath', 'SourceAst', 'StaticData', 'ClassName', 'ClassNames', 'MethodNames', 'OutputPath', 'EntryPoint', 'Deterministic') {
-                if ($PSBoundParameters.ContainsKey($name)) { $compileParameters[$name] = $PSBoundParameters[$name] }
-            }
-            if ($Program) {
-                # The script parsed (with the keywords it declares taught to SMA's parser), its fixed parameters applied,
-                # and compiled as a program with Main as its entry point.
-                $programAst = $SourceAst
-                if ($null -eq $programAst) {
-                    $programPath = [IO.Path]::GetFullPath($SourcePath)
-                    $programAst = Read-PowerShellSource -Source ([IO.File]::ReadAllText($programPath)) -SourceFile $programPath
-                }
-                if ($null -ne $FixedParameters -and $FixedParameters.Count) { $programAst = [PscReachability]::Prune([PscFixedParameters]::new($FixedParameters).Fix($programAst)) }
-                $null = $compileParameters.Remove('SourcePath')
-                $compileParameters['SourceAst'] = $programAst
-                $compileParameters['Program'] = $true
-                if (-not $EntryPoint) { $compileParameters['EntryPoint'] = 'Main'; $EntryPoint = 'Main' }
-            }
-            if (-not $Native) { return Export-LoweredAssembly @compileParameters }
-            if (-not $EntryPoint) { throw 'A native executable needs -EntryPoint.' }
-            # The lowered assembly sits beside the executable, named for it; ILC and the linker take it from there.
-            $compileParameters['OutputPath'] = [IO.Path]::ChangeExtension([IO.Path]::GetFullPath($OutputPath), '.dll')
-            $lowered = Export-LoweredAssembly @compileParameters
-            $image = Export-NativeImage -AssemblyPath $lowered.OutputPath -OutputPath $OutputPath -Subsystem $Subsystem -ApplicationIcon $lowered.ApplicationIcon
-            [pscustomobject]@{ Assembly = $lowered; Native = $image }
-        }
-        'CSharp' {
-            if (-not $SourcePath) { throw 'CSharp requires -SourcePath (a C# source file).' }
-            if ($Native) { throw 'CSharp acquires semantics; use Compile on the admitted SMA AST to emit code.' }
-            Invoke-PscCSharpAcquisition -SourcePath $SourcePath -OutputPath $OutputPath -ClassOnly:$CSharpClassOnly -Define $CSharpDefine -ReferencePath $CSharpReferencePath
-        }
-        'Expression' {
-            if ($null -eq $MethodAst) { throw 'Expression requires -MethodAst.' }
-            ConvertTo-TypedExpression -MethodAst $MethodAst
-        }
-        'Inspect' { Test-LoweredAssembly -AssemblyPath $AssemblyPath -ClassName $ClassName -MethodNames $MethodNames }
-        'Capability' { Get-LoweringCapability }
-        'Graph' { Get-SmaGraph $(if ($ProjectPath) { $ProjectPath } else { $PSScriptRoot }) }
-        'Lint' {
-            $targets = if ($LintFiles) { $LintFiles } else { foreach ($project in Get-Projects) { foreach ($relative in $project.Files) { Join-Path $project.Path $relative } } }
-            $findings = @(foreach ($file in $targets) { if (Test-Path -LiteralPath $file) { Get-SmaLint ([IO.Path]::GetFullPath($file)) } })
-            if ($LintEdit) { return Edit-SmaLintFinding -Findings $findings }
-            $findings | Group-Object Rule | Sort-Object Count -Descending | ForEach-Object { '{0,-20} {1,5}' -f $_.Name, $_.Count }
-            $findings | Sort-Object Rule, File, Line | ForEach-Object { '{0,-20} {1}:{2}  {3}' -f $_.Rule, $_.File, $_.Line, $_.Detail }
-        }
-        'Guard' {
-            if (-not $LintFiles) { throw 'Guard requires -LintFiles.' }
-            $verdicts = @(foreach ($file in $LintFiles) { Test-SmaGuard ([IO.Path]::GetFullPath($file)) $CheckerHash })
-            $verdicts
-            $failed = @($verdicts | Where-Object { -not $_.Passed })
-            if ($failed.Count) { throw ('Guard: {0}' -f (@($failed | ForEach-Object { '{0}: {1}' -f $_.File, ($_.Reasons -join '; ') }) -join ' | ')) }
-        }
-        'Profile' { Invoke-SmaProfile }
-        'Report' {
-            if (-not $ProfilePath) { throw 'Report requires a historical -ProfilePath.' }
-            $profiled = Import-Clixml -LiteralPath $ProfilePath
-            Get-SmaReport @(Get-SmaUnits $profiled) $profiled
-        }
-        'Verify' { Test-SmaGraph }
-        'Consolidate' {
-            if (-not $SourcePath -or -not $OutputPath) { throw 'Consolidate requires -SourcePath (the entry script) and -OutputPath (the single script to write).' }
-            ConvertTo-PscSingleScript -Path $SourcePath -OutputPath $OutputPath
-        }
-        'Investigate' {
-            if (-not $InvestigatePath) { throw 'Investigate requires -InvestigatePath.' }
-            Invoke-PscInvestigation -Path $InvestigatePath
-        }
-        'Records' {
-            if ($null -eq $SourceAst) { throw 'Records requires -SourceAst.' }
-            Get-PscRecord -Root $SourceAst
-        }
-        'Run' {
-            if ($null -ne $SourceAst) { Invoke-PscRun -Ast $SourceAst -Parameters $RunParameters }
-            elseif ($SourcePath) { Invoke-PscRun -Path $SourcePath -Parameters $RunParameters }
-            else { throw 'Run requires -SourcePath or -SourceAst.' }
-        }
-        'Readme' {
-            $readme = Join-Path $PSScriptRoot 'README.md'
-            [IO.File]::WriteAllLines($readme, [string[]]@(ConvertTo-PscReadme -Api (Get-PscApi)), [Text.UTF8Encoding]::new($false))
-            Get-Item -LiteralPath $readme
-        }
-        'Link' {
-            $resolution = Resolve-CoffLink -Inputs $LinkInput -LibraryDirectories @($LibraryDirectory | Where-Object { $_ }) -DefaultLibraries @($DefaultLibrary | Where-Object { $_ }) -IgnoredDefaultLibraries @($NoDefaultLibrary | Where-Object { $_ }) -Entry $EntrySymbol
-            if ($ResolveOnly) { return $resolution }
-            if ($resolution.Unresolved.Count) { throw ("Link: unresolved external symbols:`n" + ($resolution.Unresolved -join "`n")) }
-            Write-CoffImage -Resolution $resolution -Path ([IO.Path]::GetFullPath($OutputPath)) -Merges @($LinkMerge | Where-Object { $_ }) -Subsystem $(if ($Subsystem -eq 'Windows') { 2 } else { 3 }) -StackReserve $StackReserve
-        }
-    }
-}
- + (Get-VariableName $_) })
+            $parameters = @($symbol.Parameters | ForEach-Object { "[$(Get-StorageType $_.Type $_)] `$$(Get-VariableName $_)" })
+            $arguments = @($symbol.Parameters | ForEach-Object { '$' + (Get-VariableName $_) })
             return "function $name { param($($parameters -join ', ')); return ,[$(Get-PsTypeName $symbol.ContainingType)]::$classMethod($($arguments -join ', ')) }"
         }
         return ''
@@ -13128,7 +13021,7 @@ function Convert-Method($type, $m) {
         # Parameters are optional: the binder already admits null/empty values.
         $attributes = ''
         $note = if ((Test-String $p.Type) -and $t -eq 'object') { ' <# Null and empty are observably distinct for this parameter. #>' } else { '' }
-        "$attributes[$t] `$(Get-VariableName $p)$note"
+        "$attributes[$t] `$$(Get-VariableName $p)$note"
     }
     if (-not $symbol.IsStatic) { $params = @('        [object] $self') + @($params) }
     [void]$sb.AppendLine("    param($($params -join ', '))")
@@ -13136,7 +13029,7 @@ function Convert-Method($type, $m) {
     [void]$sb.AppendLine("    # From C# $($type.Identifier.Text).$($m.Identifier.Text) (line $line).")
     if (-not $symbol.IsStatic) { [void]$sb.AppendLine('    if ($null -eq $self) { throw [NullReferenceException]::new() }') }
     foreach ($p in $symbol.Parameters) {
-        if ($p.RefKind.ToString() -eq 'None' -and (Test-SourceStruct $p.Type)) { [void]$sb.AppendLine("    `$(Get-VariableName $p) = Copy-$(Get-PsTypeName $p.Type) (`$(Get-VariableName $p))") }
+        if ($p.RefKind.ToString() -eq 'None' -and (Test-SourceStruct $p.Type)) { [void]$sb.AppendLine("    `$$(Get-VariableName $p) = Copy-$(Get-PsTypeName $p.Type) (`$$(Get-VariableName $p))") }
     }
     if ($m.Body) { foreach ($s in $m.Body.Statements) { [void]$sb.Append((Convert-Statement $s 1)) } }
     elseif ($m.ExpressionBody) { [void]$sb.AppendLine("    return ,($(Convert-Value $m.ExpressionBody.Expression))") }
@@ -13186,7 +13079,7 @@ function Convert-Statement($s, [int] $depth) {
     [void]$script:GuardedStrings.Add($symbol.ToString())
     try {
         $pad = '    ' * $depth
-        $guard = "${pad}if (`$null -eq `$(Get-VariableName $symbol)) { throw [NullReferenceException]::new() } # C# string dereference rejects null.`n"
+        $guard = "${pad}if (`$null -eq `$$(Get-VariableName $symbol)) { throw [NullReferenceException]::new() } # C# string dereference rejects null.`n"
         return $guard + (Convert-StatementCore $s $depth)
     } finally { $script:GuardedStrings = $prior }
 }
@@ -13200,7 +13093,7 @@ function Convert-StatementCore($s, [int] $depth) {
                 $t = Get-StorageType $owner.Type $owner
                 if (-not (Test-SupportedValueType ($script:Model.GetDeclaredSymbol($v).Type))) { Add-Diagnostic $v 'unsupported local type' }
                 $init = if ($v.Initializer) { ' = ' + (Convert-Value $v.Initializer.Value) } else { ' = ' + (Get-DefaultValue ($script:Model.GetDeclaredSymbol($v).Type)) }
-                "$pad[$t] `$(Get-VariableName ($script:Model.GetDeclaredSymbol($v)))$init`n"
+                "$pad[$t] `$$(Get-VariableName ($script:Model.GetDeclaredSymbol($v)))$init`n"
             }
             return ($lines -join '')
         }
@@ -13223,112 +13116,7 @@ function Convert-StatementCore($s, [int] $depth) {
         'TryStatementSyntax' {
             $text = "${pad}try {`n$(Convert-Embedded $s.Block ($depth + 1))${pad}}"
             if ($s.Catches.Count) {
-                $exception = '    if ($Help) {
-        Get-Help -Name $PSCommandPath -Full
-        return
-    }
-    # With no arguments, the script describes itself instead of compiling nothing.
-    if ($PSBoundParameters.Count -eq 0) { return Get-PscApi }
-    switch ($Mode) {
-        'Api' { Get-PscApi }
-        'PowerShell' { Get-PinnedPowerShell -ArchivePath $ArchivePath }
-        'Compile' {
-            if ($FixedParametersPath) {
-                if ($null -ne $FixedParameters) { throw 'Supply FixedParameters or FixedParametersPath, not both.' }
-                $fixedData = Import-Clixml -LiteralPath $FixedParametersPath
-                if ($fixedData -isnot [hashtable]) { throw 'FixedParametersPath must contain a CLIXML hashtable of fixed parameter values.' }
-                $FixedParameters = $fixedData
-            }
-            $compileParameters = @{}
-            foreach ($name in 'SourcePath', 'SourceAst', 'StaticData', 'ClassName', 'ClassNames', 'MethodNames', 'OutputPath', 'EntryPoint', 'Deterministic') {
-                if ($PSBoundParameters.ContainsKey($name)) { $compileParameters[$name] = $PSBoundParameters[$name] }
-            }
-            if ($Program) {
-                # The script parsed (with the keywords it declares taught to SMA's parser), its fixed parameters applied,
-                # and compiled as a program with Main as its entry point.
-                $programAst = $SourceAst
-                if ($null -eq $programAst) {
-                    $programPath = [IO.Path]::GetFullPath($SourcePath)
-                    $programAst = Read-PowerShellSource -Source ([IO.File]::ReadAllText($programPath)) -SourceFile $programPath
-                }
-                if ($null -ne $FixedParameters -and $FixedParameters.Count) { $programAst = [PscReachability]::Prune([PscFixedParameters]::new($FixedParameters).Fix($programAst)) }
-                $null = $compileParameters.Remove('SourcePath')
-                $compileParameters['SourceAst'] = $programAst
-                $compileParameters['Program'] = $true
-                if (-not $EntryPoint) { $compileParameters['EntryPoint'] = 'Main'; $EntryPoint = 'Main' }
-            }
-            if (-not $Native) { return Export-LoweredAssembly @compileParameters }
-            if (-not $EntryPoint) { throw 'A native executable needs -EntryPoint.' }
-            # The lowered assembly sits beside the executable, named for it; ILC and the linker take it from there.
-            $compileParameters['OutputPath'] = [IO.Path]::ChangeExtension([IO.Path]::GetFullPath($OutputPath), '.dll')
-            $lowered = Export-LoweredAssembly @compileParameters
-            $image = Export-NativeImage -AssemblyPath $lowered.OutputPath -OutputPath $OutputPath -Subsystem $Subsystem -ApplicationIcon $lowered.ApplicationIcon
-            [pscustomobject]@{ Assembly = $lowered; Native = $image }
-        }
-        'CSharp' {
-            if (-not $SourcePath) { throw 'CSharp requires -SourcePath (a C# source file).' }
-            if ($Native) { throw 'CSharp acquires semantics; use Compile on the admitted SMA AST to emit code.' }
-            Invoke-PscCSharpAcquisition -SourcePath $SourcePath -OutputPath $OutputPath -ClassOnly:$CSharpClassOnly -Define $CSharpDefine -ReferencePath $CSharpReferencePath
-        }
-        'Expression' {
-            if ($null -eq $MethodAst) { throw 'Expression requires -MethodAst.' }
-            ConvertTo-TypedExpression -MethodAst $MethodAst
-        }
-        'Inspect' { Test-LoweredAssembly -AssemblyPath $AssemblyPath -ClassName $ClassName -MethodNames $MethodNames }
-        'Capability' { Get-LoweringCapability }
-        'Graph' { Get-SmaGraph $(if ($ProjectPath) { $ProjectPath } else { $PSScriptRoot }) }
-        'Lint' {
-            $targets = if ($LintFiles) { $LintFiles } else { foreach ($project in Get-Projects) { foreach ($relative in $project.Files) { Join-Path $project.Path $relative } } }
-            $findings = @(foreach ($file in $targets) { if (Test-Path -LiteralPath $file) { Get-SmaLint ([IO.Path]::GetFullPath($file)) } })
-            if ($LintEdit) { return Edit-SmaLintFinding -Findings $findings }
-            $findings | Group-Object Rule | Sort-Object Count -Descending | ForEach-Object { '{0,-20} {1,5}' -f $_.Name, $_.Count }
-            $findings | Sort-Object Rule, File, Line | ForEach-Object { '{0,-20} {1}:{2}  {3}' -f $_.Rule, $_.File, $_.Line, $_.Detail }
-        }
-        'Guard' {
-            if (-not $LintFiles) { throw 'Guard requires -LintFiles.' }
-            $verdicts = @(foreach ($file in $LintFiles) { Test-SmaGuard ([IO.Path]::GetFullPath($file)) $CheckerHash })
-            $verdicts
-            $failed = @($verdicts | Where-Object { -not $_.Passed })
-            if ($failed.Count) { throw ('Guard: {0}' -f (@($failed | ForEach-Object { '{0}: {1}' -f $_.File, ($_.Reasons -join '; ') }) -join ' | ')) }
-        }
-        'Profile' { Invoke-SmaProfile }
-        'Report' {
-            if (-not $ProfilePath) { throw 'Report requires a historical -ProfilePath.' }
-            $profiled = Import-Clixml -LiteralPath $ProfilePath
-            Get-SmaReport @(Get-SmaUnits $profiled) $profiled
-        }
-        'Verify' { Test-SmaGraph }
-        'Consolidate' {
-            if (-not $SourcePath -or -not $OutputPath) { throw 'Consolidate requires -SourcePath (the entry script) and -OutputPath (the single script to write).' }
-            ConvertTo-PscSingleScript -Path $SourcePath -OutputPath $OutputPath
-        }
-        'Investigate' {
-            if (-not $InvestigatePath) { throw 'Investigate requires -InvestigatePath.' }
-            Invoke-PscInvestigation -Path $InvestigatePath
-        }
-        'Records' {
-            if ($null -eq $SourceAst) { throw 'Records requires -SourceAst.' }
-            Get-PscRecord -Root $SourceAst
-        }
-        'Run' {
-            if ($null -ne $SourceAst) { Invoke-PscRun -Ast $SourceAst -Parameters $RunParameters }
-            elseif ($SourcePath) { Invoke-PscRun -Path $SourcePath -Parameters $RunParameters }
-            else { throw 'Run requires -SourcePath or -SourceAst.' }
-        }
-        'Readme' {
-            $readme = Join-Path $PSScriptRoot 'README.md'
-            [IO.File]::WriteAllLines($readme, [string[]]@(ConvertTo-PscReadme -Api (Get-PscApi)), [Text.UTF8Encoding]::new($false))
-            Get-Item -LiteralPath $readme
-        }
-        'Link' {
-            $resolution = Resolve-CoffLink -Inputs $LinkInput -LibraryDirectories @($LibraryDirectory | Where-Object { $_ }) -DefaultLibraries @($DefaultLibrary | Where-Object { $_ }) -IgnoredDefaultLibraries @($NoDefaultLibrary | Where-Object { $_ }) -Entry $EntrySymbol
-            if ($ResolveOnly) { return $resolution }
-            if ($resolution.Unresolved.Count) { throw ("Link: unresolved external symbols:`n" + ($resolution.Unresolved -join "`n")) }
-            Write-CoffImage -Resolution $resolution -Path ([IO.Path]::GetFullPath($OutputPath)) -Merges @($LinkMerge | Where-Object { $_ }) -Subsystem $(if ($Subsystem -eq 'Windows') { 2 } else { 3 }) -StackReserve $StackReserve
-        }
-    }
-}
- + (Get-GeneratedName $s 'exception')
+                $exception = '$' + (Get-GeneratedName $s 'exception')
                 $text += " catch {`n${pad}    $exception = Get-CS2PSException `$_.Exception`n"
                 $first = $true
                 foreach ($clause in $s.Catches) {
@@ -13338,7 +13126,7 @@ function Convert-StatementCore($s, [int] $depth) {
                     $text += "${pad}    $keyword ($exception -is [$typeName]) {`n"
                     if ($clause.Declaration -and $clause.Declaration.Identifier.Text) {
                         $local = $script:Model.GetDeclaredSymbol($clause.Declaration)
-                        $text += "${pad}        [$typeName] `$(Get-VariableName $local) = $exception`n"
+                        $text += "${pad}        [$typeName] `$$(Get-VariableName $local) = $exception`n"
                     }
                     $text += Convert-Embedded $clause.Block ($depth + 2)
                     $text += "${pad}    }`n"
@@ -13362,7 +13150,7 @@ function Convert-StatementCore($s, [int] $depth) {
             return "$text`n"
         }
         'ForStatementSyntax' {
-            $init = if ($s.Declaration) { ($s.Declaration.Variables | ForEach-Object { "[$(Get-PsTypeName ($script:Model.GetDeclaredSymbol($_).Type))] `$(Get-VariableName ($script:Model.GetDeclaredSymbol($_))) = $(Convert-Expression $_.Initializer.Value)" }) -join '; ' } else { ($s.Initializers | ForEach-Object { '[void](' + (Convert-Expression $_) + ')' }) -join '; ' }
+            $init = if ($s.Declaration) { ($s.Declaration.Variables | ForEach-Object { "[$(Get-PsTypeName ($script:Model.GetDeclaredSymbol($_).Type))] `$$(Get-VariableName ($script:Model.GetDeclaredSymbol($_))) = $(Convert-Expression $_.Initializer.Value)" }) -join '; ' } else { ($s.Initializers | ForEach-Object { '[void](' + (Convert-Expression $_) + ')' }) -join '; ' }
             $cond = if ($s.Condition) { Convert-Expression $s.Condition } else { '$true' }
             $inc = ($s.Incrementors | ForEach-Object {
                 if (($_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.PostfixUnaryExpressionSyntax] -or $_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.PrefixUnaryExpressionSyntax]) -and $_.OperatorToken.Text -in '++','--' -and -not (Test-Nullable (Get-ExprType $_.Operand))) {
@@ -13379,230 +13167,20 @@ function Convert-StatementCore($s, [int] $depth) {
                 Add-Diagnostic $s 'foreach requires a single-dimensional array or List<T>'; return ''
             }
             if ($t -is [Microsoft.CodeAnalysis.IArrayTypeSymbol] -and $t.Rank -ne 1) { Add-Diagnostic $s 'multidimensional foreach'; return '' }
-            $enumerator = '    if ($Help) {
-        Get-Help -Name $PSCommandPath -Full
-        return
-    }
-    # With no arguments, the script describes itself instead of compiling nothing.
-    if ($PSBoundParameters.Count -eq 0) { return Get-PscApi }
-    switch ($Mode) {
-        'Api' { Get-PscApi }
-        'PowerShell' { Get-PinnedPowerShell -ArchivePath $ArchivePath }
-        'Compile' {
-            if ($FixedParametersPath) {
-                if ($null -ne $FixedParameters) { throw 'Supply FixedParameters or FixedParametersPath, not both.' }
-                $fixedData = Import-Clixml -LiteralPath $FixedParametersPath
-                if ($fixedData -isnot [hashtable]) { throw 'FixedParametersPath must contain a CLIXML hashtable of fixed parameter values.' }
-                $FixedParameters = $fixedData
-            }
-            $compileParameters = @{}
-            foreach ($name in 'SourcePath', 'SourceAst', 'StaticData', 'ClassName', 'ClassNames', 'MethodNames', 'OutputPath', 'EntryPoint', 'Deterministic') {
-                if ($PSBoundParameters.ContainsKey($name)) { $compileParameters[$name] = $PSBoundParameters[$name] }
-            }
-            if ($Program) {
-                # The script parsed (with the keywords it declares taught to SMA's parser), its fixed parameters applied,
-                # and compiled as a program with Main as its entry point.
-                $programAst = $SourceAst
-                if ($null -eq $programAst) {
-                    $programPath = [IO.Path]::GetFullPath($SourcePath)
-                    $programAst = Read-PowerShellSource -Source ([IO.File]::ReadAllText($programPath)) -SourceFile $programPath
-                }
-                if ($null -ne $FixedParameters -and $FixedParameters.Count) { $programAst = [PscReachability]::Prune([PscFixedParameters]::new($FixedParameters).Fix($programAst)) }
-                $null = $compileParameters.Remove('SourcePath')
-                $compileParameters['SourceAst'] = $programAst
-                $compileParameters['Program'] = $true
-                if (-not $EntryPoint) { $compileParameters['EntryPoint'] = 'Main'; $EntryPoint = 'Main' }
-            }
-            if (-not $Native) { return Export-LoweredAssembly @compileParameters }
-            if (-not $EntryPoint) { throw 'A native executable needs -EntryPoint.' }
-            # The lowered assembly sits beside the executable, named for it; ILC and the linker take it from there.
-            $compileParameters['OutputPath'] = [IO.Path]::ChangeExtension([IO.Path]::GetFullPath($OutputPath), '.dll')
-            $lowered = Export-LoweredAssembly @compileParameters
-            $image = Export-NativeImage -AssemblyPath $lowered.OutputPath -OutputPath $OutputPath -Subsystem $Subsystem -ApplicationIcon $lowered.ApplicationIcon
-            [pscustomobject]@{ Assembly = $lowered; Native = $image }
-        }
-        'CSharp' {
-            if (-not $SourcePath) { throw 'CSharp requires -SourcePath (a C# source file).' }
-            if ($Native) { throw 'CSharp acquires semantics; use Compile on the admitted SMA AST to emit code.' }
-            Invoke-PscCSharpAcquisition -SourcePath $SourcePath -OutputPath $OutputPath -ClassOnly:$CSharpClassOnly -Define $CSharpDefine -ReferencePath $CSharpReferencePath
-        }
-        'Expression' {
-            if ($null -eq $MethodAst) { throw 'Expression requires -MethodAst.' }
-            ConvertTo-TypedExpression -MethodAst $MethodAst
-        }
-        'Inspect' { Test-LoweredAssembly -AssemblyPath $AssemblyPath -ClassName $ClassName -MethodNames $MethodNames }
-        'Capability' { Get-LoweringCapability }
-        'Graph' { Get-SmaGraph $(if ($ProjectPath) { $ProjectPath } else { $PSScriptRoot }) }
-        'Lint' {
-            $targets = if ($LintFiles) { $LintFiles } else { foreach ($project in Get-Projects) { foreach ($relative in $project.Files) { Join-Path $project.Path $relative } } }
-            $findings = @(foreach ($file in $targets) { if (Test-Path -LiteralPath $file) { Get-SmaLint ([IO.Path]::GetFullPath($file)) } })
-            if ($LintEdit) { return Edit-SmaLintFinding -Findings $findings }
-            $findings | Group-Object Rule | Sort-Object Count -Descending | ForEach-Object { '{0,-20} {1,5}' -f $_.Name, $_.Count }
-            $findings | Sort-Object Rule, File, Line | ForEach-Object { '{0,-20} {1}:{2}  {3}' -f $_.Rule, $_.File, $_.Line, $_.Detail }
-        }
-        'Guard' {
-            if (-not $LintFiles) { throw 'Guard requires -LintFiles.' }
-            $verdicts = @(foreach ($file in $LintFiles) { Test-SmaGuard ([IO.Path]::GetFullPath($file)) $CheckerHash })
-            $verdicts
-            $failed = @($verdicts | Where-Object { -not $_.Passed })
-            if ($failed.Count) { throw ('Guard: {0}' -f (@($failed | ForEach-Object { '{0}: {1}' -f $_.File, ($_.Reasons -join '; ') }) -join ' | ')) }
-        }
-        'Profile' { Invoke-SmaProfile }
-        'Report' {
-            if (-not $ProfilePath) { throw 'Report requires a historical -ProfilePath.' }
-            $profiled = Import-Clixml -LiteralPath $ProfilePath
-            Get-SmaReport @(Get-SmaUnits $profiled) $profiled
-        }
-        'Verify' { Test-SmaGraph }
-        'Consolidate' {
-            if (-not $SourcePath -or -not $OutputPath) { throw 'Consolidate requires -SourcePath (the entry script) and -OutputPath (the single script to write).' }
-            ConvertTo-PscSingleScript -Path $SourcePath -OutputPath $OutputPath
-        }
-        'Investigate' {
-            if (-not $InvestigatePath) { throw 'Investigate requires -InvestigatePath.' }
-            Invoke-PscInvestigation -Path $InvestigatePath
-        }
-        'Records' {
-            if ($null -eq $SourceAst) { throw 'Records requires -SourceAst.' }
-            Get-PscRecord -Root $SourceAst
-        }
-        'Run' {
-            if ($null -ne $SourceAst) { Invoke-PscRun -Ast $SourceAst -Parameters $RunParameters }
-            elseif ($SourcePath) { Invoke-PscRun -Path $SourcePath -Parameters $RunParameters }
-            else { throw 'Run requires -SourcePath or -SourceAst.' }
-        }
-        'Readme' {
-            $readme = Join-Path $PSScriptRoot 'README.md'
-            [IO.File]::WriteAllLines($readme, [string[]]@(ConvertTo-PscReadme -Api (Get-PscApi)), [Text.UTF8Encoding]::new($false))
-            Get-Item -LiteralPath $readme
-        }
-        'Link' {
-            $resolution = Resolve-CoffLink -Inputs $LinkInput -LibraryDirectories @($LibraryDirectory | Where-Object { $_ }) -DefaultLibraries @($DefaultLibrary | Where-Object { $_ }) -IgnoredDefaultLibraries @($NoDefaultLibrary | Where-Object { $_ }) -Entry $EntrySymbol
-            if ($ResolveOnly) { return $resolution }
-            if ($resolution.Unresolved.Count) { throw ("Link: unresolved external symbols:`n" + ($resolution.Unresolved -join "`n")) }
-            Write-CoffImage -Resolution $resolution -Path ([IO.Path]::GetFullPath($OutputPath)) -Merges @($LinkMerge | Where-Object { $_ }) -Subsystem $(if ($Subsystem -eq 'Windows') { 2 } else { 3 }) -StackReserve $StackReserve
-        }
-    }
-}
- + (Get-GeneratedName $s 'enumerator')
+            $enumerator = '$' + (Get-GeneratedName $s 'enumerator')
             $loop = Get-GeneratedName $s 'loop'
             $v = Get-VariableName ($script:Model.GetDeclaredSymbol($s))
             # Use a real enumerator: List<T> must detect mutation; evaluate collection once.
             $valueType = $script:Model.GetDeclaredSymbol($s).Type
             $current = if (Test-SourceStruct $valueType) { "(Copy-$(Get-PsTypeName $valueType) ($enumerator.Current))" } else { "$enumerator.Current" }
-            return "${pad}$enumerator = (Get-CS2PSReceiver ($(Convert-Expression $s.Expression))).GetEnumerator()`n${pad}try {`n${pad}    :$loop while ($enumerator.MoveNext()) {`n${pad}        [$(Get-StorageType $valueType)] `$v = $current`n$(Convert-Embedded $s.Statement ($depth + 2))${pad}    }`n${pad}} finally {`n${pad}    if ($enumerator -is [IDisposable]) { $enumerator.Dispose() }`n${pad}}`n"
+            return "${pad}$enumerator = (Get-CS2PSReceiver ($(Convert-Expression $s.Expression))).GetEnumerator()`n${pad}try {`n${pad}    :$loop while ($enumerator.MoveNext()) {`n${pad}        [$(Get-StorageType $valueType)] `$$v = $current`n$(Convert-Embedded $s.Statement ($depth + 2))${pad}    }`n${pad}} finally {`n${pad}    if ($enumerator -is [IDisposable]) { $enumerator.Dispose() }`n${pad}}`n"
         }
         'WhileStatementSyntax' { return "${pad}:$(Get-GeneratedName $s 'loop') while ($(Convert-Expression $s.Condition)) {`n$(Convert-Embedded $s.Statement ($depth + 1))$pad}`n" }
         'BreakStatementSyntax' { return "${pad}break $(Get-JumpLabel $s $false)`n" }
         'ContinueStatementSyntax' { return "${pad}continue $(Get-JumpLabel $s $true)`n" }
         'SwitchStatementSyntax' {
             if ((Get-ExprType $s.Expression).SpecialType.ToString() -eq 'System_Object') { Add-Diagnostic $s 'object switch subject' }
-            $subject = '    if ($Help) {
-        Get-Help -Name $PSCommandPath -Full
-        return
-    }
-    # With no arguments, the script describes itself instead of compiling nothing.
-    if ($PSBoundParameters.Count -eq 0) { return Get-PscApi }
-    switch ($Mode) {
-        'Api' { Get-PscApi }
-        'PowerShell' { Get-PinnedPowerShell -ArchivePath $ArchivePath }
-        'Compile' {
-            if ($FixedParametersPath) {
-                if ($null -ne $FixedParameters) { throw 'Supply FixedParameters or FixedParametersPath, not both.' }
-                $fixedData = Import-Clixml -LiteralPath $FixedParametersPath
-                if ($fixedData -isnot [hashtable]) { throw 'FixedParametersPath must contain a CLIXML hashtable of fixed parameter values.' }
-                $FixedParameters = $fixedData
-            }
-            $compileParameters = @{}
-            foreach ($name in 'SourcePath', 'SourceAst', 'StaticData', 'ClassName', 'ClassNames', 'MethodNames', 'OutputPath', 'EntryPoint', 'Deterministic') {
-                if ($PSBoundParameters.ContainsKey($name)) { $compileParameters[$name] = $PSBoundParameters[$name] }
-            }
-            if ($Program) {
-                # The script parsed (with the keywords it declares taught to SMA's parser), its fixed parameters applied,
-                # and compiled as a program with Main as its entry point.
-                $programAst = $SourceAst
-                if ($null -eq $programAst) {
-                    $programPath = [IO.Path]::GetFullPath($SourcePath)
-                    $programAst = Read-PowerShellSource -Source ([IO.File]::ReadAllText($programPath)) -SourceFile $programPath
-                }
-                if ($null -ne $FixedParameters -and $FixedParameters.Count) { $programAst = [PscReachability]::Prune([PscFixedParameters]::new($FixedParameters).Fix($programAst)) }
-                $null = $compileParameters.Remove('SourcePath')
-                $compileParameters['SourceAst'] = $programAst
-                $compileParameters['Program'] = $true
-                if (-not $EntryPoint) { $compileParameters['EntryPoint'] = 'Main'; $EntryPoint = 'Main' }
-            }
-            if (-not $Native) { return Export-LoweredAssembly @compileParameters }
-            if (-not $EntryPoint) { throw 'A native executable needs -EntryPoint.' }
-            # The lowered assembly sits beside the executable, named for it; ILC and the linker take it from there.
-            $compileParameters['OutputPath'] = [IO.Path]::ChangeExtension([IO.Path]::GetFullPath($OutputPath), '.dll')
-            $lowered = Export-LoweredAssembly @compileParameters
-            $image = Export-NativeImage -AssemblyPath $lowered.OutputPath -OutputPath $OutputPath -Subsystem $Subsystem -ApplicationIcon $lowered.ApplicationIcon
-            [pscustomobject]@{ Assembly = $lowered; Native = $image }
-        }
-        'CSharp' {
-            if (-not $SourcePath) { throw 'CSharp requires -SourcePath (a C# source file).' }
-            if ($Native) { throw 'CSharp acquires semantics; use Compile on the admitted SMA AST to emit code.' }
-            Invoke-PscCSharpAcquisition -SourcePath $SourcePath -OutputPath $OutputPath -ClassOnly:$CSharpClassOnly -Define $CSharpDefine -ReferencePath $CSharpReferencePath
-        }
-        'Expression' {
-            if ($null -eq $MethodAst) { throw 'Expression requires -MethodAst.' }
-            ConvertTo-TypedExpression -MethodAst $MethodAst
-        }
-        'Inspect' { Test-LoweredAssembly -AssemblyPath $AssemblyPath -ClassName $ClassName -MethodNames $MethodNames }
-        'Capability' { Get-LoweringCapability }
-        'Graph' { Get-SmaGraph $(if ($ProjectPath) { $ProjectPath } else { $PSScriptRoot }) }
-        'Lint' {
-            $targets = if ($LintFiles) { $LintFiles } else { foreach ($project in Get-Projects) { foreach ($relative in $project.Files) { Join-Path $project.Path $relative } } }
-            $findings = @(foreach ($file in $targets) { if (Test-Path -LiteralPath $file) { Get-SmaLint ([IO.Path]::GetFullPath($file)) } })
-            if ($LintEdit) { return Edit-SmaLintFinding -Findings $findings }
-            $findings | Group-Object Rule | Sort-Object Count -Descending | ForEach-Object { '{0,-20} {1,5}' -f $_.Name, $_.Count }
-            $findings | Sort-Object Rule, File, Line | ForEach-Object { '{0,-20} {1}:{2}  {3}' -f $_.Rule, $_.File, $_.Line, $_.Detail }
-        }
-        'Guard' {
-            if (-not $LintFiles) { throw 'Guard requires -LintFiles.' }
-            $verdicts = @(foreach ($file in $LintFiles) { Test-SmaGuard ([IO.Path]::GetFullPath($file)) $CheckerHash })
-            $verdicts
-            $failed = @($verdicts | Where-Object { -not $_.Passed })
-            if ($failed.Count) { throw ('Guard: {0}' -f (@($failed | ForEach-Object { '{0}: {1}' -f $_.File, ($_.Reasons -join '; ') }) -join ' | ')) }
-        }
-        'Profile' { Invoke-SmaProfile }
-        'Report' {
-            if (-not $ProfilePath) { throw 'Report requires a historical -ProfilePath.' }
-            $profiled = Import-Clixml -LiteralPath $ProfilePath
-            Get-SmaReport @(Get-SmaUnits $profiled) $profiled
-        }
-        'Verify' { Test-SmaGraph }
-        'Consolidate' {
-            if (-not $SourcePath -or -not $OutputPath) { throw 'Consolidate requires -SourcePath (the entry script) and -OutputPath (the single script to write).' }
-            ConvertTo-PscSingleScript -Path $SourcePath -OutputPath $OutputPath
-        }
-        'Investigate' {
-            if (-not $InvestigatePath) { throw 'Investigate requires -InvestigatePath.' }
-            Invoke-PscInvestigation -Path $InvestigatePath
-        }
-        'Records' {
-            if ($null -eq $SourceAst) { throw 'Records requires -SourceAst.' }
-            Get-PscRecord -Root $SourceAst
-        }
-        'Run' {
-            if ($null -ne $SourceAst) { Invoke-PscRun -Ast $SourceAst -Parameters $RunParameters }
-            elseif ($SourcePath) { Invoke-PscRun -Path $SourcePath -Parameters $RunParameters }
-            else { throw 'Run requires -SourcePath or -SourceAst.' }
-        }
-        'Readme' {
-            $readme = Join-Path $PSScriptRoot 'README.md'
-            [IO.File]::WriteAllLines($readme, [string[]]@(ConvertTo-PscReadme -Api (Get-PscApi)), [Text.UTF8Encoding]::new($false))
-            Get-Item -LiteralPath $readme
-        }
-        'Link' {
-            $resolution = Resolve-CoffLink -Inputs $LinkInput -LibraryDirectories @($LibraryDirectory | Where-Object { $_ }) -DefaultLibraries @($DefaultLibrary | Where-Object { $_ }) -IgnoredDefaultLibraries @($NoDefaultLibrary | Where-Object { $_ }) -Entry $EntrySymbol
-            if ($ResolveOnly) { return $resolution }
-            if ($resolution.Unresolved.Count) { throw ("Link: unresolved external symbols:`n" + ($resolution.Unresolved -join "`n")) }
-            Write-CoffImage -Resolution $resolution -Path ([IO.Path]::GetFullPath($OutputPath)) -Merges @($LinkMerge | Where-Object { $_ }) -Subsystem $(if ($Subsystem -eq 'Windows') { 2 } else { 3 }) -StackReserve $StackReserve
-        }
-    }
-}
- + (Get-GeneratedName $s 'switchValue')
+            $subject = '$' + (Get-GeneratedName $s 'switchValue')
             $text = "${pad}$subject = $(Convert-Expression $s.Expression)`n${pad}:$(Get-GeneratedName $s 'switchBlock') do {`n"
             $sections = @($s.Sections | Where-Object { -not @($_.Labels | Where-Object { $_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.DefaultSwitchLabelSyntax] }).Count })
             $defaults = @($s.Sections | Where-Object { @($_.Labels | Where-Object { $_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.DefaultSwitchLabelSyntax] }).Count })
@@ -13657,117 +13235,12 @@ function Convert-Argument($argument) {
     if ($expr -is [Microsoft.CodeAnalysis.CSharp.Syntax.DeclarationExpressionSyntax]) {
         if ($expr.Designation -isnot [Microsoft.CodeAnalysis.CSharp.Syntax.SingleVariableDesignationSyntax]) { Add-Diagnostic $expr 'out discard/deconstruction'; return '$null' }
         $sym = $script:Model.GetDeclaredSymbol($expr.Designation)
-        return "`$([$((Get-StorageType $sym.Type))] `$(Get-VariableName $sym) = $(Get-DefaultValue $sym.Type); [ref]`$(Get-VariableName $sym))"
+        return "`$([$((Get-StorageType $sym.Type))] `$$(Get-VariableName $sym) = $(Get-DefaultValue $sym.Type); [ref]`$$(Get-VariableName $sym))"
     }
     if ($expr -isnot [Microsoft.CodeAnalysis.CSharp.Syntax.IdentifierNameSyntax]) { Add-Diagnostic $argument 'ref/out requires a local or parameter'; return '$null' }
     $sym = $script:Model.GetSymbolInfo($expr).Symbol
     if ($sym.Kind.ToString() -notin 'Local','Parameter') { Add-Diagnostic $argument 'ref/out field argument'; return '$null' }
-    $name = '    if ($Help) {
-        Get-Help -Name $PSCommandPath -Full
-        return
-    }
-    # With no arguments, the script describes itself instead of compiling nothing.
-    if ($PSBoundParameters.Count -eq 0) { return Get-PscApi }
-    switch ($Mode) {
-        'Api' { Get-PscApi }
-        'PowerShell' { Get-PinnedPowerShell -ArchivePath $ArchivePath }
-        'Compile' {
-            if ($FixedParametersPath) {
-                if ($null -ne $FixedParameters) { throw 'Supply FixedParameters or FixedParametersPath, not both.' }
-                $fixedData = Import-Clixml -LiteralPath $FixedParametersPath
-                if ($fixedData -isnot [hashtable]) { throw 'FixedParametersPath must contain a CLIXML hashtable of fixed parameter values.' }
-                $FixedParameters = $fixedData
-            }
-            $compileParameters = @{}
-            foreach ($name in 'SourcePath', 'SourceAst', 'StaticData', 'ClassName', 'ClassNames', 'MethodNames', 'OutputPath', 'EntryPoint', 'Deterministic') {
-                if ($PSBoundParameters.ContainsKey($name)) { $compileParameters[$name] = $PSBoundParameters[$name] }
-            }
-            if ($Program) {
-                # The script parsed (with the keywords it declares taught to SMA's parser), its fixed parameters applied,
-                # and compiled as a program with Main as its entry point.
-                $programAst = $SourceAst
-                if ($null -eq $programAst) {
-                    $programPath = [IO.Path]::GetFullPath($SourcePath)
-                    $programAst = Read-PowerShellSource -Source ([IO.File]::ReadAllText($programPath)) -SourceFile $programPath
-                }
-                if ($null -ne $FixedParameters -and $FixedParameters.Count) { $programAst = [PscReachability]::Prune([PscFixedParameters]::new($FixedParameters).Fix($programAst)) }
-                $null = $compileParameters.Remove('SourcePath')
-                $compileParameters['SourceAst'] = $programAst
-                $compileParameters['Program'] = $true
-                if (-not $EntryPoint) { $compileParameters['EntryPoint'] = 'Main'; $EntryPoint = 'Main' }
-            }
-            if (-not $Native) { return Export-LoweredAssembly @compileParameters }
-            if (-not $EntryPoint) { throw 'A native executable needs -EntryPoint.' }
-            # The lowered assembly sits beside the executable, named for it; ILC and the linker take it from there.
-            $compileParameters['OutputPath'] = [IO.Path]::ChangeExtension([IO.Path]::GetFullPath($OutputPath), '.dll')
-            $lowered = Export-LoweredAssembly @compileParameters
-            $image = Export-NativeImage -AssemblyPath $lowered.OutputPath -OutputPath $OutputPath -Subsystem $Subsystem -ApplicationIcon $lowered.ApplicationIcon
-            [pscustomobject]@{ Assembly = $lowered; Native = $image }
-        }
-        'CSharp' {
-            if (-not $SourcePath) { throw 'CSharp requires -SourcePath (a C# source file).' }
-            if ($Native) { throw 'CSharp acquires semantics; use Compile on the admitted SMA AST to emit code.' }
-            Invoke-PscCSharpAcquisition -SourcePath $SourcePath -OutputPath $OutputPath -ClassOnly:$CSharpClassOnly -Define $CSharpDefine -ReferencePath $CSharpReferencePath
-        }
-        'Expression' {
-            if ($null -eq $MethodAst) { throw 'Expression requires -MethodAst.' }
-            ConvertTo-TypedExpression -MethodAst $MethodAst
-        }
-        'Inspect' { Test-LoweredAssembly -AssemblyPath $AssemblyPath -ClassName $ClassName -MethodNames $MethodNames }
-        'Capability' { Get-LoweringCapability }
-        'Graph' { Get-SmaGraph $(if ($ProjectPath) { $ProjectPath } else { $PSScriptRoot }) }
-        'Lint' {
-            $targets = if ($LintFiles) { $LintFiles } else { foreach ($project in Get-Projects) { foreach ($relative in $project.Files) { Join-Path $project.Path $relative } } }
-            $findings = @(foreach ($file in $targets) { if (Test-Path -LiteralPath $file) { Get-SmaLint ([IO.Path]::GetFullPath($file)) } })
-            if ($LintEdit) { return Edit-SmaLintFinding -Findings $findings }
-            $findings | Group-Object Rule | Sort-Object Count -Descending | ForEach-Object { '{0,-20} {1,5}' -f $_.Name, $_.Count }
-            $findings | Sort-Object Rule, File, Line | ForEach-Object { '{0,-20} {1}:{2}  {3}' -f $_.Rule, $_.File, $_.Line, $_.Detail }
-        }
-        'Guard' {
-            if (-not $LintFiles) { throw 'Guard requires -LintFiles.' }
-            $verdicts = @(foreach ($file in $LintFiles) { Test-SmaGuard ([IO.Path]::GetFullPath($file)) $CheckerHash })
-            $verdicts
-            $failed = @($verdicts | Where-Object { -not $_.Passed })
-            if ($failed.Count) { throw ('Guard: {0}' -f (@($failed | ForEach-Object { '{0}: {1}' -f $_.File, ($_.Reasons -join '; ') }) -join ' | ')) }
-        }
-        'Profile' { Invoke-SmaProfile }
-        'Report' {
-            if (-not $ProfilePath) { throw 'Report requires a historical -ProfilePath.' }
-            $profiled = Import-Clixml -LiteralPath $ProfilePath
-            Get-SmaReport @(Get-SmaUnits $profiled) $profiled
-        }
-        'Verify' { Test-SmaGraph }
-        'Consolidate' {
-            if (-not $SourcePath -or -not $OutputPath) { throw 'Consolidate requires -SourcePath (the entry script) and -OutputPath (the single script to write).' }
-            ConvertTo-PscSingleScript -Path $SourcePath -OutputPath $OutputPath
-        }
-        'Investigate' {
-            if (-not $InvestigatePath) { throw 'Investigate requires -InvestigatePath.' }
-            Invoke-PscInvestigation -Path $InvestigatePath
-        }
-        'Records' {
-            if ($null -eq $SourceAst) { throw 'Records requires -SourceAst.' }
-            Get-PscRecord -Root $SourceAst
-        }
-        'Run' {
-            if ($null -ne $SourceAst) { Invoke-PscRun -Ast $SourceAst -Parameters $RunParameters }
-            elseif ($SourcePath) { Invoke-PscRun -Path $SourcePath -Parameters $RunParameters }
-            else { throw 'Run requires -SourcePath or -SourceAst.' }
-        }
-        'Readme' {
-            $readme = Join-Path $PSScriptRoot 'README.md'
-            [IO.File]::WriteAllLines($readme, [string[]]@(ConvertTo-PscReadme -Api (Get-PscApi)), [Text.UTF8Encoding]::new($false))
-            Get-Item -LiteralPath $readme
-        }
-        'Link' {
-            $resolution = Resolve-CoffLink -Inputs $LinkInput -LibraryDirectories @($LibraryDirectory | Where-Object { $_ }) -DefaultLibraries @($DefaultLibrary | Where-Object { $_ }) -IgnoredDefaultLibraries @($NoDefaultLibrary | Where-Object { $_ }) -Entry $EntrySymbol
-            if ($ResolveOnly) { return $resolution }
-            if ($resolution.Unresolved.Count) { throw ("Link: unresolved external symbols:`n" + ($resolution.Unresolved -join "`n")) }
-            Write-CoffImage -Resolution $resolution -Path ([IO.Path]::GetFullPath($OutputPath)) -Merges @($LinkMerge | Where-Object { $_ }) -Subsystem $(if ($Subsystem -eq 'Windows') { 2 } else { 3 }) -StackReserve $StackReserve
-        }
-    }
-}
- + (Get-VariableName $sym)
+    $name = '$' + (Get-VariableName $sym)
     if ($sym.Kind.ToString() -eq 'Parameter' -and $sym.RefKind.ToString() -in 'Ref','Out') { return $name }
     return "[ref]$name"
 }
@@ -13820,112 +13293,7 @@ function Convert-Expression($e) {
         'IdentifierNameSyntax' {
             $sym = $script:Model.GetSymbolInfo($e).Symbol
             if ($sym -and $sym.Kind.ToString() -in 'Local', 'Parameter') {
-                $name = '    if ($Help) {
-        Get-Help -Name $PSCommandPath -Full
-        return
-    }
-    # With no arguments, the script describes itself instead of compiling nothing.
-    if ($PSBoundParameters.Count -eq 0) { return Get-PscApi }
-    switch ($Mode) {
-        'Api' { Get-PscApi }
-        'PowerShell' { Get-PinnedPowerShell -ArchivePath $ArchivePath }
-        'Compile' {
-            if ($FixedParametersPath) {
-                if ($null -ne $FixedParameters) { throw 'Supply FixedParameters or FixedParametersPath, not both.' }
-                $fixedData = Import-Clixml -LiteralPath $FixedParametersPath
-                if ($fixedData -isnot [hashtable]) { throw 'FixedParametersPath must contain a CLIXML hashtable of fixed parameter values.' }
-                $FixedParameters = $fixedData
-            }
-            $compileParameters = @{}
-            foreach ($name in 'SourcePath', 'SourceAst', 'StaticData', 'ClassName', 'ClassNames', 'MethodNames', 'OutputPath', 'EntryPoint', 'Deterministic') {
-                if ($PSBoundParameters.ContainsKey($name)) { $compileParameters[$name] = $PSBoundParameters[$name] }
-            }
-            if ($Program) {
-                # The script parsed (with the keywords it declares taught to SMA's parser), its fixed parameters applied,
-                # and compiled as a program with Main as its entry point.
-                $programAst = $SourceAst
-                if ($null -eq $programAst) {
-                    $programPath = [IO.Path]::GetFullPath($SourcePath)
-                    $programAst = Read-PowerShellSource -Source ([IO.File]::ReadAllText($programPath)) -SourceFile $programPath
-                }
-                if ($null -ne $FixedParameters -and $FixedParameters.Count) { $programAst = [PscReachability]::Prune([PscFixedParameters]::new($FixedParameters).Fix($programAst)) }
-                $null = $compileParameters.Remove('SourcePath')
-                $compileParameters['SourceAst'] = $programAst
-                $compileParameters['Program'] = $true
-                if (-not $EntryPoint) { $compileParameters['EntryPoint'] = 'Main'; $EntryPoint = 'Main' }
-            }
-            if (-not $Native) { return Export-LoweredAssembly @compileParameters }
-            if (-not $EntryPoint) { throw 'A native executable needs -EntryPoint.' }
-            # The lowered assembly sits beside the executable, named for it; ILC and the linker take it from there.
-            $compileParameters['OutputPath'] = [IO.Path]::ChangeExtension([IO.Path]::GetFullPath($OutputPath), '.dll')
-            $lowered = Export-LoweredAssembly @compileParameters
-            $image = Export-NativeImage -AssemblyPath $lowered.OutputPath -OutputPath $OutputPath -Subsystem $Subsystem -ApplicationIcon $lowered.ApplicationIcon
-            [pscustomobject]@{ Assembly = $lowered; Native = $image }
-        }
-        'CSharp' {
-            if (-not $SourcePath) { throw 'CSharp requires -SourcePath (a C# source file).' }
-            if ($Native) { throw 'CSharp acquires semantics; use Compile on the admitted SMA AST to emit code.' }
-            Invoke-PscCSharpAcquisition -SourcePath $SourcePath -OutputPath $OutputPath -ClassOnly:$CSharpClassOnly -Define $CSharpDefine -ReferencePath $CSharpReferencePath
-        }
-        'Expression' {
-            if ($null -eq $MethodAst) { throw 'Expression requires -MethodAst.' }
-            ConvertTo-TypedExpression -MethodAst $MethodAst
-        }
-        'Inspect' { Test-LoweredAssembly -AssemblyPath $AssemblyPath -ClassName $ClassName -MethodNames $MethodNames }
-        'Capability' { Get-LoweringCapability }
-        'Graph' { Get-SmaGraph $(if ($ProjectPath) { $ProjectPath } else { $PSScriptRoot }) }
-        'Lint' {
-            $targets = if ($LintFiles) { $LintFiles } else { foreach ($project in Get-Projects) { foreach ($relative in $project.Files) { Join-Path $project.Path $relative } } }
-            $findings = @(foreach ($file in $targets) { if (Test-Path -LiteralPath $file) { Get-SmaLint ([IO.Path]::GetFullPath($file)) } })
-            if ($LintEdit) { return Edit-SmaLintFinding -Findings $findings }
-            $findings | Group-Object Rule | Sort-Object Count -Descending | ForEach-Object { '{0,-20} {1,5}' -f $_.Name, $_.Count }
-            $findings | Sort-Object Rule, File, Line | ForEach-Object { '{0,-20} {1}:{2}  {3}' -f $_.Rule, $_.File, $_.Line, $_.Detail }
-        }
-        'Guard' {
-            if (-not $LintFiles) { throw 'Guard requires -LintFiles.' }
-            $verdicts = @(foreach ($file in $LintFiles) { Test-SmaGuard ([IO.Path]::GetFullPath($file)) $CheckerHash })
-            $verdicts
-            $failed = @($verdicts | Where-Object { -not $_.Passed })
-            if ($failed.Count) { throw ('Guard: {0}' -f (@($failed | ForEach-Object { '{0}: {1}' -f $_.File, ($_.Reasons -join '; ') }) -join ' | ')) }
-        }
-        'Profile' { Invoke-SmaProfile }
-        'Report' {
-            if (-not $ProfilePath) { throw 'Report requires a historical -ProfilePath.' }
-            $profiled = Import-Clixml -LiteralPath $ProfilePath
-            Get-SmaReport @(Get-SmaUnits $profiled) $profiled
-        }
-        'Verify' { Test-SmaGraph }
-        'Consolidate' {
-            if (-not $SourcePath -or -not $OutputPath) { throw 'Consolidate requires -SourcePath (the entry script) and -OutputPath (the single script to write).' }
-            ConvertTo-PscSingleScript -Path $SourcePath -OutputPath $OutputPath
-        }
-        'Investigate' {
-            if (-not $InvestigatePath) { throw 'Investigate requires -InvestigatePath.' }
-            Invoke-PscInvestigation -Path $InvestigatePath
-        }
-        'Records' {
-            if ($null -eq $SourceAst) { throw 'Records requires -SourceAst.' }
-            Get-PscRecord -Root $SourceAst
-        }
-        'Run' {
-            if ($null -ne $SourceAst) { Invoke-PscRun -Ast $SourceAst -Parameters $RunParameters }
-            elseif ($SourcePath) { Invoke-PscRun -Path $SourcePath -Parameters $RunParameters }
-            else { throw 'Run requires -SourcePath or -SourceAst.' }
-        }
-        'Readme' {
-            $readme = Join-Path $PSScriptRoot 'README.md'
-            [IO.File]::WriteAllLines($readme, [string[]]@(ConvertTo-PscReadme -Api (Get-PscApi)), [Text.UTF8Encoding]::new($false))
-            Get-Item -LiteralPath $readme
-        }
-        'Link' {
-            $resolution = Resolve-CoffLink -Inputs $LinkInput -LibraryDirectories @($LibraryDirectory | Where-Object { $_ }) -DefaultLibraries @($DefaultLibrary | Where-Object { $_ }) -IgnoredDefaultLibraries @($NoDefaultLibrary | Where-Object { $_ }) -Entry $EntrySymbol
-            if ($ResolveOnly) { return $resolution }
-            if ($resolution.Unresolved.Count) { throw ("Link: unresolved external symbols:`n" + ($resolution.Unresolved -join "`n")) }
-            Write-CoffImage -Resolution $resolution -Path ([IO.Path]::GetFullPath($OutputPath)) -Merges @($LinkMerge | Where-Object { $_ }) -Subsystem $(if ($Subsystem -eq 'Windows') { 2 } else { 3 }) -StackReserve $StackReserve
-        }
-    }
-}
- + (Get-VariableName $sym)
+                $name = '$' + (Get-VariableName $sym)
                 if ($sym.Kind.ToString() -eq 'Parameter' -and $sym.RefKind.ToString() -in 'Ref','Out') { $name += '.Value' }
                 return $name
             }
@@ -14011,112 +13379,7 @@ function Convert-Expression($e) {
         }
         'SwitchExpressionSyntax' {
             if ((Get-ExprType $e.GoverningExpression).SpecialType.ToString() -eq 'System_Object') { Add-Diagnostic $e 'object switch subject' }
-            $subject = '    if ($Help) {
-        Get-Help -Name $PSCommandPath -Full
-        return
-    }
-    # With no arguments, the script describes itself instead of compiling nothing.
-    if ($PSBoundParameters.Count -eq 0) { return Get-PscApi }
-    switch ($Mode) {
-        'Api' { Get-PscApi }
-        'PowerShell' { Get-PinnedPowerShell -ArchivePath $ArchivePath }
-        'Compile' {
-            if ($FixedParametersPath) {
-                if ($null -ne $FixedParameters) { throw 'Supply FixedParameters or FixedParametersPath, not both.' }
-                $fixedData = Import-Clixml -LiteralPath $FixedParametersPath
-                if ($fixedData -isnot [hashtable]) { throw 'FixedParametersPath must contain a CLIXML hashtable of fixed parameter values.' }
-                $FixedParameters = $fixedData
-            }
-            $compileParameters = @{}
-            foreach ($name in 'SourcePath', 'SourceAst', 'StaticData', 'ClassName', 'ClassNames', 'MethodNames', 'OutputPath', 'EntryPoint', 'Deterministic') {
-                if ($PSBoundParameters.ContainsKey($name)) { $compileParameters[$name] = $PSBoundParameters[$name] }
-            }
-            if ($Program) {
-                # The script parsed (with the keywords it declares taught to SMA's parser), its fixed parameters applied,
-                # and compiled as a program with Main as its entry point.
-                $programAst = $SourceAst
-                if ($null -eq $programAst) {
-                    $programPath = [IO.Path]::GetFullPath($SourcePath)
-                    $programAst = Read-PowerShellSource -Source ([IO.File]::ReadAllText($programPath)) -SourceFile $programPath
-                }
-                if ($null -ne $FixedParameters -and $FixedParameters.Count) { $programAst = [PscReachability]::Prune([PscFixedParameters]::new($FixedParameters).Fix($programAst)) }
-                $null = $compileParameters.Remove('SourcePath')
-                $compileParameters['SourceAst'] = $programAst
-                $compileParameters['Program'] = $true
-                if (-not $EntryPoint) { $compileParameters['EntryPoint'] = 'Main'; $EntryPoint = 'Main' }
-            }
-            if (-not $Native) { return Export-LoweredAssembly @compileParameters }
-            if (-not $EntryPoint) { throw 'A native executable needs -EntryPoint.' }
-            # The lowered assembly sits beside the executable, named for it; ILC and the linker take it from there.
-            $compileParameters['OutputPath'] = [IO.Path]::ChangeExtension([IO.Path]::GetFullPath($OutputPath), '.dll')
-            $lowered = Export-LoweredAssembly @compileParameters
-            $image = Export-NativeImage -AssemblyPath $lowered.OutputPath -OutputPath $OutputPath -Subsystem $Subsystem -ApplicationIcon $lowered.ApplicationIcon
-            [pscustomobject]@{ Assembly = $lowered; Native = $image }
-        }
-        'CSharp' {
-            if (-not $SourcePath) { throw 'CSharp requires -SourcePath (a C# source file).' }
-            if ($Native) { throw 'CSharp acquires semantics; use Compile on the admitted SMA AST to emit code.' }
-            Invoke-PscCSharpAcquisition -SourcePath $SourcePath -OutputPath $OutputPath -ClassOnly:$CSharpClassOnly -Define $CSharpDefine -ReferencePath $CSharpReferencePath
-        }
-        'Expression' {
-            if ($null -eq $MethodAst) { throw 'Expression requires -MethodAst.' }
-            ConvertTo-TypedExpression -MethodAst $MethodAst
-        }
-        'Inspect' { Test-LoweredAssembly -AssemblyPath $AssemblyPath -ClassName $ClassName -MethodNames $MethodNames }
-        'Capability' { Get-LoweringCapability }
-        'Graph' { Get-SmaGraph $(if ($ProjectPath) { $ProjectPath } else { $PSScriptRoot }) }
-        'Lint' {
-            $targets = if ($LintFiles) { $LintFiles } else { foreach ($project in Get-Projects) { foreach ($relative in $project.Files) { Join-Path $project.Path $relative } } }
-            $findings = @(foreach ($file in $targets) { if (Test-Path -LiteralPath $file) { Get-SmaLint ([IO.Path]::GetFullPath($file)) } })
-            if ($LintEdit) { return Edit-SmaLintFinding -Findings $findings }
-            $findings | Group-Object Rule | Sort-Object Count -Descending | ForEach-Object { '{0,-20} {1,5}' -f $_.Name, $_.Count }
-            $findings | Sort-Object Rule, File, Line | ForEach-Object { '{0,-20} {1}:{2}  {3}' -f $_.Rule, $_.File, $_.Line, $_.Detail }
-        }
-        'Guard' {
-            if (-not $LintFiles) { throw 'Guard requires -LintFiles.' }
-            $verdicts = @(foreach ($file in $LintFiles) { Test-SmaGuard ([IO.Path]::GetFullPath($file)) $CheckerHash })
-            $verdicts
-            $failed = @($verdicts | Where-Object { -not $_.Passed })
-            if ($failed.Count) { throw ('Guard: {0}' -f (@($failed | ForEach-Object { '{0}: {1}' -f $_.File, ($_.Reasons -join '; ') }) -join ' | ')) }
-        }
-        'Profile' { Invoke-SmaProfile }
-        'Report' {
-            if (-not $ProfilePath) { throw 'Report requires a historical -ProfilePath.' }
-            $profiled = Import-Clixml -LiteralPath $ProfilePath
-            Get-SmaReport @(Get-SmaUnits $profiled) $profiled
-        }
-        'Verify' { Test-SmaGraph }
-        'Consolidate' {
-            if (-not $SourcePath -or -not $OutputPath) { throw 'Consolidate requires -SourcePath (the entry script) and -OutputPath (the single script to write).' }
-            ConvertTo-PscSingleScript -Path $SourcePath -OutputPath $OutputPath
-        }
-        'Investigate' {
-            if (-not $InvestigatePath) { throw 'Investigate requires -InvestigatePath.' }
-            Invoke-PscInvestigation -Path $InvestigatePath
-        }
-        'Records' {
-            if ($null -eq $SourceAst) { throw 'Records requires -SourceAst.' }
-            Get-PscRecord -Root $SourceAst
-        }
-        'Run' {
-            if ($null -ne $SourceAst) { Invoke-PscRun -Ast $SourceAst -Parameters $RunParameters }
-            elseif ($SourcePath) { Invoke-PscRun -Path $SourcePath -Parameters $RunParameters }
-            else { throw 'Run requires -SourcePath or -SourceAst.' }
-        }
-        'Readme' {
-            $readme = Join-Path $PSScriptRoot 'README.md'
-            [IO.File]::WriteAllLines($readme, [string[]]@(ConvertTo-PscReadme -Api (Get-PscApi)), [Text.UTF8Encoding]::new($false))
-            Get-Item -LiteralPath $readme
-        }
-        'Link' {
-            $resolution = Resolve-CoffLink -Inputs $LinkInput -LibraryDirectories @($LibraryDirectory | Where-Object { $_ }) -DefaultLibraries @($DefaultLibrary | Where-Object { $_ }) -IgnoredDefaultLibraries @($NoDefaultLibrary | Where-Object { $_ }) -Entry $EntrySymbol
-            if ($ResolveOnly) { return $resolution }
-            if ($resolution.Unresolved.Count) { throw ("Link: unresolved external symbols:`n" + ($resolution.Unresolved -join "`n")) }
-            Write-CoffImage -Resolution $resolution -Path ([IO.Path]::GetFullPath($OutputPath)) -Merges @($LinkMerge | Where-Object { $_ }) -Subsystem $(if ($Subsystem -eq 'Windows') { 2 } else { 3 }) -StackReserve $StackReserve
-        }
-    }
-}
- + (Get-GeneratedName $e 'switchValue')
+            $subject = '$' + (Get-GeneratedName $e 'switchValue')
             $text = "`$($subject = $(Convert-Expression $e.GoverningExpression); "
             $first = $true
             foreach ($arm in $e.Arms) {
@@ -14280,112 +13543,7 @@ function Convert-Binary($e) {
         if ($op -eq '!=') { return "(-not ($test))" }; return "($test)"
     }
     if ($op -eq '??') {
-        $value = '    if ($Help) {
-        Get-Help -Name $PSCommandPath -Full
-        return
-    }
-    # With no arguments, the script describes itself instead of compiling nothing.
-    if ($PSBoundParameters.Count -eq 0) { return Get-PscApi }
-    switch ($Mode) {
-        'Api' { Get-PscApi }
-        'PowerShell' { Get-PinnedPowerShell -ArchivePath $ArchivePath }
-        'Compile' {
-            if ($FixedParametersPath) {
-                if ($null -ne $FixedParameters) { throw 'Supply FixedParameters or FixedParametersPath, not both.' }
-                $fixedData = Import-Clixml -LiteralPath $FixedParametersPath
-                if ($fixedData -isnot [hashtable]) { throw 'FixedParametersPath must contain a CLIXML hashtable of fixed parameter values.' }
-                $FixedParameters = $fixedData
-            }
-            $compileParameters = @{}
-            foreach ($name in 'SourcePath', 'SourceAst', 'StaticData', 'ClassName', 'ClassNames', 'MethodNames', 'OutputPath', 'EntryPoint', 'Deterministic') {
-                if ($PSBoundParameters.ContainsKey($name)) { $compileParameters[$name] = $PSBoundParameters[$name] }
-            }
-            if ($Program) {
-                # The script parsed (with the keywords it declares taught to SMA's parser), its fixed parameters applied,
-                # and compiled as a program with Main as its entry point.
-                $programAst = $SourceAst
-                if ($null -eq $programAst) {
-                    $programPath = [IO.Path]::GetFullPath($SourcePath)
-                    $programAst = Read-PowerShellSource -Source ([IO.File]::ReadAllText($programPath)) -SourceFile $programPath
-                }
-                if ($null -ne $FixedParameters -and $FixedParameters.Count) { $programAst = [PscReachability]::Prune([PscFixedParameters]::new($FixedParameters).Fix($programAst)) }
-                $null = $compileParameters.Remove('SourcePath')
-                $compileParameters['SourceAst'] = $programAst
-                $compileParameters['Program'] = $true
-                if (-not $EntryPoint) { $compileParameters['EntryPoint'] = 'Main'; $EntryPoint = 'Main' }
-            }
-            if (-not $Native) { return Export-LoweredAssembly @compileParameters }
-            if (-not $EntryPoint) { throw 'A native executable needs -EntryPoint.' }
-            # The lowered assembly sits beside the executable, named for it; ILC and the linker take it from there.
-            $compileParameters['OutputPath'] = [IO.Path]::ChangeExtension([IO.Path]::GetFullPath($OutputPath), '.dll')
-            $lowered = Export-LoweredAssembly @compileParameters
-            $image = Export-NativeImage -AssemblyPath $lowered.OutputPath -OutputPath $OutputPath -Subsystem $Subsystem -ApplicationIcon $lowered.ApplicationIcon
-            [pscustomobject]@{ Assembly = $lowered; Native = $image }
-        }
-        'CSharp' {
-            if (-not $SourcePath) { throw 'CSharp requires -SourcePath (a C# source file).' }
-            if ($Native) { throw 'CSharp acquires semantics; use Compile on the admitted SMA AST to emit code.' }
-            Invoke-PscCSharpAcquisition -SourcePath $SourcePath -OutputPath $OutputPath -ClassOnly:$CSharpClassOnly -Define $CSharpDefine -ReferencePath $CSharpReferencePath
-        }
-        'Expression' {
-            if ($null -eq $MethodAst) { throw 'Expression requires -MethodAst.' }
-            ConvertTo-TypedExpression -MethodAst $MethodAst
-        }
-        'Inspect' { Test-LoweredAssembly -AssemblyPath $AssemblyPath -ClassName $ClassName -MethodNames $MethodNames }
-        'Capability' { Get-LoweringCapability }
-        'Graph' { Get-SmaGraph $(if ($ProjectPath) { $ProjectPath } else { $PSScriptRoot }) }
-        'Lint' {
-            $targets = if ($LintFiles) { $LintFiles } else { foreach ($project in Get-Projects) { foreach ($relative in $project.Files) { Join-Path $project.Path $relative } } }
-            $findings = @(foreach ($file in $targets) { if (Test-Path -LiteralPath $file) { Get-SmaLint ([IO.Path]::GetFullPath($file)) } })
-            if ($LintEdit) { return Edit-SmaLintFinding -Findings $findings }
-            $findings | Group-Object Rule | Sort-Object Count -Descending | ForEach-Object { '{0,-20} {1,5}' -f $_.Name, $_.Count }
-            $findings | Sort-Object Rule, File, Line | ForEach-Object { '{0,-20} {1}:{2}  {3}' -f $_.Rule, $_.File, $_.Line, $_.Detail }
-        }
-        'Guard' {
-            if (-not $LintFiles) { throw 'Guard requires -LintFiles.' }
-            $verdicts = @(foreach ($file in $LintFiles) { Test-SmaGuard ([IO.Path]::GetFullPath($file)) $CheckerHash })
-            $verdicts
-            $failed = @($verdicts | Where-Object { -not $_.Passed })
-            if ($failed.Count) { throw ('Guard: {0}' -f (@($failed | ForEach-Object { '{0}: {1}' -f $_.File, ($_.Reasons -join '; ') }) -join ' | ')) }
-        }
-        'Profile' { Invoke-SmaProfile }
-        'Report' {
-            if (-not $ProfilePath) { throw 'Report requires a historical -ProfilePath.' }
-            $profiled = Import-Clixml -LiteralPath $ProfilePath
-            Get-SmaReport @(Get-SmaUnits $profiled) $profiled
-        }
-        'Verify' { Test-SmaGraph }
-        'Consolidate' {
-            if (-not $SourcePath -or -not $OutputPath) { throw 'Consolidate requires -SourcePath (the entry script) and -OutputPath (the single script to write).' }
-            ConvertTo-PscSingleScript -Path $SourcePath -OutputPath $OutputPath
-        }
-        'Investigate' {
-            if (-not $InvestigatePath) { throw 'Investigate requires -InvestigatePath.' }
-            Invoke-PscInvestigation -Path $InvestigatePath
-        }
-        'Records' {
-            if ($null -eq $SourceAst) { throw 'Records requires -SourceAst.' }
-            Get-PscRecord -Root $SourceAst
-        }
-        'Run' {
-            if ($null -ne $SourceAst) { Invoke-PscRun -Ast $SourceAst -Parameters $RunParameters }
-            elseif ($SourcePath) { Invoke-PscRun -Path $SourcePath -Parameters $RunParameters }
-            else { throw 'Run requires -SourcePath or -SourceAst.' }
-        }
-        'Readme' {
-            $readme = Join-Path $PSScriptRoot 'README.md'
-            [IO.File]::WriteAllLines($readme, [string[]]@(ConvertTo-PscReadme -Api (Get-PscApi)), [Text.UTF8Encoding]::new($false))
-            Get-Item -LiteralPath $readme
-        }
-        'Link' {
-            $resolution = Resolve-CoffLink -Inputs $LinkInput -LibraryDirectories @($LibraryDirectory | Where-Object { $_ }) -DefaultLibraries @($DefaultLibrary | Where-Object { $_ }) -IgnoredDefaultLibraries @($NoDefaultLibrary | Where-Object { $_ }) -Entry $EntrySymbol
-            if ($ResolveOnly) { return $resolution }
-            if ($resolution.Unresolved.Count) { throw ("Link: unresolved external symbols:`n" + ($resolution.Unresolved -join "`n")) }
-            Write-CoffImage -Resolution $resolution -Path ([IO.Path]::GetFullPath($OutputPath)) -Merges @($LinkMerge | Where-Object { $_ }) -Subsystem $(if ($Subsystem -eq 'Windows') { 2 } else { 3 }) -StackReserve $StackReserve
-        }
-    }
-}
- + (Get-GeneratedName $e 'coalescedValue')
+        $value = '$' + (Get-GeneratedName $e 'coalescedValue')
         $resultType = Get-ExprType $e
         $nonNull = if ((Test-Integral $resultType) -or (Test-Floating $resultType)) { "[$(Get-PsTypeName $resultType)]$value" } else { $value }
         return "`$($value = $l; if (`$null -eq $value) { ,($r) } else { ,($nonNull) })"
@@ -14451,112 +13609,7 @@ function Convert-Increment($e, [bool] $postfix) {
     if (-not (Test-Integral $type)) { Add-Diagnostic $e 'increment requires an integral local, parameter or simple field'; return '$null' }
     if (-not (Test-SimpleLValue $e.Operand)) { Add-Diagnostic $e 'increment with effectful lvalue'; return '$null' }
     $left = Convert-Expression $e.Operand
-    $old = '    if ($Help) {
-        Get-Help -Name $PSCommandPath -Full
-        return
-    }
-    # With no arguments, the script describes itself instead of compiling nothing.
-    if ($PSBoundParameters.Count -eq 0) { return Get-PscApi }
-    switch ($Mode) {
-        'Api' { Get-PscApi }
-        'PowerShell' { Get-PinnedPowerShell -ArchivePath $ArchivePath }
-        'Compile' {
-            if ($FixedParametersPath) {
-                if ($null -ne $FixedParameters) { throw 'Supply FixedParameters or FixedParametersPath, not both.' }
-                $fixedData = Import-Clixml -LiteralPath $FixedParametersPath
-                if ($fixedData -isnot [hashtable]) { throw 'FixedParametersPath must contain a CLIXML hashtable of fixed parameter values.' }
-                $FixedParameters = $fixedData
-            }
-            $compileParameters = @{}
-            foreach ($name in 'SourcePath', 'SourceAst', 'StaticData', 'ClassName', 'ClassNames', 'MethodNames', 'OutputPath', 'EntryPoint', 'Deterministic') {
-                if ($PSBoundParameters.ContainsKey($name)) { $compileParameters[$name] = $PSBoundParameters[$name] }
-            }
-            if ($Program) {
-                # The script parsed (with the keywords it declares taught to SMA's parser), its fixed parameters applied,
-                # and compiled as a program with Main as its entry point.
-                $programAst = $SourceAst
-                if ($null -eq $programAst) {
-                    $programPath = [IO.Path]::GetFullPath($SourcePath)
-                    $programAst = Read-PowerShellSource -Source ([IO.File]::ReadAllText($programPath)) -SourceFile $programPath
-                }
-                if ($null -ne $FixedParameters -and $FixedParameters.Count) { $programAst = [PscReachability]::Prune([PscFixedParameters]::new($FixedParameters).Fix($programAst)) }
-                $null = $compileParameters.Remove('SourcePath')
-                $compileParameters['SourceAst'] = $programAst
-                $compileParameters['Program'] = $true
-                if (-not $EntryPoint) { $compileParameters['EntryPoint'] = 'Main'; $EntryPoint = 'Main' }
-            }
-            if (-not $Native) { return Export-LoweredAssembly @compileParameters }
-            if (-not $EntryPoint) { throw 'A native executable needs -EntryPoint.' }
-            # The lowered assembly sits beside the executable, named for it; ILC and the linker take it from there.
-            $compileParameters['OutputPath'] = [IO.Path]::ChangeExtension([IO.Path]::GetFullPath($OutputPath), '.dll')
-            $lowered = Export-LoweredAssembly @compileParameters
-            $image = Export-NativeImage -AssemblyPath $lowered.OutputPath -OutputPath $OutputPath -Subsystem $Subsystem -ApplicationIcon $lowered.ApplicationIcon
-            [pscustomobject]@{ Assembly = $lowered; Native = $image }
-        }
-        'CSharp' {
-            if (-not $SourcePath) { throw 'CSharp requires -SourcePath (a C# source file).' }
-            if ($Native) { throw 'CSharp acquires semantics; use Compile on the admitted SMA AST to emit code.' }
-            Invoke-PscCSharpAcquisition -SourcePath $SourcePath -OutputPath $OutputPath -ClassOnly:$CSharpClassOnly -Define $CSharpDefine -ReferencePath $CSharpReferencePath
-        }
-        'Expression' {
-            if ($null -eq $MethodAst) { throw 'Expression requires -MethodAst.' }
-            ConvertTo-TypedExpression -MethodAst $MethodAst
-        }
-        'Inspect' { Test-LoweredAssembly -AssemblyPath $AssemblyPath -ClassName $ClassName -MethodNames $MethodNames }
-        'Capability' { Get-LoweringCapability }
-        'Graph' { Get-SmaGraph $(if ($ProjectPath) { $ProjectPath } else { $PSScriptRoot }) }
-        'Lint' {
-            $targets = if ($LintFiles) { $LintFiles } else { foreach ($project in Get-Projects) { foreach ($relative in $project.Files) { Join-Path $project.Path $relative } } }
-            $findings = @(foreach ($file in $targets) { if (Test-Path -LiteralPath $file) { Get-SmaLint ([IO.Path]::GetFullPath($file)) } })
-            if ($LintEdit) { return Edit-SmaLintFinding -Findings $findings }
-            $findings | Group-Object Rule | Sort-Object Count -Descending | ForEach-Object { '{0,-20} {1,5}' -f $_.Name, $_.Count }
-            $findings | Sort-Object Rule, File, Line | ForEach-Object { '{0,-20} {1}:{2}  {3}' -f $_.Rule, $_.File, $_.Line, $_.Detail }
-        }
-        'Guard' {
-            if (-not $LintFiles) { throw 'Guard requires -LintFiles.' }
-            $verdicts = @(foreach ($file in $LintFiles) { Test-SmaGuard ([IO.Path]::GetFullPath($file)) $CheckerHash })
-            $verdicts
-            $failed = @($verdicts | Where-Object { -not $_.Passed })
-            if ($failed.Count) { throw ('Guard: {0}' -f (@($failed | ForEach-Object { '{0}: {1}' -f $_.File, ($_.Reasons -join '; ') }) -join ' | ')) }
-        }
-        'Profile' { Invoke-SmaProfile }
-        'Report' {
-            if (-not $ProfilePath) { throw 'Report requires a historical -ProfilePath.' }
-            $profiled = Import-Clixml -LiteralPath $ProfilePath
-            Get-SmaReport @(Get-SmaUnits $profiled) $profiled
-        }
-        'Verify' { Test-SmaGraph }
-        'Consolidate' {
-            if (-not $SourcePath -or -not $OutputPath) { throw 'Consolidate requires -SourcePath (the entry script) and -OutputPath (the single script to write).' }
-            ConvertTo-PscSingleScript -Path $SourcePath -OutputPath $OutputPath
-        }
-        'Investigate' {
-            if (-not $InvestigatePath) { throw 'Investigate requires -InvestigatePath.' }
-            Invoke-PscInvestigation -Path $InvestigatePath
-        }
-        'Records' {
-            if ($null -eq $SourceAst) { throw 'Records requires -SourceAst.' }
-            Get-PscRecord -Root $SourceAst
-        }
-        'Run' {
-            if ($null -ne $SourceAst) { Invoke-PscRun -Ast $SourceAst -Parameters $RunParameters }
-            elseif ($SourcePath) { Invoke-PscRun -Path $SourcePath -Parameters $RunParameters }
-            else { throw 'Run requires -SourcePath or -SourceAst.' }
-        }
-        'Readme' {
-            $readme = Join-Path $PSScriptRoot 'README.md'
-            [IO.File]::WriteAllLines($readme, [string[]]@(ConvertTo-PscReadme -Api (Get-PscApi)), [Text.UTF8Encoding]::new($false))
-            Get-Item -LiteralPath $readme
-        }
-        'Link' {
-            $resolution = Resolve-CoffLink -Inputs $LinkInput -LibraryDirectories @($LibraryDirectory | Where-Object { $_ }) -DefaultLibraries @($DefaultLibrary | Where-Object { $_ }) -IgnoredDefaultLibraries @($NoDefaultLibrary | Where-Object { $_ }) -Entry $EntrySymbol
-            if ($ResolveOnly) { return $resolution }
-            if ($resolution.Unresolved.Count) { throw ("Link: unresolved external symbols:`n" + ($resolution.Unresolved -join "`n")) }
-            Write-CoffImage -Resolution $resolution -Path ([IO.Path]::GetFullPath($OutputPath)) -Merges @($LinkMerge | Where-Object { $_ }) -Subsystem $(if ($Subsystem -eq 'Windows') { 2 } else { 3 }) -StackReserve $StackReserve
-        }
-    }
-}
- + (Get-GeneratedName $e 'previousValue')
+    $old = '$' + (Get-GeneratedName $e 'previousValue')
     $op = if ($e.OperatorToken.Text -eq '++') { '+' } else { '-' }
     $value = if ($postfix) { $old } else { $left }
     $operation = if ($nullable) { "(Invoke-CS2PSNullableBinary ($old) 1 '$op' '$(Get-PsTypeName $type)' $(Get-CheckedFlag $e))" } else { Convert-IntegerOperation $e $old '1' $op $type }
@@ -14576,12 +13629,9 @@ function Convert-Increment($e, [bool] $postfix) {
     $result.ApiCalls = if ($null -ne $translation.ApiCalls) { [object[]]@($translation.ApiCalls) } else { [object[]]@() }
     $result.CSharpModel = $script:Model
     if ($null -ne $script:Model) { $result.CSharpSyntaxTree = $script:Model.SyntaxTree }
-
     $tokens = $null; $parseErrors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseInput($result.PowerShell, $sourceFullPath, [ref]$tokens, [ref]$parseErrors)
-    if ($parseErrors.Count -ne 0) {
-        throw ("CS2PS emitted invalid SMA syntax: " + ($parseErrors -join '; '))
-    }
+    if ($parseErrors.Count -gt 0) { throw ("CS2PS emitted invalid SMA syntax: " + ($parseErrors -join '; ')) }
     if ($result.Diagnostics.Length -eq 0) {
         $result.Admitted = $true
         $result.PowerShellAst = $ast
