@@ -11816,6 +11816,24 @@ class PscCSharpCallBearing {
     [object[]] $MethodArgumentSymbols
     [object] $ReturnSymbol
 }
+enum PscCSharpDispatchKind {
+    DirectStatic
+    DirectInstance
+    Virtual
+    Interface
+}
+class PscCSharpMethodPlan {
+    [object] $CallSyntax
+    [object] $Symbol
+    [object] $DefinitionSymbol
+    [object] $OwnerSymbol
+    [object[]] $ParameterSymbols
+    [object[]] $MethodArgumentSymbols
+    [object] $ReturnSymbol
+    [PscCSharpDispatchKind] $Dispatch
+    [bool] $ReceiverNullCheck
+    [bool] $OwnerClosed
+}
 class PscCSharpBoundEvidence {
     [PscCSharpTypeBearing[]] $Types
     [PscCSharpCallBearing[]] $Calls
@@ -11833,6 +11851,7 @@ class PscCSharpAcquisition {
     [System.Management.Automation.ErrorRecord] $TranslationError
     [PscCSharpTypeBearing[]] $BoundTypes
     [PscCSharpCallBearing[]] $BoundCalls
+    [PscCSharpMethodPlan[]] $MethodPlans
     [object[]] $Diagnostics
     [object[]] $Methods
     [object[]] $Types
@@ -13673,6 +13692,30 @@ function Convert-Increment($e, [bool] $postfix) {
         return $true
     }
 
+    function Get-PscCSharpMethodPlan([PscCSharpCallBearing] $Binding) {
+        $method = $Binding.Symbol
+        if ($method -isnot [Microsoft.CodeAnalysis.IMethodSymbol]) {
+            throw 'Expected bound Roslyn IMethodSymbol.'
+        }
+        $plan = [PscCSharpMethodPlan]::new()
+        $plan.CallSyntax = $Binding.Syntax
+        $plan.Symbol = $method
+        $plan.DefinitionSymbol = $method.OriginalDefinition
+        $plan.OwnerSymbol = $method.ContainingType
+        $plan.ParameterSymbols = [object[]]@($method.Parameters | ForEach-Object { $_.Type })
+        $plan.MethodArgumentSymbols = [object[]]@($method.TypeArguments)
+        $plan.ReturnSymbol = $method.ReturnType
+        $plan.ReceiverNullCheck = -not $method.IsStatic
+        $plan.OwnerClosed = Test-PscCSharpClosedType $method.ContainingType
+        # A sealed receiver type or sealed override is statically devirtualizable,
+        # but still requires the instance null check and all observable semantics.
+        $plan.Dispatch = if ($method.IsStatic) { [PscCSharpDispatchKind]::DirectStatic }
+            elseif ($method.ContainingType.TypeKind -eq [Microsoft.CodeAnalysis.TypeKind]::Interface) { [PscCSharpDispatchKind]::Interface }
+            elseif ($method.IsVirtual -and -not $method.IsSealed -and -not $method.ContainingType.IsSealed) { [PscCSharpDispatchKind]::Virtual }
+            else { [PscCSharpDispatchKind]::DirectInstance }
+        $plan
+    }
+
     function Get-PscCSharpBoundEvidence([object] $SemanticModel) {
         $typeBearings = [Collections.Generic.List[PscCSharpTypeBearing]]::new()
         $callBearings = [Collections.Generic.List[PscCSharpCallBearing]]::new()
@@ -13750,6 +13793,7 @@ function Convert-Increment($e, [bool] $postfix) {
     $evidence = Get-PscCSharpBoundEvidence $model
     $result.BoundTypes = $evidence.Types
     $result.BoundCalls = $evidence.Calls
+    $result.MethodPlans = [PscCSharpMethodPlan[]]@($evidence.Calls | ForEach-Object { Get-PscCSharpMethodPlan $_ })
 
     # Translation is a second admission gate. Its diagnostics are preserved,
     # but they cannot revoke the semantic graph already acquired above.
