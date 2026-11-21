@@ -3,6 +3,8 @@ on:
   push:
     branches: [integrate-cs2ps-semantics]
   workflow_dispatch:
+  pull_request:
+    branches: [main]
 jobs:
   semantic-acquisition:
     runs-on: windows-2025
