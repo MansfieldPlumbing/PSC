@@ -41,17 +41,24 @@ jobs:
           }
           @'
           namespace ILCompiler.DependencyAnalysisFramework {
-            public interface IMarker<T> { }
+            public interface IMarker<T> { bool Mark(T value); }
             public abstract class DependencyAnalyzerBase<T> { }
             public sealed class Context { }
-            public struct NoLogStrategy<T> : IMarker<T> { }
+            public struct NoLogStrategy<T> : IMarker<T> { public bool Mark(T value) { return true; } }
             public struct ShapeOnlyStrategy<T> { }
             public sealed class DependencyAnalyzer<MarkStrategy,T> : DependencyAnalyzerBase<T>
                 where MarkStrategy : struct, IMarker<T> {
+                public void AddRoot(T value) { }
             }
             public static class Use {
                 public static void Go() {
                     var a = new DependencyAnalyzer<NoLogStrategy<Context>,Context>();
+                    a.AddRoot(new Context());
+                    int v = Identity<int>(4);
+                }
+                public static T Identity<T>(T value) { return value; }
+                public static bool ProbeInterface(IMarker<Context> strategy) {
+                    return strategy.Mark(new Context());
                 }
             }
           }
@@ -69,6 +76,31 @@ jobs:
               -not [Microsoft.CodeAnalysis.SymbolEqualityComparer]::Default.Equals(
                   $baseType.TypeArguments[0], $constructed[0].ArgumentSymbols[1])) {
               throw 'Constructed generic base identity mismatch.'
+          }
+          $plans = @($bound.MethodPlans)
+          $rootCall = @($plans | Where-Object { $_.Symbol.Name -eq 'AddRoot' })
+          $markCall = @($plans | Where-Object { $_.Symbol.Name -eq 'Mark' })
+          $identityCall = @($plans | Where-Object { $_.Symbol.Name -eq 'Identity' })
+          if ($rootCall.Count -ne 1 -or
+              $rootCall[0].Dispatch.ToString() -ne 'DirectInstance' -or
+              -not $rootCall[0].ReceiverNullCheck -or -not $rootCall[0].OwnerClosed) {
+              throw 'Constructed sealed instance method not classified correctly.'
+          }
+          if ($markCall.Count -ne 1 -or
+              $markCall[0].Dispatch.ToString() -ne 'Interface' -or
+              -not $markCall[0].ReceiverNullCheck) {
+              throw 'Interface method dispatch plan lost.'
+          }
+          if ($identityCall.Count -ne 1 -or
+              $identityCall[0].Dispatch.ToString() -ne 'DirectStatic' -or
+              $identityCall[0].ReceiverNullCheck -or
+              $identityCall[0].MethodArgumentSymbols[0].SpecialType -ne
+                  [Microsoft.CodeAnalysis.SpecialType]::System_Int32) {
+              throw 'Constructed static generic identity call plan lost.'
+          }
+          if (-not [Microsoft.CodeAnalysis.SymbolEqualityComparer]::Default.Equals(
+              $identityCall[0].DefinitionSymbol, $identityCall[0].Symbol.OriginalDefinition)) {
+              throw 'Roslyn original method identity not retained.'
           }
           $invalidCode = (Get-Content ./ilc-generic.cs -Raw).Replace(
               'new DependencyAnalyzer<NoLogStrategy<Context>,Context>()',
