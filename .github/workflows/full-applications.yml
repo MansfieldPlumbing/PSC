@@ -1,0 +1,58 @@
+name: PSC full application conformance
+
+on:
+  push:
+    branches: [integrate-cs2ps-semantics]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  managed-applications:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Check out PSC under test
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: psc
+      - name: Check out known-good PSNES source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: MansfieldPlumbing/PSNES
+          ref: 8165c65e51ea4efbcef0cded7cd2337e336ea8a0
+          path: psnes
+      - name: Check out known-good Notepad source and icon
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: MansfieldPlumbing/Notepad
+          ref: 17b76e22a5d3132e22c195989aa9dec70dc4ded6
+          path: notepad
+      - name: Restore pinned PowerShell 7.7 / .NET 11
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 \
+            https://github.com/PowerShell/PowerShell/releases/download/v7.7.0/powershell-7.7.0-linux-x64.tar.gz \
+            --output pwsh.tar.gz
+          echo 'c89d9c682d2c403dfe726f3df948e359675235a5bd6fab535776de69729ca0cb  pwsh.tar.gz' | sha256sum --check
+          mkdir pwsh-runtime
+          tar -xzf pwsh.tar.gz -C pwsh-runtime
+          chmod +x pwsh-runtime/pwsh
+          ./pwsh-runtime/pwsh -NoProfile -NonInteractive -Command '
+            if ($PSVersionTable.PSVersion.ToString() -ne "7.7.0" -or [Environment]::Version.Major -ne 11) {
+              throw "Wrong PowerShell/CoreCLR runtime"
+            }'
+      - name: Parse and build both complete managed applications; check behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./pwsh-runtime/pwsh -NoProfile -NonInteractive -File \
+            ./psc/.github/scripts/Verify-FullApplications.ps1 \
+            -Psc ./psc/Invoke-PSC.ps1 \
+            -Psnes ./psnes/PSNES.ps1 \
+            -Notepad ./notepad/Notepad.ps1 \
+            -OutputDirectory ./build-conformance
