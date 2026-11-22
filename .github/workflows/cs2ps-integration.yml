@@ -1,0 +1,114 @@
+name: PSC CS2PS acquisition
+on:
+  push:
+    branches: [integrate-cs2ps-semantics]
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+jobs:
+  semantic-acquisition:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Parse, admit and reject C# sources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tokens = $null; $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+              (Join-Path $PWD 'Invoke-PSC.ps1'), [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw "PSC parse failed: $($errors -join '; ')" }
+          $api = & ./Invoke-PSC.ps1 -Mode Api
+          if ('CSharp' -notin $api.Modes.Mode) { throw 'CSharp mode is not discoverable.' }
+          @'
+          public class Redline {
+              public static int Multiply(int x, int y) { return x * y; }
+          }
+          '@ | Set-Content -Path ./positive.cs
+          $ok = & ./Invoke-PSC.ps1 -Mode CSharp -SourcePath ./positive.cs -OutputPath ./positive.ps1 -CSharpClassOnly
+          if (-not $ok.Admitted -or -not $ok.PowerShellAst -or -not $ok.CSharpModel) {
+              throw ("CSharp positive case was not admitted: " + ($ok.Diagnostics | Out-String))
+          }
+          if (-not (Test-Path ./positive.ps1)) { throw 'Admitted output was not written.' }
+          @'
+          public class Generic<T> {
+              public T Identity(T value) { return value; }
+          }
+          '@ | Set-Content -Path ./rejected.cs
+          $negative = & ./Invoke-PSC.ps1 -Mode CSharp -SourcePath ./rejected.cs -OutputPath ./rejected.ps1 -CSharpClassOnly
+          if (-not $negative.RoslynAdmitted -or $negative.Admitted -or $negative.Diagnostics.Count -eq 0 -or (Test-Path ./rejected.ps1)) {
+              throw 'Unsupported generics must fail closed without writing code.'
+          }
+          @'
+          namespace ILCompiler.DependencyAnalysisFramework {
+            public interface IMarker<T> { bool Mark(T value); }
+            public abstract class DependencyAnalyzerBase<T> { }
+            public sealed class Context { }
+            public struct NoLogStrategy<T> : IMarker<T> { public bool Mark(T value) { return true; } }
+            public struct ShapeOnlyStrategy<T> { }
+            public sealed class DependencyAnalyzer<MarkStrategy,T> : DependencyAnalyzerBase<T>
+                where MarkStrategy : struct, IMarker<T> {
+                public void AddRoot(T value) { }
+            }
+            public static class Use {
+                public static void Go() {
+                    var a = new DependencyAnalyzer<NoLogStrategy<Context>,Context>();
+                    a.AddRoot(new Context());
+                    int v = Identity<int>(4);
+                }
+                public static T Identity<T>(T value) { return value; }
+                public static bool ProbeInterface(IMarker<Context> strategy) {
+                    return strategy.Mark(new Context());
+                }
+            }
+          }
+          '@ | Set-Content -Path ./ilc-generic.cs
+          $bound = & ./Invoke-PSC.ps1 -Mode CSharp -SourcePath ./ilc-generic.cs -OutputPath ./ilc-generic.ps1 -CSharpClassOnly
+          if (-not $bound.RoslynAdmitted -or $bound.Admitted -or (Test-Path ./ilc-generic.ps1)) {
+              throw "ILC generic source must bind but remain unadmitted for PS1 lowering."
+          }
+          $constructed = @($bound.BoundTypes | Where-Object {
+              $_.Symbol.Name -eq 'DependencyAnalyzer' -and $_.Closed -and $_.ArgumentSymbols[1].Name -eq 'Context'
+          })
+          if ($constructed.Count -ne 1) { throw 'Closed ILC DependencyAnalyzer was not retained.' }
+          $baseType = $constructed[0].Symbol.BaseType
+          if ($baseType.Name -ne 'DependencyAnalyzerBase' -or
+              -not [Microsoft.CodeAnalysis.SymbolEqualityComparer]::Default.Equals(
+                  $baseType.TypeArguments[0], $constructed[0].ArgumentSymbols[1])) {
+              throw 'Constructed generic base identity mismatch.'
+          }
+          $plans = @($bound.MethodPlans)
+          $rootCall = @($plans | Where-Object { $_.Symbol.Name -eq 'AddRoot' })
+          $markCall = @($plans | Where-Object { $_.Symbol.Name -eq 'Mark' })
+          $identityCall = @($plans | Where-Object { $_.Symbol.Name -eq 'Identity' })
+          if ($rootCall.Count -ne 1 -or
+              $rootCall[0].Dispatch.ToString() -ne 'DirectInstance' -or
+              -not $rootCall[0].ReceiverNullCheck -or -not $rootCall[0].OwnerClosed) {
+              throw 'Constructed sealed instance method not classified correctly.'
+          }
+          if ($markCall.Count -ne 1 -or
+              $markCall[0].Dispatch.ToString() -ne 'Interface' -or
+              -not $markCall[0].ReceiverNullCheck) {
+              throw 'Interface method dispatch plan lost.'
+          }
+          if ($identityCall.Count -ne 1 -or
+              $identityCall[0].Dispatch.ToString() -ne 'DirectStatic' -or
+              $identityCall[0].ReceiverNullCheck -or
+              $identityCall[0].MethodArgumentSymbols[0].SpecialType -ne
+                  [Microsoft.CodeAnalysis.SpecialType]::System_Int32) {
+              throw 'Constructed static generic identity call plan lost.'
+          }
+          if (-not [Microsoft.CodeAnalysis.SymbolEqualityComparer]::Default.Equals(
+              $identityCall[0].DefinitionSymbol, $identityCall[0].Symbol.OriginalDefinition)) {
+              throw 'Roslyn original method identity not retained.'
+          }
+          $invalidCode = (Get-Content ./ilc-generic.cs -Raw).Replace(
+              'new DependencyAnalyzer<NoLogStrategy<Context>,Context>()',
+              'new DependencyAnalyzer<ShapeOnlyStrategy<Context>,Context>()')
+          $invalidCode | Set-Content -Path ./ilc-invalid.cs
+          $invalid = & ./Invoke-PSC.ps1 -Mode CSharp -SourcePath ./ilc-invalid.cs -CSharpClassOnly
+          if ($invalid.RoslynAdmitted -or $invalid.Admitted -or
+              -not @($invalid.RoslynDiagnostics | Where-Object Id -eq 'CS0315').Count) {
+              throw 'C# nominal constraint failure must be preserved, not approximated structurally.'
+          }
+          "PSC+CS2PS smoke passed; preserved $($bound.BoundTypes.Count) generic bearing sites and invalid constraint CS0315"
