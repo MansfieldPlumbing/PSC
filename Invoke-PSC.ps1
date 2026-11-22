@@ -4349,6 +4349,23 @@ function Resolve-MatchingMember {
 # PowerShell's semantics as typed methods, written once here and lowered by PSC into every assembly it compiles;
 # lowering calls them wherever a construct needs them, in any program. Each runs the same interpreted by SMA.
 class PowerShellSemantics {
+    # Index an object whose concrete collection type is available only at runtime.
+    # Typed arrays and typed indexers retain their ordinary direct lowering.
+    static [object] Index([object] $target, [int] $index) {
+        if ($null -eq $target) { return $null }
+        if ($target -is [System.Collections.IList]) {
+            [System.Collections.IList] $list = $target
+            if ($index -lt 0) { $index += $list.Count }
+            return $list[$index]
+        }
+        if ($target -is [string]) {
+            [string] $value = $target
+            if ($index -lt 0) { $index += $value.Length }
+            return $value[$index]
+        }
+        throw [System.InvalidOperationException]::new('The value has no indexable collection representation.')
+    }
+
     # [int]($dividend / $divisor) for Int32 and UInt32 operands: PowerShell divides as Double and rounds half to even.
     # Double holds every such quotient and half exactly, so the integer quotient, stepped away from zero when twice the
     # remainder passes the divisor or equals it with an odd quotient, is the same value. A zero divisor throws.
@@ -4776,11 +4793,10 @@ function Convert-AstExpression {
         [hashtable] $Scope
     )
 
-    # The concrete worker consumer needs a literal ThreadStart delegate type.
+    # Preserve resolved CLR Type identities as values, not source strings.
     if ($Node -is [System.Management.Automation.Language.TypeExpressionAst]) {
         $type = Resolve-AstType $Node.TypeName
-        if ($type -eq [Threading.ThreadStart]) { return [Linq.Expressions.Expression]::Constant($type,[Type]) }
-        throw ('[{0}:{1}] Only the ThreadStart type literal is admitted as a value.' -f $Node.Extent.StartLineNumber,$Node.Extent.StartColumnNumber)
+        return [Linq.Expressions.Expression]::Constant($type, [Type])
     }
     # 1. Constant literals
     if ($Node -is [System.Management.Automation.Language.ConstantExpressionAst]) {
@@ -5343,6 +5359,16 @@ function Convert-AstExpression {
             if ([Nullable]::GetUnderlyingType($right.Type) -eq $left.Type) { $right = [Linq.Expressions.Expression]::Property($right, 'Value') }
             elseif ([Nullable]::GetUnderlyingType($left.Type) -eq $right.Type) { $left = [Linq.Expressions.Expression]::Property($left, 'Value') }
         }
+        # A runtime-bound delegate returns object. When compared with a known
+        # numeric or pointer type, apply PowerShell's conversion to that type.
+        if ($left.Type -eq [object] -and $right.Type -in ($script:IntegralTypes + $script:FloatingTypes + @([IntPtr], [UIntPtr])) -and
+            $left -is [Linq.Expressions.MethodCallExpression] -and $left.Method -eq [Delegate].GetMethod('DynamicInvoke', [Type[]]@([object[]]))) {
+            $left = ConvertTo-PowerShellType -Expression $left -Type $right.Type
+        }
+        if ($right.Type -eq [object] -and $left.Type -in ($script:IntegralTypes + $script:FloatingTypes + @([IntPtr], [UIntPtr])) -and
+            $right -is [Linq.Expressions.MethodCallExpression] -and $right.Method -eq [Delegate].GetMethod('DynamicInvoke', [Type[]]@([object[]]))) {
+            $right = ConvertTo-PowerShellType -Expression $right -Type $left.Type
+        }
         if ($left.Type -ne $right.Type) {
             throw "[{0}:{1}] Binary operator '{2}' requires identical operand types, got '{3}' and '{4}'." -f `
                 $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $Node.Operator, $left.Type.FullName, $right.Type.FullName
@@ -5415,6 +5441,11 @@ function Convert-AstExpression {
                     [Linq.Expressions.Expression]::Call($targetExpr, $tryGet, [Linq.Expressions.Expression[]]@($key, $found)), $found))
             }
             return [Linq.Expressions.Expression]::MakeIndex($targetExpr, $keyed, [Linq.Expressions.Expression[]]@($key))
+        }
+        if ($targetExpr.Type -eq [object]) {
+            $at = ConvertTo-PowerShellType -Expression $idxExpr -Type ([int])
+            $method = Get-PscSemanticsMethod -Name Index -ParameterTypes ([object], [int])
+            return [Linq.Expressions.Expression]::Call($method, $targetExpr, $at)
         }
         throw "[{0}:{1}] Indexing into non-array type '{2}' is not supported." -f `
             $Node.Extent.StartLineNumber, $Node.Extent.StartColumnNumber, $targetExpr.Type.FullName
@@ -5506,6 +5537,18 @@ function Convert-AstExpression {
             # Through .PSObject, the methods are the PSObject class's own.
             if ($targetExpr.Type -eq [System.Management.Automation.PSObject] -and -not (Test-PSObjectView $Node.Expression)) {
                 $targetExpr = [Linq.Expressions.Expression]::Property($targetExpr, 'BaseObject')
+            }
+            # System.Delegate has no declared Invoke signature. PowerShell binds
+            # it against the concrete runtime delegate; DynamicInvoke retains
+            # that late-bound call without inventing a compile-time signature.
+            if ($memberName -eq 'Invoke' -and $targetExpr.Type -in @([Delegate], [MulticastDelegate])) {
+                $boxedArguments = [Linq.Expressions.Expression[]]@($argExprs | ForEach-Object {
+                    [Linq.Expressions.Expression]::Convert($_, [object])
+                })
+                $argumentArray = [Linq.Expressions.Expression]::NewArrayInit([object], $boxedArguments)
+                $dynamicInvoke = [Delegate].GetMethod('DynamicInvoke', [Type[]]@([object[]]))
+                return [Linq.Expressions.Expression]::Call($targetExpr, $dynamicInvoke,
+                    [Linq.Expressions.Expression[]]@($argumentArray))
             }
             $method = Resolve-MatchingMethod -TargetType $targetExpr.Type -MethodName $memberName -ArgumentTypes $argTypes
             if ($method.IsDefined([Runtime.InteropServices.UnmanagedCallersOnlyAttribute],$false)) {
@@ -6243,6 +6286,21 @@ function Convert-AstStatement {
                 $et::Empty())
         }
         $elementType = $collection.Type.GetElementType()
+        # A newly constructed object[] with uniform source element types
+        # remains an object[]; only its loop variable takes the known type.
+        if ($elementType -eq [object] -and $collection -is [Linq.Expressions.NewArrayExpression] -and
+            $collection.NodeType -eq [Linq.Expressions.ExpressionType]::NewArrayInit -and $collection.Expressions.Count -gt 0) {
+            $candidate = $null
+            $uniform = $true
+            foreach ($boxed in $collection.Expressions) {
+                if ($boxed -isnot [Linq.Expressions.UnaryExpression] -or $boxed.NodeType -ne [Linq.Expressions.ExpressionType]::Convert -or
+                    $boxed.Type -ne [object]) { $uniform = $false; break }
+                $type = $boxed.Operand.Type
+                if ($null -eq $candidate) { $candidate = $type }
+                elseif ($candidate -ne $type) { $uniform = $false; break }
+            }
+            if ($uniform) { $elementType = $candidate }
+        }
         $varName = $Statement.Variable.VariablePath.UserPath
         $item = if ($Scope.Parameters.ContainsKey($varName)) { $Scope.Parameters[$varName] }
                 elseif ($Scope.Locals.ContainsKey($varName)) { $Scope.Locals[$varName] }
@@ -7074,8 +7132,8 @@ function Write-IlConstant {
         return
     }
 
-    if ($val -is [Type] -and $val -eq [Threading.ThreadStart]) {
-        $IL.Emit([Reflection.Emit.OpCodes]::Ldtoken,$val)
+    if ($val -is [Type]) {
+        $IL.Emit([Reflection.Emit.OpCodes]::Ldtoken,(Get-IlType $val))
         $IL.Emit([Reflection.Emit.OpCodes]::Call,[Type].GetMethod('GetTypeFromHandle',[Type[]]@([RuntimeTypeHandle])))
         return
     }
