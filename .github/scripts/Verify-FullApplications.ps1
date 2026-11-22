@@ -29,6 +29,7 @@ foreach ($name in 'Rom','Ppu','Memory','OpInfo','Cpu6502','Nes','PsnesBench','Wi
 }
 if ($a.EntryPoint.Name -ne 'Main') { throw 'PSNES missing program entry point.' }
 if (@($a.GetTypes()).Count -lt 15) { throw 'PSNES full assembly lost authored or generated types.' }
+"PSNES referenced assemblies: $(@($a.GetReferencedAssemblies() | ForEach-Object Name) -join ', ')"
 
 # Deterministic NROM program: INC $0000; JMP $8000. The 20-frame RAM checksum
 # is nonzero, checking actual CPU writes rather than mere idle-frame execution.
@@ -69,6 +70,7 @@ $b=[Reflection.Assembly]::LoadFrom($notepadPath)
 $types=@($b.GetTypes())
 if ($types.Count -lt 54) { throw "Notepad emitted $($types.Count) CLR types, expected at least 54." }
 if ($b.EntryPoint.Name -ne 'Main') { throw 'Notepad missing Main entry.' }
+"Notepad referenced assemblies: $(@($b.GetReferencedAssemblies() | ForEach-Object Name) -join ', ')"
 $t=$b.GetType('NotepadDocument',$true)
 $d=[Activator]::CreateInstance($t,[object[]]@('abcd'))
 $get=$t.GetMethod('GetText',[Type[]]@([int],[int]))
