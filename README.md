@@ -42,9 +42,9 @@ $api.Describe('Guard').DispatchExtent.Text
 $api.Guide()
 ```
 
-Query returns typed witnesses with source identity, owner, extent and coverage. Pull in windows of 1..256; dispose cursors. Literal containment includes comments and strings inside a declaration, not proof of binding. Use `$dev.Find('Apply')` or `$dev.Search('literal')` to include projected resources; canonical queries do not parse embedded source strings. `OpenQuery` supports explicit paths, owner, kind and limit, including non-loading CIL inspection for binary queries.
+Query returns typed references with source identity, owner, extent and coverage. Pull in windows of 1..256; dispose cursors. Literal containment includes comments and strings inside a declaration, not proof of binding. Use `$dev.Find('Apply')` or `$dev.Search('literal')` to include projected resources; canonical queries do not parse embedded source strings. `OpenQuery` supports explicit paths, owner, kind and limit, including non-loading CIL inspection for binary queries.
 
-A read-only query witness can become an edit witness only through exact source/extent validation (`$doc.Resolve($hit)`). A document's own `Find` returns revision-bound editable witnesses directly. Example, using a behavior-preserving numeric-literal edit in the projected calibration resource:
+A read-only query reference can become an edit reference only through exact source/extent validation (`$doc.Resolve($hit)`). A document's own `Find` returns revision-bound editable references directly. Example, using a behavior-preserving numeric-literal edit in the projected calibration resource:
 
 ```powershell
 $doc = $dev.OpenDocument('SM/Calibration.sm1')
@@ -56,13 +56,13 @@ $doc.Save()
 $dev.Changes()
 $dev.Affected()
 $dev.Collate('./PSC.next.ps1')
-$receipt = $dev.Conform($true)
-$receipt.Stages | Select-Object Name,State,ExitCode
+$result = $dev.Conform($true)
+$result.Stages | Select-Object Name,State,ExitCode
 ```
 
 External edits to projected files are also supported. Start with a clean Git baseline and a new or matching projection. Collate needs a fresh candidate destination and rejects missing/untracked units and changed declaration boundaries. Additions, deletions and renames still require explicit canonical edits. Affected reports declared faculty dependencies, not exhaustive semantic or test coverage. No tests are omitted based on Affected.
 
-Conform runs the protected Guard against committed source, the candidate API, projection and embedded regressions. `true` selects development scope and skips historical Windows verification (`Complete = False`); `false` requests the full suite and requires its native toolchain. Review the receipt before explicitly promoting the candidate. Use `git diff -- PSC.ps1`, commit the reviewed change, verify HEAD, then open a fresh projection. Never silently change protected checkers. See [AGENTS.md](AGENTS.md) for engineering requirements.
+Conform runs the protected Guard against committed source, the candidate API, projection and embedded regressions. `true` selects development scope and skips historical Windows verification (`Complete = False`); `false` requests the full suite and requires its native toolchain. Review the result before explicitly promoting the candidate. Use `git diff -- PSC.ps1`, commit the reviewed change, verify HEAD, then open a fresh projection. Never silently change protected checkers. See [AGENTS.md](AGENTS.md) for engineering requirements.
 
 ## Compiler and runtime
 
@@ -76,6 +76,44 @@ Conform runs the protected Guard against committed source, the candidate API, pr
 PSC authoring requires a trusted PowerShell session with the required language capabilities. It uses reflection, metadata readers, assembly emission and native interop openly. Do not bypass AMSI, Defender, App Control or execution policies. Follow local signing and deployment policy. Only compile or execute trusted source; conformance runs candidate code and is not a sandbox. Use trusted assemblies for CIL import/compilation and trusted data for `FixedParametersPath` and `ProfilePath`. Query is the non-loading metadata inquiry path for supported binaries. Determinism and SHA-256 identify artifacts; they do not establish publisher trust or safety.
 
 Microsoft guidance: [script injection](https://learn.microsoft.com/en-us/powershell/scripting/security/preventing-script-injection), [PowerShell security](https://learn.microsoft.com/en-us/powershell/scripting/security/security-features), [unsafe deserialization](https://learn.microsoft.com/en-us/dotnet/standard/serialization/binaryformatter-security-guide).
+
+## Vocabulary and change control
+
+PSC uses established configuration-management and software-assurance terminology where it fits. The following is a project vocabulary, not a claim of NIST compliance. References: [NIST SP 800-128](https://csrc.nist.gov/glossary/term/baseline_configuration), [NIST SP 800-218 (SSDF 1.1)](https://csrc.nist.gov/pubs/sp/800/218/final), and the [NIST CSRC glossary](https://csrc.nist.gov/glossary).
+
+| Term | Meaning in PSC |
+|---|---|
+| Canonical source | The authoritative maintained PSC source, not a projection or compiled artifact. |
+| Baseline | An approved revision with known identity; Git HEAD is a comparison point, not inherently approval. |
+| Candidate | A proposed new canonical source or artifact, not yet accepted. |
+| Configuration item | An independently controlled source, toolchain, policy or release artifact. A projected unit need not be a separate configuration item. |
+| Drift | An unintended discrepancy from a specified baseline, requirement or documented contract. An intentional proposed change is not inherently drift. |
+| Manifest | Ordered inventory and identities of projected units; not an approval or signature. |
+| Provenance | Origin and transformation history of an artifact or observation. |
+| Integrity verification | Compare bytes or a digest against an independently trusted expected value; not publisher authentication. |
+| Finding | A diagnostic against a stated criterion, not necessarily a vulnerability. |
+| Verification | Objective evidence that specified requirements are met. |
+| Validation | Evidence of fitness for a specific intended use and operating environment. |
+| Conformance | Assessment against declared criteria and explicit scope; not a security certification. |
+| Assurance | Justified confidence supported by evidence, not a synonym for a passing test. |
+| Coverage | What was examined or exercised, with omissions and unresolved cases distinguished. |
+
+PSC-specific terms retain their distinct meanings:
+
+| Term | Meaning in PSC |
+|---|---|
+| UnCollate / Collate | Project canonical source into ordered, editable units / validate and reconstruct a single-file candidate. |
+| Consolidate | Follow admitted source-inclusion relationships to form a single script; not the inverse of UnCollate. |
+| Faculty | Named, independently realizable runtime/compiler capability with declared dependencies. |
+| Realization | An executable representation of admitted source, such as a managed assembly or native image. |
+| Referent | The structural entity identified by a reference; for an AST match, the Target is its referent. |
+| Reference | A typed source- or artifact-bound reference to a referent, including identity and extent. It does not establish arbitrary runtime binding. |
+| Result | A typed record of an operation's outcome, scope and relevant evidence; not approval or an independently signed attestation. |
+| Guard | Candidate admission policy against a committed comparison source and protected checker. |
+| Conform | Orchestrate scoped verification and record its results; acceptance and promotion remain explicit decisions. |
+| Appliance | A one-shot executable unit in source form (.sexe). |
+
+Use these terms consistently in code, help, results and development discussion. Keep source identity, assessment criteria, observation, outcome and authorization distinct. A successful partial assessment must not be described as complete; an unknown must not be described as absent. Preserve established PSC operation names unless their semantics change.
 
 ## Live reference
 
