@@ -265,11 +265,11 @@ The API is derived from the running script, so mode names and parameter evidence
 | Capability |  | Get-LoweringCapability |
 | Graph | ProjectPath | Get-SmaGraph |
 | Lint | LintEdit, LintFiles, LintObjects | Edit-SmaLintFinding, Get-Projects, Get-SmaLint |
-| Guard | AgainstPath, CheckerHash, LintFiles | Test-PscCandidateGuard, Test-SmaGuard |
+| Guard | AgainstPath, CheckerHash, ExpectedRunnerSha256, LintFiles | Assert-PscRunnerIdentity, Assert-PscStandaloneGitContext, Test-PscCandidateGuard, Test-SmaGuard |
 | Profile |  | Invoke-SmaProfile |
 | Report | ProfilePath | Get-SmaReport, Get-SmaUnits |
 | Verify |  | Test-SmaGraph |
-| Conform | AgainstPath, CheckerHash, DevelopmentOnly, SourcePath | Invoke-PscConformance |
+| Conform | AgainstPath, CheckerHash, DevelopmentOnly, ExpectedBaselineSha256, ExpectedRunnerSha256, SourcePath | Invoke-PscConformance |
 | Consolidate | OutputPath, SourcePath | ConvertTo-PscSingleScript |
 | Investigate | InvestigatePath | Invoke-PscInvestigation |
 | Records | SourceAst | Get-PscRecord |
