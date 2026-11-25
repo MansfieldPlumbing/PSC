@@ -892,6 +892,8 @@ Collate is fail-closed: missing and untracked files, manifest edits, declaration
 
 The API is available with `-Mode Api` (or no arguments). `SourceFormats` and `SourceExecutionContract` describe the SM contract; `AssertSurface()` checks mode admission against the dispatcher. `OpenQuery(paths, kind, name, owner, literal, take)` is a lazy AST query with optional ordinal literal containment within each matched extent; the CLI equivalent is `-QueryLiteral`. `OpenDocument(path)` opens a revision-bound editor. Its `Find(kind, name, owner, literal, limit)` returns editable witnesses with the same filter applied before the limit. Literal containment may include comments or strings *inside* the selected extent; it is not a semantic interpretation of the literal. Use Git for repository history, PSC for structural selection and validated edits. `UnCollate`, `Collate`, `Status`, `Diff` and `Verify` are also available directly on the API. `SourceExtensions` describes source discovery, including legacy PowerShell inputs.
 
+Development sessions: `$dev = $api.OpenDevelopment($base,$tree)` creates or opens a verified projection; `Find`, `OpenDocument`, `Changes`, `Affected`, `Collate` and `Conform` share a pinned compiler, canonical base and manifest. `Affected` reports direct paths and declared faculty dependency closure; it does not prove complete method-level impact or select fewer tests. Collation requires a fresh candidate path; conformance rejects stale candidates and requires the pinned base to equal its committed Git blob.
+
 Candidate verification: `-Mode Guard -LintFiles ./PSC.next.ps1 -AgainstPath ./PSC.ps1` compares against the committed canonical path, not its working copy. `-Mode Conform -SourcePath ./PSC.next.ps1 -AgainstPath ./PSC.ps1` runs the protected Guard, candidate API, projection, embedded document/worktree/SM fixtures and historical Verify in independent processes. `-DevelopmentOnly` explicitly skips historical Verify and returns an incomplete report. No candidate is promoted automatically. The report carries the candidate digest, committed baseline and stage outputs; use the trusted baseline compiler to evaluate candidates when possible.
 
 
@@ -1121,7 +1123,9 @@ try {
     $out = Join-Path $work 'PSC.next.ps1'
     $api = & $compiler -Mode Api
     Assert-Tree ($api.SourceExtensions.Count -eq 5 -and $api.SourceExtensions -contains '.sexe') 'API advertises unified source admission'
-    $snapshot = $api.UnCollate($base,$tree)
+    $dev = $api.OpenDevelopment($base,$tree)
+    $snapshot = $dev.Status()
+    Assert-Tree ($dev.Changes().Count -eq 0 -and $dev.Affected().Faculties.Count -eq 0) 'development session starts clean'
     Assert-Tree ($snapshot.UnitCount -gt 400 -and $snapshot.BaseSha256 -ceq $hash) 'canonical PSC projects into ordered AST units'
     Assert-Tree ([IO.File]::Exists((Join-Path $tree 'Faculties/Vom/Vom.ps1')) -and [IO.File]::Exists((Join-Path $tree 'Compiler/Functions/ConvertTo-PscIr.ps1'))) 'compiler and runtime faculty have stable declaration paths'
     Assert-Tree ([IO.File]::Exists((Join-Path $tree 'SM/Calibration.srm1')) -and [IO.File]::Exists((Join-Path $tree 'Tests/Test-Worktree.ps1'))) 'SM and worktree tests materialize from the canonical source'
@@ -1138,7 +1142,7 @@ try {
     $resource = Join-Path $tree 'SM/Calibration.sm1'; $original = Read-Text $resource
     $modified = $original.Replace('4.0 + 1.25', '4.0 + 2.25')
     Assert-Tree ($modified -cne $original) 'test resource perturbation is effective'
-    $doc = & $compiler -Mode Edit -SourcePath $resource
+    $doc = $dev.OpenDocument('SM/Calibration.sm1')
     $hit = $doc.Query('Declaration','Apply','SmCalibrationProvider',1)
     $doc.Replace($hit[0],$hit[0].Target.Extent.Text.Replace('4.0 + 1.25','4.0 + 2.25'))
     $doc.Save()
@@ -1147,6 +1151,11 @@ try {
     Assert-Tree ($status.Changes.Count -eq 1 -and $status.Changes[0].Path -ceq 'SM/Calibration.sm1') 'resource edit is localized by structural path'
     $delta = @(& $compiler -Mode Diff -TreeDirectory $tree -SourcePath $base)
     Assert-Tree ($delta.Count -eq 1 -and $delta[0].Before -ceq $original -and $delta[0].After -ceq $modified) 'diff returns exact before and after payloads'
+    $impact = $dev.Affected()
+    Assert-Tree ($impact.DirectPaths.Count -eq 1 -and $impact.DirectPaths[0] -ceq 'SM/Calibration.sm1' -and !$impact.Complete -and $impact.RequiresFullConformance) 'development impact does not claim complete coverage'
+    $sessionCandidate = Join-Path $work 'Session.ps1'
+    $sessionReceipt = $dev.Collate($sessionCandidate)
+    Assert-Tree ((Get-Hash $sessionCandidate) -ceq $sessionReceipt.SourceSha256) 'development session collates a fresh candidate'
     $receipt = & $compiler -Mode Collate -TreeDirectory $tree -OutputPath $out
     $changedHash = Get-Hash $out
     Assert-Tree ($changedHash -cne $hash) 'edited resource changes canonical bytes'
@@ -1156,6 +1165,14 @@ try {
     $stock = & (Get-Process -Id $PID).Path -NoProfile -File (Join-Path $changedTree 'SM/Calibration.sm1') -Value 10
     Assert-Tree ($LASTEXITCODE -eq 0 -and [double]$stock -eq 42.25) 'edited resource has observable execution behavior'
     Write-Text $resource $original
+    $rejected = $false
+    try { $null = $dev.Conform($true) } catch { $rejected = $_.Exception.Message.Contains('stale') }
+    Assert-Tree $rejected 'development rejects stale candidate before testing'
+    $facultyPath = Join-Path $tree 'Faculties/Vom/Vom.ps1'; $facultyOriginal = Read-Text $facultyPath
+    Write-Text $facultyPath ($facultyOriginal + ' ')
+    $impact = $dev.Affected()
+    Assert-Tree ($impact.Faculties.Count -eq 4 -and $impact.Faculties -contains 'Vom' -and $impact.Faculties -contains 'ScriptType' -and $impact.Faculties -contains 'PrimitiveConversion' -and $impact.Faculties -contains 'ObjectDispatch') 'development follows declared transitive faculty dependencies'
+    Write-Text $facultyPath $facultyOriginal
     $rejected = $false
     try { $null = & $compiler -Mode Collate -TreeDirectory $tree -OutputPath $out } catch { $rejected = $_.Exception.Message.Contains('conflict') }
     Assert-Tree ($rejected -and (Get-Hash $out) -ceq $changedHash) 'stale canonical destination rejects overwrite without data loss'
@@ -12680,7 +12697,105 @@ class PscSourceFormat {
     }
 }
 
+class PscDevelopmentImpact {
+    [string[]] $DirectPaths
+    [string[]] $Faculties
+    [string[]] $Reasons
+    [bool] $Complete
+    [bool] $RequiresFullConformance = $true
+}
+
+# A development session pins the authoring compiler, canonical base and ordered manifest.
+# The tree remains editable by external tools; changes are read afresh on every operation.
+class PscDevelopment {
+    hidden [PscApi] $Api
+    hidden [string] $Compiler
+    hidden [string] $CompilerHash
+    hidden [string] $Base
+    hidden [string] $BaseHash
+    hidden [string] $Tree
+    hidden [string] $ManifestHash
+    hidden [string] $Candidate
+    hidden [string] $CandidateHash
+    hidden [string] $CandidateTreeHash
+    PscDevelopment([PscApi]$api,[string]$base,[string]$tree){
+        $this.Api=$api;$this.Compiler=[IO.Path]::GetFullPath($api.Script);$this.CompilerHash=[PscTreeText]::Hash([PscTreeText]::Read($this.Compiler))
+        $this.Base=[IO.Path]::GetFullPath($base);$this.BaseHash=[PscTreeText]::Hash([PscTreeText]::Read($this.Base));$this.Tree=[IO.Path]::GetFullPath($tree)
+        if(![IO.Directory]::Exists($this.Tree)){$null=$api.UnCollate($this.Base,$this.Tree)}
+        $this.ManifestHash=[PscTreeText]::Hash([PscTreeText]::Read([PscTreeText]::SafePath($this.Tree,'PSC.tree')))
+        $null=$this.Changes()
+    }
+    hidden [void] AssertIdentity(){
+        if($this.Api.Script -cne $this.Compiler -or [PscTreeText]::Hash([PscTreeText]::Read($this.Compiler)) -cne $this.CompilerHash){throw 'Development compiler changed.'}
+        if([PscTreeText]::Hash([PscTreeText]::Read($this.Base)) -cne $this.BaseHash){throw 'Development baseline changed.'}
+        [PscTreeText]::CheckRoot($this.Tree)
+        if([PscTreeText]::Hash([PscTreeText]::Read([PscTreeText]::SafePath($this.Tree,'PSC.tree'))) -cne $this.ManifestHash){throw 'Development manifest changed.'}
+    }
+    [PscTreeSnapshot] Status(){
+        $this.AssertIdentity();return $this.Api.Status($this.Base,$this.Tree)
+    }
+    [PscTreeDelta[]] Changes(){
+        $this.AssertIdentity();return $this.Api.Diff($this.Base,$this.Tree)
+    }
+    [PscDocument] OpenDocument([string]$path){
+        $status=$this.Status()
+        foreach($unit in $status.Units){if($unit.Path -ceq $path -and $unit.State -cne 'Deleted'){return $this.Api.OpenDocument([PscTreeText]::SafePath($this.Tree,$path))}}
+        throw 'Document must be a present tracked source unit.'
+    }
+    [PscQueryCursor] Find([PscQueryKind]$kind,[string]$name,[string]$owner,[string]$literal,[int]$take){
+        $status=$this.Status();$paths=[Collections.Generic.List[string]]::new()
+        foreach($unit in $status.Units){if($unit.State -cne 'Deleted' -and [PscSourceFormat]::IsSource($unit.Path)){$paths.Add([PscTreeText]::SafePath($this.Tree,$unit.Path))}}
+        return $this.Api.OpenQuery($paths.ToArray(),$kind,$name,$owner,$literal,$take)
+    }
+    [PscDevelopmentImpact] Affected(){
+        $changes=$this.Changes();$result=[PscDevelopmentImpact]::new();$paths=[Collections.Generic.List[string]]::new()
+        $faculties=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase);$reasons=[Collections.Generic.List[string]]::new()
+        $broad=$false
+        foreach($change in $changes){
+            $paths.Add($change.Path);$parts=$change.Path.Split('/')
+            if($change.State -ne 'Modified'){$broad=$true;continue}
+            if($parts.Length -ge 3 -and $parts[0] -ceq 'Faculties'){$null=$faculties.Add($parts[1]);continue}
+            if([IO.Path]::GetExtension($change.Path) -ieq '.srm1'){$null=$faculties.Add('ScriptType');$reasons.Add('SRM change may alter contract materialization: '+$change.Path);continue}
+            if($parts[0] -cnotin 'SM','Tests'){$broad=$true}
+        }
+        if($broad){foreach($faculty in $this.Api.FacultyUnits){$null=$faculties.Add($faculty.Name)};$reasons.Add('Compiler, layout or unresolved tree changes conservatively affect every faculty.')}
+        do{
+            $count=$faculties.Count
+            foreach($faculty in $this.Api.FacultyUnits){foreach($dependency in $faculty.Dependencies){if($faculties.Contains($dependency)){$null=$faculties.Add($faculty.Name)}}}
+        }while($count -ne $faculties.Count)
+        $names=[Collections.Generic.List[string]]::new();foreach($faculty in $this.Api.FacultyUnits){if($faculties.Contains($faculty.Name)){$names.Add($faculty.Name)}}
+        $reasons.Add('Faculty closure is declared dependency evidence, not complete method binding or test coverage; no tests are omitted.')
+        $result.DirectPaths=$paths.ToArray();$result.Faculties=$names.ToArray();$result.Reasons=$reasons.ToArray();return $result
+    }
+    hidden [string] TreeHash(){
+        $status=$this.Status();$builder=[Text.StringBuilder]::new()
+        foreach($unit in $status.Units){[void]$builder.Append($unit.Path).Append("`t").Append($unit.State).Append("`t").Append($unit.Current).Append("`n")}
+        foreach($path in $status.Untracked){[void]$builder.Append($path).Append("`n")}
+        return [PscTreeText]::Hash($builder.ToString())
+    }
+    [PscTreeSnapshot] Collate([string]$destination){
+        $path=[IO.Path]::GetFullPath($destination)
+        if([IO.File]::Exists($path) -or [IO.Directory]::Exists($path)){throw 'Development candidate must be a fresh destination.'}
+        $null=$this.Changes();$treeHash=$this.TreeHash();$receipt=$this.Api.Collate($this.Tree,$path)
+        if($this.TreeHash() -cne $treeHash){throw 'Development tree changed during collation; discard the candidate.'}
+        $this.Candidate=$path;$this.CandidateHash=$receipt.SourceSha256;$this.CandidateTreeHash=$treeHash;return $receipt
+    }
+    [PscConformanceReport] Conform([bool]$development){
+        if(!$this.Candidate -or $this.TreeHash() -cne $this.CandidateTreeHash -or [PscTreeText]::Hash([PscTreeText]::Read($this.Candidate)) -cne $this.CandidateHash){throw 'Development candidate is absent or stale; collate again.'}
+        $directory=[IO.Path]::GetDirectoryName($this.Base);$leaf=[IO.Path]::GetFileName($this.Base)
+        $committed=git -C $directory rev-parse --verify ('HEAD:./'+$leaf) 2>$null
+        if($LASTEXITCODE -ne 0){throw 'Development conformance requires a committed baseline.'}
+        $working=git -C $directory hash-object --no-filters -- $leaf
+        if($LASTEXITCODE -ne 0 -or $working -cne $committed){throw 'Development baseline differs from Git HEAD.'}
+        $report=$this.Api.Conform($this.Candidate,$this.Base,$development)
+        if($report.CandidateSha256 -cne $this.CandidateHash -or $this.TreeHash() -cne $this.CandidateTreeHash){throw 'Development evidence changed during conformance.'}
+        return $report
+    }
+}
+
 class PscApi {
+    hidden [PscFacultyUnit[]] $FacultyUnits
+    [PscDevelopment] OpenDevelopment([string]$base,[string]$tree){return [PscDevelopment]::new($this,$base,$tree)}
     [PscSourceFormat[]] $SourceFormats = [PscSourceFormat]::SmFormats()
     [string[]] $SourceExtensions = [PscSourceFormat]::Extensions()
     [PscTreeSnapshot] UnCollate([string]$root){return $this.UnCollate($this.Script,$root)}
@@ -12853,6 +12968,7 @@ function Get-PscApi {
     $api.Classes = [string[]]@($ast.BeginBlock.FindAll({ param($node) $node -is [System.Management.Automation.Language.TypeDefinitionAst] }, $false) | ForEach-Object Name)
     $api.Environment = $script:PscEnvironment
     $api.Ast = $ast
+    $api.FacultyUnits = @(Get-PscFacultyUnits)
     $api.AssertSurface()
     $api
 }
