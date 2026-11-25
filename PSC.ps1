@@ -4762,6 +4762,8 @@ class PscConformanceReport {
     [string] $CandidateSha256
     [PscGuardVerdict] $Guard
     [PscConformanceStage[]] $Stages
+    [PscTreeUnit[]] $BaselineResources
+    [string] $RunnerSha256
     [bool] $Passed
     [bool] $Complete
 }
@@ -4780,23 +4782,74 @@ function Invoke-PscConformanceStage {
     }finally{$stageResult.Milliseconds=$watch.Elapsed.TotalMilliseconds;$child.Dispose()}
     return $stageResult
 }
+# Read the literal resource inventory directly from the commit selected by Guard, not from candidate execution.
+# Reuse the same normalized Git text and AST resource reader as Guard. Only trusted source is admitted.
+function Get-PscConformanceResources {
+    [OutputType([PscTreeUnit])]
+    param([string]$Text,[string]$Path,[string]$Root)
+    $ast=Read-PscTreeAst $Text $Path
+    foreach($unit in Get-SmaGuardResources $ast){
+        $unit.Baseline=[PscTreeText]::Hash($unit.Text);$unit.Current=$unit.Baseline;$unit.State='Clean'
+        [PscTreeText]::Write([PscTreeText]::SafePath($Root,$unit.Path),$unit.Text)
+        $unit
+    }
+}
+function Test-PscConformanceResources {
+    [OutputType([void])]
+    param([PscTreeUnit[]]$Units,[string]$Root)
+    foreach($unit in $Units){
+        $path=[PscTreeText]::SafePath($Root,$unit.Path)
+        if(![IO.File]::Exists($path) -or (Get-FileHash -LiteralPath $path).Hash -cne $unit.Baseline){throw "Conformance resource changed: $($unit.Path)"}
+    }
+}
 function Invoke-PscConformance {
     param([string]$candidate,[string]$Baseline,[string]$expectedHash,[switch]$development)
     $report=[PscConformanceReport]::new();$report.Candidate=[PscTreeText]::FullPath($candidate)
     $report.Guard=Test-PscCandidateGuard $report.Candidate $Baseline $expectedHash
     $report.CandidateSha256=$report.Guard.CandidateSha256
-    $stages=[Collections.Generic.List[PscConformanceStage]]::new()
+    $report.RunnerSha256=(Get-FileHash -LiteralPath $PSCommandPath).Hash
+    $stages=[Collections.Generic.List[PscConformanceStage]]::new();$resourceChanges=$false
     $stage=[IO.Path]::Combine([IO.Path]::GetTempPath(),'psc-conform-'+[Guid]::NewGuid().ToString('N'))
     [void][IO.Directory]::CreateDirectory($stage)
     try{
         if($report.Guard.Passed){
             $tree=[IO.Path]::Combine($stage,'tree')
+            $baselineRoot=[IO.Path]::Combine($stage,'baseline');[void][IO.Directory]::CreateDirectory($baselineRoot)
+            $candidateRoot=[IO.Path]::Combine($stage,'candidate');[void][IO.Directory]::CreateDirectory($candidateRoot)
+            $directory=[IO.Path]::GetDirectoryName($report.Guard.BaselinePath);$leaf=[IO.Path]::GetFileName($report.Guard.BaselinePath)
+            $committedLines=@(git -C $directory show ($report.Guard.BaselineCommit+':./'+$leaf) 2>$null)
+            if($LASTEXITCODE -ne 0){throw 'Conformance could not read the Guard baseline commit.'}
+            $report.BaselineResources=@(Get-PscConformanceResources ($committedLines -join "`n") $report.Guard.BaselinePath $baselineRoot)
+            $candidateResources=@(Get-PscConformanceResources ([PscTreeText]::Read($report.Candidate)) $report.Candidate $candidateRoot)
+            $baselineIndex=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+            foreach($unit in $report.BaselineResources){$baselineIndex.Add($unit.Path,$unit.Baseline)}
+            $candidateIndex=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+            foreach($unit in $candidateResources){$candidateIndex.Add($unit.Path,$unit.Baseline)}
+            $resourceChanges=$baselineIndex.Count -ne $candidateIndex.Count
+            foreach($unit in $candidateResources){if(!$baselineIndex.ContainsKey($unit.Path) -or $baselineIndex[$unit.Path] -cne $unit.Baseline){$resourceChanges=$true}}
+            $fixtures=@('Tests/Test-Document.ps1','Tests/Test-Worktree.ps1','Tests/Test-Guard.ps1','SM/Test-Formats.ps1')
+            foreach($fixture in $fixtures){
+                if(!$baselineIndex.ContainsKey($fixture)){throw "Missing baseline conformance fixture: $fixture"}
+                if(!$candidateIndex.ContainsKey($fixture)){throw "Missing candidate conformance fixture: $fixture"}
+            }
             $stages.Add((Invoke-PscConformanceStage 'Api' @('-File',$report.Candidate,'-Mode','Api')))
             if($stages[0].State -eq 'Passed'){
                 $stages.Add((Invoke-PscConformanceStage 'Projection' @('-File',$report.Candidate,'-Mode','UnCollate','-TreeDirectory',$tree)))
                 if($stages[1].State -eq 'Passed'){
-                    foreach($fixture in 'Tests/Test-Document.ps1','Tests/Test-Worktree.ps1','Tests/Test-Guard.ps1','SM/Test-Formats.ps1'){
-                        $stages.Add((Invoke-PscConformanceStage $fixture @('-File',[IO.Path]::Combine($tree,$fixture),'-Compiler',$report.Candidate)))
+                    # A candidate cannot replace the committed regression criteria by projecting different fixtures.
+                    foreach($fixture in $fixtures){
+                        Test-PscConformanceResources $report.BaselineResources $baselineRoot
+                        $stages.Add((Invoke-PscConformanceStage $fixture @('-File',[PscTreeText]::SafePath($baselineRoot,$fixture),'-Compiler',$report.Candidate)))
+                    }
+                    Test-PscConformanceResources $report.BaselineResources $baselineRoot
+                    # Changed resource inventories receive supplementary candidate tests, never instead of the baseline tests.
+                    if($resourceChanges){
+                        foreach($fixture in $fixtures){
+                            Test-PscConformanceResources $candidateResources $candidateRoot
+                            $stages.Add((Invoke-PscConformanceStage ('Candidate/'+$fixture) @('-File',[PscTreeText]::SafePath($candidateRoot,$fixture),'-Compiler',$report.Candidate)))
+                        }
+                        Test-PscConformanceResources $candidateResources $candidateRoot
+                        Test-PscConformanceResources $report.BaselineResources $baselineRoot
                     }
                     if(!$development){$stages.Add((Invoke-PscConformanceStage 'Verify' @('-File',$report.Candidate,'-Mode','Verify')))}
                     else{$omitted=[PscConformanceStage]::new();$omitted.Name='Verify';$omitted.State='Skipped';$omitted.StandardError='Development scope explicitly requested.';$stages.Add($omitted)}
@@ -4804,7 +4857,8 @@ function Invoke-PscConformance {
             }
         }
         $report.Stages=$stages.ToArray()
-        $report.Passed=$report.Guard.Passed -and $stages.Count -eq 7 -and @($stages | Where-Object State -eq 'Failed').Count -eq 0
+        $requiredCount=if($resourceChanges){11}else{7}
+        $report.Passed=$report.Guard.Passed -and $stages.Count -eq $requiredCount -and @($stages | Where-Object State -eq 'Failed').Count -eq 0
         $report.Complete=$report.Passed -and !$development
         if((Get-FileHash -LiteralPath $report.Candidate).Hash -cne $report.CandidateSha256){throw 'Candidate changed during conformance.'}
         return $report
@@ -13198,7 +13252,7 @@ class PscApi {
     # The register is the sole maintained objective list. The README is generated from these records.
     [PscRoadmapObjective[]] Roadmap(){
         $objectives=[Collections.Generic.List[PscRoadmapObjective]]::new()
-        $objectives.Add([PscRoadmapObjective]::new('F0',[PscRoadmapState]::Existing,@(),'Baseline, Guard, checker and fixture dependency closure: independently controlled assessment inputs; candidate cannot silently replace criteria, runner or fixtures. Reject removed, substituted, reordered or dynamically supplied dependencies. Record approved baseline, digests and provenance; no sandbox claim.',@('Get-SmaChecker','Test-SmaGuard','Get-PscResourceUnits','Invoke-PscConformance'),@(),@('Tests/Test-Guard.ps1')))
+        $objectives.Add([PscRoadmapObjective]::new('F0',[PscRoadmapState]::Existing,@(),'Baseline, Guard, checker and fixture dependency closure: independently controlled assessment inputs; candidate cannot silently replace criteria, runner or fixtures. Reject removed, substituted, reordered or dynamically supplied dependencies. Record approved baseline, digests and provenance; no sandbox claim.',@('Get-SmaChecker','Test-SmaGuard','Get-PscResourceUnits','Get-PscConformanceResources','Test-PscConformanceResources','Invoke-PscConformance'),@(),@('Tests/Test-Guard.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('F1',[PscRoadmapState]::Existing,@('F0'),'UnCollate/Collate: exact ordered round trip including embedded source, comments, encodings and resources; reject missing, stale, duplicate, ambiguous and untracked units.',@('Get-PscTreeProjection','Write-PscSourceTree'),@(),@('Projection','Tests/Test-Worktree.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('F2',[PscRoadmapState]::Existing,@('F1'),'Typed structural query and live API: AST/CIL identity, owner, extent, scope, bounded coverage and explicit ambiguity; parity with independently obtained observations.',@('PscQueryCursor','PscApi'),@(),@('Api','Tests/Test-Worktree.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('F3',[PscRoadmapState]::Planned,@('F1','F2'),'Persistent semantic index: scope, overloads, declaration and referent identity, cross-unit dependencies, revision invalidation; compare incremental results with full rebuild, including shadowing and rename.',@(),@(),@()))
@@ -13403,7 +13457,7 @@ $result.Stages | Select-Object Name,State,ExitCode
 
 External edits to projected files are also supported. Start with a clean Git baseline and a new or matching projection. Collate needs a fresh candidate destination and rejects missing/untracked units and changed declaration boundaries. Additions, deletions and renames still require explicit canonical edits. Affected reports declared faculty dependencies, not exhaustive semantic or test coverage. No tests are omitted based on Affected.
 
-Conform runs the protected Guard against committed source, the candidate API, projection and embedded regressions. `true` selects development scope and skips historical Windows verification (`Complete = False`); `false` requests the full suite and requires its native toolchain. Review the result before explicitly promoting the candidate. Use `git diff -- PSC.ps1`, commit the reviewed change, verify HEAD, then open a fresh projection. Never silently change protected checkers. See [AGENTS.md](AGENTS.md) for engineering requirements.
+Conform runs Guard against committed source, the candidate API and projection, then literal regression resources obtained from the same committed baseline without candidate execution. If the embedded resource inventory changes, supplementary candidate regression stages also run. The report identifies the running assessor and baseline resource digests; primary stage names identify baseline fixtures, and Candidate/ stages identify supplementary tests. This is not full assessment-authority closure: the caller must choose a trusted runner, and historical Verify still executes candidate code. `true` selects development scope and skips historical Windows verification (`Complete = False`); `false` requests the full suite and requires its native toolchain. Review the result before explicitly promoting the candidate. Use `git diff -- PSC.ps1`, commit the reviewed change, verify HEAD, then open a fresh projection. Never silently change protected checkers. See [AGENTS.md](AGENTS.md) for engineering requirements.
 
 ## Compiler and runtime
 
