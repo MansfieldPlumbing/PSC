@@ -1069,7 +1069,11 @@ try{
     Assert-Document ($literal.Length -eq 1 -and $literal[0].StartOffset -eq $hits[1].StartOffset) 'literal filter precedes the structural result limit'
     Assert-Document ($doc.Find('Call','Write-Output','',"'text'",1).Length -eq 0) 'literal in unrelated string is not a call witness'
     $q=& $compiler -Mode Query -QueryPath $path -QueryKind Call -QueryName Write-Output -QueryLiteral "'b'" -QueryTake 1
-    try{Assert-Document ($q.Pull(1)[0].StartOffset -eq $hits[1].StartOffset) 'lazy cursor and document agree on literal-filtered extent'}finally{$q.Dispose()}
+    try{$readOnly=$q.Pull(1)[0];Assert-Document ($readOnly.StartOffset -eq $hits[1].StartOffset) 'lazy cursor and document agree on literal-filtered extent'}finally{$q.Dispose()}
+    $resolved=$doc.Resolve($readOnly)
+    Assert-Document ($resolved.DocumentIdentity -eq $hits[1].DocumentIdentity -and $resolved.SourceRevision -eq $doc.Revision -and $resolved.Target.Extent.Text -ceq $hits[1].Target.Extent.Text) 'read-only match resolves into a fresh document witness'
+    $rejected=$false;try{$null=$doc.Resolve($hits[1])}catch{$rejected=$true}
+    Assert-Document $rejected 'document witness cannot be reissued through read-only resolution'
     $same=& $compiler -Mode Edit -SourcePath $path
     $otherRevision=$same.Query('Call','Write-Output','',1)
     $rejected=$false;try{$doc.Replace($otherRevision[0],"Write-Output 'other session'")}catch{$rejected=$true}
@@ -1077,6 +1081,8 @@ try{
     $doc.Replace($hits,[string[]]@("Write-Output 'longer'","Write-Output 'c'"))
     $changed=$original.Replace("Write-Output 'a'","Write-Output 'longer'").Replace("Write-Output 'b'","Write-Output 'c'")
     Assert-Document ($doc.Text() -ceq $changed -and $doc.Revision -eq 1 -and $doc.Modified()) 'batch replacement preserves untouched CRLF bytes and shifts later extents correctly'
+    $rejected=$false;try{$null=$doc.Resolve($readOnly)}catch{$rejected=$true}
+    Assert-Document $rejected 'read-only witness cannot resolve against changed content'
     $rejected=$false;try{$doc.Replace($hits[0],"Write-Output 'stale'")}catch{$rejected=$_.Exception.Message.Contains('Stale or foreign')}
     Assert-Document ($rejected -and $doc.Text() -ceq $changed -and $doc.Revision -eq 1) 'stale match cannot change edited document'
     Assert-Document ($doc.Undo() -and $doc.Text() -ceq $original -and !$doc.Modified()) 'one undo restores grouped changes exactly'
@@ -1125,8 +1131,12 @@ try {
     $out = Join-Path $work 'PSC.next.ps1'
     $api = & $compiler -Mode Api
     Assert-Tree ($api.SourceExtensions.Count -eq 5 -and $api.SourceExtensions -contains '.sexe') 'API advertises unified source admission'
+    Assert-Tree ($api.Describe('Guard').DispatchExtent.Text.Contains('Test-SmaGuard') -and $api.Guide().Contains('OpenDevelopment')) 'first-contact guide and live dispatcher description'
+    $q=$api.Find('ConvertTo-PscIr');try{Assert-Tree ($q.Pull(1)[0].Name -ceq 'ConvertTo-PscIr') 'self declaration discovery'}finally{$q.Dispose()}
+    $q=$api.Search('PersistedAssemblyBuilder');try{Assert-Tree ($q.Pull(1).Count -eq 1) 'self literal discovery'}finally{$q.Dispose()}
     $dev = $api.OpenDevelopment($base,$tree)
     $snapshot = $dev.Status()
+    $q=$dev.Find('Apply');try{Assert-Tree ($q.Pull(20).Count -gt 0) 'development declaration discovery'}finally{$q.Dispose()}
     Assert-Tree ($dev.Changes().Count -eq 0 -and $dev.Affected().Faculties.Count -eq 0) 'development session starts clean'
     Assert-Tree ($snapshot.UnitCount -gt 400 -and $snapshot.BaseSha256 -ceq $hash) 'canonical PSC projects into ordered AST units'
     Assert-Tree ([IO.File]::Exists((Join-Path $tree 'Faculties/Vom/Vom.ps1')) -and [IO.File]::Exists((Join-Path $tree 'Compiler/Functions/ConvertTo-PscIr.ps1'))) 'compiler and runtime faculty have stable declaration paths'
@@ -11786,6 +11796,7 @@ class PscParameter {
 }
 
 class PscOperation {
+    hidden [System.Management.Automation.Language.IScriptExtent] $DispatchExtent
     [string] $Mode
     [PscParameter[]] $Parameters
     [string[]] $Calls
@@ -12856,6 +12867,8 @@ class PscDevelopment {
         foreach($unit in $status.Units){if($unit.Path -ceq $path -and $unit.State -cne 'Deleted'){return $this.Api.OpenDocument([PscTreeText]::SafePath($this.Tree,$path))}}
         throw 'Document must be a present tracked source unit.'
     }
+    [PscQueryCursor] Find([string]$declaration){return $this.Find([PscQueryKind]::Declaration,$declaration,'','',[int]::MaxValue)}
+    [PscQueryCursor] Search([string]$literal){return $this.Find([PscQueryKind]::Declaration,'','',$literal,[int]::MaxValue)}
     [PscQueryCursor] Find([PscQueryKind]$kind,[string]$name,[string]$owner,[string]$literal,[int]$take){
         $status=$this.Status();$paths=[Collections.Generic.List[string]]::new()
         foreach($unit in $status.Units){if($unit.State -cne 'Deleted' -and [PscSourceFormat]::IsSource($unit.Path)){$paths.Add([PscTreeText]::SafePath($this.Tree,$unit.Path))}}
@@ -12910,6 +12923,57 @@ class PscDevelopment {
 class PscApi {
     hidden [PscFacultyUnit[]] $FacultyUnits
     [PscDevelopment] OpenDevelopment([string]$base,[string]$tree){return [PscDevelopment]::new($this,$base,$tree)}
+    [PscDevelopment] OpenDevelopment([string]$tree){return $this.OpenDevelopment($this.Script,$tree)}
+    [PscOperation] Describe([string]$modeName){
+        foreach($operation in $this.Modes){if($operation.Mode -ieq $modeName){return $operation}}
+        throw 'Unknown PSC mode; inspect Modes.'
+    }
+    [PscQueryCursor] Find([string]$declaration){return $this.OpenQuery(@($this.Script),[PscQueryKind]::Declaration,$declaration,'','',[int]::MaxValue)}
+    [PscQueryCursor] Search([string]$literal){return $this.OpenQuery(@($this.Script),[PscQueryKind]::Declaration,'','',$literal,[int]::MaxValue)}
+    [string] $StartHere = 'Guide() for the development workflow; Describe(mode) for live CLI metadata; Find(name) or Search(literal) for source declarations.'
+    [string] Guide(){
+        return @'
+## Develop PSC
+
+`PSC.ps1` is the canonical single-file compiler. `Invoke-PSC.ps1` is legacy. Use PowerShell 7.7 / .NET 11 to author and test; Git is the durable history. Realized SM code is SMA-free. `.sm1` is script source, `.srm1` is reusable resource/module source, and `.sexe` is a one-shot executable appliance in source form. All may execute through PSC once realized; `Run` is still the SMA reference path, not the SM launcher.
+
+Start in the repository root with a clean, current canonical baseline. No build or SDK installation is needed for source inquiry:
+
+```powershell
+$api = & ./PSC.ps1
+$api.Guide()
+$api.Describe('Compile').Parameters
+$api.Describe('Guard').DispatchExtent.Text
+$q = $api.Find('ConvertTo-PscIr')
+try { $q.Pull(10); $q.Coverage() } finally { $q.Dispose() }
+```
+
+Use `git grep -n -F -- 'ConvertTo-PscIr' PSC.ps1` for raw text and `git log -p -- PSC.ps1` for history. `Search(literal)` selects declaration extents containing an ordinal literal, including comments/strings in those extents; `Find(name)` selects declarations by name. Neither proves runtime binding. Pull windows are 1..256; inspect Coverage and dispose the cursor. Use OpenQuery for owner, kind, limit or explicit external paths. Querying the canonical file does not parse embedded source strings as separate source units.
+
+For work spanning declarations or embedded resources, use a disposable projection (the directory must be absent or an intact projection of the same base):
+
+```powershell
+$dev = $api.OpenDevelopment('./psc-tree')
+$q = $dev.Find('Apply')
+try { $q.Pull(20); $q.Coverage() } finally { $q.Dispose() }
+$doc = $dev.OpenDocument('SM/Calibration.sm1')
+$hit = $doc.Find('Declaration','Apply','SmCalibrationProvider',1)[0]
+$hit.Target.Extent.Text
+```
+
+`rg -n -F -- 'Apply' ./psc-tree` searches projected text, including embedded sources. To edit, use a document witness with Replace, Undo, Redo and Save; or edit the projected file externally. For a read-only cursor match, open its ArtifactPath and use `doc.Resolve(hit)` (PowerShell: `$doc.Resolve($hit)`) to obtain a fresh document witness after exact source/extent checks. Never pass a read-only match directly to Replace. Incomplete fragments must be validated by collation. Additions, deletions and renames still require explicit canonical edits.
+
+```powershell
+$dev.Changes()
+$dev.Affected()
+$dev.Collate('./PSC.next.ps1')
+$receipt = $dev.Conform($true)
+$receipt.Stages | Select-Object Name,State,ExitCode
+```
+
+Collate requires a fresh candidate destination. Conform checks the committed baseline, protected checker and embedded fixtures. The boolean `true` explicitly omits historical Verify (Windows NativeAOT); `Complete` is false. Use `false` for full verification with its prerequisites. Affected is declared dependency evidence, not complete coverage; it does not skip tests. After successful review, promote the candidate explicitly, inspect `git diff -- PSC.ps1`, commit and verify the new HEAD. Reopen the projection against the new baseline. Never silently change protected checkers or claim unrun tests passed.
+'@
+    }
     [PscSourceFormat[]] $SourceFormats = [PscSourceFormat]::SmFormats()
     [string[]] $SourceExtensions = [PscSourceFormat]::Extensions()
     [PscTreeSnapshot] UnCollate([string]$root){return $this.UnCollate($this.Script,$root)}
@@ -13063,6 +13127,7 @@ function Get-PscApi {
             }
         }
         $operation = [PscOperation]::new()
+        $operation.DispatchExtent = $body.Extent
         $operation.Mode = $clause.Item1.SafeGetValue()
         $operation.Parameters = [PscParameter[]]@(foreach ($name in $used) { Get-PscApiParameter $scriptParameters[$name] })
         $operation.Calls = [string[]]@($calls)
@@ -13154,6 +13219,7 @@ function ConvertTo-PscReadme {
     param([Parameter(Mandatory)][PscApi] $Api)
     '# PSC'
     ''
+    $Api.Guide(); ''
     if ($Api.Notes) { $Api.Notes; '' }
     $presented = @(Get-PscPresentedProperty -Type ([PscApi]))
     ConvertTo-PscMarkdownTable -Columns @($presented | Where-Object { -not $_.PropertyType.IsArray }) -Rows @($Api)
@@ -13936,6 +14002,8 @@ class PscQuerySpec {
 }
 class PscSourceQueryVisitor : System.Management.Automation.Language.AstVisitor2 {
     [PscQuerySpec] $Spec
+    [int] $ExactStart = -1
+    [int] $ExactEnd = -1
     [int] $Resume
     [int] $Seen
     [int] $Unknown
@@ -13963,7 +14031,7 @@ class PscSourceQueryVisitor : System.Management.Automation.Language.AstVisitor2 
         if($this.Seen -le $this.Resume){return [System.Management.Automation.Language.AstVisitAction]::Continue}
         if($dynamic){$this.Unknown++;return [System.Management.Automation.Language.AstVisitAction]::Continue}
         $owner=[PscSourceQueryVisitor]::OwnerOf($node)
-        if($this.Spec.Matches($name,$owner,$false) -and (!$this.Spec.Literal -or $node.Extent.Text.Contains($this.Spec.Literal,[StringComparison]::Ordinal))){
+        if(($this.ExactStart -lt 0 -or ($this.ExactStart -eq $node.Extent.StartOffset -and $this.ExactEnd -eq $node.Extent.EndOffset)) -and $this.Spec.Matches($name,$owner,$false) -and (!$this.Spec.Literal -or $node.Extent.Text.Contains($this.Spec.Literal,[StringComparison]::Ordinal))){
             $hit=[PscMatch]::new();$hit.Domain='SourceAst';$hit.ArtifactPath=$this.Path;$hit.ArtifactSha256=$this.Digest;$hit.Owner=$owner;$hit.Kind=$this.Spec.Kind;$hit.Name=$name
             $hit.StartOffset=$node.Extent.StartOffset;$hit.EndOffset=$node.Extent.EndOffset;$hit.Line=$node.Extent.StartLineNumber;$hit.Column=$node.Extent.StartColumnNumber;$hit.Target=$node;$hit.ParseIncomplete=$this.ParseIncomplete
             $this.Hits.Add($hit)
@@ -14062,6 +14130,18 @@ class PscDocument {
     }
     [PscMatch[]] Query([PscQueryKind]$kind,[string]$name,[string]$owner,[int]$limit){
         return $this.Find($kind,$name,$owner,'',$limit)
+    }
+    [PscMatch[]] Find([PscQueryKind]$kind,[string]$name,[string]$owner,[int]$limit){return $this.Query($kind,$name,$owner,$limit)}
+    [PscMatch] Resolve([PscMatch]$witness){
+        $text=$this.Text();$digest=[PscTreeText]::Hash($text)
+        if($null -eq $witness -or $witness.Domain -cne 'SourceAst' -or $witness.ParseIncomplete -or $witness.SourceRevision -ne -1 -or $witness.DocumentIdentity -ne [Guid]::Empty -or $witness.ArtifactPath -cne $this.Path -or $witness.ArtifactSha256 -cne $digest){throw 'Resolve requires a current read-only source witness.'}
+        if($witness.Target -isnot [System.Management.Automation.Language.Ast] -or $witness.StartOffset -lt 0 -or $witness.EndOffset -le $witness.StartOffset -or $witness.EndOffset -gt $text.Length){throw 'Resolve requires a valid source extent.'}
+        $extent=([System.Management.Automation.Language.Ast]$witness.Target).Extent
+        if($extent.StartOffset -ne $witness.StartOffset -or $extent.EndOffset -ne $witness.EndOffset -or $extent.Text -cne $text.Substring($witness.StartOffset,$witness.EndOffset-$witness.StartOffset)){throw 'Resolve source extent differs.'}
+        $visitor=[PscSourceQueryVisitor]::new();$visitor.Spec=[PscQuerySpec]::new($witness.Kind,$witness.Name,$witness.Owner,1);$visitor.Path=$this.Path;$visitor.Digest=$digest;$visitor.Limit=1;$visitor.ExactStart=$witness.StartOffset;$visitor.ExactEnd=$witness.EndOffset
+        $this.Parse($text).Visit($visitor)
+        if($visitor.Hits.Count -ne 1 -or $visitor.Hits[0].Target.GetType() -ne $witness.Target.GetType()){throw 'Resolve could not reproduce structural witness.'}
+        $resolved=$visitor.Hits[0];$resolved.SourceRevision=$this.Revision;$resolved.DocumentIdentity=$this.Identity;return $resolved
     }
     [PscMatch[]] Find([PscQueryKind]$kind,[string]$name,[string]$owner,[string]$literal,[int]$limit){
         if($limit -lt 1 -or $limit -gt 256 -or $kind -in [PscQueryKind]::CilMethod,[PscQueryKind]::CilOp){throw 'Document query requires a source kind and a limit of 1..256.'}
