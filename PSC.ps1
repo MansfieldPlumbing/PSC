@@ -12932,38 +12932,60 @@ class PscApi {
     [PscQueryCursor] Search([string]$literal){return $this.OpenQuery(@($this.Script),[PscQueryKind]::Declaration,'','',$literal,[int]::MaxValue)}
     [string] $StartHere = 'Guide() for the development workflow; Describe(mode) for live CLI metadata; Find(name) or Search(literal) for source declarations.'
     [string] Guide(){
-        return @'
-## Develop PSC
+        $formatRows=[Collections.Generic.List[string]]::new()
+        $formatRows.Add('| Extension | Role | Analogue | Intent |')
+        $formatRows.Add('|---|---|---|---|')
+        foreach($format in $this.SourceFormats){$formatRows.Add('| '+$format.Extension+' | '+$format.Role+' | '+$format.Analogue+' | '+$format.Intent+' |')}
+        $guideText=@'
+PSC is a single-file compiler and semantic development environment for typed PowerShell/SM source. It emits deterministic managed assemblies without an SMA runtime dependency for admitted code, links native Windows PE images, and directly emits verified x64 ELF leaf libraries. No SDK or project file is needed for managed compilation.
 
-`PSC.ps1` is the canonical single-file compiler. `Invoke-PSC.ps1` is legacy. Use PowerShell 7.7 / .NET 11 to author and test; Git is the durable history. Realized SM code is SMA-free. `.sm1` is script source, `.srm1` is reusable resource/module source, and `.sexe` is a one-shot executable appliance in source form. All may execute through PSC once realized; `Run` is still the SMA reference path, not the SM launcher.
-
-Start in the repository root with a clean, current canonical baseline. No build or SDK installation is needed for source inquiry:
+**Start here:** PowerShell 7.7 / .NET 11, Git, and `PSC.ps1`. `Invoke-PSC.ps1` is the legacy entry point.
 
 ```powershell
-$api = & ./PSC.ps1
-$api.Guide()
-$api.Describe('Compile').Parameters
-$api.Describe('Guard').DispatchExtent.Text
+$api = & ./PSC.ps1                       # Describe PSC, without compiling
+$api.Describe('Compile').Parameters       # Live command contract
+$dev = $api.OpenDevelopment('./psc-tree') # Project the canonical source
+& ./PSC.ps1 -SourcePath ./psc-tree/SM/Calibration.sexe -Program -OutputPath ./Calibration.dll
+```
+
+`Calibration.dll` is a managed program, not a native executable. The embedded SM fixture exercises its entry point. `-Native` adds the existing Windows NativeAOT/COFF pipeline; `NativeCil` is the separate, currently leaf-only native path.
+
+## Source formats
+
+@@FORMATS@@
+
+The extension describes intent, not executable eligibility. PSC is the realization authority; stock `pwsh` execution is not a requirement. Direct SMA-free one-shot launch through PSC is a target, not an implemented feature. `Run` currently executes through SMA as a reference path.
+
+## Find, inspect, edit, conform
+
+The canonical source is `PSC.ps1`. The worktree is a disposable, ordered AST projection, including embedded SM sources and tests. Do not maintain a competing source tree.
+
+| Tool | Responsibility |
+|---|---|
+| `git grep -n -F -- 'ConvertTo-PscIr' PSC.ps1` | Literal text in tracked source |
+| `rg -n -F -- 'Apply' ./psc-tree` | Literal text in the projected worktree |
+| `$api.Find('ConvertTo-PscIr')` | Named AST declarations |
+| `$api.Search('PersistedAssemblyBuilder')` | AST declaration extents containing literal text |
+| `git log -p -- PSC.ps1` | Committed history |
+
+```powershell
 $q = $api.Find('ConvertTo-PscIr')
 try { $q.Pull(10); $q.Coverage() } finally { $q.Dispose() }
+$api.Describe('Guard').DispatchExtent.Text
+$api.Guide()
 ```
 
-Use `git grep -n -F -- 'ConvertTo-PscIr' PSC.ps1` for raw text and `git log -p -- PSC.ps1` for history. `Search(literal)` selects declaration extents containing an ordinal literal, including comments/strings in those extents; `Find(name)` selects declarations by name. Neither proves runtime binding. Pull windows are 1..256; inspect Coverage and dispose the cursor. Use OpenQuery for owner, kind, limit or explicit external paths. Querying the canonical file does not parse embedded source strings as separate source units.
+Query returns typed witnesses with source identity, owner, extent and coverage. Pull in windows of 1..256; dispose cursors. Literal containment includes comments and strings inside a declaration, not proof of binding. Use `$dev.Find('Apply')` or `$dev.Search('literal')` to include projected resources; canonical queries do not parse embedded source strings. `OpenQuery` supports explicit paths, owner, kind and limit, including non-loading CIL inspection for binary queries.
 
-For work spanning declarations or embedded resources, use a disposable projection (the directory must be absent or an intact projection of the same base):
+A read-only query witness can become an edit witness only through exact source/extent validation (`$doc.Resolve($hit)`). A document's own `Find` returns revision-bound editable witnesses directly. Example, using a behavior-preserving numeric-literal edit in the projected calibration resource:
 
 ```powershell
-$dev = $api.OpenDevelopment('./psc-tree')
-$q = $dev.Find('Apply')
-try { $q.Pull(20); $q.Coverage() } finally { $q.Dispose() }
 $doc = $dev.OpenDocument('SM/Calibration.sm1')
 $hit = $doc.Find('Declaration','Apply','SmCalibrationProvider',1)[0]
-$hit.Target.Extent.Text
-```
-
-`rg -n -F -- 'Apply' ./psc-tree` searches projected text, including embedded sources. To edit, use a document witness with Replace, Undo, Redo and Save; or edit the projected file externally. For a read-only cursor match, open its ArtifactPath and use `doc.Resolve(hit)` (PowerShell: `$doc.Resolve($hit)`) to obtain a fresh document witness after exact source/extent checks. Never pass a read-only match directly to Replace. Incomplete fragments must be validated by collation. Additions, deletions and renames still require explicit canonical edits.
-
-```powershell
+$doc.Replace($hit, $hit.Target.Extent.Text.Replace('4.0 + 1.25','4.0 + 1.250'))
+$doc.Undo()
+$doc.Redo()
+$doc.Save()
 $dev.Changes()
 $dev.Affected()
 $dev.Collate('./PSC.next.ps1')
@@ -12971,8 +12993,39 @@ $receipt = $dev.Conform($true)
 $receipt.Stages | Select-Object Name,State,ExitCode
 ```
 
-Collate requires a fresh candidate destination. Conform checks the committed baseline, protected checker and embedded fixtures. The boolean `true` explicitly omits historical Verify (Windows NativeAOT); `Complete` is false. Use `false` for full verification with its prerequisites. Affected is declared dependency evidence, not complete coverage; it does not skip tests. After successful review, promote the candidate explicitly, inspect `git diff -- PSC.ps1`, commit and verify the new HEAD. Reopen the projection against the new baseline. Never silently change protected checkers or claim unrun tests passed.
+External edits to projected files are also supported. Start with a clean Git baseline and a new or matching projection. Collate needs a fresh candidate destination and rejects missing/untracked units and changed declaration boundaries. Additions, deletions and renames still require explicit canonical edits. Affected reports declared faculty dependencies, not exhaustive semantic or test coverage. No tests are omitted based on Affected.
+
+Conform runs the protected Guard against committed source, the candidate API, projection and embedded regressions. `true` selects development scope and skips historical Windows verification (`Complete = False`); `false` requests the full suite and requires its native toolchain. Review the receipt before explicitly promoting the candidate. Use `git diff -- PSC.ps1`, commit the reviewed change, verify HEAD, then open a fresh projection. Never silently change protected checkers. See [AGENTS.md](AGENTS.md) for engineering requirements.
+
+## Compiler and runtime
+
+- **Managed:** SMA AST and typed expression lowering, deterministic IL emission, static graph/data realization, reachability and fixed-parameter specialization.
+- **Native:** pinned Windows NativeAOT compiler plus PSC COFF linker; direct CIL-to-IR-to-x64 ELF leaf emission and decoded-byte ABI checks. The direct backend does not yet replace ILC for general programs.
+- **Faculties:** `Vom` (Virtual Object Model), `InquiryPrimitives`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
+- **Evidence:** differential tests, structural lint, Guard, non-loading binary queries and coverage. An observed call is not a universal binding proof; an ABI check is not a proof of arithmetic equivalence.
+
+## Trust and security
+
+PSC authoring requires a trusted PowerShell session with the required language capabilities. It uses reflection, metadata readers, assembly emission and native interop openly. Do not bypass AMSI, Defender, App Control or execution policies. Follow local signing and deployment policy. Only compile or execute trusted source; conformance runs candidate code and is not a sandbox. Use trusted assemblies for CIL import/compilation and trusted data for `FixedParametersPath` and `ProfilePath`. Query is the non-loading metadata inquiry path for supported binaries. Determinism and SHA-256 identify artifacts; they do not establish publisher trust or safety.
+
+Microsoft guidance: [script injection](https://learn.microsoft.com/en-us/powershell/scripting/security/preventing-script-injection), [PowerShell security](https://learn.microsoft.com/en-us/powershell/scripting/security/security-features), [unsafe deserialization](https://learn.microsoft.com/en-us/dotnet/standard/serialization/binaryformatter-security-guide).
+
+## Live reference
+
+```powershell
+$api.AssertSurface()
+$api.Modes
+$api.Parameters
+$api.Measures
+$api.Functions
+$api.Classes
+$api | Get-Member
+& ./PSC.ps1 -Mode Capability
+```
+
+The API is derived from the running script, so mode names and parameter evidence do not depend on a previous session's notes. Use `Describe(mode)` for dispatcher extents and associated definitions. CLI inventory below is generated; source hash, local paths, runtime and measurement values are available from the live API rather than frozen into the README. Regenerate with `& ./PSC.ps1 -Mode Readme`.
 '@
+        return $guideText.Replace('@@FORMATS@@',($formatRows -join "`n"))
     }
     [PscSourceFormat[]] $SourceFormats = [PscSourceFormat]::SmFormats()
     [string[]] $SourceExtensions = [PscSourceFormat]::Extensions()
@@ -13219,19 +13272,14 @@ function ConvertTo-PscReadme {
     param([Parameter(Mandatory)][PscApi] $Api)
     '# PSC'
     ''
+    $Api.AssertSurface()
     $Api.Guide(); ''
-    if ($Api.Notes) { $Api.Notes; '' }
-    $presented = @(Get-PscPresentedProperty -Type ([PscApi]))
-    ConvertTo-PscMarkdownTable -Columns @($presented | Where-Object { -not $_.PropertyType.IsArray }) -Rows @($Api)
-    foreach ($property in $presented | Where-Object { $_.PropertyType.IsArray }) {
-        ''
-        '## ' + $property.Name
-        ''
-        $element = $property.PropertyType.GetElementType()
-        $value = $property.GetValue($Api)
-        if ($element.Assembly -eq [PscApi].Assembly) { ConvertTo-PscMarkdownTable -Columns @(Get-PscPresentedProperty -Type $element) -Rows $value }
-        else { ConvertTo-PscMarkdownCell $value }
-    }
+    '<details>'
+    '<summary>CLI modes, parameters and dispatcher calls</summary>'
+    ''
+    ConvertTo-PscMarkdownTable -Columns @(Get-PscPresentedProperty -Type ([PscOperation])) -Rows $Api.Modes
+    ''
+    '</details>'
 }
 
 function Get-LoweringCapability {
