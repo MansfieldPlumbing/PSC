@@ -404,6 +404,8 @@ SOFTWARE.
     Conform/VerifyConformance: optional independently retained SHA-256 of the PowerShell executable used to launch stages. This does not pin the complete runtime or its dependencies.
 .PARAMETER ExpectedGitSha256
     Guard/Conform/VerifyConformance: optional independently retained SHA-256 of the Git executable used for baseline acquisition. This does not pin Git helpers, libraries or nested fixture launches.
+.PARAMETER ExpectedRuntimeSha256
+    Conform/VerifyConformance: independently retained SHA-256 of the ordered startup-file inventory. This identifies files, not loaded process state or full dependency closure.
 .PARAMETER AssessmentReport
     VerifyConformance: report to compare against source bytes; requires independently retained baseline and runner SHA-256 pins.
 .PARAMETER AgainstPath
@@ -487,6 +489,7 @@ param(
     [string] $ExpectedBaselineSha256,
     [string] $ExpectedHostSha256,
     [string] $ExpectedGitSha256,
+    [string] $ExpectedRuntimeSha256,
     $AssessmentReport,
     # Guard/Conform: tracked canonical path at Git HEAD, not the working copy.
     [string] $AgainstPath,
@@ -987,7 +990,7 @@ A retained semantic index is opened with `$index = $api.OpenSemanticIndex($root)
 
 Development sessions: `$dev = $api.OpenDevelopment($base,$tree)` creates or opens a verified projection; `Find`, `OpenDocument`, `Changes`, `Affected`, `Collate` and `Conform` share a pinned compiler, canonical base and manifest. `Affected` reports direct paths and declared faculty dependency closure; it does not prove complete method-level impact or select fewer tests. Collation requires a fresh candidate path; conformance rejects stale candidates and requires the pinned base to equal its committed Git blob.
 
-Candidate verification: `-Mode Guard -LintFiles ./PSC.next.ps1 -AgainstPath ./PSC.ps1` compares against the committed canonical path, not its working copy. `-Mode Conform -SourcePath ./PSC.next.ps1 -AgainstPath ./PSC.ps1` runs the protected Guard, candidate API, projection, embedded document/worktree/Guard/SM fixtures and historical Verify in independent processes. `-DevelopmentOnly` explicitly skips historical Verify and returns an incomplete report. No candidate is promoted automatically. The report carries candidate, committed baseline, runner and stage identities. Supply an independently retained -ExpectedRunnerSha256 to reject a different runner in Guard or Conform; verify that digest before launching the runner. Conform also accepts -ExpectedBaselineSha256 to pin the acquired committed bytes; development sessions retain both pins. Candidate baseline lookup excludes Git replacement objects; standalone Guard refuses replacement refs. Both reject inherited Git routing or injected configuration, resolve one absolute Git executable for baseline acquisition and record its SHA-256. Guard and Conform accept -ExpectedGitSha256; VerifyConformance can compare the retained acquisition identity against the independent pin. Git libraries, helpers and nested fixture invocations remain outside this executable-file check.
+Candidate verification: `-Mode Guard -LintFiles ./PSC.next.ps1 -AgainstPath ./PSC.ps1` compares against the committed canonical path, not its working copy. `-Mode Conform -SourcePath ./PSC.next.ps1 -AgainstPath ./PSC.ps1` runs the protected Guard, candidate API, projection, embedded document/worktree/Guard/SM fixtures and historical Verify in independent processes. `-DevelopmentOnly` explicitly skips historical Verify and returns an incomplete report. No candidate is promoted automatically. The report carries candidate, committed baseline, runner and stage identities. Supply an independently retained -ExpectedRunnerSha256 to reject a different runner in Guard or Conform; verify that digest before launching the runner. Conform also accepts -ExpectedBaselineSha256 to pin the acquired committed bytes; development sessions retain both pins. Candidate baseline lookup excludes Git replacement objects; standalone Guard refuses replacement refs. Both reject inherited Git routing or injected configuration, resolve one absolute Git executable for baseline acquisition and record its SHA-256. Guard and Conform accept -ExpectedGitSha256; VerifyConformance can compare the retained acquisition identity against the independent pin. Git libraries, helpers and nested fixture invocations remain outside this executable-file check. Conform inventories ten fixed startup files in the colocated PowerShell distribution before and after each executed stage. Supply -ExpectedRuntimeSha256 to Conform or VerifyConformance to check an independent inventory digest. This does not establish actual child load identity or full dependency closure.
 
 
 `Edit` opens a single file as a document with its own identity, immutable original buffer, append-only insertion buffer and grouped undo/redo journal. Query returns typed AST references bound to the document identity, SHA-256 and revision. Use a complete matching AST extent as the replacement boundary; no regex or line-based rewrite is performed.
@@ -1921,6 +1924,47 @@ try {
     if(!(& $Compiler -Mode VerifyConformance -AssessmentReport $report -SourcePath $candidate -ExpectedBaselineSha256 $argsMap.ExpectedBaselineSha256 -ExpectedRunnerSha256 $argsMap.ExpectedRunnerSha256 -ExpectedHostSha256 $hostDigest -DevelopmentOnly)){throw 'Correct host pin refused'}
     if(& $Compiler -Mode VerifyConformance -AssessmentReport $report -SourcePath $candidate -ExpectedBaselineSha256 $argsMap.ExpectedBaselineSha256 -ExpectedRunnerSha256 $argsMap.ExpectedRunnerSha256 -ExpectedHostSha256 $badHost -DevelopmentOnly){throw 'Incorrect host pin verified'}
     'PASS report verification respects independent host pin'
+    $runtime=$report.RuntimeInventory
+    $runtimeRoot=[IO.Path]::GetDirectoryName($hostPath)
+    $nativeNames=if([OperatingSystem]::IsWindows()){@('coreclr.dll','clrjit.dll','hostfxr.dll','hostpolicy.dll')}elseif([OperatingSystem]::IsMacOS()){@('libcoreclr.dylib','libclrjit.dylib','libhostfxr.dylib','libhostpolicy.dylib')}else{@('libcoreclr.so','libclrjit.so','libhostfxr.so','libhostpolicy.so')}
+    $names=@('pwsh.dll','pwsh.deps.json','pwsh.runtimeconfig.json','Microsoft.PowerShell.ConsoleHost.dll','System.Management.Automation.dll','System.Private.CoreLib.dll')+$nativeNames
+    $platform=if([OperatingSystem]::IsWindows()){'Windows'}elseif([OperatingSystem]::IsMacOS()){'MacOS'}else{'Linux'}
+    $lines=[Collections.Generic.List[string]]::new();$lines.Add('PSC Runtime Inventory v1');$lines.Add($platform)
+    foreach($name in $names){$lines.Add($name+' '+(Get-FileHash -LiteralPath ([IO.Path]::Combine($runtimeRoot,$name))).Hash)}
+    $runtimeDigest=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($lines -join "`n")))
+    if($null -eq $runtime -or $runtime.Root -cne $runtimeRoot -or $runtime.Sha256 -cne $runtimeDigest -or $runtime.Files.Count -ne 10){throw 'Runtime inventory differs from independent measurement'}
+    'PASS exact bounded runtime inventory independently reproduced'
+    foreach($observed in $report.Stages){if($observed.State -ceq 'Skipped'){if($observed.RuntimeSha256){throw 'Skipped stage claims runtime inventory'}}elseif($observed.RuntimeSha256 -cne $runtimeDigest){throw 'Executed stage missing runtime inventory'}}
+    'PASS runtime inventory stage scope'
+    $report.Stages[0].RuntimeSha256='0'*64
+    if($report.VerifyScope($true)){throw 'Changed stage runtime digest admitted'}
+    $report.Stages[0].RuntimeSha256=$runtimeDigest
+    $report.Stages[-1].RuntimeSha256=$runtimeDigest
+    if($report.VerifyScope($true)){throw 'Skipped stage runtime digest admitted'}
+    $report.Stages[-1].RuntimeSha256=''
+    'PASS changed and skipped runtime claims refused'
+    $files=$runtime.Files;$runtime.Files=@($files[1..9])
+    if($report.VerifyScope($true)){throw 'Incomplete runtime inventory admitted'}
+    $runtime.Files=$files
+    $digest=$files[0].Sha256;$files[0].Sha256='0'*64
+    if($report.VerifyScope($true)){throw 'Changed runtime file digest admitted'}
+    $files[0].Sha256=$digest
+    'PASS omitted and changed runtime file records refused'
+    $badRuntime=if($runtimeDigest[0] -eq '0'){'1'+$runtimeDigest.Substring(1)}else{'0'+$runtimeDigest.Substring(1)}
+    $refused=$false
+    try{$null=& $Compiler @argsMap -ExpectedRuntimeSha256 $badRuntime -DevelopmentOnly}catch{$refused=$_.Exception.Message.Contains('Expected runtime inventory SHA-256 mismatch')}
+    if(!$refused){throw 'Incorrect runtime pin admitted'}
+    'PASS wrong runtime pin refused before assessment'
+    if(!(& $Compiler -Mode VerifyConformance -AssessmentReport $report -SourcePath $candidate -ExpectedBaselineSha256 $argsMap.ExpectedBaselineSha256 -ExpectedRunnerSha256 $argsMap.ExpectedRunnerSha256 -ExpectedRuntimeSha256 $runtimeDigest -DevelopmentOnly)){throw 'Correct runtime pin refused'}
+    if(& $Compiler -Mode VerifyConformance -AssessmentReport $report -SourcePath $candidate -ExpectedBaselineSha256 $argsMap.ExpectedBaselineSha256 -ExpectedRunnerSha256 $argsMap.ExpectedRunnerSha256 -ExpectedRuntimeSha256 $badRuntime -DevelopmentOnly){throw 'Incorrect runtime pin verified'}
+    'PASS independent runtime inventory verification'
+    $report.RuntimeInventory=$null
+    foreach($observed in $report.Stages){$observed.RuntimeSha256=''}
+    if(!$report.VerifyScope($true) -or (& $Compiler -Mode VerifyConformance -AssessmentReport $report -SourcePath $candidate -ExpectedBaselineSha256 $argsMap.ExpectedBaselineSha256 -ExpectedRunnerSha256 $argsMap.ExpectedRunnerSha256 -ExpectedRuntimeSha256 $runtimeDigest -DevelopmentOnly)){throw 'Legacy runtime scope pin policy violated'}
+    $report.RuntimeInventory=$runtime
+    foreach($observed in $report.Stages){if($observed.State -cne 'Skipped'){$observed.RuntimeSha256=$runtimeDigest}}
+    'PASS legacy receipt cannot satisfy runtime pin'
+    $argsMap.ExpectedRuntimeSha256=$runtimeDigest
     $gitName=if([OperatingSystem]::IsWindows()){'git.exe'}else{'git'}
     $gitPath=(Get-Command $gitName -CommandType Application | Select-Object -First 1).Path
     $gitDigest=(Get-FileHash -LiteralPath $gitPath).Hash
@@ -5477,6 +5521,77 @@ class PscConformanceRequirement {
         $this.Name=$name;$this.Provenance=$provenance;$this.SourcePath=$sourcePath;$this.Sha256=$digest;$this.RequiredState=$requiredState
     }
 }
+# A bounded distribution-file inventory, not a dynamic loader trace or process attestation.
+class PscRuntimeFile {
+    [string] $Name
+    [string] $Sha256
+    PscRuntimeFile([string]$name,[string]$sha256){$this.Name=$name;$this.Sha256=$sha256}
+}
+class PscRuntimeInventory {
+    [string] $Root
+    [string] $Platform
+    [PscRuntimeFile[]] $Files
+    [string] $Sha256
+    static [string[]] RequiredNames([string]$platform){
+        $names=@('pwsh.dll','pwsh.deps.json','pwsh.runtimeconfig.json','Microsoft.PowerShell.ConsoleHost.dll','System.Management.Automation.dll','System.Private.CoreLib.dll')
+        switch -CaseSensitive ($platform){
+            'Windows' {return $names+@('coreclr.dll','clrjit.dll','hostfxr.dll','hostpolicy.dll')}
+            'Linux' {return $names+@('libcoreclr.so','libclrjit.so','libhostfxr.so','libhostpolicy.so')}
+            'MacOS' {return $names+@('libcoreclr.dylib','libclrjit.dylib','libhostfxr.dylib','libhostpolicy.dylib')}
+        }
+        throw 'Unsupported conformance runtime platform.'
+    }
+    static [string] CurrentPlatform(){
+        if([OperatingSystem]::IsWindows()){return 'Windows'}
+        if([OperatingSystem]::IsLinux()){return 'Linux'}
+        if([OperatingSystem]::IsMacOS()){return 'MacOS'}
+        throw 'Unsupported conformance runtime platform.'
+    }
+    static [string] FileDigest([string]$path){
+        $stream=[IO.File]::OpenRead($path)
+        try{return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream))}finally{$stream.Dispose()}
+    }
+    hidden [string] InventoryDigest(){
+        $names=[PscRuntimeInventory]::RequiredNames($this.Platform)
+        if($this.Files.Count -ne $names.Count){throw 'Incomplete runtime inventory.'}
+        $lines=[Collections.Generic.List[string]]::new();$lines.Add('PSC Runtime Inventory v1');$lines.Add($this.Platform)
+        for($i=0;$i -lt $names.Count;$i++){
+            $file=$this.Files[$i]
+            if($null -eq $file -or $file.Name -cne $names[$i] -or ![PscTreeText]::IsHash($file.Sha256)){throw 'Invalid runtime inventory entry.'}
+            $lines.Add($file.Name+' '+$file.Sha256)
+        }
+        return [PscTreeText]::Hash($lines -join "`n")
+    }
+    PscRuntimeInventory([string]$root,[string]$platform,[string]$expected){
+        if(![IO.Path]::IsPathFullyQualified($root)){throw 'Runtime inventory requires an absolute root.'}
+        $this.Root=[IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($root));$this.Platform=$platform
+        $entries=[Collections.Generic.List[PscRuntimeFile]]::new()
+        foreach($name in [PscRuntimeInventory]::RequiredNames($platform)){
+            $entries.Add([PscRuntimeFile]::new($name,[PscRuntimeInventory]::FileDigest([IO.Path]::Combine($this.Root,$name))))
+        }
+        $this.Files=$entries.ToArray();$this.Sha256=$this.InventoryDigest()
+        if($expected -and (![PscTreeText]::IsHash($expected.ToUpperInvariant()) -or $this.Sha256 -ine $expected)){throw 'Expected runtime inventory SHA-256 mismatch.'}
+    }
+    [bool] Consistent(){
+        if(![IO.Path]::IsPathFullyQualified($this.Root) -or ![PscTreeText]::IsHash($this.Sha256)){return $false}
+        try{return $this.InventoryDigest() -ceq $this.Sha256}catch{return $false}
+    }
+    [void] Verify(){
+        if(!$this.Consistent()){throw 'Invalid runtime inventory.'}
+        foreach($file in $this.Files){
+            if([PscRuntimeInventory]::FileDigest([IO.Path]::Combine($this.Root,$file.Name)) -cne $file.Sha256){throw "Runtime inventory file changed: $($file.Name)"}
+        }
+    }
+}
+function Get-PscRuntimeInventory {
+    [OutputType([PscRuntimeInventory])]
+    param([string]$HostPath,[string]$Expected)
+    $root=[IO.Path]::GetDirectoryName($HostPath)
+    $comparison=if([OperatingSystem]::IsWindows()){[StringComparison]::OrdinalIgnoreCase}else{[StringComparison]::Ordinal}
+    # Confirm the running SMA and CoreLib locations agree with the supported distribution layout.
+    if(![string]::Equals([psobject].Assembly.Location,[IO.Path]::Combine($root,'System.Management.Automation.dll'),$comparison) -or ![string]::Equals([object].Assembly.Location,[IO.Path]::Combine($root,'System.Private.CoreLib.dll'),$comparison)){throw 'Conformance requires a colocated PowerShell runtime distribution.'}
+    return [PscRuntimeInventory]::new($root,[PscRuntimeInventory]::CurrentPlatform(),$Expected)
+}
 class PscConformanceStage {
     [string] $Name
     [string] $State
@@ -5485,6 +5600,7 @@ class PscConformanceStage {
     [string] $Sha256
     [string] $ProcessHostPath
     [string] $ProcessHostSha256
+    [string] $RuntimeSha256
     [int] $ExitCode
     [string] $StandardOutput
     [string] $StandardError
@@ -5503,6 +5619,7 @@ class PscConformanceReport {
     [string] $RunnerSha256
     [string] $ProcessHostPath
     [string] $ProcessHostSha256
+    [PscRuntimeInventory] $RuntimeInventory
     [bool] $Passed
     [bool] $Complete
     # The mandatory stage inventory is a runner contract, not a report-supplied criterion.
@@ -5518,7 +5635,13 @@ class PscConformanceReport {
         # Legacy reports may omit host evidence. A recorded host must agree with every executed stage.
         $hostRecorded=[bool]($this.ProcessHostPath -or $this.ProcessHostSha256)
         if($hostRecorded -and (!$this.ProcessHostPath -or ![IO.Path]::IsPathFullyQualified($this.ProcessHostPath) -or ![PscTreeText]::IsHash($this.ProcessHostSha256))){return $false}
+        if($null -ne $this.RuntimeInventory){
+            if(!$hostRecorded -or !$this.RuntimeInventory.Consistent() -or $this.RuntimeInventory.Root -cne [IO.Path]::GetDirectoryName($this.ProcessHostPath)){return $false}
+        }
         foreach($stage in $this.Stages){
+            if($null -ne $this.RuntimeInventory -and $stage.State -cne 'Skipped'){
+                if($stage.RuntimeSha256 -cne $this.RuntimeInventory.Sha256){return $false}
+            }elseif($stage.RuntimeSha256){return $false}
             if($hostRecorded -and $stage.State -cne 'Skipped'){
                 if($stage.ProcessHostPath -cne $this.ProcessHostPath -or $stage.ProcessHostSha256 -cne $this.ProcessHostSha256){return $false}
             }elseif($stage.ProcessHostPath -or $stage.ProcessHostSha256){return $false}
@@ -5590,7 +5713,7 @@ function Assert-PscProcessHostIdentity {
 }
 function Invoke-PscConformanceStage {
     [OutputType([PscConformanceStage])]
-    param([PscConformanceRequirement]$Requirement,[string[]]$Arguments,[string]$ProcessHostPath,[string]$ProcessHostSha256)
+    param([PscConformanceRequirement]$Requirement,[string[]]$Arguments,[string]$ProcessHostPath,[string]$ProcessHostSha256,[PscRuntimeInventory]$RuntimeInventory)
     $stageResult=[PscConformanceStage]::new();$stageResult.Name=$Requirement.Name
     $stageResult.Provenance=$Requirement.Provenance;$stageResult.SourcePath=$Requirement.SourcePath
     $stageResult.Sha256=(Get-FileHash -LiteralPath $Requirement.SourcePath).Hash
@@ -5598,6 +5721,8 @@ function Invoke-PscConformanceStage {
     if($Requirement.RequiredState -ceq 'Skipped'){
         $stageResult.State='Skipped';$stageResult.StandardError='Development scope explicitly requested.';return $stageResult
     }
+    $RuntimeInventory.Verify()
+    $stageResult.RuntimeSha256=$RuntimeInventory.Sha256
     $stageResult.ProcessHostPath=$ProcessHostPath
     $stageResult.ProcessHostSha256=Assert-PscProcessHostIdentity $ProcessHostPath $ProcessHostSha256
     $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$ProcessHostPath
@@ -5612,6 +5737,7 @@ function Invoke-PscConformanceStage {
     }finally{$stageResult.Milliseconds=$watch.Elapsed.TotalMilliseconds;$child.Dispose()}
     if((Get-FileHash -LiteralPath $Requirement.SourcePath).Hash -cne $stageResult.Sha256){throw "Conformance stage source changed: $($Requirement.Name)"}
     $null=Assert-PscProcessHostIdentity $ProcessHostPath $ProcessHostSha256
+    $RuntimeInventory.Verify()
     return $stageResult
 }
 # Read the literal resource inventory directly from the commit selected by Guard, not from candidate execution.
@@ -5638,11 +5764,12 @@ function Test-PscConformanceResources {
 # This checks provenance consistency with independent digests, not authenticity of stage outcomes.
 function Test-PscConformanceInputs {
     [OutputType([bool])]
-    param([PscConformanceReport]$Report,[string]$CandidatePath,[string]$ExpectedBaseline,[string]$ExpectedRunner,[bool]$Development,[string]$ExpectedHost,[string]$ExpectedGit)
+    param([PscConformanceReport]$Report,[string]$CandidatePath,[string]$ExpectedBaseline,[string]$ExpectedRunner,[bool]$Development,[string]$ExpectedHost,[string]$ExpectedGit,[string]$ExpectedRuntime)
     if($null -eq $Report -or !$Report.VerifyScope($Development)){return $false}
     if(!$ExpectedBaseline -or !$ExpectedRunner -or $Report.Guard.BaselineSha256 -ine $ExpectedBaseline -or $Report.RunnerSha256 -ine $ExpectedRunner){return $false}
     if($ExpectedHost -and (![PscTreeText]::IsHash($ExpectedHost.ToUpperInvariant()) -or $Report.ProcessHostSha256 -ine $ExpectedHost)){return $false}
     if($ExpectedGit -and (![PscTreeText]::IsHash($ExpectedGit.ToUpperInvariant()) -or $Report.Guard.GitExecutableSha256 -ine $ExpectedGit)){return $false}
+    if($ExpectedRuntime -and (![PscTreeText]::IsHash($ExpectedRuntime.ToUpperInvariant()) -or $null -eq $Report.RuntimeInventory -or $Report.RuntimeInventory.Sha256 -ine $ExpectedRuntime)){return $false}
     $source=$Report.BaselineSource
     if($null -eq $source -or $null -eq $source.Bytes -or $source.Path -cne $Report.Guard.BaselinePath -or $source.Commit -cne $Report.Guard.BaselineCommit -or $source.BlobId -cne $Report.Guard.BaselineBlobId -or $source.Sha256 -cne $Report.Guard.BaselineSha256){return $false}
     if($source.GitExecutablePath -cne $Report.Guard.GitExecutablePath -or $source.GitExecutableSha256 -cne $Report.Guard.GitExecutableSha256){return $false}
@@ -5666,11 +5793,12 @@ function Test-PscResourceInventory {
 }
 
 function Invoke-PscConformance {
-    param([string]$candidate,[string]$Baseline,[string]$expectedHash,[string]$expectedRunner,[string]$expectedBaseline,[string]$expectedHost,[string]$expectedGit,[switch]$development)
+    param([string]$candidate,[string]$Baseline,[string]$expectedHash,[string]$expectedRunner,[string]$expectedBaseline,[string]$expectedHost,[string]$expectedGit,[string]$expectedRuntime,[switch]$development)
     $report=[PscConformanceReport]::new();$report.Candidate=[PscTreeText]::FullPath($candidate)
     $report.RunnerPath=[PscTreeText]::FullPath($PSCommandPath);$report.RunnerSha256=Assert-PscRunnerIdentity $report.RunnerPath $expectedRunner
     $report.ProcessHostPath=[Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
     $report.ProcessHostSha256=Assert-PscProcessHostIdentity $report.ProcessHostPath $expectedHost
+    $report.RuntimeInventory=Get-PscRuntimeInventory $report.ProcessHostPath $expectedRuntime
     $gitExecutable=Resolve-PscGitExecutable $expectedGit
     $committedSource=Read-PscCommittedSource $Baseline $gitExecutable
     if($expectedBaseline -and (![PscTreeText]::IsHash($expectedBaseline.ToUpperInvariant()) -or $committedSource.Sha256 -ine $expectedBaseline)){throw 'Expected committed baseline SHA-256 mismatch.'}
@@ -5726,7 +5854,7 @@ function Invoke-PscConformance {
                 # must retain their observed identities across each stage, not just at report completion.
                 if((Get-FileHash -LiteralPath $report.Candidate).Hash -cne $report.CandidateSha256){throw "Candidate changed during conformance before $($requirement.Name)."}
                 $null=Assert-PscRunnerIdentity $report.RunnerPath $report.RunnerSha256
-                $observation=Invoke-PscConformanceStage $requirement $arguments $report.ProcessHostPath $report.ProcessHostSha256
+                $observation=Invoke-PscConformanceStage $requirement $arguments $report.ProcessHostPath $report.ProcessHostSha256 $report.RuntimeInventory
                 if((Get-FileHash -LiteralPath $report.Candidate).Hash -cne $report.CandidateSha256){throw "Candidate changed during conformance after $($requirement.Name)."}
                 $null=Assert-PscRunnerIdentity $report.RunnerPath $report.RunnerSha256
                 $stages.Add($observation)
@@ -5736,11 +5864,12 @@ function Invoke-PscConformance {
             Test-PscConformanceResources $candidateResources $candidateRoot
         }
         $report.Requirements=$requirements.ToArray();$report.Stages=$stages.ToArray()
-        $report.Passed=$report.Guard.Passed -and (Test-PscConformanceInputs $report $report.Candidate $committedSource.Sha256 $report.RunnerSha256 ([bool]$development) $report.ProcessHostSha256 $gitExecutable.Sha256)
+        $report.Passed=$report.Guard.Passed -and (Test-PscConformanceInputs $report $report.Candidate $committedSource.Sha256 $report.RunnerSha256 ([bool]$development) $report.ProcessHostSha256 $gitExecutable.Sha256 $report.RuntimeInventory.Sha256)
         $report.Complete=$report.Passed -and !$development
         if((Get-FileHash -LiteralPath $report.Candidate).Hash -cne $report.CandidateSha256){throw 'Candidate changed during conformance.'}
         $null=Assert-PscRunnerIdentity $report.RunnerPath $report.RunnerSha256
         $null=Assert-PscProcessHostIdentity $report.ProcessHostPath $report.ProcessHostSha256
+        $report.RuntimeInventory.Verify()
         return $report
     }finally{[IO.Directory]::Delete($stage,$true)}
 }
@@ -14422,7 +14551,7 @@ $result.Stages | Select-Object Name,State,ExitCode
 
 External edits to projected files are also supported. Start with a clean Git baseline and a new or matching projection. Collate needs a fresh candidate destination and rejects missing/untracked units and changed declaration boundaries. Additions, deletions and renames still require explicit canonical edits. Affected reports declared faculty dependencies, not exhaustive semantic or test coverage. No tests are omitted based on Affected.
 
-Conform runs Guard against committed source, the candidate API and projection, then literal regression resources obtained from the same committed baseline without candidate execution. If the embedded resource inventory changes, supplementary candidate regression stages also run. Standalone and candidate Guard consume byte-verified committed source directly, without staging a temporary Git repository. Both record the candidate digest and, when present, the committed path, commit, blob identity and digest. Conform reuses that same committed object. A standalone file without a committed baseline is held to zero findings and an empty verification inventory; failed reads of existing objects are not treated as absence. Guard parses decoded source without line joining; only protected extent comparison normalizes line endings. Unborn Git repositories require Git support for show-ref --exists. The report identifies the runner and resource digests. Required stages are declared before execution, with exact names, provenance, source identity and permitted states; VerifyStages checks the observations against those requirements; VerifyScope independently requires the ordered mandatory compiler and fixture stages, resource inventory identities and permitted Verify outcome. VerifyConformance re-extracts both resource inventories from the retained committed bytes and the identified candidate, comparing independent baseline and runner digest pins. Conform also pins the observed absolute PowerShell executable path and file digest before launch and after every executed stage. Executed stages carry that identity; skipped stages do not. Supply -ExpectedHostSha256 to Conform or VerifyConformance to check an independently retained executable digest. Legacy scope reports may lack host evidence and cannot satisfy an independent host pin. This neither pins the complete runtime and module dependencies nor authenticates execution observations. Roadmap checks retained inputs when present; legacy reports without retained bytes remain scope-only observations. Primary fixture stages use baseline resources, and Candidate/ stages identify supplementary tests. Candidate resource extraction is checked against the Guard digest; the candidate and complete runner identities are checked before and after each stage. This detects persistent interstage changes, not changes made and restored within one child process. Guard and Conform resolve one absolute Git executable through application-only discovery, pin its SHA-256 before and after every committed-source read, and retain its path and digest. Supply -ExpectedGitSha256 to Guard, Conform or VerifyConformance to compare an independently retained executable digest; legacy reports without Git evidence cannot satisfy that pin. This does not authenticate Git, pin its libraries or helpers, or constrain Git invocations inside candidate fixtures. Standalone replacement-reference checks use the same native read boundary as committed-object acquisition. The byte-level blob identity calculation follows Pwsh prior art. Report consistency does not authenticate the runner or its evidence. This is not full assessment-authority closure: the caller must choose a trusted runner, and historical Verify still executes candidate code. `true` selects development scope and skips historical Windows verification (`Complete = False`); `false` requests the full suite and requires its native toolchain. Review the result before explicitly promoting the candidate. Use `git diff -- PSC.ps1`, commit the reviewed change, verify HEAD, then open a fresh projection. Never silently change protected checkers. See [AGENTS.md](AGENTS.md) for engineering requirements.
+Conform runs Guard against committed source, the candidate API and projection, then literal regression resources obtained from the same committed baseline without candidate execution. If the embedded resource inventory changes, supplementary candidate regression stages also run. Standalone and candidate Guard consume byte-verified committed source directly, without staging a temporary Git repository. Both record the candidate digest and, when present, the committed path, commit, blob identity and digest. Conform reuses that same committed object. A standalone file without a committed baseline is held to zero findings and an empty verification inventory; failed reads of existing objects are not treated as absence. Guard parses decoded source without line joining; only protected extent comparison normalizes line endings. Unborn Git repositories require Git support for show-ref --exists. The report identifies the runner and resource digests. Required stages are declared before execution, with exact names, provenance, source identity and permitted states; VerifyStages checks the observations against those requirements; VerifyScope independently requires the ordered mandatory compiler and fixture stages, resource inventory identities and permitted Verify outcome. VerifyConformance re-extracts both resource inventories from the retained committed bytes and the identified candidate, comparing independent baseline and runner digest pins. Conform also pins the observed absolute PowerShell executable path and file digest before launch and after every executed stage. Executed stages carry that identity; skipped stages do not. Supply -ExpectedHostSha256 to Conform or VerifyConformance to check an independently retained executable digest. Legacy scope reports may lack host evidence and cannot satisfy an independent host pin. Conform additionally inventories ten fixed files in the colocated PowerShell distribution (entry assembly, deps/runtimeconfig, ConsoleHost, SMA, CoreLib, CoreCLR, JIT, hostfxr and hostpolicy), checks their bytes before and after each executed stage and at completion, and records the ordered inventory digest in executed stages. VerifyConformance checks the recorded inventory structure and stage identities; -ExpectedRuntimeSha256 independently pins that digest. Legacy reports cannot satisfy this independent pin without runtime evidence. This is a bounded file inventory, not an observation of child module loads, complete runtime dependency closure or process authentication; non-colocated hosts are not admitted. Roadmap checks retained inputs when present; legacy reports without retained bytes remain scope-only observations. Primary fixture stages use baseline resources, and Candidate/ stages identify supplementary tests. Candidate resource extraction is checked against the Guard digest; the candidate and complete runner identities are checked before and after each stage. This detects persistent interstage changes, not changes made and restored within one child process. Guard and Conform resolve one absolute Git executable through application-only discovery, pin its SHA-256 before and after every committed-source read, and retain its path and digest. Supply -ExpectedGitSha256 to Guard, Conform or VerifyConformance to compare an independently retained executable digest; legacy reports without Git evidence cannot satisfy that pin. This does not authenticate Git, pin its libraries or helpers, or constrain Git invocations inside candidate fixtures. Standalone replacement-reference checks use the same native read boundary as committed-object acquisition. The byte-level blob identity calculation follows Pwsh prior art. Report consistency does not authenticate the runner or its evidence. This is not full assessment-authority closure: the caller must choose a trusted runner, and historical Verify still executes candidate code. `true` selects development scope and skips historical Windows verification (`Complete = False`); `false` requests the full suite and requires its native toolchain. Review the result before explicitly promoting the candidate. Use `git diff -- PSC.ps1`, commit the reviewed change, verify HEAD, then open a fresh projection. Never silently change protected checkers. See [AGENTS.md](AGENTS.md) for engineering requirements.
 
 ## Compiler and runtime
 
@@ -14573,15 +14702,17 @@ The API is derived from the running script, so mode names and parameter evidence
     [PscGuardVerdict] GuardCandidate([string]$candidateFile,[string]$baselineFile,[string]$expectedHash,[string]$expectedRunner,[string]$expectedGit){return & $this.Script -Mode Guard -LintFiles $candidateFile -AgainstPath $baselineFile -CheckerHash $expectedHash -ExpectedRunnerSha256 $expectedRunner -ExpectedGitSha256 $expectedGit}
     [bool] VerifyConformance([PscConformanceReport]$report,[string]$candidateFile,[string]$baselineDigest,[string]$runnerDigest,[bool]$development){return $this.VerifyConformance($report,$candidateFile,$baselineDigest,$runnerDigest,$development,'')}
     [bool] VerifyConformance([PscConformanceReport]$report,[string]$candidateFile,[string]$baselineDigest,[string]$runnerDigest,[bool]$development,[string]$expectedHost){return $this.VerifyConformance($report,$candidateFile,$baselineDigest,$runnerDigest,$development,$expectedHost,'')}
-    [bool] VerifyConformance([PscConformanceReport]$report,[string]$candidateFile,[string]$baselineDigest,[string]$runnerDigest,[bool]$development,[string]$expectedHost,[string]$expectedGit){
+    [bool] VerifyConformance([PscConformanceReport]$report,[string]$candidateFile,[string]$baselineDigest,[string]$runnerDigest,[bool]$development,[string]$expectedHost,[string]$expectedGit){return $this.VerifyConformance($report,$candidateFile,$baselineDigest,$runnerDigest,$development,$expectedHost,$expectedGit,'')}
+    [bool] VerifyConformance([PscConformanceReport]$report,[string]$candidateFile,[string]$baselineDigest,[string]$runnerDigest,[bool]$development,[string]$expectedHost,[string]$expectedGit,[string]$expectedRuntime){
         if([Convert]::ToHexString([Security.Cryptography.SHA512]::HashData([IO.File]::ReadAllBytes($this.Script))) -cne $this.SourceSha512){throw 'Conformance verification API source has changed.'}
-        return & $this.Script -Mode VerifyConformance -AssessmentReport $report -SourcePath $candidateFile -ExpectedBaselineSha256 $baselineDigest -ExpectedRunnerSha256 $runnerDigest -ExpectedHostSha256 $expectedHost -ExpectedGitSha256 $expectedGit -DevelopmentOnly:$development
+        return & $this.Script -Mode VerifyConformance -AssessmentReport $report -SourcePath $candidateFile -ExpectedBaselineSha256 $baselineDigest -ExpectedRunnerSha256 $runnerDigest -ExpectedHostSha256 $expectedHost -ExpectedGitSha256 $expectedGit -ExpectedRuntimeSha256 $expectedRuntime -DevelopmentOnly:$development
     }
     [PscConformanceReport] Conform([string]$candidateFile,[string]$baselineFile,[bool]$development){return $this.Conform($candidateFile,$baselineFile,$development,'')}
     [PscConformanceReport] Conform([string]$candidateFile,[string]$baselineFile,[bool]$development,[string]$expectedRunner){return $this.Conform($candidateFile,$baselineFile,$development,$expectedRunner,'')}
     [PscConformanceReport] Conform([string]$candidateFile,[string]$baselineFile,[bool]$development,[string]$expectedRunner,[string]$expectedBaseline){return $this.Conform($candidateFile,$baselineFile,$development,$expectedRunner,$expectedBaseline,'')}
     [PscConformanceReport] Conform([string]$candidateFile,[string]$baselineFile,[bool]$development,[string]$expectedRunner,[string]$expectedBaseline,[string]$expectedHost){return $this.Conform($candidateFile,$baselineFile,$development,$expectedRunner,$expectedBaseline,$expectedHost,'')}
-    [PscConformanceReport] Conform([string]$candidateFile,[string]$baselineFile,[bool]$development,[string]$expectedRunner,[string]$expectedBaseline,[string]$expectedHost,[string]$expectedGit){return & $this.Script -Mode Conform -SourcePath $candidateFile -AgainstPath $baselineFile -DevelopmentOnly:$development -ExpectedRunnerSha256 $expectedRunner -ExpectedBaselineSha256 $expectedBaseline -ExpectedHostSha256 $expectedHost -ExpectedGitSha256 $expectedGit}
+    [PscConformanceReport] Conform([string]$candidateFile,[string]$baselineFile,[bool]$development,[string]$expectedRunner,[string]$expectedBaseline,[string]$expectedHost,[string]$expectedGit){return $this.Conform($candidateFile,$baselineFile,$development,$expectedRunner,$expectedBaseline,$expectedHost,$expectedGit,'')}
+    [PscConformanceReport] Conform([string]$candidateFile,[string]$baselineFile,[bool]$development,[string]$expectedRunner,[string]$expectedBaseline,[string]$expectedHost,[string]$expectedGit,[string]$expectedRuntime){return & $this.Script -Mode Conform -SourcePath $candidateFile -AgainstPath $baselineFile -DevelopmentOnly:$development -ExpectedRunnerSha256 $expectedRunner -ExpectedBaselineSha256 $expectedBaseline -ExpectedHostSha256 $expectedHost -ExpectedGitSha256 $expectedGit -ExpectedRuntimeSha256 $expectedRuntime}
     [string] $SourceExecutionContract = 'PSC realizes SM source; realized execution is SMA-free. File roles do not prohibit execution. Stock pwsh execution is not a compatibility requirement.'
     [PscSemanticIndex] OpenSemanticIndex([string]$root){return [PscSemanticIndex]::new($this.Script,$root)}
     [PscDocument] OpenDocument([string]$path){return [PscDocument]::new($path)}
@@ -19024,13 +19155,13 @@ process {
         'Verify' { Test-SmaGraph }
         'Conform' {
             if(!$SourcePath -or !$AgainstPath){throw 'Conform requires -SourcePath and -AgainstPath.'}
-            $report=Invoke-PscConformance $SourcePath $AgainstPath $CheckerHash $ExpectedRunnerSha256 $ExpectedBaselineSha256 $ExpectedHostSha256 $ExpectedGitSha256 -Development:$DevelopmentOnly
+            $report=Invoke-PscConformance $SourcePath $AgainstPath $CheckerHash $ExpectedRunnerSha256 $ExpectedBaselineSha256 $ExpectedHostSha256 $ExpectedGitSha256 $ExpectedRuntimeSha256 -Development:$DevelopmentOnly
             $report
             if(!$report.Passed){throw 'Candidate conformance failed; inspect the Guard and stage results.'}
         }
         'VerifyConformance' {
             if($AssessmentReport -isnot [PscConformanceReport] -or !$SourcePath -or !$ExpectedBaselineSha256 -or !$ExpectedRunnerSha256){throw 'VerifyConformance requires a typed report, source path and independent baseline and runner digests.'}
-            Test-PscConformanceInputs $AssessmentReport ([PscTreeText]::FullPath($SourcePath)) $ExpectedBaselineSha256 $ExpectedRunnerSha256 ([bool]$DevelopmentOnly) $ExpectedHostSha256 $ExpectedGitSha256
+            Test-PscConformanceInputs $AssessmentReport ([PscTreeText]::FullPath($SourcePath)) $ExpectedBaselineSha256 $ExpectedRunnerSha256 ([bool]$DevelopmentOnly) $ExpectedHostSha256 $ExpectedGitSha256 $ExpectedRuntimeSha256
         }
         'Consolidate' {
             if (-not $SourcePath -or -not $OutputPath) { throw 'Consolidate requires -SourcePath (the entry script) and -OutputPath (the single script to write).' }
