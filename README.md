@@ -44,7 +44,7 @@ $api.Guide()
 
 Query returns typed references with source identity, owner, extent and coverage. Pull in windows of 1..256; dispose cursors. Literal containment includes comments and strings inside a declaration, not proof of binding. Use `$dev.Find('Apply')` or `$dev.Search('literal')` to include projected resources; canonical queries do not parse embedded source strings. `OpenQuery` supports explicit paths, owner, kind and limit, including non-loading CIL inspection for binary queries.
 
-A retained semantic index is opened with `$index = $api.OpenSemanticIndex($root)`; `$graph = $index.Refresh()` uses the existing SMA graph and retains parsed root source by path and exact byte digest when it has no explicit parser-dependency markers. Sources with parse errors, `using` statements or script requirements are conservatively reparsed. `SourceRevision`, `SourcesParsed`, `SourcesReused` and `SourcesRemoved` describe each refresh. Declarations, edges, embedded source and lint are rebuilt and rebound, not incrementally cached; refresh is not an atomic filesystem snapshot; cross-file and overload binding remain limited. The index is in-process, not an on-disk database.
+A retained semantic index is opened with `$index = $api.OpenSemanticIndex($root)`; `$graph = $index.Refresh()` uses the existing SMA graph and retains parsed root source by path and exact byte digest when it has no explicit parser-dependency markers. Sources with parse errors, `using` statements or script requirements are conservatively reparsed. `SourceRevision`, `SourcesParsed`, `SourcesReused` and `SourcesRemoved` describe each refresh. Declarations, edges, embedded source and lint are rebuilt and rebound, not incrementally cached; refresh is not an atomic filesystem snapshot; cross-file and overload binding remain limited. The index is in-process, not an on-disk database. Graph method binding is confined to the same parsed source identity, including independent embedded literals. `$graph.Changes()` uses the pinned compiler source inventory without rebuilding graph facts.
 
 A read-only query reference can become an edit reference only through exact source/extent validation (`$doc.Resolve($hit)`). A document's own `Find` returns revision-bound editable references directly. Example, using a behavior-preserving numeric-literal edit in the projected calibration resource:
 
@@ -129,7 +129,7 @@ PSC is the upstream compiler, SDK, semantic development environment and procedur
 
 ### Baseline and objective register
 
-Assessment basis: PSC [7a7871f](https://github.com/MansfieldPlumbing/PSC/commit/7a7871f297bd7c5259969191dc31376538b0db82), reviewed November 25, 2026. Existing implementation is not equivalent to completed acceptance. At this baseline seven faculties, ordered projection, typed query, revision-bound replacement/undo, candidate Guard including embedded source, managed compilation, NativeAOT/COFF and direct x64 ELF leaf emission exist. The preceding development assessment reported 144 passing Guard/worktree/document/SM cases; Windows historical Verify was not run in that environment. Full candidate-independent conformance is not established.
+Assessment basis: PSC [8411f68](https://github.com/MansfieldPlumbing/PSC/commit/8411f68681188a994083f32f53a2f1d79ead96c8), reviewed November 25, 2026. Existing implementation is not equivalent to completed acceptance. At this baseline seven faculties, ordered projection, typed query, revision-bound replacement/undo, retained semantic source identity, candidate Guard including embedded source, managed compilation, NativeAOT/COFF and direct x64 ELF leaf emission exist. Development Conform reported 427 passing fixture assertions across ten executed stages; historical Windows Verify was explicitly skipped. Full candidate-independent conformance is not established.
 
 States: Existing = demonstrated mechanism requiring remaining scope checks; Planned = a defined objective; Research = evidence needed before committing to a design; Accepted = explicitly accepted with revision, evidence, scope, omissions and redundancy disposition. Outstanding prerequisites are computed from the typed register, not hand-maintained readiness labels. They gate acceptance, not all incremental development. An objective is never accepted merely because declarations exist or a conformance stage passes.
 
@@ -265,7 +265,7 @@ The API is derived from the running script, so mode names and parameter evidence
 | ImportCil | AssemblyPath, ClassName, Deterministic, MethodNames, OutputPath | Import-PscCilAssembly |
 | Inspect | AssemblyPath, ClassName, MethodNames | Test-LoweredAssembly |
 | Capability |  | Get-LoweringCapability |
-| Graph | ProjectPath, SemanticIndex | Get-SmaGraph |
+| Graph | GraphInventoryOnly, ProjectPath, SemanticIndex | Get-SmaGraph, Get-SmaSourceFiles |
 | Lint | LintEdit, LintFiles, LintObjects | Edit-SmaLintFinding, Get-Projects, Get-SmaLint |
 | Guard | AgainstPath, CheckerHash, ExpectedRunnerSha256, LintFiles | Assert-PscRunnerIdentity, Assert-PscStandaloneGitContext, Test-PscCandidateGuard, Test-SmaGuard |
 | Profile |  | Invoke-SmaProfile |

@@ -314,6 +314,8 @@ SOFTWARE.
     pinned ILC and linked by PSC's own COFF linker with the pinned Native AOT runtime; requires EntryPoint.
 .PARAMETER SemanticIndex
     Internal Graph refresh transport: an existing PscSemanticIndex opened by the API.
+.PARAMETER GraphInventoryOnly
+    Graph: return the admitted source paths without parsing or building graph facts.
 .PARAMETER ProjectPath
     Graph: the project folder to graph. Call with & to keep the returned live objects.
 .PARAMETER LintFiles
@@ -467,6 +469,7 @@ param(
     [string] $ArchivePath,
     [string] $ProjectPath,
     $SemanticIndex,
+    [switch] $GraphInventoryOnly,
     [string[]] $LintFiles,
     # Lint: apply the edits the findings carry instead of listing the findings.
     [switch] $LintEdit,
@@ -712,16 +715,16 @@ function Get-PscTreeProjection {
     foreach($faculty in Get-PscFacultyUnits){foreach($name in $faculty.Declarations){$faculties.Add($name,$faculty.Name)}}
     $first=$ast.BeginBlock.Statements[0].Extent.StartOffset
     Add-PscTreeUnit $units 'Fragment' 'Layout/Header.ps1part' 0 $first
-    Add-PscTreeDeclarations $units $ast.BeginBlock.Statements $first $text.Length 'Compiler' $faculties
+    Add-PscTreeDeclarations $units $ast.BeginBlock.Statements $first $Text.Length 'Compiler' $faculties
     $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $at=0
     foreach($unit in $units){
         if($unit.Start -ne $at -or !$seen.Add($unit.Path)){throw "Ambiguous projection: $($unit.Path)"}
-        $unit.Text=$text.Substring($unit.Start,$unit.End-$unit.Start)
+        $unit.Text=$Text.Substring($unit.Start,$unit.End-$unit.Start)
         $unit.Baseline=[PscTreeText]::Hash($unit.Text);$unit.Current=$unit.Baseline;$unit.State='Clean';$at=$unit.End
     }
-    if($at -ne $text.Length){throw 'Projection does not cover source.'}
-    $snapshot=[PscTreeSnapshot]::new();$snapshot.BaseSha256=[PscTreeText]::Hash($text);$snapshot.Units=$units.ToArray();$snapshot.UnitCount=$units.Count;$snapshot.Source=$text;$snapshot.SourceSha256=$snapshot.BaseSha256
+    if($at -ne $Text.Length){throw 'Projection does not cover source.'}
+    $snapshot=[PscTreeSnapshot]::new();$snapshot.BaseSha256=[PscTreeText]::Hash($Text);$snapshot.Units=$units.ToArray();$snapshot.UnitCount=$units.Count;$snapshot.Source=$Text;$snapshot.SourceSha256=$snapshot.BaseSha256
     return $snapshot
 }
 function New-PscSourceTree {
@@ -971,7 +974,7 @@ Collate is fail-closed: missing and untracked files, manifest edits, declaration
 
 The API is available with `-Mode Api` (or no arguments). `SourceFormats` and `SourceExecutionContract` describe the SM contract; `AssertSurface()` checks mode admission against the dispatcher. `OpenQuery(paths, kind, name, owner, literal, take)` is a lazy AST query with optional ordinal literal containment within each matched extent; the CLI equivalent is `-QueryLiteral`. `OpenDocument(path)` opens a revision-bound editor. Its `Find(kind, name, owner, literal, limit)` returns editable references with the same filter applied before the limit. Literal containment may include comments or strings *inside* the selected extent; it is not a semantic interpretation of the literal. Use Git for repository history, PSC for structural selection and validated edits. `UnCollate`, `Collate`, `Status`, `Diff` and `Verify` are also available directly on the API. `SourceExtensions` describes source discovery, including legacy PowerShell inputs.
 
-A retained semantic index is opened with `$index = $api.OpenSemanticIndex($root)`; `$graph = $index.Refresh()` uses the existing SMA graph and retains parsed root source by path and exact byte digest when it has no explicit parser-dependency markers. Sources with parse errors, `using` statements or script requirements are conservatively reparsed. `SourceRevision`, `SourcesParsed`, `SourcesReused` and `SourcesRemoved` describe each refresh. Declarations, edges, embedded source and lint are rebuilt and rebound, not incrementally cached; refresh is not an atomic filesystem snapshot; cross-file and overload binding remain limited. The index is in-process, not an on-disk database.
+A retained semantic index is opened with `$index = $api.OpenSemanticIndex($root)`; `$graph = $index.Refresh()` uses the existing SMA graph and retains parsed root source by path and exact byte digest when it has no explicit parser-dependency markers. Sources with parse errors, `using` statements or script requirements are conservatively reparsed. `SourceRevision`, `SourcesParsed`, `SourcesReused` and `SourcesRemoved` describe each refresh. Declarations, edges, embedded source and lint are rebuilt and rebound, not incrementally cached; refresh is not an atomic filesystem snapshot; cross-file and overload binding remain limited. The index is in-process, not an on-disk database. Graph method binding is confined to the same parsed source identity, including independent embedded literals. `$graph.Changes()` uses the pinned compiler source inventory without rebuilding graph facts.
 
 Development sessions: `$dev = $api.OpenDevelopment($base,$tree)` creates or opens a verified projection; `Find`, `OpenDocument`, `Changes`, `Affected`, `Collate` and `Conform` share a pinned compiler, canonical base and manifest. `Affected` reports direct paths and declared faculty dependency closure; it does not prove complete method-level impact or select fewer tests. Collation requires a fresh candidate path; conformance rejects stale candidates and requires the pinned base to equal its committed Git blob.
 
@@ -1261,7 +1264,18 @@ try {
     $report.Stages=@($stage);$stage.ExitCode=1
     Assert-Tree (!$report.VerifyStages()) 'nonzero exit code cannot be reported as passed'
     $stage.ExitCode=0
-    $report.CandidateSha256='Stale';$rejected=$false
+    $report.Passed=$true
+    Assert-Tree ($api.AssessRoadmap($report)[0].ConformancePassed) 'roadmap accepts consistent successful stage evidence'
+    $stage.ExitCode=1;$rejected=$false
+    try{[void]$api.AssessRoadmap($report)}catch{$rejected=$_.Exception.Message.Contains('Conformance report failed stage verification')}
+    Assert-Tree $rejected 'roadmap refuses inconsistent claimed success'
+    $report.Passed=$false
+    Assert-Tree (!$api.AssessRoadmap($report)[0].ConformancePassed) 'roadmap retains unsuccessful assessment evidence'
+    $stage.ExitCode=0;$report.Complete=$true;$rejected=$false
+    try{[void]$api.AssessRoadmap($report)}catch{$rejected=$_.Exception.Message.Contains('Complete conformance report has incomplete scope')}
+    Assert-Tree $rejected 'roadmap refuses completion without success'
+    $report.Complete=$false
+    $report.CandidateSha256='Stale' ;$rejected=$false
     try{[void]$api.AssessRoadmap($report)}catch{$rejected=$_.Exception.Message.Contains('Conformance report does not identify')}
     Assert-Tree $rejected 'roadmap rejects evidence from a different revision'
     Assert-Tree ($api.Guide().Contains('| F0 | Existing |') -and !$api.Guide().Contains('@@ROADMAP@@')) 'guide generates the objective register from typed records'
@@ -1490,6 +1504,61 @@ try {
     $independentAst=[System.Management.Automation.Language.Parser]::ParseFile($encodedFile,[ref]$encodedTokens,[ref]$encodedErrors)
     Assert-Tree ($encodedSource.Sha256 -ceq (Get-Hash $encodedFile) -and !$encodedErrors.Count -and $encodedSource.Ast.Extent.Text -ceq $independentAst.Extent.Text) 'semantic index byte digest and decoded AST agree with ParseFile'
     Assert-GraphParity $encodedGraph 'encoded bytes'
+    $embeddedRoot=[IO.Directory]::CreateDirectory([IO.Path]::Combine($work,'embedded-binding')).FullName
+    $embeddedFile=Join-Path $embeddedRoot 'embedded.ps1'
+    $literalOne="class Probe { static [int] Value(){return 1} }`n[Probe]::Value()`n#"+('x'*450)
+    $literalTwo="class Probe { static [int] Value(){return 2} }`n[Probe]::Value()`n#"+('y'*450)
+    $literalThree="function Other { [Probe]::Value() }`nOther`n#"+('z'*450)
+    Write-Text $embeddedFile ("@'`n"+$literalOne+"`n'@`n@'`n"+$literalTwo+"`n'@`n@'`n"+$literalThree+"`n'@`n")
+    $embeddedIndex=$api.OpenSemanticIndex($embeddedRoot);$embeddedGraph=$embeddedIndex.Refresh()
+    $probeEdges=@($embeddedGraph.Edges | Where-Object To -CEQ 'Probe.Value')
+    Assert-Tree ($probeEdges.Count -eq 3 -and @($probeEdges | Where-Object Resolution -CEQ 'Bound').Count -eq 2) 'independent embedded roots bind only their own declarations'
+    foreach($probeEdge in $probeEdges | Where-Object Resolution -CEQ 'Bound'){
+        $referent=@($embeddedGraph.Units | Where-Object Identity -CEQ $probeEdge.ToIdentity)
+        Assert-Tree ($referent.Count -eq 1 -and $referent[0].SourceIdentity -ceq $probeEdge.SourceIdentity) 'bound method shares actual parsed source identity'
+    }
+    Assert-Tree ($probeEdges[2].Resolution -ceq 'Unresolved' -and !$probeEdges[2].ToIdentity) 'embedded literal cannot bind to another literal declaration'
+    $embeddedRefresh=$embeddedIndex.Refresh()
+    Assert-Tree ($embeddedRefresh.SourcesReused -eq 1 -and @($embeddedRefresh.Edges | Where-Object To -CEQ 'Probe.Value' | Where-Object Resolution -CEQ 'Bound').Count -eq 2) 'retained refresh preserves independent literal bindings'
+    Assert-Tree ($embeddedGraph.Changes().Count -eq 0) 'exported graph changes callable with unchanged inventory'
+    [IO.File]::AppendAllText($embeddedFile,"`n# changed")
+    $addedPath=Join-Path $embeddedRoot 'new.sm1';Write-Text $addedPath 'function NewSource { 9 }'
+    $changedSources=$embeddedGraph.Changes()
+    Assert-Tree ($changedSources.Count -eq 2 -and @($changedSources | Where-Object Kind -CEQ 'Modified').Count -eq 1 -and @($changedSources | Where-Object Kind -CEQ 'Added').Count -eq 1) 'exported graph observes changed and added source without refresh'
+    [IO.File]::Delete($embeddedFile)
+    $changedSources=$embeddedGraph.Changes()
+    Assert-Tree ($changedSources.Count -eq 2 -and @($changedSources | Where-Object Kind -CEQ 'Missing').Count -eq 1) 'exported graph observes missing source'
+    Assert-Tree ($embeddedGraph.SourceRevision -eq 1 -and $embeddedIndex.Refresh().SourceRevision -eq 3) 'changes inquiry does not advance retained revision'
+    $gitIndexRoot=[IO.Directory]::CreateDirectory([IO.Path]::Combine($work,'git-index-fixture')).FullName
+    git -C $gitIndexRoot init -q
+    if($LASTEXITCODE){throw 'git init'}
+    [IO.File]::WriteAllText((Join-Path $gitIndexRoot '.gitignore'),"ignored.ps1`n")
+    [IO.File]::WriteAllText((Join-Path $gitIndexRoot 'tracked.ps1'),'function Tracked { 1 }')
+    [IO.File]::WriteAllText((Join-Path $gitIndexRoot 'ignored.ps1'),'function Ignored { 1 }')
+    git -C $gitIndexRoot add -- .gitignore tracked.ps1
+    git -C $gitIndexRoot -c user.name=PSC -c user.email=psc@localhost commit -qm 'fixture'
+    if($LASTEXITCODE){throw 'git commit'}
+    $gitIndex=$api.OpenSemanticIndex($gitIndexRoot);$gitGraph=$gitIndex.Refresh()
+    Assert-Tree ($gitGraph.Files.Count -eq 1 -and $gitGraph.Files[0] -ceq 'tracked.ps1') 'source discovery excludes ignored sources'
+    Assert-Tree ($gitGraph.Changes().Count -eq 0) 'Git snapshot starts unchanged'
+    [IO.File]::Delete((Join-Path $gitIndexRoot 'tracked.ps1'))
+    Assert-Tree ($gitGraph.Changes().Count -eq 1 -and [string]$gitGraph.Changes()[0].Kind -ceq 'Missing') 'tracked deletion observed'
+    $missingGraph=$gitIndex.Refresh()
+    Assert-Tree ($missingGraph.Changes().Count -eq 0) 'tracked missing source remains unchanged'
+    [IO.File]::WriteAllText((Join-Path $gitIndexRoot 'tracked.ps1'),'function Tracked { 1 }')
+    Assert-Tree ($missingGraph.Changes().Count -eq 1 -and [string]$missingGraph.Changes()[0].Kind -ceq 'Added') 'tracked missing source restored'
+    [IO.File]::WriteAllText((Join-Path $gitIndexRoot 'new.srm1'),'function Resource { 2 }')
+    Assert-Tree ($missingGraph.Changes().Count -eq 2) 'new nonignored SM source admitted'
+    $inventory=@(& $compiler -Mode Graph -ProjectPath $gitIndexRoot -GraphInventoryOnly)
+    Assert-Tree ($inventory.Count -eq 2 -and $inventory -ccontains 'new.srm1') 'Graph inventory matches Git source discovery'
+    [IO.File]::WriteAllText((Join-Path $gitIndexRoot 'Case.ps1'),'class Example { static [int] Value(){return 1} }; function Call { [Example]::Value() }; Call')
+    if(![IO.File]::Exists((Join-Path $gitIndexRoot 'case.ps1'))){
+        [IO.File]::WriteAllText((Join-Path $gitIndexRoot 'case.ps1'),'class Example { static [int] Value(){return 1} }; function Call { [Example]::Value() }; Call')
+        $both=$gitIndex.Refresh();$edges=@($both.Edges | Where-Object To -CEQ 'Example.Value')
+        Assert-Tree ($edges.Count -eq 2 -and @($edges | Where-Object Resolution -CEQ 'Bound').Count -eq 2 -and $edges[0].ToIdentity -cne $edges[1].ToIdentity) 'case-distinct physical roots bind independently'
+        $calls=@($both.Edges | Where-Object To -CEQ 'Call')
+        Assert-Tree ($calls.Count -eq 2 -and @($calls | Where-Object Resolution -CEQ 'Bound').Count -eq 2 -and $calls[0].ToIdentity -cne $calls[1].ToIdentity) 'case-distinct lexical roots bind independently'
+    }
 } finally { [IO.Directory]::Delete($work, $true) }
 
 '@)
@@ -5281,14 +5350,14 @@ function Invoke-PscConformance {
 # (file and line). Code held in string literals is parsed and graphed too, marked Embedded: it is cruft by the AST
 # rule, and it is still part of what the project does. String literals that are not PowerShell are listed as Foreign.
 class SmaUnit {
-    [string] $Identity; [string] $Scope; [string] $BodyScope
+    [string] $Identity; [string] $Scope; [string] $BodyScope; [string] $SourceIdentity
     [string] $Name; [string] $Kind; [string] $File; [int] $Line; [int] $Lines; [string] $Class
     [bool] $Embedded; [string[]] $Parameters; [string] $Synopsis
     [object] $Ast
     [string] ToString() { return "$($this.Name) ($($this.File):$($this.Line))" }
 }
 class SmaEdge {
-    [string] $FromIdentity; [string] $ToIdentity; [string] $Scope
+    [string] $FromIdentity; [string] $ToIdentity; [string] $Scope; [string] $SourceIdentity
     [string] $Resolution = 'Unresolved'; [string] $Reason
     [object] $Ast
     [string] $From; [string] $To; [string] $Kind; [string] $File; [int] $Line
@@ -5314,6 +5383,7 @@ class SmaChange {
 class SmaProject {
     [string] $Root; [string] $Commit; [datetime] $BuiltUtc
     [int] $SourceRevision; [int] $SourcesParsed; [int] $SourcesReused; [int] $SourcesRemoved
+    hidden [string] $CompilerPath; hidden [string] $CompilerDigest
     [Collections.Generic.List[SmaUnit]] $Units
     [Collections.Generic.List[SmaEdge]] $Edges
     SmaProject() { $this.Units = [Collections.Generic.List[SmaUnit]]::new(); $this.Edges = [Collections.Generic.List[SmaEdge]]::new() }
@@ -5348,13 +5418,18 @@ class SmaProject {
     }
     [SmaChange[]] Changes() {
         $changes = [Collections.Generic.List[SmaChange]]::new()
+        if((Get-FileHash -LiteralPath $this.CompilerPath).Hash -cne $this.CompilerDigest){throw 'Graph compiler changed.'}
+        $currentFiles=[string[]]@(& $this.CompilerPath -Mode Graph -ProjectPath $this.Root -GraphInventoryOnly)
+        $currentPaths=[Collections.Generic.HashSet[string]]::new($currentFiles,[StringComparer]::Ordinal)
+        $priorPaths=[Collections.Generic.HashSet[string]]::new($this.Files,[StringComparer]::Ordinal)
         foreach ($source in $this.Sources | Where-Object { -not $_.Embedded }) {
             $path = Join-Path $this.Root $source.File
-            $after = if ([IO.File]::Exists($path)) { (Get-FileHash -LiteralPath $path).Hash } else { '' }
-            if ($after -cne $source.Sha256) { $changes.Add([SmaChange]@{ File = $source.File; Before = $source.Sha256; After = $after; Kind = $(if ($after) { 'Modified' } else { 'Missing' }) }) }
+            $after = if ($currentPaths.Contains($source.File) -and [IO.File]::Exists($path)) { (Get-FileHash -LiteralPath $path).Hash } else { '' }
+            if ($after -cne [string]$source.Sha256) { $changes.Add([SmaChange]@{ File = $source.File; Before = $source.Sha256; After = $after; Kind = $(if (!$after) { 'Missing' } elseif (!$source.Sha256) {'Added'} else { 'Modified' }) }) }
         }
-        foreach ($relative in Get-SmaSourceFiles $this.Root) {
-            if ($relative -notin $this.Files) { $changes.Add([SmaChange]@{ File = $relative; After = (Get-FileHash -LiteralPath (Join-Path $this.Root $relative)).Hash; Kind = 'Added' }) }
+        foreach ($relative in $currentFiles) {
+            $path=Join-Path $this.Root $relative
+            if (!$priorPaths.Contains($relative) -and [IO.File]::Exists($path)) { $changes.Add([SmaChange]@{ File = $relative; After = (Get-FileHash -LiteralPath $path).Hash; Kind = 'Added' }) }
         }
         return $changes.ToArray()
     }
@@ -5482,7 +5557,7 @@ function Get-SmaOwner($node, $project, [string] $sourceIdentity) {
 
 function Add-SmaGraphSource($project, [string] $relative, $ast, [bool] $embedded, [int] $lineOffset, [string] $sourceIdentity) {
     $scriptName=if($embedded){'<embedded-script>'+$sourceIdentity}else{'<script>'+$relative}
-    $scriptUnit = [SmaUnit]@{ Identity = $sourceIdentity + ':script'; Name = $scriptName; Kind = 'script'; File = $relative
+    $scriptUnit = [SmaUnit]@{ Identity = $sourceIdentity + ':script'; SourceIdentity = $sourceIdentity; Name = $scriptName; Kind = 'script'; File = $relative
         Line = 1 + $lineOffset; Lines = $ast.Extent.EndLineNumber; Ast = $ast; Embedded = $embedded
         Scope = $sourceIdentity + ':0'; BodyScope = $sourceIdentity + ':' + $ast.Extent.StartOffset }
     $project.Units.Add($scriptUnit)
@@ -5492,14 +5567,14 @@ function Add-SmaGraphSource($project, [string] $relative, $ast, [bool] $embedded
         if ($node -is [System.Management.Automation.Language.TypeDefinitionAst]) { $kind = 'class' }
         elseif ($node.Parent -is [System.Management.Automation.Language.FunctionMemberAst]) { $className = $node.Parent.Parent.Name; $kind = 'method'; $name = $className + '.' + $name }
         if ($kind -ne 'class') { $bodyScope = $sourceIdentity + ':' + $node.Body.Extent.StartOffset }
-        $unit = [SmaUnit]@{ Identity = $sourceIdentity + ':' + $node.Extent.StartOffset + ':' + $kind; Name = $name; Kind = $kind; Class = $className
+        $unit = [SmaUnit]@{ Identity = $sourceIdentity + ':' + $node.Extent.StartOffset + ':' + $kind; SourceIdentity = $sourceIdentity; Name = $name; Kind = $kind; Class = $className
             File = $relative; Line = $node.Extent.StartLineNumber + $lineOffset; Lines = $node.Extent.EndLineNumber - $node.Extent.StartLineNumber + 1
             Ast = $node; Embedded = $embedded; Scope = (Get-SmaLexicalScope $node $sourceIdentity); BodyScope = $bodyScope }
         $project.Units.Add($unit)
         $project.NodeOwners[$node] = $unit
     }
     foreach ($node in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.ScriptBlockExpressionAst] }, $true)) {
-        $unit=[SmaUnit]@{ Identity=$sourceIdentity+':'+$node.Extent.StartOffset+':closure'; Name='<closure>'+$relative+':'+$node.Extent.StartOffset
+        $unit=[SmaUnit]@{ Identity=$sourceIdentity+':'+$node.Extent.StartOffset+':closure'; SourceIdentity=$sourceIdentity; Name='<closure>'+$relative+':'+$node.Extent.StartOffset
             Kind='closure'; File=$relative; Line=$node.Extent.StartLineNumber+$lineOffset; Lines=$node.Extent.EndLineNumber-$node.Extent.StartLineNumber+1
             Ast=$node; Embedded=$embedded; Scope=(Get-SmaLexicalScope $node $sourceIdentity); BodyScope=$sourceIdentity+':'+$node.ScriptBlock.Extent.StartOffset }
         $project.Units.Add($unit);$project.NodeOwners[$node]=$unit
@@ -5554,7 +5629,7 @@ function Add-SmaGraphSource($project, [string] $relative, $ast, [bool] $embedded
     }
     foreach ($node in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] -or $args[0] -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -or $args[0] -is [System.Management.Automation.Language.UsingStatementAst] }, $true)) {
         $owner = Get-SmaOwner $node $project $sourceIdentity
-        $edge = [SmaEdge]@{ From = $owner.Name; FromIdentity = $owner.Identity; Scope = (Get-SmaLexicalScope $node $sourceIdentity)
+        $edge = [SmaEdge]@{ From = $owner.Name; FromIdentity = $owner.Identity; SourceIdentity = $sourceIdentity; Scope = (Get-SmaLexicalScope $node $sourceIdentity)
             File = $relative; Line = $node.Extent.StartLineNumber + $lineOffset; Ast = $node; Reason = 'Target requires binding or runtime observation.' }
         if ($node -is [System.Management.Automation.Language.CommandAst]) {
             $edge.Kind = 'command'; $edge.To = $node.GetCommandName()
@@ -5584,10 +5659,12 @@ function Add-SmaGraphSource($project, [string] $relative, $ast, [bool] $embedded
 }
 
 function Resolve-SmaEdges($project) {
-    $functions = @{}; $methods = @{}
+    # A physical file can contain independent parsed sources. Never bind across their identities.
+    $functions = [Collections.Generic.Dictionary[string,Collections.Generic.List[SmaUnit]]]::new([StringComparer]::Ordinal)
+    $methods = [Collections.Generic.Dictionary[string,Collections.Generic.List[SmaUnit]]]::new([StringComparer]::Ordinal)
     foreach ($unit in $project.Units) {
-        if ($unit.Kind -eq 'function') { $index = $functions; $key = $unit.Scope + '|' + $unit.Name }
-        elseif ($unit.Kind -eq 'method') { $index = $methods; $key = $unit.File + '|' + $unit.Name }
+        if ($unit.Kind -eq 'function') { $index = $functions; $key = $unit.Scope + '|' + $unit.Name.ToUpperInvariant() }
+        elseif ($unit.Kind -eq 'method') { $index = $methods; $key = $unit.SourceIdentity + '|' + $unit.Name.ToUpperInvariant() }
         else { continue }
         if (-not $index.ContainsKey($key)) { $index[$key] = [Collections.Generic.List[SmaUnit]]::new() }
         $index[$key].Add($unit)
@@ -5599,17 +5676,15 @@ function Resolve-SmaEdges($project) {
             $cursor = $edge.Ast.Parent
             while ($cursor) {
                 if ($cursor -is [System.Management.Automation.Language.ScriptBlockAst]) {
-                    # Scope identities already include the secondary source identity.
-                    $prefix = $edge.Scope.Substring(0, $edge.Scope.LastIndexOf(':'))
-                    $scope = $prefix + ':' + $cursor.Extent.StartOffset
-                    $key = $scope + '|' + $edge.To
+                    $scope = $edge.SourceIdentity + ':' + $cursor.Extent.StartOffset
+                    $key = $scope + '|' + $edge.To.ToUpperInvariant()
                     $candidates = @(if ($functions.ContainsKey($key)) { $functions[$key] })
                     if ($candidates.Count) { break }
                 }
                 $cursor = $cursor.Parent
             }
         } elseif ($edge.Kind -in 'static','this-member') {
-            $key = $edge.File + '|' + $edge.To
+            $key = $edge.SourceIdentity + '|' + $edge.To.ToUpperInvariant()
             $candidates = @(if ($methods.ContainsKey($key)) { $methods[$key] })
         }
         if ($candidates.Count -eq 1) { $edge.ToIdentity = $candidates[0].Identity; $edge.To = $candidates[0].Name; $edge.Resolution = 'Bound'; $edge.Reason = 'Unique declaration in lexical scope; static relationship, not an execution observation.' }
@@ -5690,6 +5765,7 @@ function Get-SmaGraph {
     $index.Begin($root,[PscTreeText]::FullPath($PSCommandPath))
     try {
         $project = [SmaProject]::new(); $project.Root = $root; $project.BuiltUtc = [DateTime]::UtcNow
+        $project.CompilerPath=[PscTreeText]::FullPath($PSCommandPath);$project.CompilerDigest=(Get-FileHash -LiteralPath $project.CompilerPath).Hash
         if ([IO.Directory]::Exists((Join-Path $root '.git')) -or [IO.File]::Exists((Join-Path $root '.git'))) { $project.Commit = (git --no-replace-objects -C $root rev-parse HEAD 2>$null) }
         # Tracked and untracked-but-not-ignored PowerShell files: a working directory's whole source.
         $project.Files = @(Get-SmaSourceFiles $root)
@@ -13809,6 +13885,8 @@ class PscApi {
         if($null -ne $report){
             if($report.CandidateSha256 -cne $sourceHash -or $null -eq $report.Guard -or $report.Guard.CandidateSha256 -cne $sourceHash){throw 'Conformance report does not identify this PSC source.'}
             foreach($stage in $report.Stages){if(!$stages.TryAdd($stage.Name,$stage)){throw "Duplicate conformance stage: $($stage.Name)"}}
+            if(($report.Passed -or $report.Complete) -and (!$report.Guard.Passed -or !$report.VerifyStages())){throw 'Conformance report failed stage verification.'}
+            if($report.Complete -and (!$report.Passed -or @($report.Stages | Where-Object State -CEQ 'Skipped').Count)){throw 'Complete conformance report has incomplete scope.'}
         }
         $remaining=[Collections.Generic.HashSet[string]]::new($index.Keys,[StringComparer]::OrdinalIgnoreCase)
         $results=[Collections.Generic.List[PscRoadmapAssessment]]::new()
@@ -13923,7 +14001,7 @@ $api.Guide()
 
 Query returns typed references with source identity, owner, extent and coverage. Pull in windows of 1..256; dispose cursors. Literal containment includes comments and strings inside a declaration, not proof of binding. Use `$dev.Find('Apply')` or `$dev.Search('literal')` to include projected resources; canonical queries do not parse embedded source strings. `OpenQuery` supports explicit paths, owner, kind and limit, including non-loading CIL inspection for binary queries.
 
-A retained semantic index is opened with `$index = $api.OpenSemanticIndex($root)`; `$graph = $index.Refresh()` uses the existing SMA graph and retains parsed root source by path and exact byte digest when it has no explicit parser-dependency markers. Sources with parse errors, `using` statements or script requirements are conservatively reparsed. `SourceRevision`, `SourcesParsed`, `SourcesReused` and `SourcesRemoved` describe each refresh. Declarations, edges, embedded source and lint are rebuilt and rebound, not incrementally cached; refresh is not an atomic filesystem snapshot; cross-file and overload binding remain limited. The index is in-process, not an on-disk database.
+A retained semantic index is opened with `$index = $api.OpenSemanticIndex($root)`; `$graph = $index.Refresh()` uses the existing SMA graph and retains parsed root source by path and exact byte digest when it has no explicit parser-dependency markers. Sources with parse errors, `using` statements or script requirements are conservatively reparsed. `SourceRevision`, `SourcesParsed`, `SourcesReused` and `SourcesRemoved` describe each refresh. Declarations, edges, embedded source and lint are rebuilt and rebound, not incrementally cached; refresh is not an atomic filesystem snapshot; cross-file and overload binding remain limited. The index is in-process, not an on-disk database. Graph method binding is confined to the same parsed source identity, including independent embedded literals. `$graph.Changes()` uses the pinned compiler source inventory without rebuilding graph facts.
 
 A read-only query reference can become an edit reference only through exact source/extent validation (`$doc.Resolve($hit)`). A document's own `Find` returns revision-bound editable references directly. Example, using a behavior-preserving numeric-literal edit in the projected calibration resource:
 
@@ -14008,7 +14086,7 @@ PSC is the upstream compiler, SDK, semantic development environment and procedur
 
 ### Baseline and objective register
 
-Assessment basis: PSC [7a7871f](https://github.com/MansfieldPlumbing/PSC/commit/7a7871f297bd7c5259969191dc31376538b0db82), reviewed November 25, 2026. Existing implementation is not equivalent to completed acceptance. At this baseline seven faculties, ordered projection, typed query, revision-bound replacement/undo, candidate Guard including embedded source, managed compilation, NativeAOT/COFF and direct x64 ELF leaf emission exist. The preceding development assessment reported 144 passing Guard/worktree/document/SM cases; Windows historical Verify was not run in that environment. Full candidate-independent conformance is not established.
+Assessment basis: PSC [8411f68](https://github.com/MansfieldPlumbing/PSC/commit/8411f68681188a994083f32f53a2f1d79ead96c8), reviewed November 25, 2026. Existing implementation is not equivalent to completed acceptance. At this baseline seven faculties, ordered projection, typed query, revision-bound replacement/undo, retained semantic source identity, candidate Guard including embedded source, managed compilation, NativeAOT/COFF and direct x64 ELF leaf emission exist. Development Conform reported 427 passing fixture assertions across ten executed stages; historical Windows Verify was explicitly skipped. Full candidate-independent conformance is not established.
 
 States: Existing = demonstrated mechanism requiring remaining scope checks; Planned = a defined objective; Research = evidence needed before committing to a design; Accepted = explicitly accepted with revision, evidence, scope, omissions and redundancy disposition. Outstanding prerequisites are computed from the typed register, not hand-maintained readiness labels. They gate acceptance, not all incremental development. An objective is never accepted merely because declarations exist or a conformance stage passes.
 
@@ -18487,6 +18565,13 @@ process {
         'Inspect' { Test-LoweredAssembly -AssemblyPath $AssemblyPath -ClassName $ClassName -MethodNames $MethodNames }
         'Capability' { Get-LoweringCapability }
         'Graph' {
+            if($GraphInventoryOnly){
+                if($null -ne $SemanticIndex){throw 'Graph inventory does not refresh a semantic index.'}
+                $inventoryRoot=[PscTreeText]::FullPath($(if($ProjectPath){$ProjectPath}else{$PSScriptRoot}))
+                if(![IO.Directory]::Exists($inventoryRoot)){throw 'Graph inventory requires an existing source directory.'}
+                Get-SmaSourceFiles $inventoryRoot
+                return
+            }
             if($null -ne $SemanticIndex -and $SemanticIndex -isnot [PscSemanticIndex]){throw 'Graph refresh requires a PscSemanticIndex.'}
             Get-SmaGraph $(if ($ProjectPath) { $ProjectPath } else { $PSScriptRoot }) $SemanticIndex
         }
