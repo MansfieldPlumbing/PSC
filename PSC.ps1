@@ -1266,6 +1266,14 @@ try {
     $stage.ExitCode=0
     $report.Passed=$true
     Assert-Tree ($api.AssessRoadmap($report)[0].ConformancePassed) 'roadmap accepts consistent successful stage evidence'
+    Assert-Tree (!$report.VerifyScope($false) -and !$report.VerifyScope($true)) 'self-consistent partial report cannot satisfy mandatory scope'
+    $report.Complete=$true;$rejected=$false
+    try{[void]$api.AssessRoadmap($report)}catch{$rejected=$_.Exception.Message.Contains('Complete conformance report has incomplete scope')}
+    Assert-Tree $rejected 'roadmap refuses self-consistent one-stage completion'
+    $report.Complete=$false;$report.RunnerSha256=$report.CandidateSha256;$rejected=$false
+    try{[void]$api.AssessRoadmap($report)}catch{$rejected=$_.Exception.Message.Contains('Development conformance report has incomplete scope')}
+    Assert-Tree $rejected 'roadmap refuses claimed development assessment with missing mandatory stages'
+    $report.RunnerSha256=''
     $stage.ExitCode=1;$rejected=$false
     try{[void]$api.AssessRoadmap($report)}catch{$rejected=$_.Exception.Message.Contains('Conformance report failed stage verification')}
     Assert-Tree $rejected 'roadmap refuses inconsistent claimed success'
@@ -1842,6 +1850,52 @@ try{
     if((Get-FileHash -LiteralPath $driftCandidate).Hash -ceq (Get-FileHash -LiteralPath $driftBase).Hash){throw 'Restoration fixture executed after mutation.'}
     'PASS conformance stops before restoration stage'
 }finally{[IO.Directory]::Delete($driftRoot,$true)}
+
+# Scope is independently constrained even when each observation matches its reported requirement.
+function Test-RequiredConformanceScope([string]$Compiler){
+$root=[IO.Directory]::CreateTempSubdirectory('psc-scope-').FullName
+try {
+    $base=Join-Path $root 'source.ps1';$candidate=Join-Path $root 'candidate.ps1'
+    $payloads=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+    foreach($fixture in 'Tests/Test-Document.ps1','Tests/Test-Worktree.ps1','Tests/Test-Guard.ps1','SM/Test-Formats.ps1'){$payloads.Add($fixture,'param([string]$Compiler)')}
+    $lines=[Collections.Generic.List[string]]::new()
+    $lines.Add('param([string]$Mode,[string]$TreeDirectory)');$lines.Add('function Get-PscEmbeddedSources {')
+    foreach($entry in $payloads.GetEnumerator()){$lines.Add("[PscSourceResource]::new('$($entry.Key)', @'");$lines.Add($entry.Value);$lines.Add("'@)")}
+    $lines.Add('}')
+    $text=$lines -join "`n"
+    [IO.File]::WriteAllText($base,$text);[IO.File]::WriteAllText($candidate,$text)
+    git -C $root init -q;git -C $root add source.ps1;git -C $root -c user.name=PSC -c user.email=psc@localhost commit -qm fixture
+    if($LASTEXITCODE -ne 0){throw 'Fixture Git failed'}
+    $argsMap=@{Mode='Conform';SourcePath=$candidate;AgainstPath=$base;ExpectedRunnerSha256=(Get-FileHash $Compiler).Hash;ExpectedBaselineSha256=(Get-FileHash $base).Hash}
+    $report=& $Compiler @argsMap -DevelopmentOnly
+    if(!$report.Passed -or $report.Complete -or !$report.VerifyScope($true) -or $report.VerifyScope($false)){throw 'Development scope failure'}
+    'PASS development scope exact mandatory inventory'
+    $report=& $Compiler @argsMap
+    if(!$report.Passed -or !$report.Complete -or !$report.VerifyScope($false) -or $report.VerifyScope($true)){throw 'Full scope failure'}
+    'PASS full scope exact mandatory inventory'
+    $requirements=$report.Requirements;$observations=$report.Stages
+    $report.Requirements=@($requirements | Where-Object Name -CNE 'Tests/Test-Guard.ps1');$report.Stages=@($observations | Where-Object Name -CNE 'Tests/Test-Guard.ps1')
+    if(!$report.VerifyStages() -or $report.VerifyScope($false)){throw 'Omitted paired stage was admitted'}
+    'PASS paired requirement and stage omission rejected'
+    $report.Requirements=$requirements;$report.Stages=$observations
+    $report.Requirements=@($requirements[1],$requirements[0]) + @($requirements[2..($requirements.Length-1)]);$report.Stages=@($observations[1],$observations[0]) + @($observations[2..($observations.Length-1)])
+    if(!$report.VerifyStages() -or $report.VerifyScope($false)){throw 'Reordered pair admitted'}
+    'PASS paired reorder rejected'
+    $report.Requirements=$requirements;$report.Stages=$observations
+    $digest=$requirements[2].Sha256;$requirements[2].Sha256=$report.CandidateSha256;$observations[2].Sha256=$report.CandidateSha256
+    if(!$report.VerifyStages() -or $report.VerifyScope($false)){throw 'Substituted fixture digest admitted'}
+    'PASS paired digest substitution rejected'
+    $requirements[2].Sha256=$digest;$observations[2].Sha256=$digest
+    [IO.File]::WriteAllText($candidate,$text.Replace('param([string]$Compiler)','param([string]$Compiler) # changed'))
+    $report=& $Compiler @argsMap -DevelopmentOnly
+    if(!$report.Passed -or !$report.VerifyScope($true) -or $report.Requirements.Count -ne 11){throw 'Supplementary scope failure'}
+    'PASS changed resources require supplementary inventory'
+    $report.Requirements=@($report.Requirements | Where-Object { !$_.Name.StartsWith('Candidate/',[StringComparison]::Ordinal) });$report.Stages=@($report.Stages | Where-Object { !$_.Name.StartsWith('Candidate/',[StringComparison]::Ordinal) })
+    if(!$report.VerifyStages() -or $report.VerifyScope($true)){throw 'Supplementary omission admitted'}
+    'PASS supplementary omission rejected'
+}finally{[IO.Directory]::Delete($root,$true)}
+}
+Test-RequiredConformanceScope $compiler
 '@)
 }
 
@@ -5309,11 +5363,55 @@ class PscConformanceReport {
     [PscGuardVerdict] $Guard
     [PscConformanceStage[]] $Stages
     [PscTreeUnit[]] $BaselineResources
+    [PscTreeUnit[]] $CandidateResources
     [PscConformanceRequirement[]] $Requirements
     [string] $RunnerPath
     [string] $RunnerSha256
     [bool] $Passed
     [bool] $Complete
+    # The mandatory stage inventory is a runner contract, not a report-supplied criterion.
+    static [string[]] RequiredFixtures(){return @('Tests/Test-Document.ps1','Tests/Test-Worktree.ps1','Tests/Test-Guard.ps1','SM/Test-Formats.ps1')}
+    [bool] VerifyScope([bool]$development){
+        if(!$this.VerifyStages() -or $null -eq $this.Guard -or !$this.Guard.Passed){return $false}
+        if(!$this.Candidate -or ![PscTreeText]::IsHash($this.CandidateSha256) -or $this.Guard.CandidateSha256 -cne $this.CandidateSha256 -or $this.Guard.File -cne $this.Candidate){return $false}
+        if(!$this.RunnerPath -or ![PscTreeText]::IsHash($this.RunnerSha256) -or $this.Guard.RunnerPath -cne $this.RunnerPath -or $this.Guard.RunnerSha256 -cne $this.RunnerSha256){return $false}
+        if(!$this.Guard.BaselineCommit -or !$this.Guard.BaselineBlobId -or !$this.Guard.BaselinePath -or ![PscTreeText]::IsHash($this.Guard.BaselineSha256)){return $false}
+        $before=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+        $after=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+        foreach($unit in $this.BaselineResources){
+            if($null -eq $unit -or !$unit.Path -or ![PscTreeText]::IsHash($unit.Baseline) -or [PscTreeText]::Hash($unit.Text) -cne $unit.Baseline -or !$before.TryAdd($unit.Path,$unit.Baseline)){return $false}
+        }
+        foreach($unit in $this.CandidateResources){
+            if($null -eq $unit -or !$unit.Path -or ![PscTreeText]::IsHash($unit.Baseline) -or [PscTreeText]::Hash($unit.Text) -cne $unit.Baseline -or !$after.TryAdd($unit.Path,$unit.Baseline)){return $false}
+        }
+        $changed=$before.Count -ne $after.Count
+        foreach($entry in $after.GetEnumerator()){if(!$before.ContainsKey($entry.Key) -or $before[$entry.Key] -cne $entry.Value){$changed=$true}}
+        $fixtures=[PscConformanceReport]::RequiredFixtures()
+        $names=[Collections.Generic.List[string]]::new();$names.Add('Api');$names.Add('Projection')
+        foreach($fixture in $fixtures){
+            if(!$before.ContainsKey($fixture) -or !$after.ContainsKey($fixture)){return $false}
+            $names.Add($fixture)
+        }
+        if($changed){foreach($fixture in $fixtures){$names.Add('Candidate/'+$fixture)}}
+        $names.Add('Verify')
+        if($names.Count -ne $this.Requirements.Count){return $false}
+        for($index=0;$index -lt $names.Count;$index++){
+            $name=$names[$index];$criterion=$this.Requirements[$index]
+            if($criterion.Name -cne $name -or $this.Stages[$index].Name -cne $name){return $false}
+            if($name -cin 'Api','Projection','Verify'){
+                $state=if($name -ceq 'Verify' -and $development){'Skipped'}else{'Passed'}
+                if($criterion.Provenance -ne [PscConformanceProvenance]::Candidate -or $criterion.SourcePath -cne $this.Candidate -or $criterion.Sha256 -cne $this.CandidateSha256 -or $criterion.RequiredState -cne $state){return $false}
+            }else{
+                $supplementary=$name.StartsWith('Candidate/',[StringComparison]::Ordinal)
+                $fixture=if($supplementary){$name.Substring(10)}else{$name}
+                $inventory=if($supplementary){$after}else{$before}
+                $origin=if($supplementary){[PscConformanceProvenance]::Candidate}else{[PscConformanceProvenance]::Baseline}
+                $suffix=[IO.Path]::DirectorySeparatorChar+$fixture.Replace('/',[IO.Path]::DirectorySeparatorChar)
+                if($criterion.Provenance -ne $origin -or $criterion.Sha256 -cne $inventory[$fixture] -or $criterion.RequiredState -cne 'Passed' -or !$criterion.SourcePath.EndsWith($suffix,[StringComparison]::Ordinal)){return $false}
+            }
+        }
+        return $true
+    }
     # Validate the recorded observations against the required stage identities.
     # This is consistency checking, not independent authentication of a report.
     [bool] VerifyStages(){
@@ -5397,13 +5495,14 @@ function Invoke-PscConformance {
             $candidateText=[PscTreeText]::Read($report.Candidate)
             if([PscTreeText]::Hash($candidateText) -cne $report.CandidateSha256){throw 'Candidate changed during conformance resource acquisition.'}
             $candidateResources=@(Get-PscConformanceResources $candidateText $report.Candidate $candidateRoot)
+            $report.CandidateResources=$candidateResources
             $baselineIndex=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
             foreach($unit in $report.BaselineResources){$baselineIndex.Add($unit.Path,$unit.Baseline)}
             $candidateIndex=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
             foreach($unit in $candidateResources){$candidateIndex.Add($unit.Path,$unit.Baseline)}
             $resourceChanges=$baselineIndex.Count -ne $candidateIndex.Count
             foreach($unit in $candidateResources){if(!$baselineIndex.ContainsKey($unit.Path) -or $baselineIndex[$unit.Path] -cne $unit.Baseline){$resourceChanges=$true}}
-            $fixtures=@('Tests/Test-Document.ps1','Tests/Test-Worktree.ps1','Tests/Test-Guard.ps1','SM/Test-Formats.ps1')
+            $fixtures=[PscConformanceReport]::RequiredFixtures()
             foreach($fixture in $fixtures){
                 if(!$baselineIndex.ContainsKey($fixture)){throw "Missing baseline conformance fixture: $fixture"}
                 if(!$candidateIndex.ContainsKey($fixture)){throw "Missing candidate conformance fixture: $fixture"}
@@ -5442,7 +5541,7 @@ function Invoke-PscConformance {
             Test-PscConformanceResources $candidateResources $candidateRoot
         }
         $report.Requirements=$requirements.ToArray();$report.Stages=$stages.ToArray()
-        $report.Passed=$report.Guard.Passed -and $report.VerifyStages()
+        $report.Passed=$report.Guard.Passed -and $report.VerifyScope([bool]$development)
         $report.Complete=$report.Passed -and !$development
         if((Get-FileHash -LiteralPath $report.Candidate).Hash -cne $report.CandidateSha256){throw 'Candidate changed during conformance.'}
         $null=Assert-PscRunnerIdentity $report.RunnerPath $report.RunnerSha256
@@ -13990,7 +14089,8 @@ class PscApi {
             if($report.CandidateSha256 -cne $sourceHash -or $null -eq $report.Guard -or $report.Guard.CandidateSha256 -cne $sourceHash){throw 'Conformance report does not identify this PSC source.'}
             foreach($stage in $report.Stages){if(!$stages.TryAdd($stage.Name,$stage)){throw "Duplicate conformance stage: $($stage.Name)"}}
             if(($report.Passed -or $report.Complete) -and (!$report.Guard.Passed -or !$report.VerifyStages())){throw 'Conformance report failed stage verification.'}
-            if($report.Complete -and (!$report.Passed -or @($report.Stages | Where-Object State -CEQ 'Skipped').Count)){throw 'Complete conformance report has incomplete scope.'}
+            if($report.Complete -and (!$report.Passed -or !$report.VerifyScope($false))){throw 'Complete conformance report has incomplete scope.'}
+            if($report.Passed -and !$report.Complete -and ($report.RunnerPath -or $report.RunnerSha256 -or $report.BaselineResources.Count -or $report.CandidateResources.Count) -and !$report.VerifyScope($true)){throw 'Development conformance report has incomplete scope.'}
         }
         $remaining=[Collections.Generic.HashSet[string]]::new($index.Keys,[StringComparer]::OrdinalIgnoreCase)
         $results=[Collections.Generic.List[PscRoadmapAssessment]]::new()
@@ -14125,7 +14225,7 @@ $result.Stages | Select-Object Name,State,ExitCode
 
 External edits to projected files are also supported. Start with a clean Git baseline and a new or matching projection. Collate needs a fresh candidate destination and rejects missing/untracked units and changed declaration boundaries. Additions, deletions and renames still require explicit canonical edits. Affected reports declared faculty dependencies, not exhaustive semantic or test coverage. No tests are omitted based on Affected.
 
-Conform runs Guard against committed source, the candidate API and projection, then literal regression resources obtained from the same committed baseline without candidate execution. If the embedded resource inventory changes, supplementary candidate regression stages also run. Standalone and candidate Guard consume byte-verified committed source directly, without staging a temporary Git repository. Both record the candidate digest and, when present, the committed path, commit, blob identity and digest. Conform reuses that same committed object. A standalone file without a committed baseline is held to zero findings and an empty verification inventory; failed reads of existing objects are not treated as absence. Guard parses decoded source without line joining; only protected extent comparison normalizes line endings. Unborn Git repositories require Git support for show-ref --exists. The report identifies the runner and resource digests. Required stages are declared before execution, with exact names, provenance, source identity and permitted states; VerifyStages checks the observations against those requirements. Primary fixture stages use baseline resources, and Candidate/ stages identify supplementary tests. Candidate resource extraction is checked against the Guard digest; the candidate and complete runner identities are checked before and after each stage. This detects persistent interstage changes, not changes made and restored within one child process. The local Git transport still uses git.exe; the byte-level blob identity calculation follows Pwsh prior art. Report consistency does not authenticate the runner or its evidence. This is not full assessment-authority closure: the caller must choose a trusted runner, and historical Verify still executes candidate code. `true` selects development scope and skips historical Windows verification (`Complete = False`); `false` requests the full suite and requires its native toolchain. Review the result before explicitly promoting the candidate. Use `git diff -- PSC.ps1`, commit the reviewed change, verify HEAD, then open a fresh projection. Never silently change protected checkers. See [AGENTS.md](AGENTS.md) for engineering requirements.
+Conform runs Guard against committed source, the candidate API and projection, then literal regression resources obtained from the same committed baseline without candidate execution. If the embedded resource inventory changes, supplementary candidate regression stages also run. Standalone and candidate Guard consume byte-verified committed source directly, without staging a temporary Git repository. Both record the candidate digest and, when present, the committed path, commit, blob identity and digest. Conform reuses that same committed object. A standalone file without a committed baseline is held to zero findings and an empty verification inventory; failed reads of existing objects are not treated as absence. Guard parses decoded source without line joining; only protected extent comparison normalizes line endings. Unborn Git repositories require Git support for show-ref --exists. The report identifies the runner and resource digests. Required stages are declared before execution, with exact names, provenance, source identity and permitted states; VerifyStages checks the observations against those requirements; VerifyScope independently requires the ordered mandatory compiler and fixture stages, resource inventory identities and permitted Verify outcome. A scoped observation without runner identity is not proof of complete conformance. Primary fixture stages use baseline resources, and Candidate/ stages identify supplementary tests. Candidate resource extraction is checked against the Guard digest; the candidate and complete runner identities are checked before and after each stage. This detects persistent interstage changes, not changes made and restored within one child process. The local Git transport still uses git.exe; the byte-level blob identity calculation follows Pwsh prior art. Report consistency does not authenticate the runner or its evidence. This is not full assessment-authority closure: the caller must choose a trusted runner, and historical Verify still executes candidate code. `true` selects development scope and skips historical Windows verification (`Complete = False`); `false` requests the full suite and requires its native toolchain. Review the result before explicitly promoting the candidate. Use `git diff -- PSC.ps1`, commit the reviewed change, verify HEAD, then open a fresh projection. Never silently change protected checkers. See [AGENTS.md](AGENTS.md) for engineering requirements.
 
 ## Compiler and runtime
 
@@ -14190,7 +14290,7 @@ PSC is the upstream compiler, SDK, semantic development environment and procedur
 
 ### Baseline and objective register
 
-Assessment basis: PSC [7897b43](https://github.com/MansfieldPlumbing/PSC/commit/7897b4354855e154d459ae8737a45c11ebad67ca), reviewed November 25, 2026. Existing implementation is not equivalent to completed acceptance. At this baseline seven faculties, ordered projection, typed query, revision-bound replacement/undo, retained semantic source identity, candidate Guard including embedded source, managed compilation, NativeAOT/COFF and direct x64 ELF leaf emission exist. The shared byte-exact Guard authority migration reported 345 passing fixture assertions, with separate preceding and revised verifier comparisons; historical Windows Verify was not run. Full candidate-independent conformance is not established.
+Assessment basis: PSC [36a5046](https://github.com/MansfieldPlumbing/PSC/commit/36a5046d47e0f9c3716657c8157fed62216d7cab), reviewed November 25, 2026. Existing implementation is not equivalent to completed acceptance. At this baseline seven faculties, ordered projection, typed query, revision-bound replacement/undo, retained semantic source identity, candidate Guard including embedded source, managed compilation, NativeAOT/COFF and direct x64 ELF leaf emission exist. Development Conform reported 516 passing fixture assertions across ten executed stages; historical Windows Verify was explicitly skipped. Full candidate-independent conformance is not established.
 
 States: Existing = demonstrated mechanism requiring remaining scope checks; Planned = a defined objective; Research = evidence needed before committing to a design; Accepted = explicitly accepted with revision, evidence, scope, omissions and redundancy disposition. Outstanding prerequisites are computed from the typed register, not hand-maintained readiness labels. They gate acceptance, not all incremental development. An objective is never accepted merely because declarations exist or a conformance stage passes.
 
