@@ -1602,6 +1602,10 @@ try {
         $identityVerdict=$api.GuardCandidate($candidate,$base,'')
         if(!$identityVerdict.Passed -or $identityVerdict.BaselineBlobId -cne $blobId -or $identityVerdict.BaselineSha256 -cne $expectedDigest -or $identityVerdict.CandidateSha256 -cne $expectedDigest){throw 'Guard lost exact committed identity.'}
         'PASS exact committed baseline bytes despite dirty checkout'
+        [IO.File]::WriteAllBytes($base,$committedBytes)
+        $standalone=& $compiler -Mode Guard -LintFiles $base
+        if(!$standalone.Passed -or $standalone.BaselineCommit -cne $identityVerdict.BaselineCommit -or $standalone.BaselineBlobId -cne $blobId -or $standalone.BaselineSha256 -cne $expectedDigest -or $standalone.CandidateSha256 -cne $expectedDigest){throw 'Standalone Guard lost exact committed identity.'}
+        'PASS standalone exact committed identity' 
     }
     Test-Case 'equal count replacement' '$x = 1; $X = 2' '$y = 1; $Y = 2' $false
     Test-Case 'lower count replacement' '$x = 1; $X = 2; $z = 1; $Z = 2' '$y = 1; $Y = 2' $false
@@ -1773,6 +1777,45 @@ try{
     Assert-AuthorityRefusal 'replacement ref cannot admit new finding' $candidateArgs 'DynamicCodeExecution: new finding'
     Assert-AuthorityRefusal 'standalone refuses replacement refs' $standaloneArgs 'Git replacement references are not admitted'
 }finally{[IO.Directory]::Delete($identityRoot,$true)}
+# Missing sources and failed Git reads are deliberately different states.
+$directRoot=[IO.Directory]::CreateDirectory([IO.Path]::Combine([IO.Path]::GetTempPath(),'psc-guard-direct-'+[Guid]::NewGuid().ToString('N'))).FullName
+try{
+    $directPath=Join-Path $directRoot 'source.ps1'
+    [IO.File]::WriteAllText($directPath,'Write-Output 1')
+    $directArgs=@{Mode='Guard';LintFiles=$directPath}
+    $untracked=& $compiler @directArgs
+    if(!$untracked.Passed -or $untracked.BaselineBlobId -or $untracked.CandidateSha256 -cne (Get-FileHash -LiteralPath $directPath).Hash){throw 'Nonrepository source identity lost.'}
+    'PASS standalone source outside repository'
+    git -C $directRoot init -q
+    if($LASTEXITCODE -ne 0){throw 'git init failed'}
+    $unborn=& $compiler @directArgs
+    if(!$unborn.Passed -or $unborn.BaselineBlobId){throw 'Unborn baseline unexpectedly acquired.'}
+    'PASS standalone unborn repository'
+    git -C $directRoot -c user.name=PSC -c user.email=psc@localhost commit --allow-empty -qm 'empty baseline'
+    if($LASTEXITCODE -ne 0){throw 'git commit failed'}
+    $absent=& $compiler @directArgs
+    if(!$absent.Passed -or $absent.BaselineBlobId){throw 'Absent path unexpectedly acquired.'}
+    'PASS standalone absent committed path'
+    [IO.File]::WriteAllText($directPath,'Invoke-Expression $text')
+    Assert-AuthorityRefusal 'untracked source must not introduce findings' $directArgs 'DynamicCodeExecution: new finding'
+    $directCandidate=Join-Path $directRoot 'candidate.ps1'
+    [IO.File]::WriteAllText($directCandidate,'Write-Output 1')
+    Assert-AuthorityRefusal 'explicit candidate baseline must exist' @{Mode='Guard';LintFiles=$directCandidate;AgainstPath=$directPath} 'Committed baseline path is absent'
+    $nested=[IO.Directory]::CreateDirectory((Join-Path $directRoot 'nested')).FullName
+    $literalPath=Join-Path $nested 'source[1].ps1'
+    [IO.File]::WriteAllText($literalPath,'Write-Output 2')
+    git --literal-pathspecs -C $directRoot add -- 'nested/source[1].ps1'
+    if($LASTEXITCODE -ne 0){throw 'git add failed'}
+    git -C $directRoot -c user.name=PSC -c user.email=psc@localhost commit -qm 'literal nested source'
+    if($LASTEXITCODE -ne 0){throw 'git commit failed'}
+    $literalBlob=git -C $directRoot rev-parse --verify 'HEAD:nested/source[1].ps1'
+    $literalVerdict=& $compiler -Mode Guard -LintFiles $literalPath
+    if(!$literalVerdict.Passed -or $literalVerdict.BaselineBlobId -cne $literalBlob){throw 'Literal nested path resolved incorrectly.'}
+    'PASS literal nested committed path'
+    $blobPath=Join-Path $directRoot ('.git/objects/'+$literalBlob.Substring(0,2)+'/'+$literalBlob.Substring(2))
+    [IO.File]::Delete($blobPath)
+    Assert-AuthorityRefusal 'missing committed object is not an absent baseline' @{Mode='Guard';LintFiles=$literalPath} 'Git object acquisition failed'
+}finally{[IO.Directory]::Delete($directRoot,$true)}
 '@)
 }
 
@@ -5002,17 +5045,19 @@ function Get-SmaGuardResources {
 # Canonical embedded source units are assessed separately by path; inert resources are not treated as code.
 function Test-SmaGuard {
     [PscVerify()]
-    param([string] $file, [string] $expectedHash)
+    param([string] $file, [string] $expectedHash, [AllowNull()][PscCommittedSource] $committedSource)
     $tokens = $errors = $committedErrors = $null
-    $text = [IO.File]::ReadAllLines($file) -join "`n"
-    $ast = [System.Management.Automation.Language.Parser]::ParseInput($text, $file, [ref]$tokens, [ref]$errors)
+    $candidateBytes = [IO.File]::ReadAllBytes($file)
+    $candidateDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($candidateBytes))
+    $text = [PscCommittedSource]::DecodeGuardText($candidateBytes)
+    $committed = $null -ne $committedSource
+    $comparisonPath = if ($committed) { $committedSource.Path } else { $file }
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($text, $comparisonPath, [ref]$tokens, [ref]$errors)
     $reasons = [Collections.Generic.List[string]]::new()
     foreach ($problem in $errors) { $reasons.Add(('parse error at line {0}: {1}' -f $problem.Extent.StartLineNumber, $problem.Message)) }
-    $committedLines = @(git -C (Split-Path -Parent $file) show ('HEAD:./' + (Split-Path -Leaf $file)) 2>$null)
-    $committed = $LASTEXITCODE -eq 0
-    $committedText = $committedLines -join "`n"
-    $before = @(if ($committed) { Get-SmaLint $file $committedText })
-    $after = @(Get-SmaLint $file $text)
+    $committedText = if ($committed) { [PscCommittedSource]::DecodeGuardText($committedSource.Bytes) }
+    $before = @(if ($committed) { Get-SmaLint $comparisonPath $committedText })
+    $after = @(Get-SmaLint $comparisonPath $text)
     Compare-SmaGuardFindings $before $after $reasons ''
     $committedAst=if($committed){[System.Management.Automation.Language.Parser]::ParseInput($committedText,[ref]$tokens,[ref]$committedErrors)}
     try {
@@ -5041,7 +5086,7 @@ function Test-SmaGuard {
             if (!$currentIndex.TryAdd($function.Name,$function)) { $reasons.Add(('ambiguous candidate verification declaration: {0}' -f $function.Name)); $function.Name }
         }
         foreach ($function in $prior) {
-            if (!$currentIndex.ContainsKey($function.Name) -or $currentIndex[$function.Name].Extent.Text -cne $function.Extent.Text) { $function.Name }
+            if (!$currentIndex.ContainsKey($function.Name) -or [PscCommittedSource]::NormalizeGuardExtent($currentIndex[$function.Name].Extent.Text) -cne [PscCommittedSource]::NormalizeGuardExtent($function.Extent.Text)) { $function.Name }
         }
         foreach ($function in $now) {
             if (!$priorIndex.ContainsKey($function.Name)) { $function.Name }
@@ -5060,7 +5105,13 @@ function Test-SmaGuard {
     $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($checkerText)))
     foreach ($name in $changed) { $reasons.Add(('checker function {0} differs from HEAD' -f $name)) }
     if ($expectedHash -and $expectedHash -ne $hash) { $reasons.Add(('checker hash {0} is not the expected {1}' -f $hash, $expectedHash)) }
-    [PscGuardVerdict]@{ File = $file; Passed = $reasons.Count -eq 0; Reasons = $reasons; CheckerChanged = $changed; CheckerHash = $hash }
+    $verdict=[PscGuardVerdict]@{ File = $file; Passed = $reasons.Count -eq 0; Reasons = $reasons; CheckerChanged = $changed; CheckerHash = $hash; CandidateSha256 = $candidateDigest }
+    if($committed){
+        $verdict.BaselineCommit=$committedSource.Commit;$verdict.BaselinePath=$committedSource.Path
+        $verdict.BaselineBlobId=$committedSource.BlobId;$verdict.BaselineSha256=$committedSource.Sha256
+    }
+    if((Get-FileHash -LiteralPath $file).Hash -cne $candidateDigest){throw 'Candidate changed during Guard.'}
+    return $verdict
 }
 
 # Local Git transport retains exact object bytes. The object header/hash check follows
@@ -5076,6 +5127,14 @@ class PscCommittedSource {
         if($sourceText.Length -and $sourceText[0] -eq [char]0xfeff){throw "UTF-8 BOM not admitted: $($this.Path)"}
         return $sourceText
     }
+    # Guard accepts BOM-identified source encodings, as its former file reader did.
+    # Source identity remains the exact bytes; only protected extent comparison normalizes newlines.
+    static [string] DecodeGuardText([byte[]]$content){
+        $stream=[IO.MemoryStream]::new($content,$false)
+        $reader=[IO.StreamReader]::new($stream,[PscTreeText]::Encoding(),$true)
+        try{return $reader.ReadToEnd()}finally{$reader.Dispose()}
+    }
+    static [string] NormalizeGuardExtent([string]$extent){return $extent.Replace("`r`n","`n").Replace("`r","`n")}
     static [string] BlobIdentity([byte[]]$content,[int]$idLength){
         if($idLength -eq 40){$algorithm=[Security.Cryptography.HashAlgorithmName]::SHA1}
         elseif($idLength -eq 64){$algorithm=[Security.Cryptography.HashAlgorithmName]::SHA256}
@@ -5107,7 +5166,7 @@ function Assert-PscGitEnvironment {
         if($name -in $blocked -or $name.StartsWith('GIT_CONFIG_KEY_',[StringComparison]::OrdinalIgnoreCase) -or $name.StartsWith('GIT_CONFIG_VALUE_',[StringComparison]::OrdinalIgnoreCase)){throw "Ambient Git repository override not admitted: $name"}
     }
 }
-# Standalone Guard preserves its untracked-file policy but refuses replacement refs before legacy Git lookup.
+# Standalone Guard preserves its untracked-file policy but refuses replacement refs before acquisition.
 function Assert-PscStandaloneGitContext {
     [OutputType([void])]
     param([string]$Path)
@@ -5120,66 +5179,76 @@ function Assert-PscStandaloneGitContext {
     }
 }
 
-function Read-PscGitBytes {
-    [OutputType([byte[]])]
+# Keep exit status distinct from empty successful output: absent sources are not failed reads.
+class PscGitRead {
+    [byte[]] $Bytes
+    [int] $ExitCode
+    [string] $Diagnostic
+}
+function Invoke-PscGitRead {
+    [OutputType([PscGitRead])]
     param([string]$Directory,[string[]]$Arguments)
     Assert-PscGitEnvironment
     $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName='git'
     $info.UseShellExecute=$false;$info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
+    $info.Environment['LC_ALL']='C'
     foreach($argument in @('--no-replace-objects','-C',$Directory)+$Arguments){$info.ArgumentList.Add($argument)}
     $buffer=[IO.MemoryStream]::new();$child=$null
     try{
         $child=[Diagnostics.Process]::Start($info)
         $copy=$child.StandardOutput.BaseStream.CopyToAsync($buffer);$diagnostic=$child.StandardError.ReadToEndAsync()
-        $child.WaitForExit();[void]$copy.GetAwaiter().GetResult();$message=$diagnostic.GetAwaiter().GetResult()
-        if($child.ExitCode -ne 0){throw ('Git object acquisition failed: '+$message.Trim())}
-        return ,$buffer.ToArray()
+        $child.WaitForExit();[void]$copy.GetAwaiter().GetResult()
+        return [PscGitRead]@{Bytes=$buffer.ToArray();ExitCode=$child.ExitCode;Diagnostic=$diagnostic.GetAwaiter().GetResult()}
     }finally{if($child){$child.Dispose()};$buffer.Dispose()}
+}
+function Read-PscGitBytes {
+    [OutputType([byte[]])]
+    param([string]$Directory,[string[]]$Arguments)
+    $read=Invoke-PscGitRead $Directory $Arguments
+    if($read.ExitCode -ne 0){throw ('Git object acquisition failed: '+$read.Diagnostic.Trim())}
+    return ,$read.Bytes
 }
 function Read-PscCommittedSource {
     [OutputType([PscCommittedSource])]
-    param([string]$Baseline)
+    param([string]$Baseline,[switch]$AllowAbsent)
     $source=[PscCommittedSource]::new();$source.Path=[PscTreeText]::FullPath($Baseline)
     $directory=[IO.Path]::GetDirectoryName($source.Path);$leaf=[IO.Path]::GetFileName($source.Path)
-    $source.Commit=[Text.Encoding]::ASCII.GetString((Read-PscGitBytes $directory @('rev-parse','--verify','HEAD'))).Trim()
-    $source.BlobId=[Text.Encoding]::ASCII.GetString((Read-PscGitBytes $directory @('rev-parse','--verify',($source.Commit+':./'+$leaf)))).Trim()
+    $head=Invoke-PscGitRead $directory @('rev-parse','--verify','HEAD')
+    if($head.ExitCode -ne 0){
+        if($AllowAbsent){
+            $repository=Invoke-PscGitRead $directory @('rev-parse','--git-dir')
+            if($repository.ExitCode -ne 0 -and $repository.Diagnostic.StartsWith('fatal: not a git repository',[StringComparison]::Ordinal)){return $null}
+            if($repository.ExitCode -eq 0){
+                $symbolic=Invoke-PscGitRead $directory @('symbolic-ref','-q','HEAD')
+                if($symbolic.ExitCode -eq 0){
+                    $reference=[Text.Encoding]::UTF8.GetString($symbolic.Bytes).TrimEnd("`r","`n")
+                    $exists=Invoke-PscGitRead $directory @('show-ref','--exists',$reference)
+                    if($exists.ExitCode -eq 2){return $null}
+                }
+            }
+        }
+        throw ('Git object acquisition failed: '+$head.Diagnostic.Trim())
+    }
+    $source.Commit=[Text.Encoding]::ASCII.GetString($head.Bytes).Trim()
+    # ls-tree succeeds with empty output for an absent literal path in this exact commit.
+    $entry=Read-PscGitBytes $directory @('--literal-pathspecs','ls-tree','--object-only','-z',$source.Commit,'--',$leaf)
+    if(!$entry.Length){if($AllowAbsent){return $null};throw 'Committed baseline path is absent.'}
+    if($entry[-1] -ne 0){throw 'Unterminated committed tree entry.'}
+    $source.BlobId=[Text.Encoding]::ASCII.GetString($entry,0,$entry.Length-1)
+    if($source.BlobId.Contains([char]0)){throw 'Ambiguous committed tree entry.'}
     $source.Bytes=Read-PscGitBytes $directory @('cat-file','blob',$source.BlobId)
     if([PscCommittedSource]::BlobIdentity($source.Bytes,$source.BlobId.Length) -cne $source.BlobId){throw 'Committed blob identity mismatch.'}
     $source.Sha256=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($source.Bytes))
     return $source
 }
-# Compare a candidate under the canonical filename in an isolated Git repository.
-# Conform passes the same acquired object to Guard and literal resource extraction.
+# Both entry points assess the acquired baseline directly. Conform reuses that object for fixtures.
 function Test-PscCandidateGuard {
     [OutputType([PscGuardVerdict])]
     param([string]$candidate,[string]$Baseline,[string]$expectedHash,[PscCommittedSource]$CommittedSource)
     Assert-PscGitEnvironment
     $candidateFile=[PscTreeText]::FullPath($candidate)
     if($null -eq $CommittedSource){$CommittedSource=Read-PscCommittedSource $Baseline}
-    $baselineLeaf=[IO.Path]::GetFileName($CommittedSource.Path)
-    $candidateBytes=[IO.File]::ReadAllBytes($candidateFile)
-    $candidateDigest=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($candidateBytes))
-    $stage=[IO.Path]::Combine([IO.Path]::GetTempPath(),'psc-guard-'+[Guid]::NewGuid().ToString('N'))
-    [void][IO.Directory]::CreateDirectory($stage)
-    try{
-        $fixtureFile=[IO.Path]::Combine($stage,$baselineLeaf)
-        $empty=[IO.Directory]::CreateDirectory([IO.Path]::Combine($stage,'empty')).FullName
-        git -C $stage init --quiet --template=$empty
-        if($LASTEXITCODE -ne 0){throw 'Candidate Guard could not initialize its isolated Git baseline.'}
-        [IO.File]::WriteAllBytes($fixtureFile,$CommittedSource.Bytes)
-        git -C $stage -c core.autocrlf=false add -- $baselineLeaf
-        if($LASTEXITCODE -ne 0){throw 'Candidate Guard could not stage its baseline.'}
-        git -C $stage -c user.name=PSC -c user.email=psc@localhost -c commit.gpgsign=false -c core.hooksPath=$empty commit --quiet --no-verify -m 'Isolated committed baseline'
-        if($LASTEXITCODE -ne 0){throw 'Candidate Guard could not establish its baseline.'}
-        $isolated=Read-PscCommittedSource $fixtureFile
-        if($isolated.Sha256 -cne $CommittedSource.Sha256){throw 'Isolated baseline bytes differ from the committed source.'}
-        [IO.File]::WriteAllBytes($fixtureFile,$candidateBytes)
-        $verdict=Test-SmaGuard $fixtureFile $expectedHash
-        $verdict.File=$candidateFile;$verdict.BaselineCommit=$CommittedSource.Commit;$verdict.BaselinePath=$CommittedSource.Path
-        $verdict.BaselineBlobId=$CommittedSource.BlobId;$verdict.BaselineSha256=$CommittedSource.Sha256;$verdict.CandidateSha256=$candidateDigest
-        if((Get-FileHash -LiteralPath $candidateFile).Hash -cne $candidateDigest){throw 'Candidate changed during Guard.'}
-        return $verdict
-    }finally{[IO.Directory]::Delete($stage,$true)}
+    return Test-SmaGuard $candidateFile $expectedHash $CommittedSource
 }
 
 enum PscConformanceProvenance {
@@ -5288,6 +5357,7 @@ function Invoke-PscConformance {
     $committedSource=Read-PscCommittedSource $Baseline
     if($expectedBaseline -and (![PscTreeText]::IsHash($expectedBaseline.ToUpperInvariant()) -or $committedSource.Sha256 -ine $expectedBaseline)){throw 'Expected committed baseline SHA-256 mismatch.'}
     $report.Guard=Test-PscCandidateGuard $report.Candidate $Baseline $expectedHash $committedSource
+    $report.Guard.RunnerPath=$report.RunnerPath;$report.Guard.RunnerSha256=$report.RunnerSha256
     $report.CandidateSha256=$report.Guard.CandidateSha256
     $stages=[Collections.Generic.List[PscConformanceStage]]::new();$requirements=[Collections.Generic.List[PscConformanceRequirement]]::new();$resourceChanges=$false
     $stage=[IO.Path]::Combine([IO.Path]::GetTempPath(),'psc-conform-'+[Guid]::NewGuid().ToString('N'))
@@ -13812,7 +13882,7 @@ class PscApi {
     # The register is the sole maintained objective list. The README is generated from these records.
     [PscRoadmapObjective[]] Roadmap(){
         $objectives=[Collections.Generic.List[PscRoadmapObjective]]::new()
-        $objectives.Add([PscRoadmapObjective]::new('F0',[PscRoadmapState]::Existing,@(),'Baseline, Guard, checker and fixture dependency closure: independently controlled assessment inputs; candidate cannot silently replace criteria, runner or fixtures. Reject removed, substituted, reordered or dynamically supplied dependencies. Record approved baseline, digests and provenance; no sandbox claim.',@('Get-SmaChecker','Test-SmaGuard','Get-PscResourceUnits','PscCommittedSource','Read-PscCommittedSource','Assert-PscGitEnvironment','Assert-PscRunnerIdentity','Assert-PscStandaloneGitContext','PscConformanceRequirement','Get-PscConformanceResources','Test-PscConformanceResources','Invoke-PscConformance'),@(),@('Tests/Test-Guard.ps1')))
+        $objectives.Add([PscRoadmapObjective]::new('F0',[PscRoadmapState]::Existing,@(),'Baseline, Guard, checker and fixture dependency closure: independently controlled assessment inputs; candidate cannot silently replace criteria, runner or fixtures. Reject removed, substituted, reordered or dynamically supplied dependencies. Record approved baseline, digests and provenance; no sandbox claim.',@('Get-SmaChecker','Test-SmaGuard','Get-PscResourceUnits','PscCommittedSource','Read-PscCommittedSource','Invoke-PscGitRead','Assert-PscGitEnvironment','Assert-PscRunnerIdentity','Assert-PscStandaloneGitContext','PscConformanceRequirement','Get-PscConformanceResources','Test-PscConformanceResources','Invoke-PscConformance'),@(),@('Tests/Test-Guard.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('F1',[PscRoadmapState]::Existing,@('F0'),'UnCollate/Collate: exact ordered round trip including embedded source, comments, encodings and resources; reject missing, stale, duplicate, ambiguous and untracked units.',@('Get-PscTreeProjection','Write-PscSourceTree'),@(),@('Projection','Tests/Test-Worktree.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('F2',[PscRoadmapState]::Existing,@('F1'),'Typed structural query and live API: AST/CIL identity, owner, extent, scope, bounded coverage and explicit ambiguity; parity with independently obtained observations.',@('PscQueryCursor','PscApi'),@(),@('Api','Tests/Test-Worktree.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('F3',[PscRoadmapState]::Existing,@('F1','F2'),'Persistent semantic index: retained parsed source and revision refresh exist; extend scope, overloads, declaration and referent identity, cross-unit dependencies and incremental fact invalidation. Compare incremental results with full rebuild, including shadowing and rename.',@('PscSemanticIndex','PscIndexedSource','Get-SmaGraph','Resolve-SmaEdges'),@(),@('Tests/Test-Worktree.ps1')))
@@ -14021,7 +14091,7 @@ $result.Stages | Select-Object Name,State,ExitCode
 
 External edits to projected files are also supported. Start with a clean Git baseline and a new or matching projection. Collate needs a fresh candidate destination and rejects missing/untracked units and changed declaration boundaries. Additions, deletions and renames still require explicit canonical edits. Affected reports declared faculty dependencies, not exhaustive semantic or test coverage. No tests are omitted based on Affected.
 
-Conform runs Guard against committed source, the candidate API and projection, then literal regression resources obtained from the same committed baseline without candidate execution. If the embedded resource inventory changes, supplementary candidate regression stages also run. Guard and Conform share a byte-exact committed source, with commit, Git blob identity and SHA-256 recorded in Guard. The report identifies the runner and resource digests. Required stages are declared before execution, with exact names, provenance, source identity and permitted states; VerifyStages checks the observations against those requirements. Primary fixture stages use baseline resources, and Candidate/ stages identify supplementary tests. The local Git transport still uses git.exe; the byte-level blob identity calculation follows Pwsh prior art. Report consistency does not authenticate the runner or its evidence. This is not full assessment-authority closure: the caller must choose a trusted runner, and historical Verify still executes candidate code. `true` selects development scope and skips historical Windows verification (`Complete = False`); `false` requests the full suite and requires its native toolchain. Review the result before explicitly promoting the candidate. Use `git diff -- PSC.ps1`, commit the reviewed change, verify HEAD, then open a fresh projection. Never silently change protected checkers. See [AGENTS.md](AGENTS.md) for engineering requirements.
+Conform runs Guard against committed source, the candidate API and projection, then literal regression resources obtained from the same committed baseline without candidate execution. If the embedded resource inventory changes, supplementary candidate regression stages also run. Standalone and candidate Guard consume byte-verified committed source directly, without staging a temporary Git repository. Both record the candidate digest and, when present, the committed path, commit, blob identity and digest. Conform reuses that same committed object. A standalone file without a committed baseline is held to zero findings and an empty verification inventory; failed reads of existing objects are not treated as absence. Guard parses decoded source without line joining; only protected extent comparison normalizes line endings. Unborn Git repositories require Git support for show-ref --exists. The report identifies the runner and resource digests. Required stages are declared before execution, with exact names, provenance, source identity and permitted states; VerifyStages checks the observations against those requirements. Primary fixture stages use baseline resources, and Candidate/ stages identify supplementary tests. The local Git transport still uses git.exe; the byte-level blob identity calculation follows Pwsh prior art. Report consistency does not authenticate the runner or its evidence. This is not full assessment-authority closure: the caller must choose a trusted runner, and historical Verify still executes candidate code. `true` selects development scope and skips historical Windows verification (`Complete = False`); `false` requests the full suite and requires its native toolchain. Review the result before explicitly promoting the candidate. Use `git diff -- PSC.ps1`, commit the reviewed change, verify HEAD, then open a fresh projection. Never silently change protected checkers. See [AGENTS.md](AGENTS.md) for engineering requirements.
 
 ## Compiler and runtime
 
@@ -14086,7 +14156,7 @@ PSC is the upstream compiler, SDK, semantic development environment and procedur
 
 ### Baseline and objective register
 
-Assessment basis: PSC [8411f68](https://github.com/MansfieldPlumbing/PSC/commit/8411f68681188a994083f32f53a2f1d79ead96c8), reviewed November 25, 2026. Existing implementation is not equivalent to completed acceptance. At this baseline seven faculties, ordered projection, typed query, revision-bound replacement/undo, retained semantic source identity, candidate Guard including embedded source, managed compilation, NativeAOT/COFF and direct x64 ELF leaf emission exist. Development Conform reported 427 passing fixture assertions across ten executed stages; historical Windows Verify was explicitly skipped. Full candidate-independent conformance is not established.
+Assessment basis: PSC [5570157](https://github.com/MansfieldPlumbing/PSC/commit/55701570f6346a7f213f75a69e7e5df19be4a37d), reviewed November 25, 2026. Existing implementation is not equivalent to completed acceptance. At this baseline seven faculties, ordered projection, typed query, revision-bound replacement/undo, retained semantic source identity, candidate Guard including embedded source, managed compilation, NativeAOT/COFF and direct x64 ELF leaf emission exist. Development Conform reported 474 passing fixture assertions across ten executed stages; historical Windows Verify was explicitly skipped. Full candidate-independent conformance is not established.
 
 States: Existing = demonstrated mechanism requiring remaining scope checks; Planned = a defined objective; Research = evidence needed before committing to a design; Accepted = explicitly accepted with revision, evidence, scope, omissions and redundancy disposition. Outstanding prerequisites are computed from the typed register, not hand-maintained readiness labels. They gate acceptance, not all incremental development. An objective is never accepted merely because declarations exist or a conformance stage passes.
 
@@ -18589,7 +18659,7 @@ process {
             if($AgainstPath -and $LintFiles.Count -ne 1){throw 'Candidate Guard requires exactly one candidate.'}
             $runnerPath=[PscTreeText]::FullPath($PSCommandPath)
             $runnerDigest=Assert-PscRunnerIdentity $runnerPath $ExpectedRunnerSha256
-            $verdicts = @(foreach ($file in $LintFiles) { if($AgainstPath){Test-PscCandidateGuard $file $AgainstPath $CheckerHash}else{$guardPath=[PscTreeText]::FullPath($file);Assert-PscStandaloneGitContext $guardPath;Test-SmaGuard $guardPath $CheckerHash} })
+            $verdicts = @(foreach ($file in $LintFiles) { if($AgainstPath){Test-PscCandidateGuard $file $AgainstPath $CheckerHash}else{$guardPath=[PscTreeText]::FullPath($file);Assert-PscStandaloneGitContext $guardPath;$guardBaseline=Read-PscCommittedSource $guardPath -AllowAbsent;Test-SmaGuard $guardPath $CheckerHash $guardBaseline} })
             $null=Assert-PscRunnerIdentity $runnerPath $runnerDigest
             foreach($verdict in $verdicts){$verdict.RunnerPath=$runnerPath;$verdict.RunnerSha256=$runnerDigest}
             $verdicts
