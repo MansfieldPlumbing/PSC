@@ -633,6 +633,29 @@ function Add-PscTreeUnit {
     if($End -lt $Start){throw "Overlapping source extents: $Path"}
     if($End -gt $Start -or $Kind -ceq 'Resource'){$Units.Add([PscTreeUnit]::new($Kind,$Path,$Start,$End))}
 }
+function Get-PscResourceUnits {
+    [PscChecker()]
+    [OutputType([PscTreeUnit])]
+    param([System.Management.Automation.Language.FunctionDefinitionAst]$holder)
+    if(!$holder.Body.EndBlock -or $holder.Body.BeginBlock -or $holder.Body.ProcessBlock -or $holder.Body.DynamicParamBlock -or $holder.Body.CleanBlock){throw 'Invalid resource holder body.'}
+    $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach($statement in $holder.Body.EndBlock.Statements){
+        if($statement -isnot [System.Management.Automation.Language.PipelineAst] -or $statement.PipelineElements.Count -ne 1 -or $statement.PipelineElements[0] -isnot [System.Management.Automation.Language.CommandExpressionAst]){throw 'Invalid SM resource declaration.'}
+        $call=$statement.PipelineElements[0].Expression
+        if($call -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst] -or !$call.Static -or $call.Expression -isnot [System.Management.Automation.Language.TypeExpressionAst] -or $call.Expression.TypeName.FullName -cne 'PscSourceResource' -or $call.Member.Value -cne 'new' -or $call.Arguments.Count -ne 2){throw 'Invalid SM resource declaration.'}
+        $name=$call.Arguments[0];$literal=$call.Arguments[1]
+        if($name -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -or $literal -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -or $literal.StringConstantType -ne [System.Management.Automation.Language.StringConstantType]::SingleQuotedHereString -or !($name.Value.StartsWith('SM/',[StringComparison]::Ordinal) -or $name.Value.StartsWith('Tests/',[StringComparison]::Ordinal))){throw 'SM resources require a literal path and single-quoted here-string.'}
+        $raw=$literal.Extent.Text
+        $opening=if($raw.StartsWith("@'`r`n",[StringComparison]::Ordinal)){4}elseif($raw.StartsWith("@'`n",[StringComparison]::Ordinal)){3}else{throw 'Invalid SM resource opener.'}
+        $closing=if($raw.EndsWith("`r`n'@",[StringComparison]::Ordinal)){4}elseif($raw.EndsWith("`n'@",[StringComparison]::Ordinal)){3}else{throw 'Invalid SM resource closer.'}
+        $start=$literal.Extent.StartOffset+$opening;$finish=$literal.Extent.EndOffset-$closing
+        if($finish -lt $start -or $raw.Substring($opening,$finish-$start) -cne $literal.Value){throw 'Resource payload differs from parser value.'}
+        if(!$seen.Add($name.Value)){throw "Duplicate resource path: $($name.Value)"}
+        $unit=[PscTreeUnit]::new('Resource',$name.Value,$start,$finish)
+        $unit.Text=$literal.Value
+        $unit
+    }
+}
 function Add-PscTreeDeclarations {
     param([Collections.Generic.List[PscTreeUnit]]$Units,[System.Management.Automation.Language.StatementAst[]]$Statements,[int]$Start,[int]$End,[string]$Scope,[Collections.Generic.Dictionary[string,string]]$Faculties)
     $at=$Start;$ordinal=0
@@ -645,20 +668,10 @@ function Add-PscTreeDeclarations {
             Add-PscTreeDeclarations $Units $children $inner $limit $node.Name $Faculties
         } elseif($node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-PscEmbeddedSources'){
             $cursor=$at;$i=0
-            foreach($statement in $node.Body.EndBlock.Statements){
-                if($statement -isnot [System.Management.Automation.Language.PipelineAst] -or $statement.PipelineElements.Count -ne 1 -or $statement.PipelineElements[0] -isnot [System.Management.Automation.Language.CommandExpressionAst]){throw 'Invalid SM resource declaration.'}
-                $call=$statement.PipelineElements[0].Expression
-                if($call -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst] -or !$call.Static -or $call.Expression -isnot [System.Management.Automation.Language.TypeExpressionAst] -or $call.Expression.TypeName.FullName -cne 'PscSourceResource' -or $call.Member.Value -cne 'new' -or $call.Arguments.Count -ne 2){throw 'Invalid SM resource declaration.'}
-                $name=$call.Arguments[0];$literal=$call.Arguments[1]
-                if($name -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -or $literal -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -or $literal.StringConstantType -ne [System.Management.Automation.Language.StringConstantType]::SingleQuotedHereString -or !($name.Value.StartsWith('SM/',[StringComparison]::Ordinal) -or $name.Value.StartsWith('Tests/',[StringComparison]::Ordinal))){throw 'SM resources require a literal path and single-quoted here-string.'}
-                $raw=$literal.Extent.Text
-                $opening=if($raw.StartsWith("@'`r`n",[StringComparison]::Ordinal)){4}elseif($raw.StartsWith("@'`n",[StringComparison]::Ordinal)){3}else{throw 'Invalid SM resource opener.'}
-                $closing=if($raw.EndsWith("`r`n'@",[StringComparison]::Ordinal)){4}elseif($raw.EndsWith("`n'@",[StringComparison]::Ordinal)){3}else{throw 'Invalid SM resource closer.'}
-                $start=$literal.Extent.StartOffset+$opening;$finish=$literal.Extent.EndOffset-$closing
-                if($finish -lt $start -or $raw.Substring($opening,$finish-$start) -cne $literal.Value){throw 'Resource payload differs from parser value.'}
-                Add-PscTreeUnit $Units 'Fragment' ('Layout/SM-'+$i+'.ps1part') $cursor $start
-                Add-PscTreeUnit $Units 'Resource' $name.Value $start $finish
-                $cursor=$finish;$i++
+            foreach($resource in Get-PscResourceUnits $node){
+                Add-PscTreeUnit $Units 'Fragment' ('Layout/SM-'+$i+'.ps1part') $cursor $resource.Start
+                $Units.Add($resource)
+                $cursor=$resource.End;$i++
             }
             Add-PscTreeUnit $Units 'Fragment' 'Layout/SM-close.ps1part' $cursor $limit
         } elseif($node -is [System.Management.Automation.Language.TypeDefinitionAst]){
@@ -966,7 +979,7 @@ $doc.Save()
 
 All paired replacements in a group are checked for overlapping extents and parsed together before updating the journal. Re-query after any change, undo or redo. Save refuses a changed on-disk file and uses a sibling temporary file; it is not a cross-process locking protocol. Document query requires a fully parsed source unit; incomplete fragments may instead be edited in an external editor and checked by Collate. The piece-table model is adapted from Notepad.ps1 at 17b76e2, not its cached find/replace UI logic. Dirty state compares content hashes, including after a new branch of edits.
 
-To reproduce development fixtures, first UnCollate and run `Tests/Test-Document.ps1`, `Tests/Test-Worktree.ps1` and `Tests/Test-Guard.ps1` in the projected tree, passing `-Compiler ./PSC.ps1`. `PscApi.Lint(paths)` or `-Mode Lint -LintObjects` returns typed findings with AST extents, diagnostic text, named authoring scope and a baseline identity. Guard compares occurrences of identities, not aggregate counts. Casing uses known local declarations and visible enclosing names; arbitrary dynamic scope and invoked scriptblocks remain unresolved, not proven bindings.
+To reproduce development fixtures, first UnCollate and run `Tests/Test-Document.ps1`, `Tests/Test-Worktree.ps1` and `Tests/Test-Guard.ps1` in the projected tree, passing `-Compiler ./PSC.ps1`. `PscApi.Lint(paths)` or `-Mode Lint -LintObjects` returns typed findings with AST extents, diagnostic text, named authoring scope and a baseline identity. Guard compares occurrences of identities, not aggregate counts. Embedded source resources are discovered from literal AST declarations and assessed independently by resource path; an existing finding cannot excuse a finding in another resource. Non-source resources are not linted. Casing uses known local declarations and visible enclosing names; arbitrary dynamic scope and invoked scriptblocks remain unresolved, not proven bindings.
 
 ## Development criteria
 
@@ -1315,7 +1328,7 @@ param([Parameter(Mandatory)][string]$Compiler)
 $ErrorActionPreference='Stop'
 $compiler=[IO.Path]::GetFullPath($Compiler)
 $root=[IO.Directory]::CreateDirectory([IO.Path]::Combine([IO.Path]::GetTempPath(),'psc-guard-review-'+[Guid]::NewGuid().ToString('N'))).FullName
-function Test-Case([string]$label,[string]$before,[string]$after,[bool]$expected) {
+function Test-Case([string]$label,[string]$before,[string]$after,[bool]$expected,[string]$reason='new finding') {
     [IO.File]::WriteAllText($base,$before)
     git -C $root add source.ps1
     if($LASTEXITCODE -ne 0){throw 'git add failed'}
@@ -1323,7 +1336,7 @@ function Test-Case([string]$label,[string]$before,[string]$after,[bool]$expected
     if($LASTEXITCODE -ne 0){throw 'git commit failed'}
     [IO.File]::WriteAllText($candidate,$after)
     $passed=$false
-    try{$result=$api.GuardCandidate($candidate,$base,'');$passed=$result.Passed}catch{if($_.Exception.Message -notmatch 'new finding'){throw}}
+    try{$result=$api.GuardCandidate($candidate,$base,'');$passed=$result.Passed}catch{if($expected -or !$_.Exception.Message.Contains($reason,[StringComparison]::Ordinal)){throw}}
     if($passed -ne $expected){throw "$label expected $expected actual $passed"}
     "PASS $label ($passed)"
 }
@@ -1344,6 +1357,28 @@ try {
     Test-Case 'new direct evaluation rejected' 'Write-Output $text' 'Invoke-Expression $text' $false
     Test-Case 'new certificate override rejected' 'Invoke-WebRequest -Uri $uri' 'Invoke-WebRequest -Uri $uri -SkipCertificateCheck' $false
     Test-Case 'new insecure formatter rejected' 'Write-Output 1' 'New-Object BinaryFormatter' $false
+    function New-ResourceFixture([string]$path,[string]$payload) {
+        return "function Get-PscEmbeddedSources {`n    [PscSourceResource]::new('$path', @'`n$payload`n'@)`n}"
+    }
+    $clean=New-ResourceFixture 'SM/One.sm1' 'Write-Output 1'
+    $finding=New-ResourceFixture 'SM/One.sm1' 'Invoke-Expression $text'
+    Test-Case 'embedded SM finding rejected' $clean $finding $false 'SM/One.sm1: DynamicCodeExecution: new finding'
+    Test-Case 'embedded existing finding retained' $finding ($finding.Replace('Invoke-Expression $text',"# shifted`nInvoke-Expression `$text")) $true
+    Test-Case 'embedded finding removed' $finding $clean $true
+    Test-Case 'embedded finding not transferable across paths' $finding ($finding.Replace('One.sm1','Two.sm1')) $false 'SM/Two.sm1: DynamicCodeExecution: new finding'
+    Test-Case 'embedded duplicate finding rejected' $finding ($finding.Replace('Invoke-Expression $text','Invoke-Expression $text; Invoke-Expression $text')) $false 'SM/One.sm1: DynamicCodeExecution: new finding'
+    foreach($extension in '.ps1','.psm1','.srm1','.sexe'){
+        $resourcePath='Tests/Resource'+$extension
+        Test-Case ('new source resource '+$extension) $clean (New-ResourceFixture $resourcePath 'Invoke-Expression $text') $false ($resourcePath+': DynamicCodeExecution: new finding')
+    }
+    Test-Case 'non-source resource inert' $clean (New-ResourceFixture 'SM/Notes.md' 'Invoke-Expression $text') $true
+    Test-Case 'embedded invalid syntax rejected' $clean (New-ResourceFixture 'SM/One.sm1' 'if (') $false 'Invalid source SM/One.sm1'
+    Test-Case 'embedded missing faculty type admitted' $clean (New-ResourceFixture 'SM/One.sm1' 'class ExternalUse { [ExternalFaculty] $Role }') $true
+    Test-Case 'resource holder removed rejected' $clean 'Write-Output 1' $false 'Embedded resource holder removed or emptied'
+    Test-Case 'resource expression rejected' $clean ($clean.Replace("@'`nWrite-Output 1`n'@",'$text')) $false 'Embedded resource coverage failed'
+    $duplicate=$clean.Insert($clean.LastIndexOf('}'),$clean.Substring($clean.IndexOf('[PscSourceResource]'),$clean.LastIndexOf('}')-$clean.IndexOf('[PscSourceResource]')))
+    Test-Case 'duplicate resource path rejected' $clean $duplicate $false 'Duplicate resource path'
+    Test-Case 'ambiguous holder rejected' $clean ($clean+"`n"+$clean) $false 'Ambiguous resource holder'
 }finally{[IO.Directory]::Delete($root,$true)}
 $root=[IO.Directory]::CreateDirectory([IO.Path]::Combine([IO.Path]::GetTempPath(),'psc-guard-scope-'+[Guid]::NewGuid().ToString('N'))).FullName
 try {
@@ -4578,8 +4613,33 @@ function Get-SmaChecker {
         @($node.Body.ParamBlock.Attributes | Where-Object { $_.TypeName.Name -eq [PscChecker].Name }).Count }, $true)
 }
 
+function Compare-SmaGuardFindings {
+    [PscChecker()]
+    param([SmaLintFinding[]]$before,[SmaLintFinding[]]$after,[Collections.Generic.List[string]]$reasons,[string]$resourcePath)
+    $prefix=if($resourcePath){$resourcePath+': '}else{''}
+    foreach ($rule in $after | Group-Object Rule) {
+        $was = @($before | Where-Object Rule -EQ $rule.Name)
+        $known = [Collections.Generic.Dictionary[string,int]]::new([StringComparer]::Ordinal)
+        foreach ($observation in $was) {
+            if (!$known.ContainsKey($observation.Identity)) { $known.Add($observation.Identity,0) }
+            $known[$observation.Identity]++
+        }
+        foreach ($observation in $rule.Group) {
+            if ($known.ContainsKey($observation.Identity) -and $known[$observation.Identity] -gt 0) { $known[$observation.Identity]--; continue }
+            $reasons.Add(($prefix+'{0}: new finding at line {1}: {2}' -f $rule.Name, $observation.Line, $observation.Detail))
+        }
+    }
+}
+function Get-SmaGuardResources {
+    [PscChecker()]
+    param([System.Management.Automation.Language.ScriptBlockAst]$ast)
+    $holders=@($ast.FindAll({$args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -ieq 'Get-PscEmbeddedSources'},$true))
+    if($holders.Count -gt 1){throw 'Ambiguous resource holder.'}
+    if($holders.Count -eq 1){Get-PscResourceUnits $holders[0]}
+}
 # Guard: one file against its committed version. The file fails on parse errors or a new lint finding identity,
 # including excess occurrences of an existing identity. A file with no version at HEAD is held to no findings.
+# Canonical embedded source units are assessed separately by path; inert resources are not treated as code.
 function Test-SmaGuard {
     [PscChecker()]
     param([string] $file, [string] $expectedHash)
@@ -4593,20 +4653,23 @@ function Test-SmaGuard {
     $committedText = $committedLines -join "`n"
     $before = @(if ($committed) { Get-SmaLint $file $committedText })
     $after = @(Get-SmaLint $file $text)
-    foreach ($rule in $after | Group-Object Rule) {
-        $was = @($before | Where-Object Rule -EQ $rule.Name)
-        $known = [Collections.Generic.Dictionary[string,int]]::new([StringComparer]::Ordinal)
-        foreach ($observation in $was) {
-            if (!$known.ContainsKey($observation.Identity)) { $known.Add($observation.Identity,0) }
-            $known[$observation.Identity]++
+    Compare-SmaGuardFindings $before $after $reasons ''
+    $committedAst=if($committed){[System.Management.Automation.Language.Parser]::ParseInput($committedText,[ref]$tokens,[ref]$committedErrors)}
+    try {
+        $beforeResources=@(if($committed){Get-SmaGuardResources $committedAst})
+        $afterResources=@(Get-SmaGuardResources $ast)
+        if($beforeResources.Count -and !$afterResources.Count){$reasons.Add('Embedded resource holder removed or emptied.')}
+        $priorResources=[Collections.Generic.Dictionary[string,PscTreeUnit]]::new([StringComparer]::Ordinal)
+        foreach($resource in $beforeResources){$priorResources.Add($resource.Path,$resource)}
+        foreach($resource in $afterResources){
+            if(![PscSourceFormat]::IsSource($resource.Path)){continue}
+            try{$null=Read-PscTreeAst $resource.Text $resource.Path -Resource}catch{$reasons.Add($_.Exception.Message);continue}
+            $priorFindings=@(if($priorResources.ContainsKey($resource.Path)){Get-SmaLint $resource.Path $priorResources[$resource.Path].Text})
+            $currentFindings=@(Get-SmaLint $resource.Path $resource.Text)
+            Compare-SmaGuardFindings $priorFindings $currentFindings $reasons $resource.Path
         }
-        foreach ($observation in $rule.Group) {
-            if ($known.ContainsKey($observation.Identity) -and $known[$observation.Identity] -gt 0) { $known[$observation.Identity]--; continue }
-            $reasons.Add(('{0}: new finding at line {1}: {2}' -f $rule.Name, $observation.Line, $observation.Detail))
-        }
-    }
+    } catch { $reasons.Add('Embedded resource coverage failed: '+$_.Exception.Message) }
     $changed = @(if ($committed) {
-        $committedAst = [System.Management.Automation.Language.Parser]::ParseInput($committedText, [ref]$tokens, [ref]$committedErrors)
         $now = @(Get-SmaChecker $ast)
         foreach ($function in Get-SmaChecker $committedAst) {
             $current = @($now | Where-Object Name -EQ $function.Name)
