@@ -2034,6 +2034,49 @@ try {
 }
 Test-RequiredConformanceScope $compiler
 '@)
+    [PscSourceResource]::new('Tests/Test-ScriptTypeReference.ps1', @'
+#requires -Version 7.7
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$Compiler)
+$ErrorActionPreference='Stop'
+$compilerPath=[IO.Path]::GetFullPath($Compiler)
+$work=[IO.Directory]::CreateTempSubdirectory('psc-sts-reference-').FullName
+try {
+    $path=Join-Path $work 'Contract.sm1'
+    [IO.File]::WriteAllLines($path,[string[]]@(
+        'class Peer {'
+        '    [Owner] $Owner'
+        '}'
+        'class Owner {'
+        '    [Owner] $Self'
+        '    [Peer[]] $Peers'
+        '    [Peer[,]] $Grid'
+        '    [System.Collections.Generic.List[Peer]] $List'
+        '    [Peer] Echo([Peer]$value){return $value}'
+        '    [int] Echo([int]$value){return $value}'
+        '    [Peer[]] Echo([Peer[]]$value){return $value}'
+        '}'
+    ))
+    $hostPath=[Environment]::ProcessPath
+    & $hostPath -NoProfile -File $compilerPath -Mode BuildFaculty -Faculty Vom -RuntimeDirectory $work | Out-Null
+    if($LASTEXITCODE -ne 0){throw 'Vom build failed'}
+    & $hostPath -NoProfile -File $compilerPath -Mode BuildFaculty -Faculty ScriptType -RuntimeDirectory $work -ContractPaths $path | Out-Null
+    if($LASTEXITCODE -ne 0){throw 'ScriptType build failed'}
+    [void][Reflection.Assembly]::LoadFrom((Join-Path $work 'Vom.dll'))
+    $a=[Reflection.Assembly]::LoadFrom((Join-Path $work 'ScriptType.dll'))
+    $owner=[ScriptTypeCatalog]::Find('Owner');$peer=[ScriptTypeCatalog]::Find('Peer')
+    $single=$owner.Find('Echo',[string[]]@('Peer'));$scalar=$owner.Find('Echo',[string[]]@('int'));$array=$owner.Find('Echo',[string[]]@('Peer[]'))
+    if(![object]::ReferenceEquals($owner.Find('Self').ResultReference.Definition,$owner) -or ![object]::ReferenceEquals($peer.Find('Owner').ResultReference.Definition,$owner)){throw 'Self or forward identity lost'}
+    if(![object]::ReferenceEquals($single.ResultReference.Definition,$peer) -or !$single.ResultReference.Same($single.ParameterReferences[0])){throw 'Peer signature lost'}
+    if(!$array.ResultReference.Same($array.ParameterReferences[0]) -or $array.ResultReference.Same($owner.Find('Grid').ResultReference)){throw 'Array identity or rank mismatch'}
+    if(![object]::ReferenceEquals($owner.FindReference('Echo',$single.ParameterReferences),$single) -or ![object]::ReferenceEquals($owner.FindReference('Echo',$scalar.ParameterReferences),$scalar) -or ![object]::ReferenceEquals($owner.FindReference('Echo',$array.ParameterReferences),$array)){throw 'Reference-based binding mismatch'}
+    if($single.ResultTypeIdentity -or $array.ResultTypeIdentity -or $scalar.ResultTypeIdentity -cne [int].AssemblyQualifiedName){throw 'Legacy mapping changed'}
+    $generic=$owner.Find('List').ResultReference
+    if($generic.Arguments.Length -ne 1 -or ![object]::ReferenceEquals($generic.Arguments[0].Definition,$peer) -or !$generic.Element.ClrIdentity -or $generic.ClrIdentity){throw 'Generic reference mismatch'}
+    if($null -ne $a.GetType('Owner') -or $null -ne $a.GetType('Peer') -or 'System.Management.Automation' -in $a.GetReferencedAssemblies().Name){throw 'Foreign realization dependency'}
+    'PASS emitted STS contract graph restores shared referents, signature binding, array rank and generic structure without realizing source types or referencing SMA'
+} finally { [IO.Directory]::Delete($work,$true) }
+'@)
     [PscSourceResource]::new('Tests/Test-Redundancy.ps1', @'
 #requires -Version 7.7
 [CmdletBinding()]
@@ -2079,6 +2122,27 @@ function Get-PscFacultyDeclarations {
 # Only descriptor types are realized in the authoring scope. Other faculties must not shadow imported CLR identities.
 # The semantic description and the executable generation are ordinary VOM objects.
 # No separate type registry, lookup cache, or invocation interpreter.
+enum ScriptTypeReferenceKind { Unresolved; Source; Clr; Array; Generic }
+# Semantic references retain the original definition, not a materialized CLR type.
+# ClrIdentity is a compatibility mapping; it is absent for source-owned references.
+class ScriptTypeReference {
+    [ScriptTypeReferenceKind] $Kind
+    [string] $Spelling
+    [ScriptTypeContract] $Definition
+    [string] $ClrIdentity
+    [ScriptTypeReference] $Element
+    [int] $Rank
+    [ScriptTypeReference[]] $Arguments
+    [bool] Same([ScriptTypeReference]$Other){
+        if($null -eq $Other -or $this.Kind -ne $Other.Kind){return $false}
+        if($this.Kind -eq [ScriptTypeReferenceKind]::Source){return $null -ne $this.Definition -and [object]::ReferenceEquals($this.Definition,$Other.Definition)}
+        if($this.Kind -eq [ScriptTypeReferenceKind]::Clr){return ![string]::IsNullOrEmpty($this.ClrIdentity) -and [string]::Equals($this.ClrIdentity,$Other.ClrIdentity,[StringComparison]::Ordinal)}
+        if($this.Kind -eq [ScriptTypeReferenceKind]::Array){return $this.Rank -eq $Other.Rank -and $null -ne $this.Element -and $this.Element.Same($Other.Element)}
+        if($this.Kind -ne [ScriptTypeReferenceKind]::Generic -or $null -eq $this.Element -or !$this.Element.Same($Other.Element) -or $this.Arguments.Length -ne $Other.Arguments.Length){return $false}
+        for([int]$i=0;$i -lt $this.Arguments.Length;$i++){if(!$this.Arguments[$i].Same($Other.Arguments[$i])){return $false}}
+        return $true
+    }
+}
 class ScriptTypeMember {
     [string] $Name
     [bool] $Operation
@@ -2088,6 +2152,8 @@ class ScriptTypeMember {
     [string[]] $ParameterNames
     [string[]] $ParameterTypeIdentities
     [string] $ResultTypeIdentity
+    [ScriptTypeReference] $ResultReference
+    [ScriptTypeReference[]] $ParameterReferences
     [string] $Declaration
     [bool] $Static
     [bool] $Hidden
@@ -2104,6 +2170,7 @@ class ScriptTypeContract {
     [ScriptTypeMember[]] $Members
     [string[]] $BaseTypes
     [ScriptTypeContract[]] $BaseContracts
+    [ScriptTypeReference[]] $BaseReferences
     [ScriptTypeMember] Find([string]$Name){
         [ScriptTypeMember]$result=$null
         foreach($member in $this.Members){
@@ -2114,7 +2181,19 @@ class ScriptTypeContract {
         }
         return $result
     }
-    # Typed queries use normalized assembly-qualified signatures, not source
+    [ScriptTypeMember] FindReference([string]$Name,[ScriptTypeReference[]]$Parameters){
+        [ScriptTypeMember]$result=$null
+        foreach($member in $this.Members){
+            if(![string]::Equals($member.Name,$Name,[StringComparison]::OrdinalIgnoreCase) -or !$member.Operation -or $member.Constructor -or $member.Static -or $null -eq $member.ParameterReferences -or $member.ParameterReferences.Length -ne $Parameters.Length){continue}
+            [bool]$same=$true
+            for([int]$i=0;$i -lt $Parameters.Length;$i++){if(!$member.ParameterReferences[$i].Same($Parameters[$i])){$same=$false;break}}
+            if($same){if($null -ne $result){return $null};$result=$member}
+        }
+        if($null -ne $result){return $result}
+        if($null -ne $this.BaseContracts -and $this.BaseContracts.Length -eq 1){return $this.BaseContracts[0].FindReference($Name,$Parameters)}
+        return $null
+    }
+    # CLR compatibility queries use normalized assembly-qualified signatures, not source
     # spelling. Publication still owns runtime identity through VOM handles.
     [ScriptTypeMember] FindResolved([string]$Name,[type[]]$Parameters){
         [ScriptTypeMember]$result=$null
@@ -4370,20 +4449,34 @@ class PscElfImageReader {
 }
 
 # Authoring-time metadata extraction; compiled runtime receives the resulting typed graph.
-function Get-ScriptTypeIdentity {
-    param([System.Management.Automation.Language.ITypeName]$Name,[Collections.Generic.HashSet[string]]$SourceNames,[type]$DefaultType)
-    if($null -eq $Name){return $DefaultType.AssemblyQualifiedName}
-    # A source declaration is not an external CLR identity. Preserve its
-    # spelling in the descriptor and leave runtime identity unqualified.
-    if($SourceNames.Contains($Name.FullName)){return ''}
+function Get-ScriptTypeReference {
+    [OutputType([ScriptTypeReference])]
+    param([System.Management.Automation.Language.ITypeName]$Name,[Collections.Generic.Dictionary[string,ScriptTypeContract]]$Catalog,[type]$DefaultType)
+    $reference=[ScriptTypeReference]::new();$reference.Arguments=[ScriptTypeReference[]]::new(0)
+    if($null -eq $Name){$reference.Kind=[ScriptTypeReferenceKind]::Clr;$reference.Spelling=$DefaultType.FullName;$reference.ClrIdentity=$DefaultType.AssemblyQualifiedName;return $reference}
+    $reference.Spelling=$Name.FullName
+    # Source identity takes precedence over imported runtime types.
+    if(!$Name.AssemblyName -and $Catalog.ContainsKey($Name.FullName)){$reference.Kind=[ScriptTypeReferenceKind]::Source;$reference.Definition=$Catalog[$Name.FullName];return $reference}
     if($Name -is [System.Management.Automation.Language.ArrayTypeName]){
-        if(!(Get-ScriptTypeIdentity $Name.ElementType $SourceNames ([object]))){return ''}
+        $reference.Kind=[ScriptTypeReferenceKind]::Array;$reference.Rank=$Name.Rank
+        $reference.Element=Get-ScriptTypeReference $Name.ElementType $Catalog ([object])
+        if(!$reference.Element.ClrIdentity){return $reference}
     }elseif($Name -is [System.Management.Automation.Language.GenericTypeName]){
-        foreach($arg in $Name.GenericArguments){if(!(Get-ScriptTypeIdentity $arg $SourceNames ([object]))){return ''}}
+        $reference.Kind=[ScriptTypeReferenceKind]::Generic
+        $reference.Element=Get-ScriptTypeReference $Name.TypeName $Catalog ([object])
+        $reference.Arguments=@(foreach($argument in $Name.GenericArguments){Get-ScriptTypeReference $argument $Catalog ([object])})
+        if($reference.Element.Kind -eq [ScriptTypeReferenceKind]::Source){return $reference}
+        foreach($argument in $reference.Arguments){if(!$argument.ClrIdentity){return $reference}}
     }
     $resolved=$Name.GetReflectionType()
-    if($null -eq $resolved){return ''}
-    return $resolved.AssemblyQualifiedName
+    if($null -ne $resolved){
+        $reference.ClrIdentity=$resolved.AssemblyQualifiedName
+        if($reference.Kind -eq [ScriptTypeReferenceKind]::Generic -and $resolved.IsGenericType){
+            $reference.Element.Kind=[ScriptTypeReferenceKind]::Clr;$reference.Element.ClrIdentity=$resolved.GetGenericTypeDefinition().AssemblyQualifiedName
+        }
+        if($reference.Kind -eq [ScriptTypeReferenceKind]::Unresolved){$reference.Kind=[ScriptTypeReferenceKind]::Clr}
+    }
+    return $reference
 }
 function Get-ScriptTypeContract {
     param([string[]]$Paths)
@@ -4394,9 +4487,12 @@ function Get-ScriptTypeContract {
         if($errors.Count){throw "Invalid source: $path"}
         foreach($definition in $root.EndBlock.Statements){if($definition -is [System.Management.Automation.Language.TypeDefinitionAst] -and $definition.IsClass){$definitions.Add($definition)}}
     }
-    $names=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach($shape in $definitions){if(!$names.Add($shape.Name)){throw "Duplicate declaration: $($shape.Name)"}}
     $catalog=[Collections.Generic.Dictionary[string,ScriptTypeContract]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach($shape in $definitions){
+        if($catalog.ContainsKey($shape.Name)){throw "Duplicate declaration: $($shape.Name)"}
+        $description=[ScriptTypeContract]::new();$description.Name=$shape.Name;$description.Source=$shape.Extent.Text
+        $catalog.Add($shape.Name,$description)
+    }
     foreach($shape in $definitions){
         $required=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         foreach($owner in $definitions){foreach($method in $owner.Members){
@@ -4409,19 +4505,21 @@ function Get-ScriptTypeContract {
                 }
             }
         }}
-        $description=[ScriptTypeContract]::new();$description.Name=$shape.Name;$description.Source=$shape.Extent.Text;$description.BaseTypes=@($shape.BaseTypes|ForEach-Object {$_.TypeName.FullName})
+        $description=$catalog[$shape.Name];$description.BaseTypes=@($shape.BaseTypes|ForEach-Object {$_.TypeName.FullName})
+        $description.BaseReferences=@(foreach($baseType in $shape.BaseTypes){Get-ScriptTypeReference $baseType.TypeName $catalog ([object])})
         $description.Members=@(foreach($member in $shape.Members){
             $item=[ScriptTypeMember]::new();$item.Name=$member.Name;$item.Required=$required.Contains($item.Name);$item.Declaration=$member.Extent.Text;$item.Static=$member.IsStatic;$item.Hidden=$member.IsHidden
             if($member -is [System.Management.Automation.Language.FunctionMemberAst]){
                 $item.Operation=$true;$item.Constructor=$member.IsConstructor;$item.ResultType=if($member.ReturnType){$member.ReturnType.TypeName.FullName}else{'void'}
                 $item.ParameterTypes=@(foreach($parameter in $member.Parameters){$tc=$parameter.Attributes|Where-Object {$_ -is [System.Management.Automation.Language.TypeConstraintAst]}|Select-Object -First 1;if($tc){$tc.TypeName.FullName}else{'object'}})
                 $item.ParameterNames=@($member.Parameters|ForEach-Object {$_.Name.VariablePath.UserPath})
-                $item.ResultTypeIdentity=Get-ScriptTypeIdentity $member.ReturnType.TypeName $names ([void])
-                $item.ParameterTypeIdentities=@(foreach($parameter in $member.Parameters){$tc=$parameter.Attributes|Where-Object {$_ -is [System.Management.Automation.Language.TypeConstraintAst]}|Select-Object -First 1;Get-ScriptTypeIdentity $tc.TypeName $names ([object])})
-            }else{$item.ResultType=if($member.PropertyType){$member.PropertyType.TypeName.FullName}else{'object'};$item.ParameterTypes=@();$item.ParameterNames=@();$item.ParameterTypeIdentities=@();$item.ResultTypeIdentity=Get-ScriptTypeIdentity $member.PropertyType.TypeName $names ([object])}
+                $item.ResultReference=Get-ScriptTypeReference $member.ReturnType.TypeName $catalog ([void])
+                $item.ParameterReferences=@(foreach($parameter in $member.Parameters){$tc=$parameter.Attributes|Where-Object {$_ -is [System.Management.Automation.Language.TypeConstraintAst]}|Select-Object -First 1;Get-ScriptTypeReference $tc.TypeName $catalog ([object])})
+                $item.ResultTypeIdentity=$item.ResultReference.ClrIdentity
+                $item.ParameterTypeIdentities=@(foreach($reference in $item.ParameterReferences){$reference.ClrIdentity})
+            }else{$item.ResultType=if($member.PropertyType){$member.PropertyType.TypeName.FullName}else{'object'};$item.ParameterTypes=@();$item.ParameterNames=@();$item.ParameterTypeIdentities=@();$item.ResultReference=Get-ScriptTypeReference $member.PropertyType.TypeName $catalog ([object]);$item.ResultTypeIdentity=$item.ResultReference.ClrIdentity;$item.ParameterReferences=[ScriptTypeReference[]]::new(0)}
             $item
         })
-        $catalog.Add($description.Name,$description)
     }
     foreach($shape in $definitions){
         $description=$catalog[$shape.Name]
@@ -4446,7 +4544,7 @@ class PscFacultyUnit {
 function Get-PscFacultyUnits {
     [PscFacultyUnit]::new('Vom','Vom',@('VomState','VomRetention','VomCell','VomInfo','VomLease','VomPairLease','Vom','VomFence'),@())
     [PscFacultyUnit]::new('InquiryPrimitives','InquiryCase',@('InquirySourceCleanReference','InquiryAxis','InquiryPredictiveScalar','InquiryOrigin','InquiryBlock','InquiryReading','InquiryCase','InquirySemanticAttachment','InquiryExecutionTier','InquiryReliance','InquiryWhenClause','InquiryJudgment'),@())
-    [PscFacultyUnit]::new('ScriptType','ScriptTypeReflection',@('ScriptTypeMember','ScriptTypeContract','ScriptTypeCall','ScriptTypeSelectionMemo','ScriptTypeBindingExtension','ScriptTypeSmaSelector','ScriptTypeRealization','ScriptTypeRole','ScriptTypeReflection','ScriptTypeCatalog'),@('Vom'))
+    [PscFacultyUnit]::new('ScriptType','ScriptTypeReflection',@('ScriptTypeReferenceKind','ScriptTypeReference','ScriptTypeMember','ScriptTypeContract','ScriptTypeCall','ScriptTypeSelectionMemo','ScriptTypeBindingExtension','ScriptTypeSmaSelector','ScriptTypeRealization','ScriptTypeRole','ScriptTypeReflection','ScriptTypeCatalog'),@('Vom'))
     [PscFacultyUnit]::new('PrimitiveConversion','ScriptTypePrimitiveConversion',@('ScriptTypePrimitiveConversion'),@('Vom','ScriptType'))
     [PscFacultyUnit]::new('ObjectDispatch','ScriptTypeObjectDispatch',@('ScriptTypeObjectDispatch'),@('Vom','InquiryPrimitives','ScriptType'))
     [PscFacultyUnit]::new('NativeEncoding','PscNativeEncoding',@('PscNativeInstruction','PscNativeEncoding','HexagonForm','HexagonFields','HexagonDecoded','HexagonPatternEncoder'),@())
@@ -14473,7 +14571,7 @@ class PscApi {
         $objectives.Add([PscRoadmapObjective]::new('F4',[PscRoadmapState]::Existing,@('F0','F3'),'Structural editing: replacement exists; add insertion, deletion, rename, move and dependency-aware validation, atomic grouped undo/redo and stale-reference refusal. No textual parser or competing authority.',@('PscDocument','PscDocumentEdit'),@(),@('Tests/Test-Document.ps1','Tests/Test-Worktree.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('F5',[PscRoadmapState]::Planned,@('F1','F4'),'Canonical script, ordered tree and artifacts: deterministic realization and independently tested exact source, semantic identity and target realization recovery when requested. Explicit retention policy; development information must not impose execution dependencies. Keep compiled faculties optional.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('F6',[PscRoadmapState]::Planned,@('F0','F2','F4','R1','H1'),'Persistent PscHost, accepted/candidate workspaces, typed operations and PSRP; concurrent sessions, revision leases, restart recovery and constrained write admission. Agents use this same API; no second compiler or string-based control plane.',@(),@(),@()))
-        $objectives.Add([PscRoadmapObjective]::new('L1',[PscRoadmapState]::Existing,@('F1'),'First-class PSC-owned STS and CTS definitions, references, signatures, constraints and compatibility relations; reconcile ScriptType with compiler declarations before extending value/generic types, interfaces, properties, events, visibility and namespaces. Use SMA-visible forms; prove supported definitions independent of runtime materialization.',@('PscAstRebuild','Export-LoweredAssembly','Get-ScriptTypeContract'),@('ScriptType'),@('SM/Test-Formats.ps1')))
+        $objectives.Add([PscRoadmapObjective]::new('L1',[PscRoadmapState]::Existing,@('F1'),'First-class PSC-owned STS and CTS definitions, references, signatures, constraints and compatibility relations; reconcile ScriptType with compiler declarations before extending value/generic types, interfaces, properties, events, visibility and namespaces. Use SMA-visible forms; prove supported definitions independent of runtime materialization.',@('PscAstRebuild','Export-LoweredAssembly','Get-ScriptTypeContract','Get-ScriptTypeReference','ScriptTypeReference'),@('ScriptType'),@('SM/Test-Formats.ps1','Tests/Test-ScriptTypeReference.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('L2',[PscRoadmapState]::Planned,@('L1'),'Explicit program semantics profiles; independent typed binding, structural compatibility, inference and conversion; consolidate duplicate binders. Test declared differences from SMA and CTS, null/overflow/conversion/exception semantics, ambiguity and target parity without requiring runtime materialization.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('L3',[PscRoadmapState]::Planned,@('F2','L1','L2'),'Managed CLI realization from bound definitions; close compiler refusals using complete pinned application sources, non-loading metadata and executable repros; no stubs counted as completion. Deterministic PE, entry points, callbacks, static graphs, reachability, dependencies, independent execution and CTS interoperability.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('I1',[PscRoadmapState]::Planned,@('F2','F3'),'Inventory donor declarations and contracts, hashes, dependencies, licenses, historical revisions and evidence; reconcile duplicate mechanisms and admit typed source into PSC only.',@(),@(),@()))
@@ -15251,6 +15349,21 @@ function ConvertTo-StaticDataExpression {
     if ($null -ne $Graph) {
         $instance = Get-PscStaticInstance $Graph $Value $Type
         if ($null -ne $instance) { return $instance }
+    }
+    if ($Type.IsEnum) {
+        $sourceType=$Value.GetType()
+        $storage=[Enum]::GetUnderlyingType($Type)
+        if (!$sourceType.IsEnum -or [Enum]::GetUnderlyingType($sourceType) -ne $storage) { throw "Static data enum type mismatch: expected $Type, received $sourceType." }
+        if ($sourceType -ne $Type) {
+            if ($null -eq $Graph -or $sourceType.Name -cne $Type.Name -or $Graph.Mirror[$Type.Name] -ne $Type) { throw "Static data enum has no source mapping: $sourceType to $Type." }
+            $sourceNames=[Enum]::GetNames($sourceType);$targetNames=[Enum]::GetNames($Type)
+            if ($sourceNames.Length -ne $targetNames.Length) { throw 'Static data enum declarations differ.' }
+            foreach($literal in $sourceNames){
+                if ($literal -cnotin $targetNames -or [Convert]::ChangeType([Enum]::Parse($sourceType,$literal),$storage) -ne [Convert]::ChangeType([Enum]::Parse($Type,$literal),$storage)) { throw 'Static data enum declarations differ.' }
+            }
+        }
+        $raw=[Convert]::ChangeType($Value,$storage,[Globalization.CultureInfo]::InvariantCulture)
+        return [Linq.Expressions.Expression]::Convert([Linq.Expressions.Expression]::Constant($raw,$storage),$Type)
     }
     $underlying = [Nullable]::GetUnderlyingType($Type)
     if ($null -ne $underlying) { return [Linq.Expressions.Expression]::Convert((ConvertTo-StaticDataExpression $Value $underlying $Graph), $Type) }
