@@ -2156,6 +2156,45 @@ try {
     try{$null=Get-PscFacultyDeclarations -CompilerClassAsts $classes -MaterializedTypes $types}catch{$refused=$true}
     if(!$refused){throw 'Incomplete source mapping admitted'}
     'PASS STS source reference mapping, original declaration identity, composite signatures, scope isolation and missing mapping refusal'
+    $scopeSource=@"
+class RetainedEmpty {}
+class RetainedPeer {
+    [RetainedPeer[]] `$Peers
+    RetainedPeer(){}
+    static [RetainedPeer] Identity([RetainedPeer]`$value){return `$value}
+}
+function Copy-Peer { [OutputType([RetainedPeer])] param([RetainedPeer]`$value); return `$value }
+"@
+    $scope=[System.Management.Automation.Language.Parser]::ParseInput($scopeSource,[ref]$tokens,[ref]$errors)
+    if($errors.Count){throw 'Retained graph fixture parse failed'}
+    $functionClass=Get-ScriptFunctionClass -Root $scope
+    $functionRoot=$functionClass;while($functionRoot.Parent){$functionRoot=$functionRoot.Parent}
+    $sourceClasses=[System.Management.Automation.Language.TypeDefinitionAst[]]@($scope.EndBlock.Statements | Where-Object {$_ -is [System.Management.Automation.Language.TypeDefinitionAst]})
+    $before=$script:LoweringClassTypes
+    $mirror=Get-ClassMirror -Root $scope
+    if(![object]::ReferenceEquals($before,$script:LoweringClassTypes) -or ![object]::ReferenceEquals($mirror,(Get-ClassMirror -Root $scope)) -or ![object]::ReferenceEquals($mirror.Types,(Get-ClassMirrorType -Root $scope))){throw 'Mirror reuse or lowering restoration failed'}
+    if($mirror.Contracts.Count -ne 2 -or $mirror.Signatures.Count -ne 3 -or $mirror.Contracts[$sourceClasses[0]].Members.Length -ne 0){throw 'Incomplete retained declaration inventory'}
+    $peerAst=$sourceClasses[1];$peerContract=$mirror.Contracts[$peerAst]
+    $method=$mirror.Signatures[$peerAst.Members[2]];$field=$mirror.Signatures[$peerAst.Members[0]]
+    if(![object]::ReferenceEquals($method.Owner,$peerContract) -or ![object]::ReferenceEquals($method.Member,$peerContract.Members[2]) -or ![object]::ReferenceEquals($field.Member.ResultReference.Element.Definition,$peerContract)){throw 'Mirror detached original semantic members'}
+    if(![object]::ReferenceEquals($peerContract.FindReference('Identity',$method.Member.ParameterReferences,$true,$false),$method.Member)){throw 'Cached exact reference binding failed'}
+    Use-ClassMirror -Ast $scope
+    $dependent=Get-ClassMirror -Root $functionRoot -Resolving $mirror
+    $functionSignature=$dependent.Signatures[$functionClass.Members[0]]
+    if(![object]::ReferenceEquals($functionSignature.Member.ParameterReferences[0].Definition,$peerContract) -or $functionSignature.Parameters[0] -ne $mirror.Types['RetainedPeer'] -or ![object]::ReferenceEquals($dependent.Resolving,$mirror)){throw 'Synthetic function signature did not retain source identity'}
+    $other=[System.Management.Automation.Language.Parser]::ParseInput($scopeSource,[ref]$tokens,[ref]$errors)
+    $otherMirror=Get-ClassMirror -Root $other
+    $otherPeer=@($otherMirror.Contracts.Values|Where-Object Name -ceq 'RetainedPeer')[0]
+    if([object]::ReferenceEquals($peerContract,$otherPeer) -or $mirror.Types['RetainedPeer'] -eq $otherMirror.Types['RetainedPeer']){throw 'Distinct parsed scopes merged'}
+    $rebuilt=Get-ClassMirror -Root $scope -SelectedClassAst $sourceClasses
+    Use-ClassMirror -Ast $scope
+    $nextDependent=Get-ClassMirror -Root $functionRoot -Resolving $rebuilt
+    $nextFunction=$nextDependent.Signatures[$functionClass.Members[0]]
+    if([object]::ReferenceEquals($mirror,$rebuilt) -or [object]::ReferenceEquals($dependent,$nextDependent) -or ![object]::ReferenceEquals($nextFunction.Member.ParameterReferences[0].Definition,$rebuilt.Contracts[$peerAst]) -or $nextFunction.Parameters[0] -ne $rebuilt.Types['RetainedPeer'] -or ![object]::ReferenceEquals($functionSignature.Member.ParameterReferences[0].Definition,$peerContract)){throw 'Dependent mirror revision or retained historical witness failed'}
+    $empty=[System.Management.Automation.Language.Parser]::ParseInput('enum MirrorOnly { One }',[ref]$tokens,[ref]$errors)
+    $emptyMirror=Get-ClassMirror -Root $empty
+    if($emptyMirror.Contracts.Count -ne 0 -or $emptyMirror.Signatures.Count -ne 0 -or !$emptyMirror.Types['MirrorOnly'].IsEnum){throw 'Enum-only mirror inventory failed'}
+    'PASS cached STS graph, empty class, exact member identity, dependent function scope, independent roots and revision invalidation'
     $output=Join-Path $work 'Signature.dll'
     & ([Environment]::ProcessPath) -NoProfile -File $compilerPath -Mode Compile -SourcePath $path -ClassName SignatureOwner -OutputPath $output | Out-Null
     if($LASTEXITCODE -ne 0){throw 'Signature compilation failed'}
@@ -2270,14 +2309,17 @@ try{
 }
 
 # PSC-owned source faculties. The holder provides real parser-visible declarations, not executable text.
-# CLR signature adapter output; semantic references remain in the STS authoring scope.
-class PscMaterializedSignature {
-    [System.Management.Automation.Language.MemberAst] $Declaration
-    [type] $Result
-    [type[]] $Parameters
+# A root owns one mirror and its retained semantic declarations. The faculty
+# authoring scope supplies the closed generic dictionaries; their collection
+# interface crosses this boundary without loading or shadowing faculty types.
+class PscClassMirror {
+    [hashtable] $Types = @{}
+    [System.Collections.IDictionary] $Contracts
+    [System.Collections.IDictionary] $Signatures
+    [PscClassMirror] $Resolving
 }
 function Get-PscFacultyDeclarations {
-    param([string[]]$ContractPaths,[System.Management.Automation.Language.TypeDefinitionAst[]]$CompilerClassAsts,[hashtable]$MaterializedTypes,[type[][]]$SelectionSignatures,[type[]]$SelectionSources)
+    param([string[]]$ContractPaths,[System.Management.Automation.Language.TypeDefinitionAst[]]$CompilerClassAsts,[hashtable]$MaterializedTypes,[type[][]]$SelectionSignatures,[type[]]$SelectionSources,[PscClassMirror]$Mirror)
 
 # Only descriptor types are realized in the authoring scope. Other faculties must not shadow imported CLR identities.
 # The semantic description and the executable generation are ordinary VOM objects.
@@ -2408,6 +2450,15 @@ class ScriptTypeContract {
         }
         return $result
     }
+}
+# Keep the original AST witness, its STS owner/member and the compatibility
+# signature together. These are authoring records, not additional runtime types.
+class PscMaterializedSignature {
+    [System.Management.Automation.Language.MemberAst] $Declaration
+    [ScriptTypeContract] $Owner
+    [ScriptTypeMember] $Member
+    [type] $Result
+    [type[]] $Parameters
 }
 # Each published call references the original source member and a lowered thunk.
 
@@ -4653,7 +4704,7 @@ function Get-ScriptTypeReference {
     return $reference
 }
 function Get-ScriptTypeContract {
-    param([string[]]$Paths,[System.Management.Automation.Language.TypeDefinitionAst[]]$DefinitionAsts,[switch]$SignaturesOnly)
+    param([string[]]$Paths,[System.Management.Automation.Language.TypeDefinitionAst[]]$DefinitionAsts,[switch]$SignaturesOnly,[ScriptTypeContract[]]$ImportedContracts)
     $definitions=[Collections.Generic.List[System.Management.Automation.Language.TypeDefinitionAst]]::new()
     if($null -ne $DefinitionAsts -and $DefinitionAsts.Length){$definitions.AddRange($DefinitionAsts)}
     foreach($path in $Paths){
@@ -4668,6 +4719,9 @@ function Get-ScriptTypeContract {
         $description=[ScriptTypeContract]::new();$description.Name=$shape.Name;$description.Source=$shape.Extent.Text
         $catalog.Add($shape.Name,$description)
     }
+    # Imported definitions are the original retained objects, not copies. Local
+    # declarations take precedence in the same way as the mirror's type mapping.
+    foreach($imported in $ImportedContracts){$null=$catalog.TryAdd($imported.Name,$imported)}
     foreach($shape in $definitions){
         $required=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         if(!$SignaturesOnly){foreach($owner in $definitions){foreach($method in $owner.Members){
@@ -4729,20 +4783,28 @@ function Get-ScriptTypeContract {
         return Resolve-AstType $Witness
     }
     if($null -ne $SelectionSignatures){return Get-PscOtherFacultyDeclarations -SelectionSignatures $SelectionSignatures -SelectionSources $SelectionSources}
-    if($null -ne $CompilerClassAsts -and $CompilerClassAsts.Length){
+    if($null -ne $Mirror -or ($null -ne $CompilerClassAsts -and $CompilerClassAsts.Length)){
         if($null -ne $ContractPaths -and $ContractPaths.Length -or $null -eq $MaterializedTypes){throw 'Compiler signature realization requires one selected source scope'}
-        $contracts=@(Get-ScriptTypeContract -DefinitionAsts $CompilerClassAsts -SignaturesOnly)
+        $retainedContracts=[Collections.Generic.Dictionary[System.Management.Automation.Language.TypeDefinitionAst,ScriptTypeContract]]::new()
+        $retainedSignatures=[Collections.Generic.Dictionary[System.Management.Automation.Language.MemberAst,PscMaterializedSignature]]::new()
+        $imported=[ScriptTypeContract[]]@()
         $types=[Collections.Generic.Dictionary[ScriptTypeContract,type]]::new()
+        if($null -ne $Mirror -and $null -ne $Mirror.Resolving){
+            $imported=[ScriptTypeContract[]]@($Mirror.Resolving.Contracts.Values)
+            foreach($contract in $imported){$types.Add($contract,$Mirror.Resolving.Types[$contract.Name])}
+        }
+        $contracts=@(Get-ScriptTypeContract -DefinitionAsts $CompilerClassAsts -SignaturesOnly -ImportedContracts $imported)
         foreach($contract in $contracts){
             if(!$MaterializedTypes.ContainsKey($contract.Name)){throw 'Missing selected CLR type builder'}
             $types.Add($contract,$MaterializedTypes[$contract.Name])
         }
         for($ownerIndex=0;$ownerIndex -lt $CompilerClassAsts.Length;$ownerIndex++){
             $owner=$CompilerClassAsts[$ownerIndex];$contract=$contracts[$ownerIndex]
+            $retainedContracts.Add($owner,$contract)
             if($owner.Members.Count -ne $contract.Members.Length){throw 'STS member inventory differs from source'}
             for($memberIndex=0;$memberIndex -lt $owner.Members.Count;$memberIndex++){
                 $member=$owner.Members[$memberIndex];$descriptor=$contract.Members[$memberIndex]
-                $signature=[PscMaterializedSignature]::new();$signature.Declaration=$member
+                $signature=[PscMaterializedSignature]::new();$signature.Declaration=$member;$signature.Owner=$contract;$signature.Member=$descriptor
                 if($member -is [System.Management.Automation.Language.FunctionMemberAst]){
                     $signature.Result=ConvertTo-PscMaterializedSignatureType $descriptor.ResultReference $(if($member.ReturnType){$member.ReturnType.TypeName}) $types ([void])
                     $isFunction=Test-ScriptFunctionMember $member
@@ -4755,9 +4817,11 @@ function Get-ScriptTypeContract {
                     $signature.Result=ConvertTo-PscMaterializedSignatureType $descriptor.ResultReference $(if($member.PropertyType){$member.PropertyType.TypeName}) $types ([object])
                     $signature.Parameters=[type[]]::new(0)
                 }
+                $retainedSignatures.Add($member,$signature)
                 $signature
             }
         }
+        if($null -ne $Mirror){$Mirror.Contracts=$retainedContracts;$Mirror.Signatures=$retainedSignatures}
     }elseif ($ContractPaths.Count) { Get-ScriptTypeContract -Paths $ContractPaths }
 }
 
@@ -8020,8 +8084,14 @@ function New-ClassMirror {
         maps each mirror member to the output assembly's member.
         Registers the mirror types for Resolve-AstType.
     #>
-    param([Parameter(Mandatory)][object[]] $Model, [System.Management.Automation.Language.TypeDefinitionAst[]] $Enums = @())
+    [OutputType([PscClassMirror])]
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]] $Model, [System.Management.Automation.Language.TypeDefinitionAst[]] $Enums = @(),[PscClassMirror]$Resolving)
 
+    $mirror=[PscClassMirror]::new();$mirror.Resolving=$Resolving
+    if(!$Model.Count -and !$Enums.Count){
+        $null=Get-PscFacultyDeclarations -CompilerClassAsts @() -MaterializedTypes $script:LoweringClassTypes -Mirror $mirror
+        return $mirror
+    }
     $name = [Reflection.AssemblyName]::new("PSLoweringMirror$([Guid]::NewGuid().ToString('N'))")
     $assembly = [Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly($name, [Reflection.Emit.AssemblyBuilderAccess]::RunAndCollect)
     $module = $assembly.DefineDynamicModule($name.Name)
@@ -8044,12 +8114,8 @@ function New-ClassMirror {
     # Extract the selected definitions from the live AST once. The existing
     # materializer consumes STS signature references rather than rediscovering
     # source-owned types from member syntax.
-    $signatures=[Collections.Generic.Dictionary[System.Management.Automation.Language.MemberAst,PscMaterializedSignature]]::new()
-    if($Model.Count){
-        foreach($signature in (Get-PscFacultyDeclarations -CompilerClassAsts @($Model.Ast) -MaterializedTypes $script:LoweringClassTypes)){
-            $signatures.Add($signature.Declaration,$signature)
-        }
-    }
+    $null=Get-PscFacultyDeclarations -CompilerClassAsts @(foreach($c in $Model){$c.Ast}) -MaterializedTypes $script:LoweringClassTypes -Mirror $mirror
+    $signatures=$mirror.Signatures
     function Write-ThrowBody([Reflection.Emit.ILGenerator] $IL) {
         $IL.Emit([Reflection.Emit.OpCodes]::Newobj, $notSupported)
         $IL.Emit([Reflection.Emit.OpCodes]::Throw)
@@ -8092,10 +8158,9 @@ function New-ClassMirror {
     foreach ($c in $Model) {
         $script:LoweringClassTypes[$c.Name] = $builders[$c.Name].CreateType()
     }
-    $types = [ordered]@{}
-    foreach ($enumAst in $Enums) { $types[$enumAst.Name] = $script:LoweringClassTypes[$enumAst.Name] }
-    foreach ($c in $Model) { $types[$c.Name] = $script:LoweringClassTypes[$c.Name] }
-    $types
+    foreach ($enumAst in $Enums) { $mirror.Types[$enumAst.Name] = $script:LoweringClassTypes[$enumAst.Name] }
+    foreach ($c in $Model) { $mirror.Types[$c.Name] = $script:LoweringClassTypes[$c.Name] }
+    $mirror
 }
 
 # An enum's underlying type: its declared base, or Int32.
@@ -8115,7 +8180,7 @@ function Get-EnumLiterals([System.Management.Automation.Language.TypeDefinitionA
     }
 }
 
-$script:ClassMirrorCache = [System.Runtime.CompilerServices.ConditionalWeakTable[object, hashtable]]::new()
+$script:ClassMirrorCache = [System.Runtime.CompilerServices.ConditionalWeakTable[System.Management.Automation.Language.ScriptBlockAst,PscClassMirror]]::new()
 
 function Use-ClassMirror {
     <#
@@ -8129,44 +8194,55 @@ function Use-ClassMirror {
     # A source's function class resolves the source's own types; the source resolves its function class.
     $source = $null
     if ($script:ScriptFunctionSources.TryGetValue($root, [ref]$source)) {
-        $sourceTypes = Get-ClassMirrorType -Root $source
-        $script:LoweringClassTypes = @{} + $sourceTypes + (Get-ClassMirrorType -Root $root -Resolving $sourceTypes)
+        $sourceMirror = Get-ClassMirror -Root $source
+        $functionMirror = Get-ClassMirror -Root $root -Resolving $sourceMirror
+        $script:LoweringClassTypes = @{} + $sourceMirror.Types + $functionMirror.Types
         return
     }
-    $types = Get-ClassMirrorType -Root $root
+    $sourceMirror = Get-ClassMirror -Root $root
+    $types = $sourceMirror.Types
     $functionClass = $null
     if ($script:ScriptFunctionClasses.TryGetValue($root, [ref]$functionClass) -and $null -ne $functionClass) {
         $functionRoot = $functionClass; while ($functionRoot.Parent) { $functionRoot = $functionRoot.Parent }
-        $types = $types + (Get-ClassMirrorType -Root $functionRoot -Resolving $types)
+        $functionMirror=Get-ClassMirror -Root $functionRoot -Resolving $sourceMirror
+        $types = $types + $functionMirror.Types
     }
     $script:LoweringClassTypes = @{} + $types
 }
 
-# The mirror types of the classes and enums under one root, built once per root; -Resolving names types its
-# signatures may use from elsewhere. Building one leaves the lowering in progress resolving what it was resolving.
-function Get-ClassMirrorType {
-    param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Root, [hashtable] $Resolving = @{},
+# The mirror retains semantic declarations and compatibility types for one root.
+# An auxiliary function root must be rebuilt when its source mirror changes, even
+# if its own AST is unchanged. The old scope remains valid for existing witnesses.
+function Get-ClassMirror {
+    [OutputType([PscClassMirror])]
+    param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Root,[PscClassMirror]$Resolving,
         [System.Management.Automation.Language.TypeDefinitionAst[]] $SelectedClassAst)
-    if ($PSBoundParameters.ContainsKey('SelectedClassAst')) { $null = $script:ClassMirrorCache.Remove($Root) }
-    $types = $null
-    if (-not $script:ClassMirrorCache.TryGetValue($Root, [ref]$types)) {
-        $inProgress = $script:LoweringClassTypes
-        try {
-            $classes = @(if ($PSBoundParameters.ContainsKey('SelectedClassAst')) { $SelectedClassAst }
-                else { $Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true) | Where-Object { -not (Test-AttributeClass $_) } })
-            $enums = @($Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsEnum }, $true))
-            $script:LoweringClassTypes = @{} + $Resolving
-            $types = @{}
-            # A source without classes or enums of its own (a program of functions alone) mirrors none.
-            if ($classes.Count -or $enums.Count) {
-                $mirror = New-ClassMirror -Model @(if ($classes.Count) { Get-ClassModel -ClassAsts $classes }) -Enums $enums
-                foreach ($name in $mirror.Keys) { $types[$name] = $mirror[$name] }
-            }
-            $script:ClassMirrorCache.Add($Root, $types)
-        }
-        finally { $script:LoweringClassTypes = $inProgress }
+    $mirror=$null
+    if($script:ClassMirrorCache.TryGetValue($Root,[ref]$mirror)){
+        if(!$PSBoundParameters.ContainsKey('SelectedClassAst') -and [object]::ReferenceEquals($mirror.Resolving,$Resolving)){return $mirror}
     }
-    $types
+    $inProgress = $script:LoweringClassTypes
+    try {
+        $classes = @(if ($PSBoundParameters.ContainsKey('SelectedClassAst')) { $SelectedClassAst }
+            else { $Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true) | Where-Object { -not (Test-AttributeClass $_) } })
+        $enums = @($Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsEnum }, $true))
+        $script:LoweringClassTypes = @{}
+        if($null -ne $Resolving){$script:LoweringClassTypes += $Resolving.Types}
+        $next=New-ClassMirror -Model @(if ($classes.Count) { Get-ClassModel -ClassAsts $classes }) -Enums $enums -Resolving $Resolving
+        $null=$script:ClassMirrorCache.Remove($Root)
+        $script:ClassMirrorCache.Add($Root,$next)
+        return $next
+    }
+    finally { $script:LoweringClassTypes = $inProgress }
+}
+
+# Compatibility projection for the existing CLR consumers; semantic identity stays
+# in the owning cache entry, rather than being rediscovered from this projection.
+function Get-ClassMirrorType {
+    [OutputType([hashtable])]
+    param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Root,[PscClassMirror]$Resolving,
+        [System.Management.Automation.Language.TypeDefinitionAst[]] $SelectedClassAst)
+    (Get-ClassMirror @PSBoundParameters).Types
 }
 
 # A PowerShellSemantics method for lowering to call. The helper class is off until a lowering asks for one: its
@@ -14786,7 +14862,7 @@ class PscApi {
         $objectives.Add([PscRoadmapObjective]::new('F4',[PscRoadmapState]::Existing,@('F0','F3'),'Structural editing: replacement exists; add insertion, deletion, rename, move and dependency-aware validation, atomic grouped undo/redo and stale-reference refusal. No textual parser or competing authority.',@('PscDocument','PscDocumentEdit'),@(),@('Tests/Test-Document.ps1','Tests/Test-Worktree.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('F5',[PscRoadmapState]::Planned,@('F1','F4'),'Canonical script, ordered tree and artifacts: deterministic realization and independently tested exact source, semantic identity and target realization recovery when requested. Explicit retention policy; development information must not impose execution dependencies. Keep compiled faculties optional.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('F6',[PscRoadmapState]::Planned,@('F0','F2','F4','R1','H1'),'Persistent PscHost, accepted/candidate workspaces, typed operations and PSRP; concurrent sessions, revision leases, restart recovery and constrained write admission. Agents use this same API; no second compiler or string-based control plane.',@(),@(),@()))
-        $objectives.Add([PscRoadmapObjective]::new('L1',[PscRoadmapState]::Existing,@('F1'),'First-class PSC-owned STS and CTS definitions, references, signatures, constraints and compatibility relations; reconcile ScriptType with compiler declarations before extending value/generic types, interfaces, properties, events, visibility and namespaces. Use SMA-visible forms; prove supported definitions independent of runtime materialization.',@('PscAstRebuild','Export-LoweredAssembly','Get-ScriptTypeContract','Get-ScriptTypeReference','ScriptTypeReference','PscMaterializedSignature','ConvertTo-PscMaterializedSignatureType'),@('ScriptType'),@('SM/Test-Formats.ps1','Tests/Test-ScriptTypeReference.ps1','Tests/Test-ScriptTypeCompiler.ps1')))
+        $objectives.Add([PscRoadmapObjective]::new('L1',[PscRoadmapState]::Existing,@('F1'),'First-class PSC-owned STS and CTS definitions, references, signatures, constraints and compatibility relations; reconcile ScriptType with compiler declarations before extending value/generic types, interfaces, properties, events, visibility and namespaces. Use SMA-visible forms; prove supported definitions independent of runtime materialization.',@('PscAstRebuild','Export-LoweredAssembly','Get-ScriptTypeContract','Get-ScriptTypeReference','ScriptTypeReference','PscMaterializedSignature','ConvertTo-PscMaterializedSignatureType','PscClassMirror','Get-ClassMirror'),@('ScriptType'),@('SM/Test-Formats.ps1','Tests/Test-ScriptTypeReference.ps1','Tests/Test-ScriptTypeCompiler.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('L2',[PscRoadmapState]::Planned,@('L1'),'Explicit program semantics profiles; independent typed binding, structural compatibility, inference and conversion; consolidate duplicate binders. Test declared differences from SMA and CTS, null/overflow/conversion/exception semantics, ambiguity and target parity without requiring runtime materialization.',@('ScriptTypePrimitiveConversion','Select-PscStructuralNumericOverload'),@('PrimitiveConversion'),@('Tests/Test-ScriptTypeSelection.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('L3',[PscRoadmapState]::Planned,@('F2','L1','L2'),'Managed CLI realization from bound definitions; close compiler refusals using complete pinned application sources, non-loading metadata and executable repros; no stubs counted as completion. Deterministic PE, entry points, callbacks, static graphs, reachability, dependencies, independent execution and CTS interoperability.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('I1',[PscRoadmapState]::Planned,@('F2','F3'),'Inventory donor declarations and contracts, hashes, dependencies, licenses, historical revisions and evidence; reconcile duplicate mechanisms and admit typed source into PSC only.',@(),@(),@()))
