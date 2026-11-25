@@ -415,6 +415,8 @@ param(
     [string[]] $LintFiles,
     # Lint: apply the edits the findings carry instead of listing the findings.
     [switch] $LintEdit,
+    # Lint: return typed finding witnesses instead of presentation strings.
+    [switch] $LintObjects,
     # Guard: the checker hash kept outside this machine; a running checker with another hash fails every file.
     [string] $CheckerHash,
     # Guard/Conform: tracked canonical path at Git HEAD, not the working copy.
@@ -894,7 +896,7 @@ The API is available with `-Mode Api` (or no arguments). `SourceFormats` and `So
 
 Development sessions: `$dev = $api.OpenDevelopment($base,$tree)` creates or opens a verified projection; `Find`, `OpenDocument`, `Changes`, `Affected`, `Collate` and `Conform` share a pinned compiler, canonical base and manifest. `Affected` reports direct paths and declared faculty dependency closure; it does not prove complete method-level impact or select fewer tests. Collation requires a fresh candidate path; conformance rejects stale candidates and requires the pinned base to equal its committed Git blob.
 
-Candidate verification: `-Mode Guard -LintFiles ./PSC.next.ps1 -AgainstPath ./PSC.ps1` compares against the committed canonical path, not its working copy. `-Mode Conform -SourcePath ./PSC.next.ps1 -AgainstPath ./PSC.ps1` runs the protected Guard, candidate API, projection, embedded document/worktree/SM fixtures and historical Verify in independent processes. `-DevelopmentOnly` explicitly skips historical Verify and returns an incomplete report. No candidate is promoted automatically. The report carries the candidate digest, committed baseline and stage outputs; use the trusted baseline compiler to evaluate candidates when possible.
+Candidate verification: `-Mode Guard -LintFiles ./PSC.next.ps1 -AgainstPath ./PSC.ps1` compares against the committed canonical path, not its working copy. `-Mode Conform -SourcePath ./PSC.next.ps1 -AgainstPath ./PSC.ps1` runs the protected Guard, candidate API, projection, embedded document/worktree/Guard/SM fixtures and historical Verify in independent processes. `-DevelopmentOnly` explicitly skips historical Verify and returns an incomplete report. No candidate is promoted automatically. The report carries the candidate digest, committed baseline and stage outputs; use the trusted baseline compiler to evaluate candidates when possible.
 
 
 `Edit` opens a single file as a document with its own identity, immutable original buffer, append-only insertion buffer and grouped undo/redo journal. Query returns typed AST witnesses bound to the document identity, SHA-256 and revision. Use a complete matching AST extent as the replacement boundary; no regex or line-based rewrite is performed.
@@ -910,7 +912,7 @@ $doc.Save()
 
 All paired replacements in a group are checked for overlapping extents and parsed together before updating the journal. Re-query after any change, undo or redo. Save refuses a changed on-disk file and uses a sibling temporary file; it is not a cross-process locking protocol. Document query requires a fully parsed source unit; incomplete fragments may instead be edited in an external editor and checked by Collate. The piece-table model is adapted from Notepad.ps1 at 17b76e2, not its cached find/replace UI logic. Dirty state compares content hashes, including after a new branch of edits.
 
-To reproduce the editing and projection fixtures, first UnCollate and run `Tests/Test-Document.ps1` and `Tests/Test-Worktree.ps1` in the projected tree, passing `-Compiler ./PSC.ps1`.
+To reproduce development fixtures, first UnCollate and run `Tests/Test-Document.ps1`, `Tests/Test-Worktree.ps1` and `Tests/Test-Guard.ps1` in the projected tree, passing `-Compiler ./PSC.ps1`. `PscApi.Lint(paths)` or `-Mode Lint -LintObjects` returns typed findings with AST extents, diagnostic text, named authoring scope and a baseline identity. Guard compares occurrences of identities, not aggregate counts. Casing uses known local declarations and visible enclosing names; arbitrary dynamic scope and invoked scriptblocks remain unresolved, not proven bindings.
 
 ## Development criteria
 
@@ -1227,6 +1229,60 @@ try {
     $null = & $compiler -Mode Collate -TreeDirectory $crlfTree -OutputPath $crlfOut
     Assert-Tree ((Get-Hash $crlf) -ceq (Get-Hash $crlfOut)) 'CRLF canonical source round trips byte-for-byte'
 } finally { [IO.Directory]::Delete($work, $true) }
+
+'@)
+    [PscSourceResource]::new('Tests/Test-Guard.ps1', @'
+#requires -Version 7.7
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$Compiler)
+$ErrorActionPreference='Stop'
+$compiler=[IO.Path]::GetFullPath($Compiler)
+$root=[IO.Directory]::CreateDirectory([IO.Path]::Combine([IO.Path]::GetTempPath(),'psc-guard-review-'+[Guid]::NewGuid().ToString('N'))).FullName
+function Test-Case([string]$label,[string]$before,[string]$after,[bool]$expected) {
+    [IO.File]::WriteAllText($base,$before)
+    git -C $root add source.ps1
+    if($LASTEXITCODE -ne 0){throw 'git add failed'}
+    git -C $root -c user.name=PSC -c user.email=psc@localhost commit --allow-empty -qm $label
+    if($LASTEXITCODE -ne 0){throw 'git commit failed'}
+    [IO.File]::WriteAllText($candidate,$after)
+    $passed=$false
+    try{$receipt=$api.GuardCandidate($candidate,$base,'');$passed=$receipt.Passed}catch{if($_.Exception.Message -notmatch 'new finding'){throw}}
+    if($passed -ne $expected){throw "$label expected $expected actual $passed"}
+    "PASS $label ($passed)"
+}
+try {
+    $base=Join-Path $root 'source.ps1';$candidate=Join-Path $root 'candidate.ps1'
+    git -C $root init -q
+    if($LASTEXITCODE -ne 0){throw 'git init failed'}
+    $api=& $compiler -Mode Api
+    Test-Case 'equal count replacement' '$x = 1; $X = 2' '$y = 1; $Y = 2' $false
+    Test-Case 'lower count replacement' '$x = 1; $X = 2; $z = 1; $Z = 2' '$y = 1; $Y = 2' $false
+    Test-Case 'same identity' '$x = 1; $X = 2' '$x = 3; $X = 4' $true
+    Test-Case 'new scope with same spelling' 'function First { $x = 1; $X = 2 }' 'function Second { $x = 1; $X = 2 }' $false
+    Test-Case 'removed finding' '$x = 1; $X = 2' '$x = 1' $true
+    Test-Case 'duplicate identity replaces another' 'Foo(1,2); Bar(1,2)' 'Foo(1,2); Foo(1,2)' $false
+    $clobber='function Example { $value = 0; foreach ($item in 1,2) { $value = $item }; Write-Output $value }'
+    Test-Case 'clobber shifted by lines' $clobber ("# comment`n`n"+$clobber) $true
+    Test-Case 'clobber changed symbol' $clobber ($clobber.Replace('$value','$other')) $false
+}finally{[IO.Directory]::Delete($root,$true)}
+$root=[IO.Directory]::CreateDirectory([IO.Path]::Combine([IO.Path]::GetTempPath(),'psc-guard-scope-'+[Guid]::NewGuid().ToString('N'))).FullName
+try {
+ $fixture=Join-Path $root 'scope.ps1'
+ function Assert-Lint([string]$label,[string]$source,[string]$rule,[int]$expected) {
+   [IO.File]::WriteAllText($fixture,$source)
+   $lines=@($api.Lint(@($fixture)) | Where-Object Rule -CEQ $rule)
+   if($lines.Count -ne $expected){throw "$label expected $expected actual $($lines.Count): $lines"}
+   foreach($item in $lines){if(!$item.Extent -or $item.Extent.StartOffset -ge $item.Extent.EndOffset -or !$item.Identity -or !$item.Scope){throw 'Incomplete typed lint witness.'}}
+   "PASS $label ($expected)"
+ }
+ Assert-Lint 'independent function locals' 'function First { $node = 1 }; function Second { $Node = 2 }' 'CaseSpelledTwoWays' 0
+ Assert-Lint 'same function casing' 'function First { $node = 1; $Node = 2 }' 'CaseSpelledTwoWays' 1
+ Assert-Lint 'enclosing variable read' '$node = 1; function First { return $Node }' 'CaseSpelledTwoWays' 1
+ Assert-Lint 'explicit script scope' '$node = 1; function First { return $script:Node }' 'CaseSpelledTwoWays' 1
+ Assert-Lint 'parameter shadow of script parameter' 'param($node); function First { param($Node); $Node }' 'CaseSpelledTwoWays' 0
+ Assert-Lint 'two shadowed properties, duplicate reads' 'class Sample { [int] $A; [int] $B; [int] Read() { return $A + $B + $A } }' 'LocalShadowsProperty' 2
+ Assert-Lint 'independent method overloads' 'class Sample { [int] M([int]$v){return $v}; [double] M([double]$V){return $V} }' 'CaseSpelledTwoWays' 0
+}finally{[IO.Directory]::Delete($root,$true)}
 
 '@)
 }
@@ -3964,11 +4020,66 @@ function Get-SmaLint {
     $tokens = $errors = $null
     $ast = if ($PSBoundParameters.ContainsKey('text')) { [System.Management.Automation.Language.Parser]::ParseInput($text, $file, [ref]$tokens, [ref]$errors) }
         else { [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$tokens, [ref]$errors) }
-    $finding = { param([string] $rule, $node, [string] $detail, [object[]] $edits = @()) [SmaLintFinding]@{ File = $file; Line = $node.Extent.StartLineNumber; Rule = $rule; Detail = $detail; Edits = $edits } }
+    # Named authoring scopes, not a claim to resolve arbitrary dynamic caller scope or invoked scriptblocks.
+    $scopeOf = {
+        param($node)
+        for ($parent = $node; $null -ne $parent; $parent = $parent.Parent) {
+            if ($parent -is [System.Management.Automation.Language.FunctionMemberAst]) { return $parent }
+            if ($parent -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $parent.Parent -isnot [System.Management.Automation.Language.FunctionMemberAst]) { return $parent }
+        }
+        return $ast
+    }
+    $scopeName = {
+        param($scope)
+        $parts = [Collections.Generic.List[string]]::new()
+        while ($scope -ne $ast) {
+            if ($scope -is [System.Management.Automation.Language.FunctionMemberAst]) {
+                $signature = @($scope.Parameters | ForEach-Object { $constraint = @($_.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.TypeConstraintAst] }); if ($constraint.Count) { $constraint[0].TypeName.FullName } else { 'object' } }) -join ','
+                $parts.Insert(0, ('{0}.{1}({2})' -f $scope.Parent.Name, $scope.Name, $signature))
+            } else { $parts.Insert(0, ('function:' + $scope.Name)) }
+            $scope = & $scopeOf $scope.Parent
+        }
+        return 'script/' + ($parts -join '/')
+    }
+    $finding = {
+        param([string] $rule, $node, [string] $detail, [object[]] $edits = @(), [string] $identity = '')
+        $scope = & $scopeName (& $scopeOf $node)
+        if (!$identity) { $identity = $scope + '|' + $detail }
+        [SmaLintFinding]@{ File = $file; Line = $node.Extent.StartLineNumber; Rule = $rule; Detail = $detail; Identity = $identity; Scope = $scope; Extent = $node.Extent; Edits = $edits }
+    }
     $variables = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.VariableExpressionAst] }, $true))
-    foreach ($group in $variables | Where-Object { -not $_.VariablePath.IsDriveQualified } | Group-Object { $_.VariablePath.UserPath.ToLowerInvariant() }) {
-        $spellings = @($group.Group | ForEach-Object { $_.VariablePath.UserPath } | Sort-Object -Unique -CaseSensitive)
-        if ($spellings.Count -gt 1) { & $finding 'CaseSpelledTwoWays' $group.Group[0] ('$' + ($spellings -join ' $')) }
+    $locals = [Collections.Generic.Dictionary[System.Management.Automation.Language.Ast,Collections.Generic.HashSet[string]]]::new()
+    $scopeOfVariable = [Collections.Generic.Dictionary[System.Management.Automation.Language.Ast,System.Management.Automation.Language.Ast]]::new()
+    foreach ($variable in $variables) {
+        $path = $variable.VariablePath
+        if ($path.IsDriveQualified -and !$path.IsScript -and !$path.IsLocal -and !$path.IsPrivate) { continue }
+        $scope = if ($path.IsScript) { $ast } else { & $scopeOf $variable }
+        $scopeOfVariable.Add($variable,$scope)
+        if (!$locals.ContainsKey($scope)) { $locals.Add($scope,[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)) }
+        $name = $path.UserPath
+        if ($name.Contains(':')) { $name = $name.Substring($name.IndexOf(':') + 1) }
+        $target = $variable
+        while ($target.Parent -is [System.Management.Automation.Language.ConvertExpressionAst]) { $target = $target.Parent }
+        $parent = $target.Parent
+        if ($path.IsScript -or $path.IsLocal -or $path.IsPrivate -or $parent -is [System.Management.Automation.Language.ParameterAst] -or ($parent -is [System.Management.Automation.Language.AssignmentStatementAst] -and [object]::ReferenceEquals($parent.Left,$target)) -or ($parent -is [System.Management.Automation.Language.ForEachStatementAst] -and [object]::ReferenceEquals($parent.Variable,$variable))) { $null = $locals[$scope].Add($name) }
+    }
+    $groups = [Collections.Generic.Dictionary[string,Collections.Generic.List[System.Management.Automation.Language.VariableExpressionAst]]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($variable in $variables) {
+        if (!$scopeOfVariable.ContainsKey($variable)) { continue }
+        $path = $variable.VariablePath; $name = $path.UserPath; $scope = $scopeOfVariable[$variable]
+        if ($name.Contains(':')) { $name = $name.Substring($name.IndexOf(':') + 1) }
+        if (!$path.IsScript -and !$path.IsLocal -and !$path.IsPrivate) {
+            $enclosing = $scope
+            while ($enclosing -ne $ast -and (!$locals.ContainsKey($enclosing) -or !$locals[$enclosing].Contains($name))) { $enclosing = & $scopeOf $enclosing.Parent }
+            if ($locals.ContainsKey($enclosing) -and $locals[$enclosing].Contains($name)) { $scope = $enclosing }
+        }
+        $key = (& $scopeName $scope) + '|' + $name.ToLowerInvariant()
+        if (!$groups.ContainsKey($key)) { $groups.Add($key,[Collections.Generic.List[System.Management.Automation.Language.VariableExpressionAst]]::new()) }
+        $groups[$key].Add($variable)
+    }
+    foreach ($entry in $groups.GetEnumerator()) {
+        $spellings = @($entry.Value | ForEach-Object { $name = $_.VariablePath.UserPath; if ($name.Contains(':')) { $name.Substring($name.IndexOf(':') + 1) } else { $name } } | Sort-Object -Unique -CaseSensitive)
+        if ($spellings.Count -gt 1) { $detail = '$' + ($spellings -join ' $'); & $finding 'CaseSpelledTwoWays' $entry.Value[0] $detail @() ($entry.Key + '|' + $detail) }
     }
     # In a class method, a local whose name equals a property's name in any casing is the property to PowerShell:
     # assigning it is a parse error, and reading it is easy to confuse. Every such name is a finding.
@@ -3982,19 +4093,14 @@ function Get-SmaLint {
             $parameterNames = [Collections.Generic.HashSet[string]]::new([string[]]@($method.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath }), [StringComparer]::OrdinalIgnoreCase)
             $assigned = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
             foreach ($assignment in $method.Body.FindAll({ $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) { $left = $assignment.Left; while ($left -is [System.Management.Automation.Language.ConvertExpressionAst]) { $left = $left.Child }; if ($left -is [System.Management.Automation.Language.VariableExpressionAst]) { $null = $assigned.Add($left.VariablePath.UserPath) } }
+            $reported = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
             foreach ($variable in $method.Body.FindAll({ $args[0] -is [System.Management.Automation.Language.VariableExpressionAst] -and -not $args[0].VariablePath.IsDriveQualified }, $true)) {
                 $variableName = $variable.VariablePath.UserPath
-                if ($variableName -eq 'this' -or -not $properties.Contains($variableName) -or $parameterNames.Contains($variableName)) { continue }
+                if ($variableName -eq 'this' -or -not $properties.Contains($variableName) -or $parameterNames.Contains($variableName) -or !$reported.Add($variableName)) { continue }
                 $how = if ($assigned.Contains($variableName)) { 'assigned as a local' } else { 'read but never assigned or passed in; $this.' + $variableName + ' was probably meant' }
-                & $finding 'LocalShadowsProperty' $variable ("`$$variableName in $($type.Name).$($method.Name) shares property $($type.Name).$variableName's name and is $how"); break
+                & $finding 'LocalShadowsProperty' $variable ("`$$variableName in $($type.Name).$($method.Name) shares property $($type.Name).$variableName's name and is $how")
             }
         }
-    }
-    # A script's parameters share one case-insensitive namespace with every variable in the file.
-    $scriptParameters = @(if ($null -ne $ast.ParamBlock) { $ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath } })
-    foreach ($parameter in $scriptParameters) {
-        $others = @($variables | Where-Object { $_.VariablePath.UserPath -ieq $parameter -and $_.VariablePath.UserPath -cne $parameter })
-        if ($others.Count) { & $finding 'CaseSpelledTwoWays' $others[0] "script parameter `$$parameter also written `$$($others[0].VariablePath.UserPath)" }
     }
     $definitions = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))
     $commands = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true))
@@ -4047,7 +4153,7 @@ function Get-SmaLint {
                 $after = $i.Loop.Extent.EndOffset
                 $reads = @($body.FindAll({ param($x) $x -is [System.Management.Automation.Language.VariableExpressionAst] -and $x.VariablePath.UserPath -ieq $name -and $x.Extent.StartOffset -gt $after -and $x.Parent -isnot [System.Management.Automation.Language.AssignmentStatementAst] }, $true) | Where-Object { $null -eq (& $loopOf $_) })
                 $reassigned = @($top | Where-Object { $_.Offset -gt $after -and $_.Offset -lt $(if ($reads.Count) { $reads[0].Extent.StartOffset } else { 0 }) })
-                if ($reads.Count -and -not $reassigned.Count) { & $finding 'VariableClobbered' $i.Node ("`$$name in $($fn.Name): set at top level, reassigned in the loop at line $($i.Loop.Extent.StartLineNumber), read after it at line $($reads[0].Extent.StartLineNumber)"); break }
+                if ($reads.Count -and -not $reassigned.Count) { & $finding 'VariableClobbered' $i.Node ("`$$name in $($fn.Name): set at top level, reassigned in the loop at line $($i.Loop.Extent.StartLineNumber), read after it at line $($reads[0].Extent.StartLineNumber)") @() ((& $scopeName (& $scopeOf $i.Node)) + '|' + $name); break }
             }
         }
     }
@@ -4273,6 +4379,9 @@ class SmaLintFinding {
     [int] $Line
     [string] $Rule
     [string] $Detail
+    [string] $Identity
+    [string] $Scope
+    [System.Management.Automation.Language.IScriptExtent] $Extent
     [SmaLintEdit[]] $Edits
 }
 
@@ -4333,8 +4442,8 @@ function Get-SmaChecker {
         @($node.Body.ParamBlock.Attributes | Where-Object { $_.TypeName.Name -eq [PscChecker].Name }).Count }, $true)
 }
 
-# Guard: one file against its committed version. The file fails when SMA reports parse errors, or when a lint rule has
-# more findings than the file has at HEAD. A file with no version at HEAD is held to no findings.
+# Guard: one file against its committed version. The file fails on parse errors or a new lint finding identity,
+# including excess occurrences of an existing identity. A file with no version at HEAD is held to no findings.
 function Test-SmaGuard {
     [PscChecker()]
     param([string] $file, [string] $expectedHash)
@@ -4350,10 +4459,15 @@ function Test-SmaGuard {
     $after = @(Get-SmaLint $file $text)
     foreach ($rule in $after | Group-Object Rule) {
         $was = @($before | Where-Object Rule -EQ $rule.Name)
-        $known = @($was | ForEach-Object Detail)
-        $new = @($rule.Group | Where-Object Detail -NotIn $known | ForEach-Object Line)
-        if ($rule.Count -le $was.Count) { continue }
-        $reasons.Add(('{0}: {1} findings, {2} at HEAD; new at lines {3}' -f $rule.Name, $rule.Count, $was.Count, ($new -join ', ')))
+        $known = [Collections.Generic.Dictionary[string,int]]::new([StringComparer]::Ordinal)
+        foreach ($observation in $was) {
+            if (!$known.ContainsKey($observation.Identity)) { $known.Add($observation.Identity,0) }
+            $known[$observation.Identity]++
+        }
+        foreach ($observation in $rule.Group) {
+            if ($known.ContainsKey($observation.Identity) -and $known[$observation.Identity] -gt 0) { $known[$observation.Identity]--; continue }
+            $reasons.Add(('{0}: new finding at line {1}: {2}' -f $rule.Name, $observation.Line, $observation.Detail))
+        }
     }
     $changed = @(if ($committed) {
         $committedAst = [System.Management.Automation.Language.Parser]::ParseInput($committedText, [ref]$tokens, [ref]$committedErrors)
@@ -4449,7 +4563,7 @@ function Invoke-PscConformance {
             if($stages[0].State -eq 'Passed'){
                 $stages.Add((Invoke-PscConformanceStage 'Projection' @('-File',$report.Candidate,'-Mode','UnCollate','-TreeDirectory',$tree)))
                 if($stages[1].State -eq 'Passed'){
-                    foreach($fixture in 'Tests/Test-Document.ps1','Tests/Test-Worktree.ps1','SM/Test-Formats.ps1'){
+                    foreach($fixture in 'Tests/Test-Document.ps1','Tests/Test-Worktree.ps1','Tests/Test-Guard.ps1','SM/Test-Formats.ps1'){
                         $stages.Add((Invoke-PscConformanceStage $fixture @('-File',[IO.Path]::Combine($tree,$fixture),'-Compiler',$report.Candidate)))
                     }
                     if(!$development){$stages.Add((Invoke-PscConformanceStage 'Verify' @('-File',$report.Candidate,'-Mode','Verify')))}
@@ -4458,7 +4572,7 @@ function Invoke-PscConformance {
             }
         }
         $report.Stages=$stages.ToArray()
-        $report.Passed=$report.Guard.Passed -and $stages.Count -eq 6 -and @($stages | Where-Object State -eq 'Failed').Count -eq 0
+        $report.Passed=$report.Guard.Passed -and $stages.Count -eq 7 -and @($stages | Where-Object State -eq 'Failed').Count -eq 0
         $report.Complete=$report.Passed -and !$development
         if((Get-FileHash -LiteralPath $report.Candidate).Hash -cne $report.CandidateSha256){throw 'Candidate changed during conformance.'}
         return $report
@@ -12806,6 +12920,7 @@ class PscApi {
     [PscTreeDelta[]] Diff([string]$root){return $this.Diff($this.Script,$root)}
     [PscTreeDelta[]] Diff([string]$sourceFile,[string]$root){return @(& $this.Script -Mode Diff -SourcePath $sourceFile -TreeDirectory $root)}
     [object[]] Verify(){return @(& $this.Script -Mode Verify)}
+    [SmaLintFinding[]] Lint([string[]]$paths){return @(& $this.Script -Mode Lint -LintFiles $paths -LintObjects)}
     [PscGuardVerdict] GuardCandidate([string]$candidateFile,[string]$baselineFile,[string]$expectedHash){return & $this.Script -Mode Guard -LintFiles $candidateFile -AgainstPath $baselineFile -CheckerHash $expectedHash}
     [PscConformanceReport] Conform([string]$candidateFile,[string]$baselineFile,[bool]$development){return & $this.Script -Mode Conform -SourcePath $candidateFile -AgainstPath $baselineFile -DevelopmentOnly:$development}
     [string] $SourceExecutionContract = 'PSC realizes SM source; realized execution is SMA-free. File roles do not prohibit execution. Stock pwsh execution is not a compatibility requirement.'
@@ -17187,7 +17302,9 @@ process {
         'Lint' {
             $targets = if ($LintFiles) { $LintFiles } else { foreach ($project in Get-Projects) { foreach ($relative in $project.Files) { Join-Path $project.Path $relative } } }
             $findings = @(foreach ($file in $targets) { if (Test-Path -LiteralPath $file) { Get-SmaLint ([IO.Path]::GetFullPath($file)) } })
+            if ($LintEdit -and $LintObjects) { throw 'LintEdit and LintObjects are mutually exclusive.' }
             if ($LintEdit) { return Edit-SmaLintFinding -Findings $findings }
+            if ($LintObjects) { return $findings }
             $findings | Group-Object Rule | Sort-Object Count -Descending | ForEach-Object { '{0,-20} {1,5}' -f $_.Name, $_.Count }
             $findings | Sort-Object Rule, File, Line | ForEach-Object { '{0,-20} {1}:{2}  {3}' -f $_.Rule, $_.File, $_.Line, $_.Detail }
         }
