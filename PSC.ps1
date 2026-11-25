@@ -723,7 +723,7 @@ function Join-PscSourceTree {
     foreach($unit in $snapshot.Units){
         if($unit.State -ceq 'Deleted'){throw "Missing worktree unit: $($unit.Path)"}
         $unit.Start=$builder.Length
-        if($unit.Kind -ceq 'Resource' -and [IO.Path]::GetExtension($unit.Path) -in '.sm1','.srm1','.sexe','.ps1','.psm1'){$null=Read-PscTreeAst $unit.Text $unit.Path -Resource}
+        if($unit.Kind -ceq 'Resource' -and [PscSourceFormat]::IsSource($unit.Path)){$null=Read-PscTreeAst $unit.Text $unit.Path -Resource}
         [void]$builder.Append($unit.Text)
         $unit.End=$builder.Length
     }
@@ -866,7 +866,7 @@ pwsh -NoProfile -File ./psc-tree/SM/Test-Formats.ps1 -Compiler ./PSC.ps1
 
 The test builds seven runtime faculties in a new temporary directory, materializes the SRM contract, compares the portable script and its compiled entry point, exercises a published and revoked role, tests application specialization, and checks native kernel results on Linux x64. It cleans temporary outputs on exit. Other targets skip native loader execution rather than reporting parity without execution.
 
-`PSC.ps1 -Mode Query` admits `.sm1`, `.srm1` and `.sexe` as source candidates using the existing parser and extent witnesses. This is intentionally an inquiry change only; legacy Graph, Lint and Investigate discovery policies remain unchanged. There is no automatic inference of compilation mode from the extension and no extension-based semantic restriction yet.
+`PSC.ps1 -Mode Query` admits `.sm1`, `.srm1` and `.sexe` as source candidates using the existing parser and extent witnesses. Graph, project lint discovery, and structural investigation use the same source extension policy. The SMA interpretation and differential oracle instruments remain limited to legacy PowerShell sources; SM execution is not inferred from discovery. There is no automatic inference of compilation mode from the extension and no extension-based semantic restriction yet.
 
 ## Development worktree
 
@@ -886,7 +886,7 @@ Collate is fail-closed: missing and untracked files, manifest edits, declaration
 
 ### Structural editing
 
-The API is available with `-Mode Api` (or no arguments). `SourceFormats` and `SourceExecutionContract` describe the SM contract; `AssertSurface()` checks mode admission against the dispatcher. `OpenQuery(paths, kind, name, owner, literal, take)` is a lazy AST query with optional ordinal literal containment within each matched extent; the CLI equivalent is `-QueryLiteral`. `OpenDocument(path)` opens a revision-bound editor. Its `Find(kind, name, owner, literal, limit)` returns editable witnesses with the same filter applied before the limit. Literal containment may include comments or strings *inside* the selected extent; it is not a semantic interpretation of the literal. Use Git for repository history, PSC for structural selection and validated edits.
+The API is available with `-Mode Api` (or no arguments). `SourceFormats` and `SourceExecutionContract` describe the SM contract; `AssertSurface()` checks mode admission against the dispatcher. `OpenQuery(paths, kind, name, owner, literal, take)` is a lazy AST query with optional ordinal literal containment within each matched extent; the CLI equivalent is `-QueryLiteral`. `OpenDocument(path)` opens a revision-bound editor. Its `Find(kind, name, owner, literal, limit)` returns editable witnesses with the same filter applied before the limit. Literal containment may include comments or strings *inside* the selected extent; it is not a semantic interpretation of the literal. Use Git for repository history, PSC for structural selection and validated edits. `UnCollate`, `Collate`, `Status`, `Diff` and `Verify` are also available directly on the API. `SourceExtensions` describes source discovery, including legacy PowerShell inputs.
 
 
 `Edit` opens a single file as a document with its own identity, immutable original buffer, append-only insertion buffer and grouped undo/redo journal. Query returns typed AST witnesses bound to the document identity, SHA-256 and revision. Use a complete matching AST extent as the replacement boundary; no regex or line-based rewrite is performed.
@@ -1113,14 +1113,16 @@ try {
     $hash = Get-Hash $base
     $tree = Join-Path $work 'tree'
     $out = Join-Path $work 'PSC.next.ps1'
-    $snapshot = & $compiler -Mode UnCollate -TreeDirectory $tree -SourcePath $base
+    $api = & $compiler -Mode Api
+    Assert-Tree ($api.SourceExtensions.Count -eq 5 -and $api.SourceExtensions -contains '.sexe') 'API advertises unified source admission'
+    $snapshot = $api.UnCollate($base,$tree)
     Assert-Tree ($snapshot.UnitCount -gt 400 -and $snapshot.BaseSha256 -ceq $hash) 'canonical PSC projects into ordered AST units'
     Assert-Tree ([IO.File]::Exists((Join-Path $tree 'Faculties/Vom/Vom.ps1')) -and [IO.File]::Exists((Join-Path $tree 'Compiler/Functions/ConvertTo-PscIr.ps1'))) 'compiler and runtime faculty have stable declaration paths'
     Assert-Tree ([IO.File]::Exists((Join-Path $tree 'SM/Calibration.srm1')) -and [IO.File]::Exists((Join-Path $tree 'Tests/Test-Worktree.ps1'))) 'SM and worktree tests materialize from the canonical source'
-    $status = & $compiler -Mode Status -TreeDirectory $tree -SourcePath $base
+    $status = $api.Status($base,$tree)
     Assert-Tree ($status.Changes.Count -eq 0 -and $status.Untracked.Count -eq 0 -and $status.DestinationState -ceq 'Base') 'clean status and canonical base agreement'
-    Assert-Tree (@(& $compiler -Mode Diff -TreeDirectory $tree -SourcePath $base).Count -eq 0) 'clean structural diff is empty'
-    $receipt = & $compiler -Mode Collate -TreeDirectory $tree -OutputPath $out
+    Assert-Tree ($api.Diff($base,$tree).Count -eq 0) 'clean structural diff is empty through API'
+    $receipt = $api.Collate($tree,$out)
     Assert-Tree ((Get-Hash $out) -ceq $hash -and $receipt.SourceSha256 -ceq $hash) 'clean collate reproduces exact canonical bytes'
     $again = Join-Path $work 'again'
     $reproject = & $out -Mode UnCollate -TreeDirectory $again
@@ -3693,11 +3695,11 @@ function Get-Projects {
             $remote = Get-ProjectRemote $d.FullName
             if ($remote -and $ThirdPartyRemotes -contains $remote) { continue }
             if (-not $remote) { $remote = '(local) ' + $d.Name.ToLowerInvariant() }
-            $files = @(git -C $d.FullName ls-files --cached --others --exclude-standard -- '*.ps1' '*.psm1' 2>$null | Sort-Object -Unique)
+            $files = @(git -C $d.FullName ls-files --cached --others --exclude-standard -- ([PscSourceFormat]::Patterns()) 2>$null | Sort-Object -Unique)
         } else {
             # Project folders outside git: enumerate the file system, leaving out copied upstream references.
             $remote = '(local) ' + $d.Name.ToLowerInvariant()
-            $files = @(Get-ChildItem -LiteralPath $d.FullName -Recurse -File -Include *.ps1, *.psm1 -ErrorAction SilentlyContinue |
+            $files = @(Get-ChildItem -LiteralPath $d.FullName -Recurse -File -Include ([PscSourceFormat]::Patterns()) -ErrorAction SilentlyContinue |
                 Where-Object { -not $_.FullName.Contains('\reference\') -and -not $_.FullName.Contains('\.git\') -and -not $_.FullName.Contains('\node_modules\') } |
                 ForEach-Object { $_.FullName.Substring($d.FullName.Length + 1) })
         }
@@ -4629,10 +4631,10 @@ function Resolve-SmaEdges($project) {
 
 function Get-SmaSourceFiles([string] $root) {
     if ([IO.Directory]::Exists((Join-Path $root '.git'))) {
-        git -C $root ls-files --cached --others --exclude-standard -- '*.ps1' '*.psm1' 2>$null | Sort-Object -Unique
+        git -C $root ls-files --cached --others --exclude-standard -- ([PscSourceFormat]::Patterns()) 2>$null | Sort-Object -Unique
     } else {
         # SMA hosts retained third-party sources and evidence. Its own authored project is the root script.
-        Get-ChildItem -LiteralPath $root -File | Where-Object Extension -in '.ps1','.psm1' | ForEach-Object Name
+        Get-ChildItem -LiteralPath $root -File | Where-Object { [PscSourceFormat]::IsSource($_.FullName) } | ForEach-Object Name
     }
 }
 
@@ -12548,6 +12550,24 @@ function ConvertTo-PscLeasedStructuralSource {
 }
 
 class PscSourceFormat {
+    static [PscSourceFormat[]] SmFormats(){
+        return @(
+            [PscSourceFormat]::new('.sm1','Script','.ps1','Independent executable source')
+            [PscSourceFormat]::new('.srm1','Script Resource Module','.psm1','Reusable behavior, contracts, types and resources')
+            [PscSourceFormat]::new('.sexe','Script Executable','.exe','One-shot executable appliance before realization')
+        )
+    }
+    static [string[]] Extensions(){
+        $extensions=[Collections.Generic.List[string]]::new();$extensions.Add('.ps1');$extensions.Add('.psm1')
+        foreach($format in [PscSourceFormat]::SmFormats()){$extensions.Add($format.Extension)}
+        return $extensions.ToArray()
+    }
+    static [bool] IsSource([string]$path){return [IO.Path]::GetExtension($path) -in [PscSourceFormat]::Extensions()}
+    static [string[]] Patterns(){
+        $patterns=[Collections.Generic.List[string]]::new()
+        foreach($suffix in [PscSourceFormat]::Extensions()){$patterns.Add('*'+$suffix)}
+        return $patterns.ToArray()
+    }
     [string] $Extension
     [string] $Role
     [string] $Analogue
@@ -12558,11 +12578,16 @@ class PscSourceFormat {
 }
 
 class PscApi {
-    [PscSourceFormat[]] $SourceFormats = @(
-        [PscSourceFormat]::new('.sm1','Script','.ps1','Independent executable source')
-        [PscSourceFormat]::new('.srm1','Script Resource Module','.psm1','Reusable behavior, contracts, types and resources')
-        [PscSourceFormat]::new('.sexe','Script Executable','.exe','One-shot executable appliance before realization')
-    )
+    [PscSourceFormat[]] $SourceFormats = [PscSourceFormat]::SmFormats()
+    [string[]] $SourceExtensions = [PscSourceFormat]::Extensions()
+    [PscTreeSnapshot] UnCollate([string]$root){return $this.UnCollate($this.Script,$root)}
+    [PscTreeSnapshot] UnCollate([string]$sourceFile,[string]$root){return & $this.Script -Mode UnCollate -SourcePath $sourceFile -TreeDirectory $root}
+    [PscTreeSnapshot] Collate([string]$root,[string]$destination){return & $this.Script -Mode Collate -TreeDirectory $root -OutputPath $destination}
+    [PscTreeSnapshot] Status([string]$root){return $this.Status($this.Script,$root)}
+    [PscTreeSnapshot] Status([string]$sourceFile,[string]$root){return & $this.Script -Mode Status -SourcePath $sourceFile -TreeDirectory $root}
+    [PscTreeDelta[]] Diff([string]$root){return $this.Diff($this.Script,$root)}
+    [PscTreeDelta[]] Diff([string]$sourceFile,[string]$root){return @(& $this.Script -Mode Diff -SourcePath $sourceFile -TreeDirectory $root)}
+    [object[]] Verify(){return @(& $this.Script -Mode Verify)}
     [string] $SourceExecutionContract = 'PSC realizes SM source; realized execution is SMA-free. File roles do not prohibit execution. Stock pwsh execution is not a compatibility requirement.'
     [PscDocument] OpenDocument([string]$path){return [PscDocument]::new($path)}
     [PscQueryCursor] OpenQuery([string[]]$paths,[PscQueryKind]$kind,[string]$name,[string]$owner,[string]$literal,[int]$take){
@@ -13902,7 +13927,7 @@ class PscQueryCursor : IDisposable {
             $this.CloseArtifact();$next=$null;try{$next=$this.NextPath()}catch{$this.Counts.ReadFailures++;$this.Errors.Add($_.Exception.Message);$this.Counts.Exhausted=$true;return $false}
             if([string]::IsNullOrEmpty($next)){$this.Counts.Exhausted=$true;return $false}
             $ext=[IO.Path]::GetExtension($next).ToLowerInvariant();$binary=$this.Spec.Kind -in [PscQueryKind]::CilMethod,[PscQueryKind]::CilOp
-            if(($binary -and $ext -notin '.dll','.exe') -or (!$binary -and $ext -notin '.ps1','.psm1','.sm1','.srm1','.sexe')){$this.Counts.SkippedByDomain++;continue}
+            if(($binary -and $ext -notin '.dll','.exe') -or (!$binary -and ![PscSourceFormat]::IsSource($next))){$this.Counts.SkippedByDomain++;continue}
             $this.Path=$next;$this.Counts.ArtifactsOpened++
             try{
                 $bytes=[IO.File]::ReadAllBytes($next);$this.Digest=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
@@ -16222,7 +16247,7 @@ class PscInstrument {
 
 # SMA's parse of a PowerShell file: the PscSource, then each parse error as its own observation.
 class ParseInstrument : PscInstrument {
-    [bool] AppliesTo([string] $target) { return [IO.Path]::GetExtension($target) -in '.ps1', '.psm1' }
+    [bool] AppliesTo([string] $target) { return [PscSourceFormat]::IsSource($target) }
     [void] Examine([PscInvestigation] $investigation, [string] $target) {
         $source = [PscSource]::new($target)
         $investigation.Observe($target, [ParseInstrument], $source)
@@ -16237,7 +16262,7 @@ class ParseErrorInstrument : PscInstrument {
 
 class MeasureInstrument : PscInstrument {
     [type[]] Requires() { return [type[]]@([ParseInstrument]) }
-    [bool] AppliesTo([string] $target) { return [IO.Path]::GetExtension($target) -in '.ps1', '.psm1' }
+    [bool] AppliesTo([string] $target) { return [PscSourceFormat]::IsSource($target) }
     [void] Examine([PscInvestigation] $investigation, [string] $target) {
         foreach ($measure in [PscInstrument]::Source($investigation, $target).Measures) { $investigation.Observe($target, [MeasureInstrument], $measure) }
     }
@@ -16245,7 +16270,7 @@ class MeasureInstrument : PscInstrument {
 
 class DerivedCheckInstrument : PscInstrument {
     [type[]] Requires() { return [type[]]@([ParseInstrument]) }
-    [bool] AppliesTo([string] $target) { return [IO.Path]::GetExtension($target) -in '.ps1', '.psm1' }
+    [bool] AppliesTo([string] $target) { return [PscSourceFormat]::IsSource($target) }
     [void] Examine([PscInvestigation] $investigation, [string] $target) {
         foreach ($check in Get-PscDerivedCheck -Path $target -Ast ([PscInstrument]::Source($investigation, $target).Ast)) { $investigation.Observe($target, [DerivedCheckInstrument], $check) }
     }
@@ -16255,7 +16280,7 @@ class DerivedCheckInstrument : PscInstrument {
 # existing file is observed and becomes a target.
 class ReferenceInstrument : PscInstrument {
     [type[]] Requires() { return [type[]]@([ParseInstrument]) }
-    [bool] AppliesTo([string] $target) { return [IO.Path]::GetExtension($target) -in '.ps1', '.psm1' }
+    [bool] AppliesTo([string] $target) { return [PscSourceFormat]::IsSource($target) }
     [void] Examine([PscInvestigation] $investigation, [string] $target) {
         $ast = [PscInstrument]::Source($investigation, $target).Ast
         $directory = [IO.Path]::GetDirectoryName($target)
@@ -16281,7 +16306,7 @@ function Invoke-PscInvestigation {
     param([Parameter(Mandatory)][string[]] $Path)
     $investigation = [PscInvestigation]::new()
     foreach ($item in $Path) {
-        if ([IO.Directory]::Exists($item)) { foreach ($file in Get-ChildItem -LiteralPath $item -Recurse -File -Include *.ps1, *.psm1) { $investigation.AddTarget($file.FullName) } }
+        if ([IO.Directory]::Exists($item)) { foreach ($file in Get-ChildItem -LiteralPath $item -Recurse -File -Include ([PscSourceFormat]::Patterns())) { $investigation.AddTarget($file.FullName) } }
         else { $investigation.AddTarget($item) }
     }
     $instruments = [PscInstrument]::All()
@@ -16690,7 +16715,7 @@ class PscMemberLowering {
 
 class MemberLoweringInstrument : PscInstrument {
     [type[]] Requires() { return [type[]]@([ParseInstrument]) }
-    [bool] AppliesTo([string] $target) { return [IO.Path]::GetExtension($target) -in '.ps1', '.psm1' }
+    [bool] AppliesTo([string] $target) { return [PscSourceFormat]::IsSource($target) }
     [void] Examine([PscInvestigation] $investigation, [string] $target) {
         $root = ConvertTo-PscRecordSource -Root ([PscInstrument]::Source($investigation, $target).Ast)
         $classes = [System.Collections.Generic.List[System.Management.Automation.Language.TypeDefinitionAst]]::new()
@@ -16715,7 +16740,7 @@ class MemberLoweringInstrument : PscInstrument {
 
 class LowerInstrument : PscInstrument {
     [type[]] Requires() { return [type[]]@([ParseInstrument]) }
-    [bool] AppliesTo([string] $target) { return [IO.Path]::GetExtension($target) -in '.ps1', '.psm1' }
+    [bool] AppliesTo([string] $target) { return [PscSourceFormat]::IsSource($target) }
     [void] Examine([PscInvestigation] $investigation, [string] $target) {
         $source = [PscInstrument]::Source($investigation, $target)
         $classes = @($source.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $false) | Where-Object { -not (Test-AttributeClass $_) })
