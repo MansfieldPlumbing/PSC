@@ -294,9 +294,10 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 #>
+
 <#
 .SYNOPSIS
-    A Pwsh script designed to amortize.
+    A single-file compiler and semantic development environment for typed PowerShell and SM source.
 .DESCRIPTION
     Self-contained compiler. Compile emits an assembly (or, with -Native, an executable);
     Expression returns live AST and expression objects in the calling process;
@@ -305,11 +306,7 @@ SOFTWARE.
     native image. No module import or external implementation source is required.
     Called with no arguments, it returns its own API (Mode Api), read from this file's AST.
 .PARAMETER Mode
-    Compile (the default when compile inputs are given), Api (the default with no arguments), Expression,
-    Inspect, ImportCil, Query (read-only pull cursor), BuildRuntime, BuildFaculty, Capability, Link or PowerShell (the pinned PowerShell build, downloaded and verified on first use);
-    or, from SMA's own parser over PowerShell projects: Graph (one project as live objects: units, edges,
-    coverage, absence, changes), Lint, Profile (every project's functions and methods), Report (on a historical
-    profile) or Verify (the graph's structural fixture).
+    Compile is the default with compile inputs; no arguments return the live API. Inspect the API's Modes and Describe(mode) for the current dispatcher inventory. The declared ValidateSet is the authoritative set of mode names.
 .PARAMETER ArchivePath
     PowerShell: an already-downloaded release archive, verified the same way as a download.
 .PARAMETER Native
@@ -340,7 +337,7 @@ SOFTWARE.
 .PARAMETER StackReserve
     Link: stack reserve size in bytes.
 .PARAMETER SourcePath
-    Source file containing typed PowerShell classes.
+    Source file for compilation, document editing, projection, candidate conformance or reference execution, as selected by Mode.
 .PARAMETER SourceAst
     Retained ScriptBlockAst to compile directly, as an alternative to SourcePath.
 .PARAMETER ClassNames
@@ -369,7 +366,7 @@ SOFTWARE.
 .PARAMETER QueryOwner
     Source lexical owner; CilMethod declaring type; CilOp declaring type plus method name.
 .PARAMETER QueryTake
-    Maximum number of returned witnesses. Pull(1..256) limits each window. Dispose the returned cursor.
+    Maximum number of returned references. Pull(1..256) limits each window. Dispose the returned cursor.
 .PARAMETER QuerySpace
     Optional existing VOM space. QueryOwnerHandle selects the owner (default root); one lease per pull.
 .PARAMETER AssemblyPath
@@ -384,6 +381,56 @@ SOFTWARE.
     Optional compiled assemblies used to resolve contract signatures.
 .PARAMETER ContractInputsPath
     Internal child-build transport containing contract source and reference paths only.
+.PARAMETER RunParameters
+    Named parameters for the SMA reference execution path (Run).
+.PARAMETER BindingEnvironment
+    Optional existing authoring binding environment; used by the compiler API.
+.PARAMETER LintEdit
+    Apply supported structural lint edits rather than report findings.
+.PARAMETER LintObjects
+    Return typed lint findings, including AST extents; incompatible with LintEdit.
+.PARAMETER CheckerHash
+    Expected SHA-256 of the running protected checker, independently retained.
+.PARAMETER AgainstPath
+    Tracked canonical source path at Git HEAD for candidate Guard or Conform.
+.PARAMETER DevelopmentOnly
+    Conform: explicitly omit historical Verify. A development-scope pass is not complete verification.
+.PARAMETER InvestigatePath
+    Files or directories for investigation instruments and referenced source discovery.
+.PARAMETER StructuralBindings
+    Structural contract to concrete provider mappings for static specialization.
+.PARAMETER StructuralThunks
+    Structural contract bindings for generating managed provider thunks.
+.PARAMETER LeasedStructuralContracts
+    Contract names to lower to leased ScriptTypeRole calls in named managed methods.
+.PARAMETER DynamicBindingParameter
+    Experimental named ScriptTypeRole binding context for object receiver operations; not a documented general compilation guarantee.
+.PARAMETER DeclarationsOnly
+    Lower original top-level classes only, without function-class synthesis or record rewriting.
+.PARAMETER Program
+    Realize top-level source statements as a managed program entry point.
+.PARAMETER FixedParameters
+    Named build-time values used to specialize Program source and prune unreachable branches and functions.
+.PARAMETER FixedParametersPath
+    Trusted CLIXML hashtable of fixed parameter values, alternative to FixedParameters.
+.PARAMETER QueryName
+    Optional structural name filter; an empty value matches any name.
+.PARAMETER QueryLiteral
+    Ordinal literal containment within a selected source AST extent, applied before QueryTake.
+.PARAMETER QueryOwnerHandle
+    Owner handle for the optional QuerySpace lease; zero selects the root.
+.PARAMETER NativeFrameBytes
+    Expected stack-frame size in bytes for raw native leaf verification.
+.PARAMETER NativeIntegerArguments
+    Number of integer argument registers expected by the SysV leaf verifier.
+.PARAMETER NativeFloatArguments
+    Number of floating-point argument registers expected by the SysV leaf verifier.
+.PARAMETER NativeBorrowedCell
+    Admit the explicit caller-pinned floating-point cell contract for a native leaf.
+.PARAMETER NativeReturnKind
+    Declared leaf return kind: I32, F32, F64 or Void.
+.PARAMETER TreeDirectory
+    Ordered projection directory used by UnCollate, Collate, Status and Diff.
 .PARAMETER Help
     Displays full script help without compiling.
 .EXAMPLE
@@ -415,7 +462,7 @@ param(
     [string[]] $LintFiles,
     # Lint: apply the edits the findings carry instead of listing the findings.
     [switch] $LintEdit,
-    # Lint: return typed finding witnesses instead of presentation strings.
+    # Lint: return typed finding references instead of presentation strings.
     [switch] $LintObjects,
     # Guard: the checker hash kept outside this machine; a running checker with another hash fails every file.
     [string] $CheckerHash,
@@ -530,6 +577,13 @@ class PscSourceResource {
     PscSourceResource([string]$path,[string]$text){$this.Path=$path;$this.Text=$text}
 }
 class PscTreeText {
+    static [string] FullPath([string]$path){
+        if([string]::IsNullOrWhiteSpace($path)){throw 'A filesystem path is required.'}
+        if([IO.Path]::IsPathFullyQualified($path)){return [IO.Path]::GetFullPath($path)}
+        $location=Get-Location
+        if($location.Provider.Name -cne 'FileSystem'){throw 'PSC requires a filesystem path.'}
+        return [IO.Path]::GetFullPath($path,$location.ProviderPath)
+    }
     static [Text.UTF8Encoding] Encoding(){return [Text.UTF8Encoding]::new($false,$true)}
     static [string] Read([string]$path){
         $text=[PscTreeText]::Encoding().GetString([IO.File]::ReadAllBytes($path))
@@ -627,7 +681,7 @@ function Add-PscTreeDeclarations {
 function Get-PscTreeProjection {
     [OutputType([PscTreeSnapshot])]
     param([string]$SourceFile,[AllowEmptyString()][string]$Text)
-    if(!$PSBoundParameters.ContainsKey('Text')){$Text=[PscTreeText]::Read($SourceFile)}
+    if(!$PSBoundParameters.ContainsKey('Text')){$SourceFile=[PscTreeText]::FullPath($SourceFile);$Text=[PscTreeText]::Read($SourceFile)}
     $ast=Read-PscTreeAst $Text $SourceFile
     if(!$ast.BeginBlock -or !$ast.BeginBlock.Statements.Count){throw 'Worktree projection requires PSC begin/process source.'}
     $units=[Collections.Generic.List[PscTreeUnit]]::new()
@@ -650,7 +704,7 @@ function Get-PscTreeProjection {
 function New-PscSourceTree {
     [OutputType([PscTreeSnapshot])]
     param([string]$SourceFile,[string]$Root)
-    $root=[IO.Path]::GetFullPath($Root)
+    $root=[PscTreeText]::FullPath($Root)
     if([IO.Directory]::Exists($root) -or [IO.File]::Exists($root)){throw 'UnCollate destination must not exist.'}
     $snapshot=Get-PscTreeProjection $SourceFile;$snapshot.Root=$root
     $stage=$root+'.psc-'+[Guid]::NewGuid().ToString('N')
@@ -671,7 +725,7 @@ function New-PscSourceTree {
 function Read-PscSourceTree {
     [OutputType([PscTreeSnapshot])]
     param([string]$Root)
-    $root=[IO.Path]::GetFullPath($Root);[PscTreeText]::CheckRoot($root)
+    $root=[PscTreeText]::FullPath($Root);[PscTreeText]::CheckRoot($root)
     $manifest=[PscTreeText]::Read([PscTreeText]::SafePath($root,'PSC.tree'))
     $newline=$manifest.IndexOf("`n",[StringComparison]::Ordinal)
     if($newline -lt 0){throw 'Invalid manifest.'}
@@ -749,7 +803,7 @@ function Write-PscSourceTree {
     [OutputType([PscTreeSnapshot])]
     param([string]$Root,[string]$Destination)
     $snapshot=Join-PscSourceTree $Root
-    $path=[IO.Path]::GetFullPath($Destination)
+    $path=[PscTreeText]::FullPath($Destination)
     $relative=[IO.Path]::GetRelativePath($snapshot.Root,$path)
     if(![IO.Path]::IsPathRooted($relative) -and $relative -ne '..' -and !$relative.StartsWith('..'+[IO.Path]::DirectorySeparatorChar,[StringComparison]::Ordinal)){throw 'Collate destination must be outside the worktree.'}
     if([IO.File]::Exists($path)){
@@ -872,7 +926,7 @@ pwsh -NoProfile -File ./psc-tree/SM/Test-Formats.ps1 -Compiler ./PSC.ps1
 
 The test builds seven runtime faculties in a new temporary directory, materializes the SRM contract, compares the portable script and its compiled entry point, exercises a published and revoked role, tests application specialization, and checks native kernel results on Linux x64. It cleans temporary outputs on exit. Other targets skip native loader execution rather than reporting parity without execution.
 
-`PSC.ps1 -Mode Query` admits `.sm1`, `.srm1` and `.sexe` as source candidates using the existing parser and extent witnesses. Graph, project lint discovery, and structural investigation use the same source extension policy. The SMA interpretation and differential oracle instruments remain limited to legacy PowerShell sources; SM execution is not inferred from discovery. There is no automatic inference of compilation mode from the extension and no extension-based semantic restriction yet.
+`PSC.ps1 -Mode Query` admits `.sm1`, `.srm1` and `.sexe` as source candidates using the existing parser and extent references. Graph, project lint discovery, and structural investigation use the same source extension policy. The SMA interpretation and differential oracle instruments remain limited to legacy PowerShell sources; SM execution is not inferred from discovery. There is no automatic inference of compilation mode from the extension and no extension-based semantic restriction yet.
 
 ## Development worktree
 
@@ -892,14 +946,14 @@ Collate is fail-closed: missing and untracked files, manifest edits, declaration
 
 ### Structural editing
 
-The API is available with `-Mode Api` (or no arguments). `SourceFormats` and `SourceExecutionContract` describe the SM contract; `AssertSurface()` checks mode admission against the dispatcher. `OpenQuery(paths, kind, name, owner, literal, take)` is a lazy AST query with optional ordinal literal containment within each matched extent; the CLI equivalent is `-QueryLiteral`. `OpenDocument(path)` opens a revision-bound editor. Its `Find(kind, name, owner, literal, limit)` returns editable witnesses with the same filter applied before the limit. Literal containment may include comments or strings *inside* the selected extent; it is not a semantic interpretation of the literal. Use Git for repository history, PSC for structural selection and validated edits. `UnCollate`, `Collate`, `Status`, `Diff` and `Verify` are also available directly on the API. `SourceExtensions` describes source discovery, including legacy PowerShell inputs.
+The API is available with `-Mode Api` (or no arguments). `SourceFormats` and `SourceExecutionContract` describe the SM contract; `AssertSurface()` checks mode admission against the dispatcher. `OpenQuery(paths, kind, name, owner, literal, take)` is a lazy AST query with optional ordinal literal containment within each matched extent; the CLI equivalent is `-QueryLiteral`. `OpenDocument(path)` opens a revision-bound editor. Its `Find(kind, name, owner, literal, limit)` returns editable references with the same filter applied before the limit. Literal containment may include comments or strings *inside* the selected extent; it is not a semantic interpretation of the literal. Use Git for repository history, PSC for structural selection and validated edits. `UnCollate`, `Collate`, `Status`, `Diff` and `Verify` are also available directly on the API. `SourceExtensions` describes source discovery, including legacy PowerShell inputs.
 
 Development sessions: `$dev = $api.OpenDevelopment($base,$tree)` creates or opens a verified projection; `Find`, `OpenDocument`, `Changes`, `Affected`, `Collate` and `Conform` share a pinned compiler, canonical base and manifest. `Affected` reports direct paths and declared faculty dependency closure; it does not prove complete method-level impact or select fewer tests. Collation requires a fresh candidate path; conformance rejects stale candidates and requires the pinned base to equal its committed Git blob.
 
 Candidate verification: `-Mode Guard -LintFiles ./PSC.next.ps1 -AgainstPath ./PSC.ps1` compares against the committed canonical path, not its working copy. `-Mode Conform -SourcePath ./PSC.next.ps1 -AgainstPath ./PSC.ps1` runs the protected Guard, candidate API, projection, embedded document/worktree/Guard/SM fixtures and historical Verify in independent processes. `-DevelopmentOnly` explicitly skips historical Verify and returns an incomplete report. No candidate is promoted automatically. The report carries the candidate digest, committed baseline and stage outputs; use the trusted baseline compiler to evaluate candidates when possible.
 
 
-`Edit` opens a single file as a document with its own identity, immutable original buffer, append-only insertion buffer and grouped undo/redo journal. Query returns typed AST witnesses bound to the document identity, SHA-256 and revision. Use a complete matching AST extent as the replacement boundary; no regex or line-based rewrite is performed.
+`Edit` opens a single file as a document with its own identity, immutable original buffer, append-only insertion buffer and grouped undo/redo journal. Query returns typed AST references bound to the document identity, SHA-256 and revision. Use a complete matching AST extent as the replacement boundary; no regex or line-based rewrite is performed.
 
 ```powershell
 $doc = & ./PSC.ps1 -Mode Edit -SourcePath ./psc-tree/SM/Calibration.sm1
@@ -970,7 +1024,7 @@ try {
         try {
             Assert-Pass ($q.Coverage().ArtifactsOpened -eq 0) "lazy query opens no $([IO.Path]::GetExtension($entry[0])) at creation"
             $hits = $q.Pull(1)
-            Assert-Pass ($hits.Length -eq 1 -and $hits[0].Name -ceq $entry[1] -and $hits[0].ArtifactSha256 -ceq (Get-FileHash -LiteralPath $entry[0]).Hash -and !$hits[0].ParseIncomplete) "structural witness for $([IO.Path]::GetExtension($entry[0]))"
+            Assert-Pass ($hits.Length -eq 1 -and $hits[0].Name -ceq $entry[1] -and $hits[0].ArtifactSha256 -ceq (Get-FileHash -LiteralPath $entry[0]).Hash -and !$hits[0].ParseIncomplete) "structural reference for $([IO.Path]::GetExtension($entry[0]))"
         } finally { $q.Dispose() }
     }
     $q = & $Compiler -Mode Query -QueryPath $PSScriptRoot -QueryKind Declaration -QueryName SmApplianceKernel
@@ -1064,16 +1118,16 @@ try{
     [IO.File]::WriteAllText($path,$original,$encoding);[IO.File]::WriteAllText($foreign,$original,$encoding)
     $doc=& $compiler -Mode Edit -SourcePath $path
     $hits=$doc.Query('Call','Write-Output','',2)
-    Assert-Document ($hits.Length -eq 2 -and $hits[0].StartOffset -eq 25 -and $hits[1].SourceRevision -eq 0) 'query uses structural call witnesses, excluding comment and string'
+    Assert-Document ($hits.Length -eq 2 -and $hits[0].StartOffset -eq 25 -and $hits[1].SourceRevision -eq 0) 'query uses structural call references, excluding comment and string'
     $literal=$doc.Find('Call','Write-Output','',"'b'",1)
     Assert-Document ($literal.Length -eq 1 -and $literal[0].StartOffset -eq $hits[1].StartOffset) 'literal filter precedes the structural result limit'
-    Assert-Document ($doc.Find('Call','Write-Output','',"'text'",1).Length -eq 0) 'literal in unrelated string is not a call witness'
+    Assert-Document ($doc.Find('Call','Write-Output','',"'text'",1).Length -eq 0) 'literal in unrelated string is not a call reference'
     $q=& $compiler -Mode Query -QueryPath $path -QueryKind Call -QueryName Write-Output -QueryLiteral "'b'" -QueryTake 1
     try{$readOnly=$q.Pull(1)[0];Assert-Document ($readOnly.StartOffset -eq $hits[1].StartOffset) 'lazy cursor and document agree on literal-filtered extent'}finally{$q.Dispose()}
     $resolved=$doc.Resolve($readOnly)
-    Assert-Document ($resolved.DocumentIdentity -eq $hits[1].DocumentIdentity -and $resolved.SourceRevision -eq $doc.Revision -and $resolved.Target.Extent.Text -ceq $hits[1].Target.Extent.Text) 'read-only match resolves into a fresh document witness'
+    Assert-Document ($resolved.DocumentIdentity -eq $hits[1].DocumentIdentity -and $resolved.SourceRevision -eq $doc.Revision -and $resolved.Target.Extent.Text -ceq $hits[1].Target.Extent.Text) 'read-only match resolves into a fresh document reference'
     $rejected=$false;try{$null=$doc.Resolve($hits[1])}catch{$rejected=$true}
-    Assert-Document $rejected 'document witness cannot be reissued through read-only resolution'
+    Assert-Document $rejected 'document reference cannot be reissued through read-only resolution'
     $same=& $compiler -Mode Edit -SourcePath $path
     $otherRevision=$same.Query('Call','Write-Output','',1)
     $rejected=$false;try{$doc.Replace($otherRevision[0],"Write-Output 'other session'")}catch{$rejected=$true}
@@ -1082,18 +1136,18 @@ try{
     $changed=$original.Replace("Write-Output 'a'","Write-Output 'longer'").Replace("Write-Output 'b'","Write-Output 'c'")
     Assert-Document ($doc.Text() -ceq $changed -and $doc.Revision -eq 1 -and $doc.Modified()) 'batch replacement preserves untouched CRLF bytes and shifts later extents correctly'
     $rejected=$false;try{$null=$doc.Resolve($readOnly)}catch{$rejected=$true}
-    Assert-Document $rejected 'read-only witness cannot resolve against changed content'
+    Assert-Document $rejected 'read-only reference cannot resolve against changed content'
     $rejected=$false;try{$doc.Replace($hits[0],"Write-Output 'stale'")}catch{$rejected=$_.Exception.Message.Contains('Stale or foreign')}
     Assert-Document ($rejected -and $doc.Text() -ceq $changed -and $doc.Revision -eq 1) 'stale match cannot change edited document'
     Assert-Document ($doc.Undo() -and $doc.Text() -ceq $original -and !$doc.Modified()) 'one undo restores grouped changes exactly'
     $rejected=$false;try{$doc.Replace($hits[0],"Write-Output 'stale'")}catch{$rejected=$_.Exception.Message.Contains('Stale or foreign')}
-    Assert-Document $rejected 'undo does not revive stale witness revision'
+    Assert-Document $rejected 'undo does not revive stale reference revision'
     Assert-Document ($doc.Redo() -and $doc.Text() -ceq $changed) 'one redo reapplies grouped edits exactly'
     $fresh=$doc.Query('Call','Write-Output','',2)
     $rejected=$false;try{$doc.Replace($fresh[0],'class {')}catch{$rejected=$_.Exception.Message.Contains('parse failed')}
     Assert-Document ($rejected -and $doc.Text() -ceq $changed -and $doc.Revision -eq 3) 'invalid replacement leaves document and journal unchanged'
     $rejected=$false;try{$doc.Replace(@($fresh[0],$fresh[0]),[string[]]@('1','2'))}catch{$rejected=$_.Exception.Message.Contains('Overlapping')}
-    Assert-Document $rejected 'duplicate or overlapping witnesses rejected'
+    Assert-Document $rejected 'duplicate or overlapping references rejected'
     $doc.Save();Assert-Document (!$doc.Modified() -and [IO.File]::ReadAllText($path) -ceq $changed) 'saved content is clean'
     $null=$doc.Undo();$fresh=$doc.Query('Call','Write-Output','',1);$doc.Replace($fresh[0],"Write-Output 'branch'")
     Assert-Document ($doc.Modified() -and !$doc.Redo()) 'branch after undo does not reuse saved journal identity'
@@ -1103,7 +1157,7 @@ try{
     $other=& $compiler -Mode Edit -SourcePath $foreign
     $otherHits=$other.Query('Call','Write-Output','',1)
     $rejected=$false;try{$doc.Replace($otherHits[0],"Write-Output 'foreign'")}catch{$rejected=$true}
-    Assert-Document $rejected 'foreign document witness rejected'
+    Assert-Document $rejected 'foreign document reference rejected'
 }finally{[IO.Directory]::Delete($dir,$true)}
 
 '@)
@@ -1131,6 +1185,19 @@ try {
     $out = Join-Path $work 'PSC.next.ps1'
     $api = & $compiler -Mode Api
     Assert-Tree ($api.SourceExtensions.Count -eq 5 -and $api.SourceExtensions -contains '.sexe') 'API advertises unified source admission'
+    Assert-Tree (@($api.Parameters | Where-Object { [string]::IsNullOrWhiteSpace($_.Description) }).Count -eq 0 -and $api.Describe('Conform').Parameters.Description.Count -gt 0) 'all declared parameters carry live help descriptions'
+    $describedParameter=$api.Parameters[0];$savedDescription=$describedParameter.Description;$describedParameter.Description='';$rejected=$false
+    try{$api.AssertSurface()}catch{$rejected=$_.Exception.Message.Contains('Undocumented PSC parameter')}finally{$describedParameter.Description=$savedDescription}
+    Assert-Tree $rejected 'API surface rejects undocumented parameters'
+    Push-Location -LiteralPath $work
+    try{
+        $relativeDoc=$api.OpenDocument([IO.Path]::GetFileName($base))
+        Assert-Tree ($relativeDoc.Path -ceq $base) 'document resolves from PowerShell location'
+        $relativeQuery=$api.OpenQuery(@([IO.Path]::GetFileName($base)),'Declaration','Get-PscApi','','',1)
+        try{Assert-Tree ($relativeQuery.Pull(1)[0].ArtifactPath -ceq $base) 'query resolves from PowerShell location'}finally{$relativeQuery.Dispose()}
+        $relativeProjection=$api.UnCollate([IO.Path]::GetFileName($base),'relative-tree')
+        Assert-Tree ($relativeProjection.Root -ceq (Join-Path $work 'relative-tree')) 'projection resolves from PowerShell location'
+    }finally{Pop-Location}
     Assert-Tree ($api.Describe('Guard').DispatchExtent.Text.Contains('Test-SmaGuard') -and $api.Guide().Contains('OpenDevelopment')) 'first-contact guide and live dispatcher description'
     $q=$api.Find('ConvertTo-PscIr');try{Assert-Tree ($q.Pull(1)[0].Name -ceq 'ConvertTo-PscIr') 'self declaration discovery'}finally{$q.Dispose()}
     $q=$api.Search('PersistedAssemblyBuilder');try{Assert-Tree ($q.Pull(1).Count -eq 1) 'self literal discovery'}finally{$q.Dispose()}
@@ -1144,8 +1211,8 @@ try {
     $status = $api.Status($base,$tree)
     Assert-Tree ($status.Changes.Count -eq 0 -and $status.Untracked.Count -eq 0 -and $status.DestinationState -ceq 'Base') 'clean status and canonical base agreement'
     Assert-Tree ($api.Diff($base,$tree).Count -eq 0) 'clean structural diff is empty through API'
-    $receipt = $api.Collate($tree,$out)
-    Assert-Tree ((Get-Hash $out) -ceq $hash -and $receipt.SourceSha256 -ceq $hash) 'clean collate reproduces exact canonical bytes'
+    $result = $api.Collate($tree,$out)
+    Assert-Tree ((Get-Hash $out) -ceq $hash -and $result.SourceSha256 -ceq $hash) 'clean collate reproduces exact canonical bytes'
     $again = Join-Path $work 'again'
     $reproject = & $out -Mode UnCollate -TreeDirectory $again
     Assert-Tree ((Read-Text (Join-Path $tree 'PSC.tree')) -ceq (Read-Text (Join-Path $again 'PSC.tree'))) 'collated compiler projects itself identically'
@@ -1166,9 +1233,9 @@ try {
     $impact = $dev.Affected()
     Assert-Tree ($impact.DirectPaths.Count -eq 1 -and $impact.DirectPaths[0] -ceq 'SM/Calibration.sm1' -and !$impact.Complete -and $impact.RequiresFullConformance) 'development impact does not claim complete coverage'
     $sessionCandidate = Join-Path $work 'Session.ps1'
-    $sessionReceipt = $dev.Collate($sessionCandidate)
-    Assert-Tree ((Get-Hash $sessionCandidate) -ceq $sessionReceipt.SourceSha256) 'development session collates a fresh candidate'
-    $receipt = & $compiler -Mode Collate -TreeDirectory $tree -OutputPath $out
+    $sessionResult = $dev.Collate($sessionCandidate)
+    Assert-Tree ((Get-Hash $sessionCandidate) -ceq $sessionResult.SourceSha256) 'development session collates a fresh candidate'
+    $result = & $compiler -Mode Collate -TreeDirectory $tree -OutputPath $out
     $changedHash = Get-Hash $out
     Assert-Tree ($changedHash -cne $hash) 'edited resource changes canonical bytes'
     $changedTree = Join-Path $work 'changed'
@@ -1256,7 +1323,7 @@ function Test-Case([string]$label,[string]$before,[string]$after,[bool]$expected
     if($LASTEXITCODE -ne 0){throw 'git commit failed'}
     [IO.File]::WriteAllText($candidate,$after)
     $passed=$false
-    try{$receipt=$api.GuardCandidate($candidate,$base,'');$passed=$receipt.Passed}catch{if($_.Exception.Message -notmatch 'new finding'){throw}}
+    try{$result=$api.GuardCandidate($candidate,$base,'');$passed=$result.Passed}catch{if($_.Exception.Message -notmatch 'new finding'){throw}}
     if($passed -ne $expected){throw "$label expected $expected actual $passed"}
     "PASS $label ($passed)"
 }
@@ -1274,6 +1341,9 @@ try {
     $clobber='function Example { $value = 0; foreach ($item in 1,2) { $value = $item }; Write-Output $value }'
     Test-Case 'clobber shifted by lines' $clobber ("# comment`n`n"+$clobber) $true
     Test-Case 'clobber changed symbol' $clobber ($clobber.Replace('$value','$other')) $false
+    Test-Case 'new direct evaluation rejected' 'Write-Output $text' 'Invoke-Expression $text' $false
+    Test-Case 'new certificate override rejected' 'Invoke-WebRequest -Uri $uri' 'Invoke-WebRequest -Uri $uri -SkipCertificateCheck' $false
+    Test-Case 'new insecure formatter rejected' 'Write-Output 1' 'New-Object BinaryFormatter' $false
 }finally{[IO.Directory]::Delete($root,$true)}
 $root=[IO.Directory]::CreateDirectory([IO.Path]::Combine([IO.Path]::GetTempPath(),'psc-guard-scope-'+[Guid]::NewGuid().ToString('N'))).FullName
 try {
@@ -1282,7 +1352,7 @@ try {
    [IO.File]::WriteAllText($fixture,$source)
    $lines=@($api.Lint(@($fixture)) | Where-Object Rule -CEQ $rule)
    if($lines.Count -ne $expected){throw "$label expected $expected actual $($lines.Count): $lines"}
-   foreach($item in $lines){if(!$item.Extent -or $item.Extent.StartOffset -ge $item.Extent.EndOffset -or !$item.Identity -or !$item.Scope){throw 'Incomplete typed lint witness.'}}
+   foreach($item in $lines){if(!$item.Extent -or $item.Extent.StartOffset -ge $item.Extent.EndOffset -or !$item.Identity -or !$item.Scope){throw 'Incomplete typed lint reference.'}}
    "PASS $label ($expected)"
  }
  Assert-Lint 'independent function locals' 'function First { $node = 1 }; function Second { $Node = 2 }' 'CaseSpelledTwoWays' 0
@@ -1292,6 +1362,24 @@ try {
  Assert-Lint 'parameter shadow of script parameter' 'param($node); function First { param($Node); $Node }' 'CaseSpelledTwoWays' 0
  Assert-Lint 'two shadowed properties, duplicate reads' 'class Sample { [int] $A; [int] $B; [int] Read() { return $A + $B + $A } }' 'LocalShadowsProperty' 2
  Assert-Lint 'independent method overloads' 'class Sample { [int] M([int]$v){return $v}; [double] M([double]$V){return $V} }' 'CaseSpelledTwoWays' 0
+ Assert-Lint 'class method is not a command declaration' 'class Sample { [void] Verify() {} }; verify' 'CaseSpelledTwoWays' 0
+ Assert-Lint 'direct string evaluation' 'Invoke-Expression $text' 'DynamicCodeExecution' 1
+ Assert-Lint 'stock evaluation alias' 'iex $text' 'DynamicCodeExecution' 1
+ Assert-Lint 'qualified evaluation command' 'Microsoft.PowerShell.Utility\Invoke-Expression $text' 'DynamicCodeExecution' 1
+ Assert-Lint 'static script construction' '[scriptblock]::Create($text)' 'DynamicCodeExecution' 1
+ Assert-Lint 'inline source compilation' 'Add-Type -TypeDefinition $text' 'DynamicCodeExecution' 1
+ Assert-Lint 'existing assembly reference' 'Add-Type -AssemblyName System.Xml' 'DynamicCodeExecution' 0
+ Assert-Lint 'inert evaluation string' '$description = "Invoke-Expression text"' 'DynamicCodeExecution' 0
+ Assert-Lint 'typed scriptblock literal' '& { Write-Output 1 }' 'DynamicCodeExecution' 0
+ Assert-Lint 'certificate override' 'Invoke-WebRequest -Uri $uri -SkipCertificateCheck' 'CertificateValidationDisabled' 1
+ Assert-Lint 'certificate validation retained' 'Invoke-WebRequest -Uri $uri -SkipCertificateCheck:$false' 'CertificateValidationDisabled' 0
+ Assert-Lint 'ordinary web request' 'Invoke-WebRequest -Uri $uri' 'CertificateValidationDisabled' 0
+ Assert-Lint 'formatter constructor' '[System.Runtime.Serialization.Formatters.Binary.BinaryFormatter]::new()' 'UnsafeDeserialization' 1
+ Assert-Lint 'formatter named construction' 'New-Object -TypeName System.Runtime.Serialization.Formatters.Binary.BinaryFormatter' 'UnsafeDeserialization' 1
+ Assert-Lint 'formatter positional construction' 'New-Object BinaryFormatter' 'UnsafeDeserialization' 1
+ Assert-Lint 'ordinary object construction' 'New-Object System.Text.StringBuilder' 'UnsafeDeserialization' 0
+ Assert-Lint 'security policy mutation' 'Set-MpPreference @settings' 'SecurityControlMutation' 1
+ Assert-Lint 'security policy inspection' 'Get-MpPreference' 'SecurityControlMutation' 0
 }finally{[IO.Directory]::Delete($root,$true)}
 
 '@)
@@ -3720,10 +3808,11 @@ function Build-PscRuntime {
     }
     $exe=Join-Path $PSHOME 'pwsh'
     if($IsWindows){$exe+='.exe'}
-    $transport=[IO.Path]::GetTempFileName()
+    $transportDirectory=[IO.Directory]::CreateTempSubdirectory('psc-contract-').FullName
+    $transport=[IO.Path]::Combine($transportDirectory,'inputs.bin')
     try{
         # A data-only length-prefixed path manifest, not source or scriptblocks.
-        $writer=[IO.BinaryWriter]::new([IO.File]::Open($transport,[IO.FileMode]::Truncate,[IO.FileAccess]::Write,[IO.FileShare]::None))
+        $writer=[IO.BinaryWriter]::new([IO.File]::Open($transport,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None))
         try{
             $writer.Write([int]$ContractPaths.Length)
             foreach($path in $ContractPaths){$writer.Write([string]$path)}
@@ -3736,7 +3825,7 @@ function Build-PscRuntime {
             & $exe @arguments
             if($LASTEXITCODE -ne 0){throw "PSC faculty build failed: $($unit.Name)"}
         }
-    }finally{[IO.File]::Delete($transport)}
+    }finally{[IO.Directory]::Delete($transportDirectory,$true)}
 }
 function Read-PscContractInputs([string]$Path){
     $reader=[IO.BinaryReader]::new([IO.File]::OpenRead($Path))
@@ -3789,7 +3878,7 @@ function Get-Projects {
             # Project folders outside git: enumerate the file system, leaving out copied upstream references.
             $remote = '(local) ' + $d.Name.ToLowerInvariant()
             $files = @(Get-ChildItem -LiteralPath $d.FullName -Recurse -File -Include ([PscSourceFormat]::Patterns()) -ErrorAction SilentlyContinue |
-                Where-Object { -not $_.FullName.Contains('\reference\') -and -not $_.FullName.Contains('\.git\') -and -not $_.FullName.Contains('\node_modules\') } |
+                Where-Object { $parts = [IO.Path]::GetRelativePath($d.FullName,$_.FullName).Split([IO.Path]::DirectorySeparatorChar); 'reference' -cnotin $parts -and '.git' -cnotin $parts -and 'node_modules' -cnotin $parts } |
                 ForEach-Object { $_.FullName.Substring($d.FullName.Length + 1) })
         }
         if ($files.Count) { [pscustomobject]@{ Project = $d.Name; Path = $d.FullName; Remote = $remote; Files = $files } }
@@ -4114,7 +4203,44 @@ function Get-SmaLint {
     }
     $definitions = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))
     $commands = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true))
-    $defined = @{}; foreach ($d in $definitions) { $defined[$d.Name.ToLowerInvariant()] = $d.Name }
+    # Guard explicit security-sensitive language forms. These are AST references, not claims about
+    # Defender classification, resolved command identity, taint propagation or runtime behavior.
+    $unsafeFormatters = [string[]]@('BinaryFormatter','System.Runtime.Serialization.Formatters.Binary.BinaryFormatter','Runtime.Serialization.Formatters.Binary.BinaryFormatter','NetDataContractSerializer','System.Runtime.Serialization.NetDataContractSerializer','Runtime.Serialization.NetDataContractSerializer','LosFormatter','System.Web.UI.LosFormatter','Web.UI.LosFormatter','ObjectStateFormatter','System.Web.UI.ObjectStateFormatter','Web.UI.ObjectStateFormatter')
+    foreach ($command in $commands) {
+        $commandName = $command.GetCommandName()
+        if (!$commandName) { continue }
+        $commandName = $commandName.Split('\')[-1]
+        if ($commandName -in 'Invoke-Expression','iex') { & $finding 'DynamicCodeExecution' $command 'String-to-code evaluation: use parsed, typed source or parameterized invocation.' @() ((& $scopeName (& $scopeOf $command)) + '|Invoke-Expression') }
+        if ($commandName -in 'Set-MpPreference','Add-MpPreference','Remove-MpPreference','Set-ExecutionPolicy') { & $finding 'SecurityControlMutation' $command 'Security policy modification is outside PSC realization.' @() ((& $scopeName (& $scopeOf $command)) + '|' + $commandName.ToLowerInvariant()) }
+        foreach ($element in $command.CommandElements) {
+            if ($element -isnot [System.Management.Automation.Language.CommandParameterAst]) { continue }
+            if ($commandName -in 'Invoke-WebRequest','Invoke-RestMethod','iwr','irm' -and $element.ParameterName -ieq 'SkipCertificateCheck') {
+                if ($element.Argument -is [System.Management.Automation.Language.VariableExpressionAst] -and [string]::Equals($element.Argument.VariablePath.UserPath,'false',[StringComparison]::OrdinalIgnoreCase)) { continue }
+                & $finding 'CertificateValidationDisabled' $element 'Explicit certificate-validation override.'
+            }
+            if ($commandName -ieq 'Add-Type' -and $element.ParameterName -in 'TypeDefinition','MemberDefinition') { & $finding 'DynamicCodeExecution' $element 'Runtime compilation of inline source.' @() ((& $scopeName (& $scopeOf $element)) + '|Add-Type:' + $element.ParameterName.ToLowerInvariant()) }
+        }
+        if ($commandName -ieq 'New-Object') {
+            $typeArgument = $null
+            $elements = $command.CommandElements
+            for ($index = 1; $index -lt $elements.Count; $index++) {
+                $element = $elements[$index]
+                if ($element -is [System.Management.Automation.Language.CommandParameterAst] -and [string]::Equals($element.ParameterName,'TypeName',[StringComparison]::OrdinalIgnoreCase)) {
+                    $typeArgument = if ($null -ne $element.Argument) { $element.Argument } elseif ($index + 1 -lt $elements.Count) { $elements[$index + 1] }
+                    break
+                }
+            }
+            if ($null -eq $typeArgument -and $elements.Count -gt 1 -and $elements[1] -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $typeArgument = $elements[1] }
+            if ($typeArgument -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $typeArgument.Value -in $unsafeFormatters) { & $finding 'UnsafeDeserialization' $typeArgument ('Insecure formatter construction: ' + $typeArgument.Value) }
+        }
+    }
+    foreach ($invocation in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $args[0].Static -and $args[0].Expression -is [System.Management.Automation.Language.TypeExpressionAst] -and $args[0].Member -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true)) {
+        $typeName = $invocation.Expression.TypeName.FullName
+        $methodName = $invocation.Member.Value
+        if ($typeName -in 'scriptblock','System.Management.Automation.ScriptBlock','Management.Automation.ScriptBlock' -and $methodName -ieq 'Create') { & $finding 'DynamicCodeExecution' $invocation 'Constructing executable scriptblocks from text.' @() ((& $scopeName (& $scopeOf $invocation)) + '|ScriptBlock.Create') }
+        if ($typeName -in $unsafeFormatters -and $methodName -ieq 'new') { & $finding 'UnsafeDeserialization' $invocation ('Insecure formatter construction: ' + $typeName) }
+    }
+    $defined = @{}; foreach ($d in $definitions) { if ($d.Parent -isnot [System.Management.Automation.Language.FunctionMemberAst]) { $defined[$d.Name.ToLowerInvariant()] = $d.Name } }
     foreach ($group in @($commands | Where-Object { $_.GetCommandName() -and $defined.ContainsKey($_.GetCommandName().ToLowerInvariant()) }) | Group-Object { $_.GetCommandName().ToLowerInvariant() }) {
         $spellings = @(@($group.Group | ForEach-Object { $_.GetCommandName() }) + $defined[$group.Name] | Sort-Object -Unique -CaseSensitive)
         if ($spellings.Count -gt 1) { & $finding 'CaseSpelledTwoWays' $group.Group[0] ($spellings -join ' ') }
@@ -4499,7 +4625,7 @@ function Test-SmaGuard {
 # The protected checker is unchanged; the baseline comes from the actual committed object, not the working copy.
 function Test-PscCandidateGuard {
     param([string]$candidate,[string]$Baseline,[string]$expectedHash)
-    $candidateFile=[IO.Path]::GetFullPath($candidate);$baselineFile=[IO.Path]::GetFullPath($Baseline)
+    $candidateFile=[PscTreeText]::FullPath($candidate);$baselineFile=[PscTreeText]::FullPath($Baseline)
     $baselineDirectory=[IO.Path]::GetDirectoryName($baselineFile);$baselineLeaf=[IO.Path]::GetFileName($baselineFile)
     $commitId=git -C $baselineDirectory rev-parse --verify HEAD 2>$null
     if($LASTEXITCODE -ne 0 -or !$commitId){throw 'Candidate Guard requires a committed Git baseline.'}
@@ -4536,8 +4662,8 @@ class PscConformanceStage {
     [double] $Milliseconds
 }
 class PscConformanceReport {
-    [string] $candidate
-    [string] $candidateSha256
+    [string] $Candidate
+    [string] $CandidateSha256
     [PscGuardVerdict] $Guard
     [PscConformanceStage[]] $Stages
     [bool] $Passed
@@ -4560,7 +4686,7 @@ function Invoke-PscConformanceStage {
 }
 function Invoke-PscConformance {
     param([string]$candidate,[string]$Baseline,[string]$expectedHash,[switch]$development)
-    $report=[PscConformanceReport]::new();$report.Candidate=[IO.Path]::GetFullPath($candidate)
+    $report=[PscConformanceReport]::new();$report.Candidate=[PscTreeText]::FullPath($candidate)
     $report.Guard=Test-PscCandidateGuard $report.Candidate $Baseline $expectedHash
     $report.CandidateSha256=$report.Guard.CandidateSha256
     $stages=[Collections.Generic.List[PscConformanceStage]]::new()
@@ -5137,7 +5263,9 @@ if (-not $Help -and $PSBoundParameters.Count) {
         'Inspect' {
             if ([string]::IsNullOrEmpty($AssemblyPath)) { throw 'Inspect requires -AssemblyPath.' }
         }
+        'VerifyNativeLeaf' { if ([string]::IsNullOrWhiteSpace($AssemblyPath)) { throw 'VerifyNativeLeaf requires -AssemblyPath.' } }
         'Link' {
+            if (!$ResolveOnly -and [string]::IsNullOrWhiteSpace($EntrySymbol)) { throw 'Link requires -EntrySymbol unless -ResolveOnly.' }
             if ($null -eq $LinkInput -or $LinkInput.Count -eq 0) { throw 'Link requires -LinkInput.' }
             if (-not $ResolveOnly -and [string]::IsNullOrEmpty($OutputPath)) { throw 'Link requires -OutputPath unless -ResolveOnly.' }
         }
@@ -11787,6 +11915,7 @@ function Get-PinnedPowerShell {
 # console display and the README show exactly the properties that are not hidden.
 class PscParameter {
     [string] $Name
+    [string] $Description
     [type] $Type
     [object] $Default
     [object[]] $AllowedValues
@@ -12534,7 +12663,7 @@ function Get-PscStructuralMembers {
 
 # Authoring-time SMA selection for a closed, value-typed numeric call.
 # MethodInformation describes the source signatures, not the CLR provider.
-# Numeric argument ranks are type-dependent; these boxed zeroes are witnesses
+# Numeric argument ranks are type-dependent; these boxed zeroes are representative values
 # of the already proven argument types, not execution of the source program.
 # The internal SMA ABI is pinned to the compiler's authoring runtime. Nothing
 # from this selector is emitted into the specialized assembly.
@@ -12557,9 +12686,9 @@ function Select-PscStructuralNumericOverload {
         }
         $infos.SetValue($mc.Invoke([object[]]@($false,$false,$parameters)), $i)
     }
-    $witness=[object[]]::new($ArgumentTypes.Length)
-    for($i=0;$i -lt $ArgumentTypes.Length;$i++){$witness[$i]=[Activator]::CreateInstance($ArgumentTypes[$i])}
-    $invoke=[object[]]@($infos,$null,$false,$witness,$null,$null,$false,$false)
+    $sampleArguments=[object[]]::new($ArgumentTypes.Length)
+    for($i=0;$i -lt $ArgumentTypes.Length;$i++){$sampleArguments[$i]=[Activator]::CreateInstance($ArgumentTypes[$i])}
+    $invoke=[object[]]@($infos,$null,$false,$sampleArguments,$null,$null,$false,$false)
     $selected=$best.Invoke($null,$invoke)
     if($null -eq $selected){throw "Missing or ambiguous source operation: $($invoke[4]): $($invoke[5])"}
     $index=[Array]::IndexOf($infos,$selected)
@@ -12845,7 +12974,7 @@ class PscDevelopment {
     hidden [string] $CandidateTreeHash
     PscDevelopment([PscApi]$api,[string]$base,[string]$tree){
         $this.Api=$api;$this.Compiler=[IO.Path]::GetFullPath($api.Script);$this.CompilerHash=[PscTreeText]::Hash([PscTreeText]::Read($this.Compiler))
-        $this.Base=[IO.Path]::GetFullPath($base);$this.BaseHash=[PscTreeText]::Hash([PscTreeText]::Read($this.Base));$this.Tree=[IO.Path]::GetFullPath($tree)
+        $this.Base=[PscTreeText]::FullPath($base);$this.BaseHash=[PscTreeText]::Hash([PscTreeText]::Read($this.Base));$this.Tree=[PscTreeText]::FullPath($tree)
         if(![IO.Directory]::Exists($this.Tree)){$null=$api.UnCollate($this.Base,$this.Tree)}
         $this.ManifestHash=[PscTreeText]::Hash([PscTreeText]::Read([PscTreeText]::SafePath($this.Tree,'PSC.tree')))
         $null=$this.Changes()
@@ -12901,11 +13030,11 @@ class PscDevelopment {
         return [PscTreeText]::Hash($builder.ToString())
     }
     [PscTreeSnapshot] Collate([string]$destination){
-        $path=[IO.Path]::GetFullPath($destination)
+        $path=[PscTreeText]::FullPath($destination)
         if([IO.File]::Exists($path) -or [IO.Directory]::Exists($path)){throw 'Development candidate must be a fresh destination.'}
-        $null=$this.Changes();$treeHash=$this.TreeHash();$receipt=$this.Api.Collate($this.Tree,$path)
+        $null=$this.Changes();$treeHash=$this.TreeHash();$result=$this.Api.Collate($this.Tree,$path)
         if($this.TreeHash() -cne $treeHash){throw 'Development tree changed during collation; discard the candidate.'}
-        $this.Candidate=$path;$this.CandidateHash=$receipt.SourceSha256;$this.CandidateTreeHash=$treeHash;return $receipt
+        $this.Candidate=$path;$this.CandidateHash=$result.SourceSha256;$this.CandidateTreeHash=$treeHash;return $result
     }
     [PscConformanceReport] Conform([bool]$development){
         if(!$this.Candidate -or $this.TreeHash() -cne $this.CandidateTreeHash -or [PscTreeText]::Hash([PscTreeText]::Read($this.Candidate)) -cne $this.CandidateHash){throw 'Development candidate is absent or stale; collate again.'}
@@ -12975,9 +13104,9 @@ $api.Describe('Guard').DispatchExtent.Text
 $api.Guide()
 ```
 
-Query returns typed witnesses with source identity, owner, extent and coverage. Pull in windows of 1..256; dispose cursors. Literal containment includes comments and strings inside a declaration, not proof of binding. Use `$dev.Find('Apply')` or `$dev.Search('literal')` to include projected resources; canonical queries do not parse embedded source strings. `OpenQuery` supports explicit paths, owner, kind and limit, including non-loading CIL inspection for binary queries.
+Query returns typed references with source identity, owner, extent and coverage. Pull in windows of 1..256; dispose cursors. Literal containment includes comments and strings inside a declaration, not proof of binding. Use `$dev.Find('Apply')` or `$dev.Search('literal')` to include projected resources; canonical queries do not parse embedded source strings. `OpenQuery` supports explicit paths, owner, kind and limit, including non-loading CIL inspection for binary queries.
 
-A read-only query witness can become an edit witness only through exact source/extent validation (`$doc.Resolve($hit)`). A document's own `Find` returns revision-bound editable witnesses directly. Example, using a behavior-preserving numeric-literal edit in the projected calibration resource:
+A read-only query reference can become an edit reference only through exact source/extent validation (`$doc.Resolve($hit)`). A document's own `Find` returns revision-bound editable references directly. Example, using a behavior-preserving numeric-literal edit in the projected calibration resource:
 
 ```powershell
 $doc = $dev.OpenDocument('SM/Calibration.sm1')
@@ -12989,13 +13118,13 @@ $doc.Save()
 $dev.Changes()
 $dev.Affected()
 $dev.Collate('./PSC.next.ps1')
-$receipt = $dev.Conform($true)
-$receipt.Stages | Select-Object Name,State,ExitCode
+$result = $dev.Conform($true)
+$result.Stages | Select-Object Name,State,ExitCode
 ```
 
 External edits to projected files are also supported. Start with a clean Git baseline and a new or matching projection. Collate needs a fresh candidate destination and rejects missing/untracked units and changed declaration boundaries. Additions, deletions and renames still require explicit canonical edits. Affected reports declared faculty dependencies, not exhaustive semantic or test coverage. No tests are omitted based on Affected.
 
-Conform runs the protected Guard against committed source, the candidate API, projection and embedded regressions. `true` selects development scope and skips historical Windows verification (`Complete = False`); `false` requests the full suite and requires its native toolchain. Review the receipt before explicitly promoting the candidate. Use `git diff -- PSC.ps1`, commit the reviewed change, verify HEAD, then open a fresh projection. Never silently change protected checkers. See [AGENTS.md](AGENTS.md) for engineering requirements.
+Conform runs the protected Guard against committed source, the candidate API, projection and embedded regressions. `true` selects development scope and skips historical Windows verification (`Complete = False`); `false` requests the full suite and requires its native toolchain. Review the result before explicitly promoting the candidate. Use `git diff -- PSC.ps1`, commit the reviewed change, verify HEAD, then open a fresh projection. Never silently change protected checkers. See [AGENTS.md](AGENTS.md) for engineering requirements.
 
 ## Compiler and runtime
 
@@ -13009,6 +13138,44 @@ Conform runs the protected Guard against committed source, the candidate API, pr
 PSC authoring requires a trusted PowerShell session with the required language capabilities. It uses reflection, metadata readers, assembly emission and native interop openly. Do not bypass AMSI, Defender, App Control or execution policies. Follow local signing and deployment policy. Only compile or execute trusted source; conformance runs candidate code and is not a sandbox. Use trusted assemblies for CIL import/compilation and trusted data for `FixedParametersPath` and `ProfilePath`. Query is the non-loading metadata inquiry path for supported binaries. Determinism and SHA-256 identify artifacts; they do not establish publisher trust or safety.
 
 Microsoft guidance: [script injection](https://learn.microsoft.com/en-us/powershell/scripting/security/preventing-script-injection), [PowerShell security](https://learn.microsoft.com/en-us/powershell/scripting/security/security-features), [unsafe deserialization](https://learn.microsoft.com/en-us/dotnet/standard/serialization/binaryformatter-security-guide).
+
+## Vocabulary and change control
+
+PSC uses established configuration-management and software-assurance terminology where it fits. The following is a project vocabulary, not a claim of NIST compliance. References: [NIST SP 800-128](https://csrc.nist.gov/glossary/term/baseline_configuration), [NIST SP 800-218 (SSDF 1.1)](https://csrc.nist.gov/pubs/sp/800/218/final), and the [NIST CSRC glossary](https://csrc.nist.gov/glossary).
+
+| Term | Meaning in PSC |
+|---|---|
+| Canonical source | The authoritative maintained PSC source, not a projection or compiled artifact. |
+| Baseline | An approved revision with known identity; Git HEAD is a comparison point, not inherently approval. |
+| Candidate | A proposed new canonical source or artifact, not yet accepted. |
+| Configuration item | An independently controlled source, toolchain, policy or release artifact. A projected unit need not be a separate configuration item. |
+| Drift | An unintended discrepancy from a specified baseline, requirement or documented contract. An intentional proposed change is not inherently drift. |
+| Manifest | Ordered inventory and identities of projected units; not an approval or signature. |
+| Provenance | Origin and transformation history of an artifact or observation. |
+| Integrity verification | Compare bytes or a digest against an independently trusted expected value; not publisher authentication. |
+| Finding | A diagnostic against a stated criterion, not necessarily a vulnerability. |
+| Verification | Objective evidence that specified requirements are met. |
+| Validation | Evidence of fitness for a specific intended use and operating environment. |
+| Conformance | Assessment against declared criteria and explicit scope; not a security certification. |
+| Assurance | Justified confidence supported by evidence, not a synonym for a passing test. |
+| Coverage | What was examined or exercised, with omissions and unresolved cases distinguished. |
+
+PSC-specific terms retain their distinct meanings:
+
+| Term | Meaning in PSC |
+|---|---|
+| UnCollate / Collate | Project canonical source into ordered, editable units / validate and reconstruct a single-file candidate. |
+| Consolidate | Follow admitted source-inclusion relationships to form a single script; not the inverse of UnCollate. |
+| Faculty | Named, independently realizable runtime/compiler capability with declared dependencies. |
+| Realization | An executable representation of admitted source, such as a managed assembly or native image. |
+| Referent | The structural entity identified by a reference; for an AST match, the Target is its referent. |
+| Reference | A typed source- or artifact-bound reference to a referent, including identity and extent. It does not establish arbitrary runtime binding. |
+| Result | A typed record of an operation's outcome, scope and relevant evidence; not approval or an independently signed attestation. |
+| Guard | Candidate admission policy against a committed comparison source and protected checker. |
+| Conform | Orchestrate scoped verification and record its results; acceptance and promotion remain explicit decisions. |
+| Appliance | A one-shot executable unit in source form (.sexe). |
+
+Use these terms consistently in code, help, results and development discussion. Keep source identity, assessment criteria, observation, outcome and authorization distinct. A successful partial assessment must not be described as complete; an unknown must not be described as absent. Preserve established PSC operation names unless their semantics change.
 
 ## Live reference
 
@@ -13053,6 +13220,7 @@ The API is derived from the running script, so mode names and parameter evidence
         foreach($parameter in $this.Parameters){if($parameter.Name -eq 'Mode'){foreach($value in $parameter.AllowedValues){if(!$allowed.Add([string]$value)){throw 'Duplicate admitted mode.'}}}}
         foreach($operation in $this.Modes){if(!$dispatched.Add($operation.Mode)){throw 'Duplicate dispatched mode.'}}
         if(!$allowed.SetEquals($dispatched) -or !$allowed.Contains($this.DefaultMode)){throw 'PSC mode admission and dispatch disagree.'}
+        foreach($parameter in $this.Parameters){if([string]::IsNullOrWhiteSpace($parameter.Description)){throw "Undocumented PSC parameter: $($parameter.Name)"}}
     }
     [string] $Synopsis
     [string] $Script
@@ -13147,9 +13315,11 @@ function Get-PscApi {
     [CmdletBinding()]
     [OutputType([PscApi])]
     param()
-    $tokens = $null; $errors = $null
-    $ast = [System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$tokens, [ref]$errors)
-    if ($errors.Count) { throw 'This script has parse errors; its API cannot be described.' }
+    $source = [PscSource]::new($PSCommandPath)
+    $ast = $source.Ast
+    if ($source.ParseErrors.Count) { throw 'This script has parse errors; its API cannot be described.' }
+    $help = $ast.GetHelpContent()
+    if ($null -eq $help) { throw 'PSC script-level help is missing.' }
     $scriptParameters = [System.Collections.Generic.Dictionary[string, System.Management.Automation.Language.ParameterAst]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($parameter in $ast.ParamBlock.Parameters) { $scriptParameters[$parameter.Name.VariablePath.UserPath] = $parameter }
     $functions = [System.Collections.Generic.Dictionary[string, System.Management.Automation.Language.FunctionDefinitionAst]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -13182,21 +13352,20 @@ function Get-PscApi {
         $operation = [PscOperation]::new()
         $operation.DispatchExtent = $body.Extent
         $operation.Mode = $clause.Item1.SafeGetValue()
-        $operation.Parameters = [PscParameter[]]@(foreach ($name in $used) { Get-PscApiParameter $scriptParameters[$name] })
+        $operation.Parameters = [PscParameter[]]@(foreach ($name in $used) { Get-PscApiParameter $scriptParameters[$name] $help.Parameters[$name.ToUpperInvariant()] })
         $operation.Calls = [string[]]@($calls)
         $operation.Definitions = [System.Management.Automation.Language.FunctionDefinitionAst[]]@(foreach ($name in $calls) { $functions[$name] })
         $operations.Add($operation)
     }
-    $help = $ast.GetHelpContent()
     $api = [PscApi]::new()
     $api.Synopsis = if ($help) { $help.Synopsis.Trim() } else { $null }
     $api.Notes = if ($help -and $help.Notes) { [string]::Join(' ', [string[]]@($help.Notes.Split("`n").Trim() | Where-Object { $_ })) } else { $null }
     $api.Script = $PSCommandPath
-    $api.SourceSha512 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA512).Hash
+    $api.SourceSha512 = $source.Sha512
     $api.DefaultMode = $scriptParameters['Mode'].DefaultValue.SafeGetValue()
     $api.Modes = $operations.ToArray()
-    $api.Parameters = [PscParameter[]]@(foreach ($parameter in $ast.ParamBlock.Parameters) { Get-PscApiParameter $parameter })
-    $api.Measures = [PscSource]::new($PSCommandPath).Measures
+    $api.Parameters = [PscParameter[]]@(foreach ($parameter in $ast.ParamBlock.Parameters) { Get-PscApiParameter $parameter $help.Parameters[$parameter.Name.VariablePath.UserPath.ToUpperInvariant()] })
+    $api.Measures = $source.Measures
     $api.Functions = [string[]]@($functions.Keys)
     $api.Classes = [string[]]@($ast.BeginBlock.FindAll({ param($node) $node -is [System.Management.Automation.Language.TypeDefinitionAst] }, $false) | ForEach-Object Name)
     $api.Environment = $script:PscEnvironment
@@ -13209,7 +13378,7 @@ function Get-PscApi {
 function Get-PscApiParameter {
     [CmdletBinding()]
     [OutputType([PscParameter])]
-    param([Parameter(Mandatory)][System.Management.Automation.Language.ParameterAst] $Parameter)
+    param([Parameter(Mandatory)][System.Management.Automation.Language.ParameterAst] $Parameter, [string] $Description)
     $allowed = [System.Collections.Generic.List[object]]::new()
     $pipeline = $false
     foreach ($attribute in $Parameter.Attributes) {
@@ -13224,6 +13393,7 @@ function Get-PscApiParameter {
     }
     $described = [PscParameter]::new()
     $described.Name = $Parameter.Name.VariablePath.UserPath
+    $described.Description = $Description.Trim()
     $described.Type = $Parameter.StaticType
     $described.Default = if ($Parameter.DefaultValue) { $Parameter.DefaultValue.SafeGetValue() } else { $null }
     $described.AllowedValues = $allowed.ToArray()
@@ -13977,7 +14147,7 @@ function Export-NativeImage {
     $libraries = @((Join-Path $toolset.Msvc 'lib\x64'), (Join-Path $toolset.Sdk 'ucrt\x64'), (Join-Path $toolset.Sdk 'um\x64'))
     $resolution = Resolve-CoffLink -Inputs $inputs.ToArray() -LibraryDirectories $libraries -DefaultLibraries @('ucrt.lib') -IgnoredDefaultLibraries @('libucrt.lib') -Entry 'wmainCRTStartup'
     if ($resolution.Unresolved.Count) { throw ("Native link: unresolved external symbols:`n" + ($resolution.Unresolved -join "`n")) }
-    $image = Write-CoffImage -Resolution $resolution -Path ([IO.Path]::GetFullPath($OutputPath)) -Merges @('.managedcode=.text', 'hydrated=.bss') -Subsystem $(if ($Subsystem -eq 'Windows') { 2 } else { 3 }) -StackReserve 1572864 -ApplicationIcon $ApplicationIcon
+    $image = Write-CoffImage -Resolution $resolution -Path ([PscTreeText]::FullPath($OutputPath)) -Merges @('.managedcode=.text', 'hydrated=.bss') -Subsystem $(if ($Subsystem -eq 'Windows') { 2 } else { 3 }) -StackReserve 1572864 -ApplicationIcon $ApplicationIcon
     [pscustomobject]@{ OutputPath = [IO.Path]::GetFullPath($OutputPath); Object = $object; ObjectLength = (Get-Item -LiteralPath $object).Length; ImageLength = (Get-Item -LiteralPath $OutputPath).Length; Image = $image }
 }
 
@@ -13993,7 +14163,7 @@ class PscCilInstruction {
     [int] $EndOffset
 }
 # Read-only structural inquiry. Authoring-side SMA ASTs and PE metadata are
-# witnesses, never executable source. No project graph or target assembly load.
+# references, never executable source. No project graph or target assembly load.
 enum PscQueryKind { Call; MemberAccess; Declaration; Index; CilMethod; CilOp }
 class PscMatch {
     [string] $Domain
@@ -14124,7 +14294,7 @@ class PscSourceQueryVisitor : System.Management.Automation.Language.AstVisitor2 
 }
 # Document core follows Notepad.ps1 (17b76e2), NotepadPiece/NotepadEdit/NotepadDocument:
 # immutable original storage, append-only insertion storage, ordered pieces and a grouped journal.
-# The search/UI layer is not imported. A replacement consumes structural witnesses of this revision.
+# The search/UI layer is not imported. A replacement consumes structural references of this revision.
 class PscDocumentPiece {
     [int] $Buffer
     [int] $Start
@@ -14156,7 +14326,7 @@ class PscDocument {
     hidden [string] $SavedHash
     hidden [Guid] $Identity = [Guid]::NewGuid()
     PscDocument([string]$path){
-        $this.Path=[IO.Path]::GetFullPath($path)
+        $this.Path=[PscTreeText]::FullPath($path)
         $this.Original=[PscTreeText]::Read($this.Path); $this.Length=$this.Original.Length
         $this.SavedHash=[PscTreeText]::Hash($this.Original)
         if($this.Length){$this.Pieces.Add([PscDocumentPiece]::new(0,0,$this.Length))}
@@ -14180,15 +14350,15 @@ class PscDocument {
         return $this.Find($kind,$name,$owner,'',$limit)
     }
     [PscMatch[]] Find([PscQueryKind]$kind,[string]$name,[string]$owner,[int]$limit){return $this.Query($kind,$name,$owner,$limit)}
-    [PscMatch] Resolve([PscMatch]$witness){
+    [PscMatch] Resolve([PscMatch]$match){
         $text=$this.Text();$digest=[PscTreeText]::Hash($text)
-        if($null -eq $witness -or $witness.Domain -cne 'SourceAst' -or $witness.ParseIncomplete -or $witness.SourceRevision -ne -1 -or $witness.DocumentIdentity -ne [Guid]::Empty -or $witness.ArtifactPath -cne $this.Path -or $witness.ArtifactSha256 -cne $digest){throw 'Resolve requires a current read-only source witness.'}
-        if($witness.Target -isnot [System.Management.Automation.Language.Ast] -or $witness.StartOffset -lt 0 -or $witness.EndOffset -le $witness.StartOffset -or $witness.EndOffset -gt $text.Length){throw 'Resolve requires a valid source extent.'}
-        $extent=([System.Management.Automation.Language.Ast]$witness.Target).Extent
-        if($extent.StartOffset -ne $witness.StartOffset -or $extent.EndOffset -ne $witness.EndOffset -or $extent.Text -cne $text.Substring($witness.StartOffset,$witness.EndOffset-$witness.StartOffset)){throw 'Resolve source extent differs.'}
-        $visitor=[PscSourceQueryVisitor]::new();$visitor.Spec=[PscQuerySpec]::new($witness.Kind,$witness.Name,$witness.Owner,1);$visitor.Path=$this.Path;$visitor.Digest=$digest;$visitor.Limit=1;$visitor.ExactStart=$witness.StartOffset;$visitor.ExactEnd=$witness.EndOffset
+        if($null -eq $match -or $match.Domain -cne 'SourceAst' -or $match.ParseIncomplete -or $match.SourceRevision -ne -1 -or $match.DocumentIdentity -ne [Guid]::Empty -or $match.ArtifactPath -cne $this.Path -or $match.ArtifactSha256 -cne $digest){throw 'Resolve requires a current read-only source reference.'}
+        if($match.Target -isnot [System.Management.Automation.Language.Ast] -or $match.StartOffset -lt 0 -or $match.EndOffset -le $match.StartOffset -or $match.EndOffset -gt $text.Length){throw 'Resolve requires a valid source extent.'}
+        $extent=([System.Management.Automation.Language.Ast]$match.Target).Extent
+        if($extent.StartOffset -ne $match.StartOffset -or $extent.EndOffset -ne $match.EndOffset -or $extent.Text -cne $text.Substring($match.StartOffset,$match.EndOffset-$match.StartOffset)){throw 'Resolve source extent differs.'}
+        $visitor=[PscSourceQueryVisitor]::new();$visitor.Spec=[PscQuerySpec]::new($match.Kind,$match.Name,$match.Owner,1);$visitor.Path=$this.Path;$visitor.Digest=$digest;$visitor.Limit=1;$visitor.ExactStart=$match.StartOffset;$visitor.ExactEnd=$match.EndOffset
         $this.Parse($text).Visit($visitor)
-        if($visitor.Hits.Count -ne 1 -or $visitor.Hits[0].Target.GetType() -ne $witness.Target.GetType()){throw 'Resolve could not reproduce structural witness.'}
+        if($visitor.Hits.Count -ne 1 -or $visitor.Hits[0].Target.GetType() -ne $match.Target.GetType()){throw 'Resolve could not reproduce structural reference.'}
         $resolved=$visitor.Hits[0];$resolved.SourceRevision=$this.Revision;$resolved.DocumentIdentity=$this.Identity;return $resolved
     }
     [PscMatch[]] Find([PscQueryKind]$kind,[string]$name,[string]$owner,[string]$literal,[int]$limit){
@@ -14228,23 +14398,23 @@ class PscDocument {
     }
     [void] Replace([PscMatch]$match,[string]$replacement){$this.Replace([PscMatch[]]@($match),[string[]]@($replacement))}
     [void] Replace([PscMatch[]]$matches,[string[]]$replacements){
-        if(!$matches.Length -or $matches.Length -gt 256 -or $matches.Length -ne $replacements.Length){throw 'Replacement requires 1..256 paired witnesses and payloads.'}
+        if(!$matches.Length -or $matches.Length -gt 256 -or $matches.Length -ne $replacements.Length){throw 'Replacement requires 1..256 paired references and payloads.'}
         $text=$this.Text(); $digest=[PscTreeText]::Hash($text)
         $order=[Collections.Generic.SortedDictionary[int,int]]::new()
         for($i=0;$i -lt $matches.Length;$i++){
             $hit=$matches[$i]
-            if($null -eq $hit -or $hit.Domain -cne 'SourceAst' -or $hit.ParseIncomplete -or $hit.ArtifactPath -cne $this.Path -or $hit.ArtifactSha256 -cne $digest -or $hit.SourceRevision -ne $this.Revision -or $hit.DocumentIdentity -ne $this.Identity){throw 'Stale or foreign document witness.'}
-            if($hit.Target -isnot [System.Management.Automation.Language.Ast] -or $hit.StartOffset -lt 0 -or $hit.EndOffset -le $hit.StartOffset -or $hit.EndOffset -gt $text.Length){throw 'Invalid document witness extent.'}
+            if($null -eq $hit -or $hit.Domain -cne 'SourceAst' -or $hit.ParseIncomplete -or $hit.ArtifactPath -cne $this.Path -or $hit.ArtifactSha256 -cne $digest -or $hit.SourceRevision -ne $this.Revision -or $hit.DocumentIdentity -ne $this.Identity){throw 'Stale or foreign document reference.'}
+            if($hit.Target -isnot [System.Management.Automation.Language.Ast] -or $hit.StartOffset -lt 0 -or $hit.EndOffset -le $hit.StartOffset -or $hit.EndOffset -gt $text.Length){throw 'Invalid document reference extent.'}
             $extent=([System.Management.Automation.Language.Ast]$hit.Target).Extent
-            if($extent.StartOffset -ne $hit.StartOffset -or $extent.EndOffset -ne $hit.EndOffset -or $extent.Text -cne $text.Substring($hit.StartOffset,$hit.EndOffset-$hit.StartOffset)){throw 'Witness extent differs from source.'}
-            if($order.ContainsKey($hit.StartOffset)){throw 'Overlapping document witnesses.'}
+            if($extent.StartOffset -ne $hit.StartOffset -or $extent.EndOffset -ne $hit.EndOffset -or $extent.Text -cne $text.Substring($hit.StartOffset,$hit.EndOffset-$hit.StartOffset)){throw 'Reference extent differs from source.'}
+            if($order.ContainsKey($hit.StartOffset)){throw 'Overlapping document references.'}
             $order.Add($hit.StartOffset,$i)
         }
         $candidate=[Text.StringBuilder]::new(); $at=0
         $keys=[int[]]::new($order.Count); $order.Keys.CopyTo($keys,0)
         foreach($key in $keys){
             $i=$order[$key];$hit=$matches[$i]
-            if($key -lt $at){throw 'Overlapping document witnesses.'}
+            if($key -lt $at){throw 'Overlapping document references.'}
             [void]$candidate.Append($text,$at,$key-$at).Append($replacements[$i]);$at=$hit.EndOffset
         }
         [void]$candidate.Append($text,$at,$text.Length-$at)
@@ -14362,7 +14532,7 @@ class PscQueryCursor : IDisposable {
     hidden [Collections.Generic.List[string]] $Errors = [Collections.Generic.List[string]]::new()
     hidden [bool] $Disposed
     PscQueryCursor([string[]]$paths,[PscQuerySpec]$spec){
-        $this.Paths=[string[]]::new($paths.Length);for($n=0;$n -lt $paths.Length;$n++){$this.Paths[$n]=[IO.Path]::GetFullPath($paths[$n])};$this.Spec=$spec
+        $this.Paths=[string[]]::new($paths.Length);for($n=0;$n -lt $paths.Length;$n++){$this.Paths[$n]=[PscTreeText]::FullPath($paths[$n])};$this.Spec=$spec
     }
     hidden [void] CloseArtifact(){
         $this.Ast=$null;$this.Resume=0;$this.ParseIncomplete=$false;$this.Body=$null;$this.Methods=$null;$this.Metadata=$null
@@ -15015,7 +15185,7 @@ function Write-PscAcquiredCil([PscCilMethod] $Body,[Reflection.Emit.MethodBuilde
 function Import-PscCilAssembly([string] $AssemblyPath,[string] $ClassName,[string[]] $MethodNames,[string] $OutputPath,[bool] $Deterministic,[switch]$Ir,[switch]$Analyze,[switch]$NativeLeaf,[switch]$BorrowedCell) {
     if($BorrowedCell -and !$NativeLeaf){throw 'Borrowed cell ABI requires NativeCil'}
     if (!$AssemblyPath -or !$ClassName -or !$MethodNames.Length -or (!$OutputPath -and !$Analyze)) { throw 'ImportCil requires AssemblyPath, ClassName, MethodNames and OutputPath.' }
-    $inputPath=[IO.Path]::GetFullPath($AssemblyPath);$output='';if(!$Analyze){$output=[IO.Path]::GetFullPath($OutputPath)}
+    $inputPath=[PscTreeText]::FullPath($AssemblyPath);$output='';if(!$Analyze){$output=[PscTreeText]::FullPath($OutputPath)}
     if ($inputPath -eq $output) { throw 'Cannot overwrite the input assembly.' }
     # Explicitly trusted input. Resolve referenced types through the host for this
     # bounded milestone; no independent type loader or native execution yet.
@@ -15049,10 +15219,10 @@ function Import-PscCilAssembly([string] $AssemblyPath,[string] $ClassName,[strin
         $mb=$tb.DefineMethod($b.Method.Name,[Reflection.MethodAttributes]'Public,Static,HideBySig',$b.Method.ReturnType,$signature)
         if($Ir){Write-PscScalarIr $graphs[$graphIndex] $mb;$graphIndex++}else{Write-PscAcquiredCil $b $mb}
     }
-    $receipt=Save-PersistedAssemblySession -Session $session -OutputPath $output -Deterministic:$Deterministic
+    $result=Save-PersistedAssemblySession -Session $session -OutputPath $output -Deterministic:$Deterministic
     [Console]::WriteLine("Acquired $($bodies.Count) method bodies into $destName; source SHA256=$([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($inputPath))))")
     foreach ($b in $bodies) { [Console]::WriteLine("CIL $($b.Method.Name): instructions=$($b.Instructions.Length) source_bytes=$($b.Length) locals=$($b.Locals.Length) handlers=$($b.Handlers.Length)") }
-    return $receipt
+    return $result
 }
 
 class PscMethodInspection {
@@ -15079,7 +15249,7 @@ class PscAssemblyInspection {
 function Test-LoweredAssembly {
     <#
     .SYNOPSIS
-        Inspects an emitted assembly, validates zero SMA dependencies, and generates a receipt.
+        Inspects an emitted assembly, validates zero SMA dependencies, and generates a result.
     #>
     [CmdletBinding()]
     param(
@@ -15088,7 +15258,7 @@ function Test-LoweredAssembly {
         [string[]] $MethodNames
     )
 
-    $fullPath = [IO.Path]::GetFullPath($AssemblyPath)
+    $fullPath = [PscTreeText]::FullPath($AssemblyPath)
     if (-not [IO.File]::Exists($fullPath)) {
         throw "Assembly file not found: '$fullPath'."
     }
@@ -17312,6 +17482,7 @@ class CompareInstrument : PscInstrument {
 process {
     if ($Help) {
         Get-Help -Name $PSCommandPath -Full
+        (Get-PscApi).Modes | Select-Object Mode,Parameters,Calls
         return
     }
     # With no arguments, the script describes itself instead of compiling nothing.
@@ -17324,7 +17495,7 @@ process {
         }
         'UnCollate' {
             if(!$TreeDirectory){throw 'UnCollate requires -TreeDirectory.'}
-            $file=if($SourcePath){[IO.Path]::GetFullPath($SourcePath)}else{$PSCommandPath}
+            $file=if($SourcePath){[PscTreeText]::FullPath($SourcePath)}else{$PSCommandPath}
             New-PscSourceTree -SourceFile $file -Root $TreeDirectory
         }
         'Collate' {
@@ -17334,13 +17505,13 @@ process {
         'Status' {
             if(!$TreeDirectory){throw 'Status requires -TreeDirectory.'}
             $status=Read-PscSourceTree $TreeDirectory
-            $file=if($SourcePath){[IO.Path]::GetFullPath($SourcePath)}else{$PSCommandPath}
+            $file=if($SourcePath){[PscTreeText]::FullPath($SourcePath)}else{$PSCommandPath}
             $status.DestinationState=if(![IO.File]::Exists($file)){'Missing'}elseif([PscTreeText]::Hash([PscTreeText]::Read($file)) -ceq $status.BaseSha256){'Base'}else{'Diverged'}
             $status
         }
         'Diff' {
             if(!$TreeDirectory){throw 'Diff requires -TreeDirectory.'}
-            $file=if($SourcePath){[IO.Path]::GetFullPath($SourcePath)}else{$PSCommandPath}
+            $file=if($SourcePath){[PscTreeText]::FullPath($SourcePath)}else{$PSCommandPath}
             Compare-PscSourceTree -Root $TreeDirectory -SourceFile $file
         }
         'BuildFaculty' {
@@ -17368,7 +17539,7 @@ process {
             if ($LeasedStructuralContracts) {
                 if($StructuralBindings -or $StructuralThunks -or $Program -or $Native -or !$ClassName -or !$MethodNames){throw 'Leased structural lowering requires named managed caller methods.'}
                 $root=$SourceAst
-                if($null -eq $root){$full=[IO.Path]::GetFullPath($SourcePath);$root=Read-PowerShellSource -Source ([IO.File]::ReadAllText($full)) -SourceFile $full}
+                if($null -eq $root){$full=[PscTreeText]::FullPath($SourcePath);$root=Read-PowerShellSource -Source ([IO.File]::ReadAllText($full)) -SourceFile $full}
                 $compileParameters['SourceAst']=ConvertTo-PscLeasedStructuralSource -Root $root -ClassName $ClassName -MethodNames $MethodNames -Contracts $LeasedStructuralContracts
                 $null=$compileParameters.Remove('SourcePath')
                 if(!$ClassNames){$compileParameters['ClassNames']=[string[]]@($ClassName)}
@@ -17377,7 +17548,7 @@ process {
             if ($StructuralThunks) {
                 if ($StructuralBindings -or $Program -or $Native -or !$ClassName -or $MethodNames -or $ClassNames) { throw 'Structural thunk generation requires a named managed class and no other selection.' }
                 $root=$SourceAst
-                if($null -eq $root){$full=[IO.Path]::GetFullPath($SourcePath);$root=Read-PowerShellSource -Source ([IO.File]::ReadAllText($full)) -SourceFile $full}
+                if($null -eq $root){$full=[PscTreeText]::FullPath($SourcePath);$root=Read-PowerShellSource -Source ([IO.File]::ReadAllText($full)) -SourceFile $full}
                 $compileParameters['SourceAst']=New-PscStructuralThunkSource -Root $root -ClassName $ClassName -Bindings $StructuralThunks
                 $null=$compileParameters.Remove('SourcePath')
             }
@@ -17385,7 +17556,7 @@ process {
                 if ($Program -or $Native -or !$ClassName -or !$MethodNames) { throw 'Structural specialization currently requires managed class/method compilation.' }
                 $structuralRoot=$SourceAst
                 if ($null -eq $structuralRoot) {
-                    $full=[IO.Path]::GetFullPath($SourcePath)
+                    $full=[PscTreeText]::FullPath($SourcePath)
                     $structuralRoot=Read-PowerShellSource -Source ([IO.File]::ReadAllText($full)) -SourceFile $full
                 }
                 $compileParameters['SourceAst']=ConvertTo-PscStructuralSource -Root $structuralRoot -ClassName $ClassName -MethodNames $MethodNames -Bindings $StructuralBindings
@@ -17398,7 +17569,7 @@ process {
                 # and compiled as a program with Main as its entry point.
                 $programAst = $SourceAst
                 if ($null -eq $programAst) {
-                    $programPath = [IO.Path]::GetFullPath($SourcePath)
+                    $programPath = [PscTreeText]::FullPath($SourcePath)
                     $programAst = Read-PowerShellSource -Source ([IO.File]::ReadAllText($programPath)) -SourceFile $programPath
                 }
                 if ($null -ne $FixedParameters -and $FixedParameters.Count) { $programAst = [PscReachability]::Prune([PscFixedParameters]::new($FixedParameters).Fix($programAst)) }
@@ -17410,7 +17581,7 @@ process {
             if (-not $Native) { return Export-LoweredAssembly @compileParameters }
             if (-not $EntryPoint) { throw 'A native executable needs -EntryPoint.' }
             # The lowered assembly sits beside the executable, named for it; ILC and the linker take it from there.
-            $compileParameters['OutputPath'] = [IO.Path]::ChangeExtension([IO.Path]::GetFullPath($OutputPath), '.dll')
+            $compileParameters['OutputPath'] = [IO.Path]::ChangeExtension([PscTreeText]::FullPath($OutputPath), '.dll')
             $lowered = Export-LoweredAssembly @compileParameters
             $image = Export-NativeImage -AssemblyPath $lowered.OutputPath -OutputPath $OutputPath -Subsystem $Subsystem -ApplicationIcon $lowered.ApplicationIcon
             [pscustomobject]@{ Assembly = $lowered; Native = $image }
@@ -17420,7 +17591,7 @@ process {
             ConvertTo-TypedExpression -MethodAst $MethodAst
         }
         'AnalyzeCilIr' { Import-PscCilAssembly -AssemblyPath $AssemblyPath -ClassName $ClassName -MethodNames $MethodNames -Analyze }
-        'VerifyNativeLeaf' { [void][Reflection.Assembly]::LoadFrom((Join-Path $RuntimeDirectory 'NativeEncoding.dll')); Test-PscX64LeafAbi ([IO.File]::ReadAllBytes([IO.Path]::GetFullPath($AssemblyPath))) $NativeFrameBytes $NativeIntegerArguments $NativeFloatArguments $NativeReturnKind -BorrowedCell:$NativeBorrowedCell }
+        'VerifyNativeLeaf' { [void][Reflection.Assembly]::LoadFrom((Join-Path $RuntimeDirectory 'NativeEncoding.dll')); Test-PscX64LeafAbi ([IO.File]::ReadAllBytes([PscTreeText]::FullPath($AssemblyPath))) $NativeFrameBytes $NativeIntegerArguments $NativeFloatArguments $NativeReturnKind -BorrowedCell:$NativeBorrowedCell }
         'NativeCil' { Import-PscCilAssembly -AssemblyPath $AssemblyPath -ClassName $ClassName -MethodNames $MethodNames -OutputPath $OutputPath -Deterministic $Deterministic -NativeLeaf -BorrowedCell:$NativeBorrowedCell }
         'ImportCilIr' { Import-PscCilAssembly -AssemblyPath $AssemblyPath -ClassName $ClassName -MethodNames $MethodNames -OutputPath $OutputPath -Deterministic $Deterministic -Ir }
         'ImportCil' { Import-PscCilAssembly -AssemblyPath $AssemblyPath -ClassName $ClassName -MethodNames $MethodNames -OutputPath $OutputPath -Deterministic $Deterministic }
@@ -17429,7 +17600,7 @@ process {
         'Graph' { Get-SmaGraph $(if ($ProjectPath) { $ProjectPath } else { $PSScriptRoot }) }
         'Lint' {
             $targets = if ($LintFiles) { $LintFiles } else { foreach ($project in Get-Projects) { foreach ($relative in $project.Files) { Join-Path $project.Path $relative } } }
-            $findings = @(foreach ($file in $targets) { if (Test-Path -LiteralPath $file) { Get-SmaLint ([IO.Path]::GetFullPath($file)) } })
+            $findings = @(foreach ($file in $targets) { if (Test-Path -LiteralPath $file) { Get-SmaLint ([PscTreeText]::FullPath($file)) } })
             if ($LintEdit -and $LintObjects) { throw 'LintEdit and LintObjects are mutually exclusive.' }
             if ($LintEdit) { return Edit-SmaLintFinding -Findings $findings }
             if ($LintObjects) { return $findings }
@@ -17439,7 +17610,7 @@ process {
         'Guard' {
             if (-not $LintFiles) { throw 'Guard requires -LintFiles.' }
             if($AgainstPath -and $LintFiles.Count -ne 1){throw 'Candidate Guard requires exactly one candidate.'}
-            $verdicts = @(foreach ($file in $LintFiles) { if($AgainstPath){Test-PscCandidateGuard $file $AgainstPath $CheckerHash}else{Test-SmaGuard ([IO.Path]::GetFullPath($file)) $CheckerHash} })
+            $verdicts = @(foreach ($file in $LintFiles) { if($AgainstPath){Test-PscCandidateGuard $file $AgainstPath $CheckerHash}else{Test-SmaGuard ([PscTreeText]::FullPath($file)) $CheckerHash} })
             $verdicts
             $failed = @($verdicts | Where-Object { -not $_.Passed })
             if ($failed.Count) { throw ('Guard: {0}' -f (@($failed | ForEach-Object { '{0}: {1}' -f $_.File, ($_.Reasons -join '; ') }) -join ' | ')) }
@@ -17455,7 +17626,7 @@ process {
             if(!$SourcePath -or !$AgainstPath){throw 'Conform requires -SourcePath and -AgainstPath.'}
             $report=Invoke-PscConformance $SourcePath $AgainstPath $CheckerHash -Development:$DevelopmentOnly
             $report
-            if(!$report.Passed){throw 'Candidate conformance failed; inspect the Guard and stage receipts.'}
+            if(!$report.Passed){throw 'Candidate conformance failed; inspect the Guard and stage results.'}
         }
         'Consolidate' {
             if (-not $SourcePath -or -not $OutputPath) { throw 'Consolidate requires -SourcePath (the entry script) and -OutputPath (the single script to write).' }
@@ -17483,7 +17654,7 @@ process {
             $resolution = Resolve-CoffLink -Inputs $LinkInput -LibraryDirectories @($LibraryDirectory | Where-Object { $_ }) -DefaultLibraries @($DefaultLibrary | Where-Object { $_ }) -IgnoredDefaultLibraries @($NoDefaultLibrary | Where-Object { $_ }) -Entry $EntrySymbol
             if ($ResolveOnly) { return $resolution }
             if ($resolution.Unresolved.Count) { throw ("Link: unresolved external symbols:`n" + ($resolution.Unresolved -join "`n")) }
-            Write-CoffImage -Resolution $resolution -Path ([IO.Path]::GetFullPath($OutputPath)) -Merges @($LinkMerge | Where-Object { $_ }) -Subsystem $(if ($Subsystem -eq 'Windows') { 2 } else { 3 }) -StackReserve $StackReserve
+            Write-CoffImage -Resolution $resolution -Path ([PscTreeText]::FullPath($OutputPath)) -Merges @($LinkMerge | Where-Object { $_ }) -Subsystem $(if ($Subsystem -eq 'Windows') { 2 } else { 3 }) -StackReserve $StackReserve
         }
     }
 }
