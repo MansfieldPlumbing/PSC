@@ -634,7 +634,7 @@ function Add-PscTreeUnit {
     if($End -gt $Start -or $Kind -ceq 'Resource'){$Units.Add([PscTreeUnit]::new($Kind,$Path,$Start,$End))}
 }
 function Get-PscResourceUnits {
-    [PscChecker()]
+    [PscVerify()]
     [OutputType([PscTreeUnit])]
     param([System.Management.Automation.Language.FunctionDefinitionAst]$holder)
     if(!$holder.Body.EndBlock -or $holder.Body.BeginBlock -or $holder.Body.ProcessBlock -or $holder.Body.DynamicParamBlock -or $holder.Body.CleanBlock){throw 'Invalid resource holder body.'}
@@ -1485,6 +1485,47 @@ try {
  Assert-Lint 'security policy inspection' 'Get-MpPreference' 'SecurityControlMutation' 0
 }finally{[IO.Directory]::Delete($root,$true)}
 
+
+# Verification inventory is ordered and complete, in both Guard entry points.
+$inventoryRoot=[IO.Directory]::CreateDirectory([IO.Path]::Combine([IO.Path]::GetTempPath(),'psc-inventory-'+[Guid]::NewGuid().ToString('N'))).FullName
+$markerFirst='function First { [PscVerify()] param() }'
+$markerSecond='function Second { [PscVerify()] param() }'
+$unmarkedSecond='function Second { param() }'
+$inventorySource=[IO.Path]::Combine($inventoryRoot,'source.ps1')
+$inventoryCandidate=[IO.Path]::Combine($inventoryRoot,'candidate.ps1')
+function Test-VerificationInventory([string]$Name,[string]$Before,[string]$After,[bool]$Expected,[string]$Reason){
+    [IO.File]::WriteAllText($inventorySource,$Before)
+    git -C $inventoryRoot add -- source.ps1
+    if($LASTEXITCODE -ne 0){throw 'git add failed'}
+    git -C $inventoryRoot -c user.name=PSC -c user.email=psc@localhost commit --allow-empty -qm $Name
+    if($LASTEXITCODE -ne 0){throw 'git commit failed'}
+    [IO.File]::WriteAllText($inventoryCandidate,$After)
+    foreach($entryPoint in 'Candidate','Standalone'){
+        $accepted=$false
+        try {
+            if($entryPoint -ceq 'Candidate'){$verdict=& $compiler -Mode Guard -LintFiles $inventoryCandidate -AgainstPath $inventorySource}
+            else{[IO.File]::WriteAllText($inventorySource,$After);$verdict=& $compiler -Mode Guard -LintFiles $inventorySource}
+            $accepted=$verdict.Passed
+        } catch {if($Expected -or !$_.Exception.Message.Contains($Reason,[StringComparison]::Ordinal)){throw}}
+        if($accepted -ne $Expected){throw "$Name / $entryPoint expected $Expected actual $accepted"}
+        "PASS $Name / $entryPoint"
+    }
+}
+try {
+    git -C $inventoryRoot init -q
+    if($LASTEXITCODE -ne 0){throw 'git init failed'}
+    Test-VerificationInventory 'unchanged' "$markerFirst`n$markerSecond" "$markerFirst`n$markerSecond" $true ''
+    Test-VerificationInventory 'non-marker edit' "$markerFirst`n$unmarkedSecond" "$markerFirst`n$unmarkedSecond`n# comment" $true ''
+    Test-VerificationInventory 'added marker' $markerFirst "$markerFirst`n$markerSecond" $false 'verification inventory count differs from HEAD'
+    Test-VerificationInventory 'first marker' $unmarkedSecond $markerSecond $false 'verification inventory count differs from HEAD'
+    Test-VerificationInventory 'removed marker' "$markerFirst`n$markerSecond" $markerFirst $false 'verification inventory count differs from HEAD'
+    Test-VerificationInventory 'reordered markers' "$markerFirst`n$markerSecond" "$markerSecond`n$markerFirst" $false 'verification inventory order differs from HEAD'
+    Test-VerificationInventory 'duplicate marker name' $markerFirst "$markerFirst`n$markerFirst" $false 'verification inventory count differs from HEAD'
+    Test-VerificationInventory 'duplicate baseline identity unchanged' "$markerFirst`n$markerFirst" "$markerFirst`n$markerFirst" $false 'ambiguous baseline verification declaration'
+    Test-VerificationInventory 'case-insensitive duplicate identity' $markerFirst ($markerFirst+"`n"+$markerFirst.Replace('First','FIRST')) $false 'ambiguous candidate verification declaration'
+    Test-VerificationInventory 'same count substitution' $markerFirst $markerSecond $false 'verification inventory order differs from HEAD'
+    Test-VerificationInventory 'changed body' $markerFirst 'function First { [PscVerify()] param() return 1 }' $false 'checker function First differs from HEAD'
+}finally{[IO.Directory]::Delete($inventoryRoot,$true)}
 '@)
 }
 
@@ -4217,7 +4258,7 @@ function Get-SmaReport {
 #   EnumNameUnknown     a string compared with an enum-typed value that names no member of the enum: never equal.
 function Get-SmaLint {
     # With $text, the findings are of that text, reported under $file's name (Guard: the committed version).
-    [PscChecker()]
+    [PscVerify()]
     param([string] $file, [string] $text)
     $tokens = $errors = $null
     $ast = if ($PSBoundParameters.ContainsKey('text')) { [System.Management.Automation.Language.Parser]::ParseInput($text, $file, [ref]$tokens, [ref]$errors) }
@@ -4587,7 +4628,7 @@ function Get-SmaLint {
 
 # Applies the edits lint findings carry, file by file, each file written only if SMA parses the result without errors.
 function Edit-SmaLintFinding {
-    [PscChecker()]
+    
     param([object[]] $findings)
     foreach ($group in @($findings | Where-Object { $_.Edits.Count }) | Group-Object File) {
         $text = [IO.File]::ReadAllText($group.Name)
@@ -4601,8 +4642,8 @@ function Edit-SmaLintFinding {
     }
 }
 
-# Marks a function as part of the checker: the functions that decide whether a file is accepted.
-class PscChecker : Attribute {}
+# Identifies a declaration participating in verification authority; Guard applies admission policy.
+class PscVerify : Attribute {}
 
 # A replacement of the source text from offset Start up to offset End.
 class SmaLintEdit {
@@ -4675,16 +4716,16 @@ class PscGuardVerdict {
     [string] $CandidateSha256
 }
 
-# The functions of a script marked [PscChecker()].
+# The functions of a script marked [PscVerify()].
 function Get-SmaChecker {
-    [PscChecker()]
+    [PscVerify()]
     param([System.Management.Automation.Language.Ast] $ast)
     $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $null -ne $node.Body.ParamBlock -and
-        @($node.Body.ParamBlock.Attributes | Where-Object { $_.TypeName.Name -eq [PscChecker].Name }).Count }, $true)
+        @($node.Body.ParamBlock.Attributes | Where-Object { $_.TypeName.Name -eq [PscVerify].Name }).Count }, $true)
 }
 
 function Compare-SmaGuardFindings {
-    [PscChecker()]
+    [PscVerify()]
     param([SmaLintFinding[]]$before,[SmaLintFinding[]]$after,[Collections.Generic.List[string]]$reasons,[string]$resourcePath)
     $prefix=if($resourcePath){$resourcePath+': '}else{''}
     foreach ($rule in $after | Group-Object Rule) {
@@ -4701,7 +4742,7 @@ function Compare-SmaGuardFindings {
     }
 }
 function Get-SmaGuardResources {
-    [PscChecker()]
+    [PscVerify()]
     param([System.Management.Automation.Language.ScriptBlockAst]$ast)
     $holders=@($ast.FindAll({$args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -ieq 'Get-PscEmbeddedSources'},$true))
     if($holders.Count -gt 1){throw 'Ambiguous resource holder.'}
@@ -4711,7 +4752,7 @@ function Get-SmaGuardResources {
 # including excess occurrences of an existing identity. A file with no version at HEAD is held to no findings.
 # Canonical embedded source units are assessed separately by path; inert resources are not treated as code.
 function Test-SmaGuard {
-    [PscChecker()]
+    [PscVerify()]
     param([string] $file, [string] $expectedHash)
     $tokens = $errors = $committedErrors = $null
     $text = [IO.File]::ReadAllLines($file) -join "`n"
@@ -4739,13 +4780,32 @@ function Test-SmaGuard {
             Compare-SmaGuardFindings $priorFindings $currentFindings $reasons $resource.Path
         }
     } catch { $reasons.Add('Embedded resource coverage failed: '+$_.Exception.Message) }
-    $changed = @(if ($committed) {
-        $now = @(Get-SmaChecker $ast)
-        foreach ($function in Get-SmaChecker $committedAst) {
-            $current = @($now | Where-Object Name -EQ $function.Name)
-            if ($current.Count -ne 1 -or $current[0].Extent.Text -cne $function.Extent.Text) { $function.Name }
+    $prior = @(if ($committed) { Get-SmaChecker $committedAst })
+    $now = @(Get-SmaChecker $ast)
+    $priorIndex = [Collections.Generic.Dictionary[string,System.Management.Automation.Language.FunctionDefinitionAst]]::new([StringComparer]::OrdinalIgnoreCase)
+    $currentIndex = [Collections.Generic.Dictionary[string,System.Management.Automation.Language.FunctionDefinitionAst]]::new([StringComparer]::OrdinalIgnoreCase)
+    $changed = @(
+        foreach ($function in $prior) {
+            if (!$priorIndex.TryAdd($function.Name,$function)) { $reasons.Add(('ambiguous baseline verification declaration: {0}' -f $function.Name)); $function.Name }
         }
-    })
+        foreach ($function in $now) {
+            if (!$currentIndex.TryAdd($function.Name,$function)) { $reasons.Add(('ambiguous candidate verification declaration: {0}' -f $function.Name)); $function.Name }
+        }
+        foreach ($function in $prior) {
+            if (!$currentIndex.ContainsKey($function.Name) -or $currentIndex[$function.Name].Extent.Text -cne $function.Extent.Text) { $function.Name }
+        }
+        foreach ($function in $now) {
+            if (!$priorIndex.ContainsKey($function.Name)) { $function.Name }
+        }
+    )
+    if ($prior.Count -ne $now.Count) { $reasons.Add('verification inventory count differs from HEAD') }
+    else {
+        for ($index = 0; $index -lt $prior.Count; $index++) {
+            if ($prior[$index].Name -cne $now[$index].Name) {
+                $reasons.Add('verification inventory order differs from HEAD'); break
+            }
+        }
+    }
     $running = [System.Management.Automation.Language.Parser]::ParseInput(([IO.File]::ReadAllLines($PSCommandPath) -join "`n"), [ref]$tokens, [ref]$committedErrors)
     $checkerText = @(Get-SmaChecker $running | ForEach-Object { $_.Extent.Text }) -join "`n"
     $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($checkerText)))
