@@ -44,6 +44,8 @@ $api.Guide()
 
 Query returns typed references with source identity, owner, extent and coverage. Pull in windows of 1..256; dispose cursors. Literal containment includes comments and strings inside a declaration, not proof of binding. Use `$dev.Find('Apply')` or `$dev.Search('literal')` to include projected resources; canonical queries do not parse embedded source strings. `OpenQuery` supports explicit paths, owner, kind and limit, including non-loading CIL inspection for binary queries.
 
+A retained semantic index is opened with `$index = $api.OpenSemanticIndex($root)`; `$graph = $index.Refresh()` uses the existing SMA graph and retains parsed root source by path and exact byte digest when it has no explicit parser-dependency markers. Sources with parse errors, `using` statements or script requirements are conservatively reparsed. `SourceRevision`, `SourcesParsed`, `SourcesReused` and `SourcesRemoved` describe each refresh. Declarations, edges, embedded source and lint are rebuilt and rebound, not incrementally cached; refresh is not an atomic filesystem snapshot; cross-file and overload binding remain limited. The index is in-process, not an on-disk database.
+
 A read-only query reference can become an edit reference only through exact source/extent validation (`$doc.Resolve($hit)`). A document's own `Find` returns revision-bound editable references directly. Example, using a behavior-preserving numeric-literal edit in the projected calibration resource:
 
 ```powershell
@@ -144,7 +146,7 @@ The structural checks reuse the source-query visitor over the API AST and the fa
 | F0 | Existing | — | Baseline, Guard, checker and fixture dependency closure: independently controlled assessment inputs; candidate cannot silently replace criteria, runner or fixtures. Reject removed, substituted, reordered or dynamically supplied dependencies. Record approved baseline, digests and provenance; no sandbox claim. |
 | F1 | Existing | F0 | UnCollate/Collate: exact ordered round trip including embedded source, comments, encodings and resources; reject missing, stale, duplicate, ambiguous and untracked units. |
 | F2 | Existing | F1 | Typed structural query and live API: AST/CIL identity, owner, extent, scope, bounded coverage and explicit ambiguity; parity with independently obtained observations. |
-| F3 | Planned | F1, F2 | Persistent semantic index: scope, overloads, declaration and referent identity, cross-unit dependencies, revision invalidation; compare incremental results with full rebuild, including shadowing and rename. |
+| F3 | Existing | F1, F2 | Persistent semantic index: retained parsed source and revision refresh exist; extend scope, overloads, declaration and referent identity, cross-unit dependencies and incremental fact invalidation. Compare incremental results with full rebuild, including shadowing and rename. |
 | F4 | Existing | F0, F3 | Structural editing: replacement exists; add insertion, deletion, rename, move and dependency-aware validation, atomic grouped undo/redo and stale-reference refusal. No textual parser or competing authority. |
 | F5 | Planned | F1, F4 | Canonical script ↔ ordered tree ↔ compiled assembly carrying recoverable exact source; deterministic realization, round-trip identity and clean reconstruction. Keep compiled faculties optional. |
 | F6 | Planned | F0, F2, F4, R1, H1 | Persistent PscHost, accepted/candidate workspaces, typed operations and PSRP; concurrent sessions, revision leases, restart recovery and constrained write admission. Agents use this same API; no second compiler or string-based control plane. |
@@ -263,7 +265,7 @@ The API is derived from the running script, so mode names and parameter evidence
 | ImportCil | AssemblyPath, ClassName, Deterministic, MethodNames, OutputPath | Import-PscCilAssembly |
 | Inspect | AssemblyPath, ClassName, MethodNames | Test-LoweredAssembly |
 | Capability |  | Get-LoweringCapability |
-| Graph | ProjectPath | Get-SmaGraph |
+| Graph | ProjectPath, SemanticIndex | Get-SmaGraph |
 | Lint | LintEdit, LintFiles, LintObjects | Edit-SmaLintFinding, Get-Projects, Get-SmaLint |
 | Guard | AgainstPath, CheckerHash, ExpectedRunnerSha256, LintFiles | Assert-PscRunnerIdentity, Assert-PscStandaloneGitContext, Test-PscCandidateGuard, Test-SmaGuard |
 | Profile |  | Invoke-SmaProfile |

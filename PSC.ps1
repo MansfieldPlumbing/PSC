@@ -312,6 +312,8 @@ SOFTWARE.
 .PARAMETER Native
     Compile: produce a native executable at OutputPath. The lowered assembly is compiled to machine code by the
     pinned ILC and linked by PSC's own COFF linker with the pinned Native AOT runtime; requires EntryPoint.
+.PARAMETER SemanticIndex
+    Internal Graph refresh transport: an existing PscSemanticIndex opened by the API.
 .PARAMETER ProjectPath
     Graph: the project folder to graph. Call with & to keep the returned live objects.
 .PARAMETER LintFiles
@@ -464,6 +466,7 @@ param(
     $BindingEnvironment,
     [string] $ArchivePath,
     [string] $ProjectPath,
+    $SemanticIndex,
     [string[]] $LintFiles,
     # Lint: apply the edits the findings carry instead of listing the findings.
     [switch] $LintEdit,
@@ -968,6 +971,8 @@ Collate is fail-closed: missing and untracked files, manifest edits, declaration
 
 The API is available with `-Mode Api` (or no arguments). `SourceFormats` and `SourceExecutionContract` describe the SM contract; `AssertSurface()` checks mode admission against the dispatcher. `OpenQuery(paths, kind, name, owner, literal, take)` is a lazy AST query with optional ordinal literal containment within each matched extent; the CLI equivalent is `-QueryLiteral`. `OpenDocument(path)` opens a revision-bound editor. Its `Find(kind, name, owner, literal, limit)` returns editable references with the same filter applied before the limit. Literal containment may include comments or strings *inside* the selected extent; it is not a semantic interpretation of the literal. Use Git for repository history, PSC for structural selection and validated edits. `UnCollate`, `Collate`, `Status`, `Diff` and `Verify` are also available directly on the API. `SourceExtensions` describes source discovery, including legacy PowerShell inputs.
 
+A retained semantic index is opened with `$index = $api.OpenSemanticIndex($root)`; `$graph = $index.Refresh()` uses the existing SMA graph and retains parsed root source by path and exact byte digest when it has no explicit parser-dependency markers. Sources with parse errors, `using` statements or script requirements are conservatively reparsed. `SourceRevision`, `SourcesParsed`, `SourcesReused` and `SourcesRemoved` describe each refresh. Declarations, edges, embedded source and lint are rebuilt and rebound, not incrementally cached; refresh is not an atomic filesystem snapshot; cross-file and overload binding remain limited. The index is in-process, not an on-disk database.
+
 Development sessions: `$dev = $api.OpenDevelopment($base,$tree)` creates or opens a verified projection; `Find`, `OpenDocument`, `Changes`, `Affected`, `Collate` and `Conform` share a pinned compiler, canonical base and manifest. `Affected` reports direct paths and declared faculty dependency closure; it does not prove complete method-level impact or select fewer tests. Collation requires a fresh candidate path; conformance rejects stale candidates and requires the pinned base to equal its committed Git blob.
 
 Candidate verification: `-Mode Guard -LintFiles ./PSC.next.ps1 -AgainstPath ./PSC.ps1` compares against the committed canonical path, not its working copy. `-Mode Conform -SourcePath ./PSC.next.ps1 -AgainstPath ./PSC.ps1` runs the protected Guard, candidate API, projection, embedded document/worktree/Guard/SM fixtures and historical Verify in independent processes. `-DevelopmentOnly` explicitly skips historical Verify and returns an incomplete report. No candidate is promoted automatically. The report carries candidate, committed baseline, runner and stage identities. Supply an independently retained -ExpectedRunnerSha256 to reject a different runner in Guard or Conform; verify that digest before launching the runner. Conform also accepts -ExpectedBaselineSha256 to pin the acquired committed bytes; development sessions retain both pins. Candidate baseline lookup excludes Git replacement objects; standalone Guard refuses replacement refs. Both reject inherited Git routing or injected configuration.
@@ -1389,6 +1394,102 @@ try {
     $null = & $compiler -Mode UnCollate -TreeDirectory $crlfTree -SourcePath $crlf
     $null = & $compiler -Mode Collate -TreeDirectory $crlfTree -OutputPath $crlfOut
     Assert-Tree ((Get-Hash $crlf) -ceq (Get-Hash $crlfOut)) 'CRLF canonical source round trips byte-for-byte'
+    # Retained graph source observations must agree with a fresh graph after every revision.
+    $indexRoot=[IO.Directory]::CreateDirectory([IO.Path]::Combine($work,'index-fixture')).FullName
+    $indexFirst=Join-Path $indexRoot 'first.ps1';$indexOther=Join-Path $indexRoot 'other.sm1'
+    $firstText='function Target { 1 }; function Outer { function Target { 2 }; Target }; Outer; Target; External'
+    Write-Text $indexFirst $firstText
+    Write-Text $indexOther 'function External { 3 }; class Example { [int] Run([int]$number){return $number} [double] Run([double]$number){return $number} [int] Use(){return $this.Run(1)} }'
+    $semanticIndex=$api.OpenSemanticIndex($indexRoot)
+    function Assert-GraphParity($Retained,[string]$Label){
+        $fresh=& $compiler -Mode Graph -ProjectPath $indexRoot
+        $same=$Retained.Files.Count -eq $fresh.Files.Count -and $Retained.Sources.Count -eq $fresh.Sources.Count -and $Retained.Units.Count -eq $fresh.Units.Count -and $Retained.Edges.Count -eq $fresh.Edges.Count -and $Retained.Diagnostics.Count -eq $fresh.Diagnostics.Count
+        for($position=0;$same -and $position -lt $Retained.Files.Count;$position++){$same=$Retained.Files[$position] -ceq $fresh.Files[$position]}
+        for($position=0;$same -and $position -lt $Retained.Sources.Count;$position++){
+            $actual=$Retained.Sources[$position];$expected=$fresh.Sources[$position]
+            $same=$actual.Identity -ceq $expected.Identity -and $actual.Sha256 -ceq $expected.Sha256 -and $actual.Boundary -ceq $expected.Boundary -and $actual.ParseErrors.Count -eq $expected.ParseErrors.Count
+        }
+        for($position=0;$same -and $position -lt $Retained.Units.Count;$position++){
+            $actual=$Retained.Units[$position];$expected=$fresh.Units[$position]
+            $same=$actual.Identity -ceq $expected.Identity -and $actual.Name -ceq $expected.Name -and $actual.Scope -ceq $expected.Scope -and $actual.BodyScope -ceq $expected.BodyScope -and $actual.Ast.Extent.Text -ceq $expected.Ast.Extent.Text
+        }
+        for($position=0;$same -and $position -lt $Retained.Edges.Count;$position++){
+            $actual=$Retained.Edges[$position];$expected=$fresh.Edges[$position]
+            $same=$actual.FromIdentity -ceq $expected.FromIdentity -and $actual.ToIdentity -ceq $expected.ToIdentity -and $actual.Resolution -ceq $expected.Resolution -and $actual.Reason -ceq $expected.Reason -and $actual.To -ceq $expected.To -and $actual.Kind -ceq $expected.Kind
+        }
+        for($position=0;$same -and $position -lt $Retained.Diagnostics.Count;$position++){
+            $actual=$Retained.Diagnostics[$position];$expected=$fresh.Diagnostics[$position]
+            $same=$actual.Rule -ceq $expected.Rule -and $actual.File -ceq $expected.File -and $actual.Line -eq $expected.Line -and $actual.Detail -ceq $expected.Detail
+        }
+        Assert-Tree ($same -and $fresh.SourcesReused -eq 0) ('semantic graph cold-build parity: '+$Label)
+    }
+    $initial=$semanticIndex.Refresh()
+    Assert-Tree ($initial.SourceRevision -eq 1 -and $initial.SourcesParsed -eq 2 -and $initial.SourcesReused -eq 0) 'semantic index initial parse'
+    Assert-GraphParity $initial 'initial'
+    $warm=$semanticIndex.Refresh()
+    Assert-Tree ($warm.SourceRevision -eq 2 -and $warm.SourcesParsed -eq 0 -and $warm.SourcesReused -eq 2 -and [object]::ReferenceEquals($initial.Sources[0].Ast,$warm.Sources[0].Ast)) 'semantic index retains identical SMA root objects'
+    Assert-GraphParity $warm 'unchanged'
+    $inner=@($warm.Units | Where-Object {$_.Name -ceq 'Target' -and $_.Scope -ceq @($warm.Units | Where-Object Name -CEQ 'Outer')[0].BodyScope})[0]
+    $innerEdge=@($warm.Edges | Where-Object From -CEQ 'Outer')[0]
+    Assert-Tree ($innerEdge.ToIdentity -ceq $inner.Identity -and $innerEdge.Resolution -ceq 'Bound') 'semantic index retains lexical shadowing'
+    Assert-Tree (@($warm.Edges | Where-Object {$_.To -ceq 'External' -and $_.Resolution -ceq 'Unresolved'}).Count -eq 1) 'semantic index does not infer cross-file command binding'
+    Assert-Tree (@($warm.Edges | Where-Object {$_.To -ceq 'Example.Run' -and $_.Resolution -ceq 'Unresolved' -and $_.Reason.Contains('overloads')}).Count -eq 1) 'semantic index retains unresolved overload ambiguity'
+    $stamp=[IO.File]::GetLastWriteTimeUtc($indexFirst)
+    Write-Text $indexFirst ($firstText.Replace('function Target { 2 }','function Renamed { 2 }'))
+    [IO.File]::SetLastWriteTimeUtc($indexFirst,$stamp)
+    $renamed=$semanticIndex.Refresh()
+    Assert-Tree ($renamed.SourcesParsed -eq 1 -and $renamed.SourcesReused -eq 1 -and $renamed.Sources[0].Sha256 -cne $warm.Sources[0].Sha256 -and ![object]::ReferenceEquals($renamed.Sources[0].Ast,$warm.Sources[0].Ast) -and [object]::ReferenceEquals($renamed.Sources[1].Ast,$warm.Sources[1].Ast)) 'semantic index invalidates by bytes rather than timestamp'
+    $outerEdge=@($renamed.Edges | Where-Object From -CEQ 'Outer')[0]
+    Assert-Tree ($outerEdge.Resolution -ceq 'Bound' -and $outerEdge.ToIdentity -cne $innerEdge.ToIdentity -and $innerEdge.ToIdentity -ceq $inner.Identity) 'semantic index rebinds renamed shadow without mutating previous graph'
+    Assert-GraphParity $renamed 'rename'
+    Write-Text $indexFirst 'function Broken { 1 + }'
+    $brokenGraph=$semanticIndex.Refresh()
+    Assert-Tree ($brokenGraph.SourcesParsed -eq 1 -and $brokenGraph.Coverage('Declarations').ParseFailures -eq 1 -and $brokenGraph.Absent('NotPresent','Declarations').Status -ceq 'Unknown') 'semantic index does not conceal changed parse failures'
+    Assert-GraphParity $brokenGraph 'parse failure'
+    Write-Text $indexFirst $firstText
+    $restoredGraph=$semanticIndex.Refresh()
+    Assert-Tree ($restoredGraph.SourcesParsed -eq 1 -and $restoredGraph.Coverage('Declarations').ParseFailures -eq 0) 'semantic index recovers after parse repair'
+    Assert-GraphParity $restoredGraph 'repair'
+    [IO.File]::Delete($indexOther)
+    $deletedGraph=$semanticIndex.Refresh()
+    Assert-Tree ($deletedGraph.SourcesRemoved -eq 1 -and $deletedGraph.SourcesReused -eq 1 -and @($deletedGraph.Units | Where-Object Name -CEQ 'External').Count -eq 0) 'semantic index removes deleted source facts'
+    Assert-GraphParity $deletedGraph 'delete'
+    [IO.File]::Move($indexFirst,(Join-Path $indexRoot 'renamed.ps1'))
+    $movedGraph=$semanticIndex.Refresh()
+    Assert-Tree ($movedGraph.SourcesRemoved -eq 1 -and $movedGraph.SourcesParsed -eq 1 -and $movedGraph.Sources[0].File -ceq 'renamed.ps1') 'semantic index file move changes source identity'
+    Assert-GraphParity $movedGraph 'file move'
+    # Explicit parser dependencies are reacquired, and discovery failures do not advance the revision.
+    $contextFile=Join-Path $indexRoot 'context.ps1'
+    Write-Text $contextFile "using namespace System`nfunction Context { 1 }"
+    $contextFirst=$semanticIndex.Refresh()
+    $contextSecond=$semanticIndex.Refresh()
+    $contextBefore=@($contextFirst.Sources | Where-Object File -CEQ 'context.ps1')[0]
+    $contextAfter=@($contextSecond.Sources | Where-Object File -CEQ 'context.ps1')[0]
+    Assert-Tree ($contextSecond.SourcesParsed -eq 1 -and $contextSecond.SourcesReused -eq 1 -and ![object]::ReferenceEquals($contextBefore.Ast,$contextAfter.Ast)) 'semantic index reparses explicit using context'
+    Assert-GraphParity $contextSecond 'using context'
+    Write-Text $contextFile 'function BrokenAgain { 1 + }'
+    $invalidFirst=$semanticIndex.Refresh();$invalidSecond=$semanticIndex.Refresh()
+    Assert-Tree ($invalidSecond.SourcesParsed -eq 1 -and $invalidSecond.SourcesReused -eq 1 -and $invalidSecond.Coverage('Declarations').ParseFailures -eq 1) 'semantic index reparses unresolved parser context'
+    [IO.File]::Delete($contextFile)
+    # A corrupt Git routing file is a discovery failure, not an empty successful graph.
+    $invalidGit=Join-Path $indexRoot '.git'
+    Write-Text $invalidGit 'not a gitdir'
+    try {
+        $refused=$false
+        try{$null=$semanticIndex.Refresh()}catch{$refused=$true}
+        Assert-Tree $refused 'semantic index refuses failed Git source discovery'
+    }finally{[IO.File]::Delete($invalidGit)}
+    $recovered=$semanticIndex.Refresh()
+    Assert-Tree ($recovered.SourceRevision -eq $invalidSecond.SourceRevision+1 -and $recovered.SourcesRemoved -eq 1 -and $recovered.SourcesReused -eq 1) 'semantic index preserves revision and cache on failed discovery'
+    # Check the exact raw-byte identity against an independently parsed BOM/CRLF source.
+    $encodedFile=Join-Path $indexRoot 'encoded.ps1'
+    $encodedText="function Encoded { 7 }`r`nEncoded`r`n"
+    [IO.File]::WriteAllText($encodedFile,$encodedText,[Text.UnicodeEncoding]::new($false,$true,$true))
+    $encodedGraph=$semanticIndex.Refresh();$encodedSource=@($encodedGraph.Sources | Where-Object File -CEQ 'encoded.ps1')[0]
+    $encodedTokens=$null;$encodedErrors=$null
+    $independentAst=[System.Management.Automation.Language.Parser]::ParseFile($encodedFile,[ref]$encodedTokens,[ref]$encodedErrors)
+    Assert-Tree ($encodedSource.Sha256 -ceq (Get-Hash $encodedFile) -and !$encodedErrors.Count -and $encodedSource.Ast.Extent.Text -ceq $independentAst.Extent.Text) 'semantic index byte digest and decoded AST agree with ParseFile'
+    Assert-GraphParity $encodedGraph 'encoded bytes'
 } finally { [IO.Directory]::Delete($work, $true) }
 
 '@)
@@ -5212,6 +5313,7 @@ class SmaChange {
 }
 class SmaProject {
     [string] $Root; [string] $Commit; [datetime] $BuiltUtc
+    [int] $SourceRevision; [int] $SourcesParsed; [int] $SourcesReused; [int] $SourcesRemoved
     [Collections.Generic.List[SmaUnit]] $Units
     [Collections.Generic.List[SmaEdge]] $Edges
     SmaProject() { $this.Units = [Collections.Generic.List[SmaUnit]]::new(); $this.Edges = [Collections.Generic.List[SmaEdge]]::new() }
@@ -5292,6 +5394,70 @@ class SmaProject {
         $status = if ($matches.Count) { 'Found' } elseif ($Scope -eq 'Declarations' -and $coverage.DeclarationsComplete) { 'NotFoundWithinScope' } else { 'Unknown' }
         return [SmaAbsence]@{ Pattern = $Pattern; Scope = $Scope; Status = $status; Matches = @($matches); Coverage = $coverage }
     }
+}
+
+# Retain SMA source objects, not a second interpretation of the language.
+# Graph records are rebuilt and rebound on each refresh; only unchanged parsed source is reused.
+class PscIndexedSource {
+    [string] $Sha256
+    [string] $Text
+    [System.Management.Automation.Language.ScriptBlockAst] $Ast
+    [System.Management.Automation.Language.ParseError[]] $Errors
+    [bool] $Reusable
+    PscIndexedSource([string]$path,[byte[]]$bytes,[string]$digest){
+        $this.Sha256=$digest
+        $reader=[IO.StreamReader]::new([IO.MemoryStream]::new($bytes,$false),[Text.Encoding]::UTF8,$true)
+        try{$this.Text=$reader.ReadToEnd()}finally{$reader.Dispose()}
+        $tokens=$null;$parseErrors=$null
+        $this.Ast=[System.Management.Automation.Language.Parser]::ParseInput($this.Text,$path,[ref]$tokens,[ref]$parseErrors)
+        $this.Errors=$parseErrors
+        # External parser context (using module/assembly, requires, unresolved types) is not pinned here.
+        $this.Reusable=!$this.Errors.Count -and !$this.Ast.UsingStatements.Count -and $null -eq $this.Ast.ScriptRequirements
+    }
+}
+class PscSemanticIndex {
+    hidden [string] $Compiler
+    hidden [string] $CompilerHash
+    hidden [string] $Root
+    hidden [int] $Revision
+    hidden [Collections.Generic.Dictionary[string,PscIndexedSource]] $Sources = [Collections.Generic.Dictionary[string,PscIndexedSource]]::new([StringComparer]::Ordinal)
+    hidden [Collections.Generic.Dictionary[string,PscIndexedSource]] $Pending
+    hidden [int] $Parsed
+    hidden [int] $Reused
+    PscSemanticIndex([string]$compiler,[string]$root){
+        $this.Compiler=[PscTreeText]::FullPath($compiler);$this.CompilerHash=(Get-FileHash -LiteralPath $this.Compiler).Hash
+        $this.Root=[PscTreeText]::FullPath($root)
+        if(![IO.Directory]::Exists($this.Root)){throw 'Semantic index requires an existing source directory.'}
+    }
+    [SmaProject] Refresh(){
+        if((Get-FileHash -LiteralPath $this.Compiler).Hash -cne $this.CompilerHash){throw 'Semantic index compiler changed.'}
+        return & $this.Compiler -Mode Graph -ProjectPath $this.Root -SemanticIndex $this
+    }
+    hidden [void] Begin([string]$root,[string]$compiler){
+        if($root -cne $this.Root -or $compiler -cne $this.Compiler){throw 'Semantic index source or compiler identity differs.'}
+        if((Get-FileHash -LiteralPath $compiler).Hash -cne $this.CompilerHash){throw 'Semantic index compiler changed.'}
+        if(![IO.Directory]::Exists($root)){throw 'Semantic index source directory no longer exists.'}
+        if($null -ne $this.Pending){throw 'Semantic index refresh already active.'}
+        $this.Pending=[Collections.Generic.Dictionary[string,PscIndexedSource]]::new([StringComparer]::Ordinal)
+        $this.Parsed=0;$this.Reused=0
+    }
+    hidden [PscIndexedSource] Acquire([string]$relative,[string]$path){
+        $bytes=[IO.File]::ReadAllBytes($path)
+        $digest=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+        $source=$null
+        if($this.Sources.TryGetValue($relative,[ref]$source) -and $source.Sha256 -ceq $digest -and $source.Reusable){$this.Reused++}
+        else{$source=[PscIndexedSource]::new($path,$bytes,$digest);$this.Parsed++}
+        $this.Pending.Add($relative,$source)
+        return $source
+    }
+    hidden [void] Complete([SmaProject]$project){
+        $removed=0
+        foreach($relative in $this.Sources.Keys){if(!$this.Pending.ContainsKey($relative)){$removed++}}
+        $this.Revision++
+        $project.SourceRevision=$this.Revision;$project.SourcesParsed=$this.Parsed;$project.SourcesReused=$this.Reused;$project.SourcesRemoved=$removed
+        $this.Sources=$this.Pending;$this.Pending=$null
+    }
+    hidden [void] Abort(){$this.Pending=$null}
 }
 
 function Get-SmaLexicalScope($node, [string] $sourceIdentity) {
@@ -5460,13 +5626,19 @@ function Resolve-SmaEdges($project) {
     }
 }
 
-function Get-SmaSourceFiles([string] $root) {
-    if ([IO.Directory]::Exists((Join-Path $root '.git'))) {
-        git -C $root ls-files --cached --others --exclude-standard -- ([PscSourceFormat]::Patterns()) 2>$null | Sort-Object -Unique
+function Get-SmaSourceFiles {
+    [OutputType([string])]
+    param([string]$root)
+    $paths=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    if ([IO.Directory]::Exists((Join-Path $root '.git')) -or [IO.File]::Exists((Join-Path $root '.git'))) {
+        $listing=Read-PscGitBytes $root (@('ls-files','-z','--cached','--others','--exclude-standard','--')+[PscSourceFormat]::Patterns())
+        foreach($relative in [PscTreeText]::Encoding().GetString($listing).Split([char]0,[StringSplitOptions]::RemoveEmptyEntries)){$null=$paths.Add($relative)}
     } else {
         # SMA hosts retained third-party sources and evidence. Its own authored project is the root script.
-        Get-ChildItem -LiteralPath $root -File | Where-Object { [PscSourceFormat]::IsSource($_.FullName) } | ForEach-Object Name
+        foreach($item in Get-ChildItem -LiteralPath $root -File -ErrorAction Stop){if([PscSourceFormat]::IsSource($item.FullName)){$null=$paths.Add($item.Name)}}
     }
+    $ordered=[string[]]::new($paths.Count);$paths.CopyTo($ordered);[Array]::Sort($ordered,[StringComparer]::Ordinal)
+    $ordered
 }
 
 function Get-SmaEncodedSourceOrigins($Ast, [string]$SourceIdentity) {
@@ -5511,65 +5683,71 @@ function Get-SmaEncodedSourceOrigins($Ast, [string]$SourceIdentity) {
     }
 }
 function Get-SmaGraph {
-    param([string] $root)
-    $root = [IO.Path]::GetFullPath($root)
-    $project = [SmaProject]::new(); $project.Root = $root; $project.BuiltUtc = [DateTime]::UtcNow
-    if ([IO.Directory]::Exists((Join-Path $root '.git'))) { $project.Commit = (git -C $root rev-parse HEAD 2>$null) }
-    # Tracked and untracked-but-not-ignored PowerShell files: a working directory's whole source.
-    $project.Files = @(Get-SmaSourceFiles $root)
-    foreach ($relative in $project.Files) {
-        $path = Join-Path $root $relative; $tokens = $errors = $null
-        if(-not [IO.File]::Exists($path)){
-            $project.Sources.Add([SmaSource]@{Identity=$relative+':missing';File=$relative;Boundary='MissingFile';ParseErrors=@('Tracked source is missing.');Provenance=$project.Commit})
-            $project.Diagnostics.Add([pscustomobject]@{Rule='MissingSource';File=$relative;Line=0;Detail='Tracked source is missing; relevant scope is incomplete.'})
-            continue
+    [OutputType([SmaProject])]
+    param([string] $root,[PscSemanticIndex]$index)
+    $root = [PscTreeText]::FullPath($root)
+    if($null -eq $index){$index=[PscSemanticIndex]::new($PSCommandPath,$root)}
+    $index.Begin($root,[PscTreeText]::FullPath($PSCommandPath))
+    try {
+        $project = [SmaProject]::new(); $project.Root = $root; $project.BuiltUtc = [DateTime]::UtcNow
+        if ([IO.Directory]::Exists((Join-Path $root '.git')) -or [IO.File]::Exists((Join-Path $root '.git'))) { $project.Commit = (git --no-replace-objects -C $root rev-parse HEAD 2>$null) }
+        # Tracked and untracked-but-not-ignored PowerShell files: a working directory's whole source.
+        $project.Files = @(Get-SmaSourceFiles $root)
+        foreach ($relative in $project.Files) {
+            $path = Join-Path $root $relative; $tokens = $errors = $null
+            if(-not [IO.File]::Exists($path)){
+                $project.Sources.Add([SmaSource]@{Identity=$relative+':missing';File=$relative;Boundary='MissingFile';ParseErrors=@('Tracked source is missing.');Provenance=$project.Commit})
+                $project.Diagnostics.Add([pscustomobject]@{Rule='MissingSource';File=$relative;Line=0;Detail='Tracked source is missing; relevant scope is incomplete.'})
+                continue
+            }
+            try {
+                $parsedSource=$index.Acquire($relative,$path)
+                $ast=$parsedSource.Ast;$errors=$parsedSource.Errors;$hash=$parsedSource.Sha256
+            } catch {
+                $project.Sources.Add([SmaSource]@{Identity=$relative+':unreadable';File=$relative;Boundary='UnreadableSource';ParseErrors=@($_);Provenance=$project.Commit})
+                $project.Diagnostics.Add([pscustomobject]@{Rule='UnreadableSource';File=$relative;Line=0;Detail=$_.Exception.Message;Error=$_})
+                continue
+            }
+            $identity = $relative + ':' + $hash
+            $project.Sources.Add([SmaSource]@{ Identity = $identity; File = $relative; Sha256 = $hash; Provenance = $project.Commit
+                Ast = $ast; ParseErrors = @($errors); Boundary = 'PowerShellFile' })
+            foreach ($errorRecord in $errors) { $project.Diagnostics.Add([pscustomobject]@{ Rule = 'ParseFailure'; File = $relative; Line = $errorRecord.Extent.StartLineNumber; Column = $errorRecord.Extent.StartColumnNumber; Detail = $errorRecord.Message; Ast = $errorRecord.Extent }) }
+            Add-SmaGraphSource $project $relative $ast $false 0 $identity
+            $encodedOrigins=@(Get-SmaEncodedSourceOrigins $ast $identity)
+            foreach($origin in $encodedOrigins){$project.Relationships.Add([pscustomobject]@{Kind='ExecutableSourceBoundary';File=$relative;Line=$origin.Literal.Extent.StartLineNumber;Source=$origin.Literal;Consumer=$origin.Consumer;Transform=$origin.Transform;Target=$origin.Target;Resolution='Structurally established source construction; execution not observed'})}
+            # String literals long enough to be source: parse each; PowerShell with definitions is Embedded, the rest Foreign.
+            $literals=@($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $args[0].Value.Length -ge 400 -and $args[0].Value.Contains("`n") }, $true))
+            foreach($origin in $encodedOrigins){if(-not @($literals | Where-Object {[object]::ReferenceEquals($_,$origin.Literal)}).Count){$literals+= $origin.Literal}}
+            foreach ($literal in $literals) {
+                $innerTokens = $innerErrors = $null
+                $inner = [System.Management.Automation.Language.Parser]::ParseInput($literal.Value, [ref]$innerTokens, [ref]$innerErrors)
+                $definitions = @($inner.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -or $args[0] -is [System.Management.Automation.Language.TypeDefinitionAst] }, $true)).Count
+                $holder = $literal.Parent; while ($null -ne $holder -and $holder -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $holder = $holder.Parent }
+                $record = [pscustomobject]@{ File = $relative; Line = $literal.Extent.StartLineNumber; EndLine = $literal.Extent.EndLineNumber; Characters = $literal.Value.Length; Text = $literal.Value
+                    HeldBy = $(if ($holder) { $holder.Name } else { '<script>' }); Definitions = $definitions; ParseErrors = $innerErrors.Count
+                    Ast = $inner; Container = $literal; Boundary = 'UnclassifiedMultilineLiteral'
+                    UnresolvedTypes = @($innerErrors | Where-Object ErrorId -eq 'TypeNotFound' | ForEach-Object { $_.Extent.Text.Trim('[', ']') } | Sort-Object -Unique) }
+                $nonTypeErrors = @($innerErrors | Where-Object ErrorId -ne 'TypeNotFound').Count
+                $encoded=@($encodedOrigins | Where-Object {[object]::ReferenceEquals($_.Literal,$literal)})
+                if (($definitions -gt 0 -and $nonTypeErrors -eq 0) -or $encoded.Count) {
+                    $record.Boundary = if($encoded.Count){'PowerShellEncodedCommandSource'}else{'PowerShellSyntaxCandidate'}
+                    $project.Embedded.Add($record)
+                    $innerHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($literal.Value)))
+                    $innerIdentity = $identity + ':literal:' + $literal.Extent.StartOffset
+                    $project.Sources.Add([SmaSource]@{ Identity = $innerIdentity; File = $relative; Sha256 = $innerHash; Ast = $inner
+                        ParseErrors = @($innerErrors); Embedded = $true; Container = $literal; ParentIdentity = $identity; Boundary = $record.Boundary })
+                    $offset=$literal.Extent.StartLineNumber-1
+                    if($literal.StringConstantType -in [System.Management.Automation.Language.StringConstantType]::SingleQuotedHereString,[System.Management.Automation.Language.StringConstantType]::DoubleQuotedHereString){$offset++}
+                    Add-SmaGraphSource $project $relative $inner $true $offset $innerIdentity
+                } else { $project.Foreign.Add($record) }
+            }
+            try { foreach ($finding in @(Get-SmaLint $path $parsedSource.Text)) { $finding.File = $relative; $project.Lint.Add($finding) } }
+            catch { $project.Diagnostics.Add([pscustomobject]@{ Rule='LintFailure'; File=$relative; Line=0; Detail=$_.Exception.Message; Error=$_ }) }
         }
-        try {
-            $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
-            $hash = (Get-FileHash -LiteralPath $path).Hash
-        } catch {
-            $project.Sources.Add([SmaSource]@{Identity=$relative+':unreadable';File=$relative;Boundary='UnreadableSource';ParseErrors=@($_);Provenance=$project.Commit})
-            $project.Diagnostics.Add([pscustomobject]@{Rule='UnreadableSource';File=$relative;Line=0;Detail=$_.Exception.Message;Error=$_})
-            continue
-        }
-        $identity = $relative + ':' + $hash
-        $project.Sources.Add([SmaSource]@{ Identity = $identity; File = $relative; Sha256 = $hash; Provenance = $project.Commit
-            Ast = $ast; ParseErrors = @($errors); Boundary = 'PowerShellFile' })
-        foreach ($errorRecord in $errors) { $project.Diagnostics.Add([pscustomobject]@{ Rule = 'ParseFailure'; File = $relative; Line = $errorRecord.Extent.StartLineNumber; Column = $errorRecord.Extent.StartColumnNumber; Detail = $errorRecord.Message; Ast = $errorRecord.Extent }) }
-        Add-SmaGraphSource $project $relative $ast $false 0 $identity
-        $encodedOrigins=@(Get-SmaEncodedSourceOrigins $ast $identity)
-        foreach($origin in $encodedOrigins){$project.Relationships.Add([pscustomobject]@{Kind='ExecutableSourceBoundary';File=$relative;Line=$origin.Literal.Extent.StartLineNumber;Source=$origin.Literal;Consumer=$origin.Consumer;Transform=$origin.Transform;Target=$origin.Target;Resolution='Structurally established source construction; execution not observed'})}
-        # String literals long enough to be source: parse each; PowerShell with definitions is Embedded, the rest Foreign.
-        $literals=@($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $args[0].Value.Length -ge 400 -and $args[0].Value.Contains("`n") }, $true))
-        foreach($origin in $encodedOrigins){if(-not @($literals | Where-Object {[object]::ReferenceEquals($_,$origin.Literal)}).Count){$literals+= $origin.Literal}}
-        foreach ($literal in $literals) {
-            $innerTokens = $innerErrors = $null
-            $inner = [System.Management.Automation.Language.Parser]::ParseInput($literal.Value, [ref]$innerTokens, [ref]$innerErrors)
-            $definitions = @($inner.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -or $args[0] -is [System.Management.Automation.Language.TypeDefinitionAst] }, $true)).Count
-            $holder = $literal.Parent; while ($null -ne $holder -and $holder -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $holder = $holder.Parent }
-            $record = [pscustomobject]@{ File = $relative; Line = $literal.Extent.StartLineNumber; EndLine = $literal.Extent.EndLineNumber; Characters = $literal.Value.Length; Text = $literal.Value
-                HeldBy = $(if ($holder) { $holder.Name } else { '<script>' }); Definitions = $definitions; ParseErrors = $innerErrors.Count
-                Ast = $inner; Container = $literal; Boundary = 'UnclassifiedMultilineLiteral'
-                UnresolvedTypes = @($innerErrors | Where-Object ErrorId -eq 'TypeNotFound' | ForEach-Object { $_.Extent.Text.Trim('[', ']') } | Sort-Object -Unique) }
-            $nonTypeErrors = @($innerErrors | Where-Object ErrorId -ne 'TypeNotFound').Count
-            $encoded=@($encodedOrigins | Where-Object {[object]::ReferenceEquals($_.Literal,$literal)})
-            if (($definitions -gt 0 -and $nonTypeErrors -eq 0) -or $encoded.Count) {
-                $record.Boundary = if($encoded.Count){'PowerShellEncodedCommandSource'}else{'PowerShellSyntaxCandidate'}
-                $project.Embedded.Add($record)
-                $innerHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($literal.Value)))
-                $innerIdentity = $identity + ':literal:' + $literal.Extent.StartOffset
-                $project.Sources.Add([SmaSource]@{ Identity = $innerIdentity; File = $relative; Sha256 = $innerHash; Ast = $inner
-                    ParseErrors = @($innerErrors); Embedded = $true; Container = $literal; ParentIdentity = $identity; Boundary = $record.Boundary })
-                $offset=$literal.Extent.StartLineNumber-1
-                if($literal.StringConstantType -in [System.Management.Automation.Language.StringConstantType]::SingleQuotedHereString,[System.Management.Automation.Language.StringConstantType]::DoubleQuotedHereString){$offset++}
-                Add-SmaGraphSource $project $relative $inner $true $offset $innerIdentity
-            } else { $project.Foreign.Add($record) }
-        }
-        try { foreach ($finding in @(Get-SmaLint $path)) { $finding.File = $relative; $project.Lint.Add($finding) } }
-        catch { $project.Diagnostics.Add([pscustomobject]@{ Rule='LintFailure'; File=$relative; Line=0; Detail=$_.Exception.Message; Error=$_ }) }
-    }
-    Resolve-SmaEdges $project
-    $project
+        Resolve-SmaEdges $project
+        $index.Complete($project)
+        $project
+    }finally{$index.Abort()}
 }
 
 function Compare-SmaRuntimeGraph($Before, $After) {
@@ -13561,7 +13739,7 @@ class PscApi {
         $objectives.Add([PscRoadmapObjective]::new('F0',[PscRoadmapState]::Existing,@(),'Baseline, Guard, checker and fixture dependency closure: independently controlled assessment inputs; candidate cannot silently replace criteria, runner or fixtures. Reject removed, substituted, reordered or dynamically supplied dependencies. Record approved baseline, digests and provenance; no sandbox claim.',@('Get-SmaChecker','Test-SmaGuard','Get-PscResourceUnits','PscCommittedSource','Read-PscCommittedSource','Assert-PscGitEnvironment','Assert-PscRunnerIdentity','Assert-PscStandaloneGitContext','PscConformanceRequirement','Get-PscConformanceResources','Test-PscConformanceResources','Invoke-PscConformance'),@(),@('Tests/Test-Guard.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('F1',[PscRoadmapState]::Existing,@('F0'),'UnCollate/Collate: exact ordered round trip including embedded source, comments, encodings and resources; reject missing, stale, duplicate, ambiguous and untracked units.',@('Get-PscTreeProjection','Write-PscSourceTree'),@(),@('Projection','Tests/Test-Worktree.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('F2',[PscRoadmapState]::Existing,@('F1'),'Typed structural query and live API: AST/CIL identity, owner, extent, scope, bounded coverage and explicit ambiguity; parity with independently obtained observations.',@('PscQueryCursor','PscApi'),@(),@('Api','Tests/Test-Worktree.ps1')))
-        $objectives.Add([PscRoadmapObjective]::new('F3',[PscRoadmapState]::Planned,@('F1','F2'),'Persistent semantic index: scope, overloads, declaration and referent identity, cross-unit dependencies, revision invalidation; compare incremental results with full rebuild, including shadowing and rename.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('F3',[PscRoadmapState]::Existing,@('F1','F2'),'Persistent semantic index: retained parsed source and revision refresh exist; extend scope, overloads, declaration and referent identity, cross-unit dependencies and incremental fact invalidation. Compare incremental results with full rebuild, including shadowing and rename.',@('PscSemanticIndex','PscIndexedSource','Get-SmaGraph','Resolve-SmaEdges'),@(),@('Tests/Test-Worktree.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('F4',[PscRoadmapState]::Existing,@('F0','F3'),'Structural editing: replacement exists; add insertion, deletion, rename, move and dependency-aware validation, atomic grouped undo/redo and stale-reference refusal. No textual parser or competing authority.',@('PscDocument','PscDocumentEdit'),@(),@('Tests/Test-Document.ps1','Tests/Test-Worktree.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('F5',[PscRoadmapState]::Planned,@('F1','F4'),'Canonical script ↔ ordered tree ↔ compiled assembly carrying recoverable exact source; deterministic realization, round-trip identity and clean reconstruction. Keep compiled faculties optional.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('F6',[PscRoadmapState]::Planned,@('F0','F2','F4','R1','H1'),'Persistent PscHost, accepted/candidate workspaces, typed operations and PSRP; concurrent sessions, revision leases, restart recovery and constrained write admission. Agents use this same API; no second compiler or string-based control plane.',@(),@(),@()))
@@ -13745,6 +13923,8 @@ $api.Guide()
 
 Query returns typed references with source identity, owner, extent and coverage. Pull in windows of 1..256; dispose cursors. Literal containment includes comments and strings inside a declaration, not proof of binding. Use `$dev.Find('Apply')` or `$dev.Search('literal')` to include projected resources; canonical queries do not parse embedded source strings. `OpenQuery` supports explicit paths, owner, kind and limit, including non-loading CIL inspection for binary queries.
 
+A retained semantic index is opened with `$index = $api.OpenSemanticIndex($root)`; `$graph = $index.Refresh()` uses the existing SMA graph and retains parsed root source by path and exact byte digest when it has no explicit parser-dependency markers. Sources with parse errors, `using` statements or script requirements are conservatively reparsed. `SourceRevision`, `SourcesParsed`, `SourcesReused` and `SourcesRemoved` describe each refresh. Declarations, edges, embedded source and lint are rebuilt and rebound, not incrementally cached; refresh is not an atomic filesystem snapshot; cross-file and overload binding remain limited. The index is in-process, not an on-disk database.
+
 A read-only query reference can become an edit reference only through exact source/extent validation (`$doc.Resolve($hit)`). A document's own `Find` returns revision-bound editable references directly. Example, using a behavior-preserving numeric-literal edit in the projected calibration resource:
 
 ```powershell
@@ -13915,6 +14095,7 @@ The API is derived from the running script, so mode names and parameter evidence
     [PscConformanceReport] Conform([string]$candidateFile,[string]$baselineFile,[bool]$development,[string]$expectedRunner){return $this.Conform($candidateFile,$baselineFile,$development,$expectedRunner,'')}
     [PscConformanceReport] Conform([string]$candidateFile,[string]$baselineFile,[bool]$development,[string]$expectedRunner,[string]$expectedBaseline){return & $this.Script -Mode Conform -SourcePath $candidateFile -AgainstPath $baselineFile -DevelopmentOnly:$development -ExpectedRunnerSha256 $expectedRunner -ExpectedBaselineSha256 $expectedBaseline}
     [string] $SourceExecutionContract = 'PSC realizes SM source; realized execution is SMA-free. File roles do not prohibit execution. Stock pwsh execution is not a compatibility requirement.'
+    [PscSemanticIndex] OpenSemanticIndex([string]$root){return [PscSemanticIndex]::new($this.Script,$root)}
     [PscDocument] OpenDocument([string]$path){return [PscDocument]::new($path)}
     [PscQueryCursor] OpenQuery([string[]]$paths,[PscQueryKind]$kind,[string]$name,[string]$owner,[string]$literal,[int]$take){
         if($literal -and $kind -in [PscQueryKind]::CilMethod,[PscQueryKind]::CilOp){throw 'Literal containment requires a source query.'}
@@ -18305,7 +18486,10 @@ process {
         'ImportCil' { Import-PscCilAssembly -AssemblyPath $AssemblyPath -ClassName $ClassName -MethodNames $MethodNames -OutputPath $OutputPath -Deterministic $Deterministic }
         'Inspect' { Test-LoweredAssembly -AssemblyPath $AssemblyPath -ClassName $ClassName -MethodNames $MethodNames }
         'Capability' { Get-LoweringCapability }
-        'Graph' { Get-SmaGraph $(if ($ProjectPath) { $ProjectPath } else { $PSScriptRoot }) }
+        'Graph' {
+            if($null -ne $SemanticIndex -and $SemanticIndex -isnot [PscSemanticIndex]){throw 'Graph refresh requires a PscSemanticIndex.'}
+            Get-SmaGraph $(if ($ProjectPath) { $ProjectPath } else { $PSScriptRoot }) $SemanticIndex
+        }
         'Lint' {
             $targets = if ($LintFiles) { $LintFiles } else { foreach ($project in Get-Projects) { foreach ($relative in $project.Files) { Join-Path $project.Path $relative } } }
             $findings = @(foreach ($file in $targets) { if (Test-Path -LiteralPath $file) { Get-SmaLint ([PscTreeText]::FullPath($file)) } })
