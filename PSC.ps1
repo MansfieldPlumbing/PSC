@@ -382,6 +382,8 @@ SOFTWARE.
     Optional typed contract sources for ScriptType catalog emission; an empty catalog is emitted when omitted.
 .PARAMETER ContractReferences
     Optional compiled assemblies used to resolve contract signatures.
+.PARAMETER ContractInputsPath
+    Internal child-build transport containing contract source and reference paths only.
 .PARAMETER Help
     Displays full script help without compiling.
 .EXAMPLE
@@ -471,6 +473,7 @@ param(
     [string] $RuntimeDirectory = '',
     [string[]] $ContractPaths = @(),
     [string[]] $ContractReferences = @(),
+    [string] $ContractInputsPath,
     [switch] $Help
 )
 
@@ -761,6 +764,13 @@ class Vom {
             [VomCell]$a=$this.Find($source);[VomCell]$b=$this.Find($target)
             if($this.Closed -or $null -eq $a -or $null -eq $b -or $a.State -ne [VomState]::Live -or $b.State -ne [VomState]::Live){throw [InvalidOperationException]::new('Retained endpoint revoked or stale')}
             if($null -eq $contract -or -not $contract.IsAssignableFrom($b.Contract)){throw [InvalidCastException]::new('Wrong retained object type')}
+            [uint64]$ancestor=$b.Owner
+            while($ancestor -ne [uint64]0){
+                if($ancestor -eq $source){throw [InvalidOperationException]::new('Retention conflicts with child-first ownership rundown')}
+                [VomCell]$parent=$this.Find($ancestor)
+                if($null -eq $parent){break}
+                $ancestor=$parent.Owner
+            }
             if($b.Retainers -eq [int]::MaxValue){throw [OverflowException]::new('Retainer count exhausted')}
             if($null -eq $a.Outgoing){$a.Outgoing=[System.Collections.Generic.List[VomRetention]]::new()}
             [VomRetention]$edge=[VomRetention]::new($source,$target)
@@ -893,6 +903,20 @@ class Vom {
                 if ($scan -ne $nextIndex -and $item.State -eq [VomState]::Live -and -not [string]::IsNullOrEmpty($item.Name) -and $null -ne $next.Names -and $next.Names.ContainsKey($item.Name)) { throw [InvalidOperationException]::new('Succession role collision') }
                 $scan = $item.NextSibling
             }
+            if($null -ne $next.Outgoing){
+                foreach($edge in $next.Outgoing){
+                    [uint64[]]$ends=$this.Retentions[$edge]
+                    [VomCell]$target=$this.Find($ends[1])
+                    while($null -ne $target -and $target.Owner -ne [uint64]0){
+                        if($target.Owner -eq $retiring){
+                            if($ends[1] -ne $successor){throw [InvalidOperationException]::new('Succession conflicts with retained ownership dependencies')}
+                            break
+                        }
+                        if($target.Owner -eq $successor){break}
+                        $target=$this.Find($target.Owner)
+                    }
+                }
+            }
             $this.Unname($next,$successor)
             $next.Name = $old.Name
             $this.Unname($old,$retiring)
@@ -930,8 +954,9 @@ class Vom {
                 $above.FirstChild = $nextIndex
             }
             $this.Mark($retiring)
-            return $this.State($retiring)
         } finally { [System.Threading.Monitor]::Exit($this.Gate) }
+        $this.Collect()
+        return $this.State($retiring)
     }
     # Detach a revoked ownership subtree as a residual root. Existing leases
     # and resources remain intact. Dependencies outside the subtree must be
@@ -2852,23 +2877,49 @@ function Build-PscFaculty {
 }
 function Build-PscRuntime {
     param([string]$RuntimeDirectory,[string[]]$ContractPaths,[string[]]$ContractReferences)
-    # All input paths are validated before publishing any new assembly.
-    foreach($path in @($ContractPaths)+@($ContractReferences)){
-        if(![IO.File]::Exists([IO.Path]::GetFullPath($path))){throw "Contract input missing: $path"}
+    # External inputs must exist before publishing; earlier faculty outputs are
+    # validated by the catalog child after their builds, never loaded here.
+    $ContractPaths = [string[]]@(foreach($path in $ContractPaths){[IO.Path]::GetFullPath($path)})
+    $ContractReferences = [string[]]@(foreach($path in $ContractReferences){[IO.Path]::GetFullPath($path)})
+    $comparison = [StringComparison]::Ordinal
+    if($IsWindows){$comparison=[StringComparison]::OrdinalIgnoreCase}
+    $earlier = [string[]]@((Join-Path $RuntimeDirectory 'Vom.dll'),(Join-Path $RuntimeDirectory 'InquiryPrimitives.dll'))
+    foreach($path in $ContractPaths){if(![IO.File]::Exists($path)){throw "Contract source missing: $path"}}
+    foreach($path in $ContractReferences){
+        $deferred=$false
+        foreach($output in $earlier){if([string]::Equals($path,$output,$comparison)){$deferred=$true;break}}
+        if(!$deferred -and ![IO.File]::Exists($path)){throw "Contract reference missing: $path"}
     }
     $exe=Join-Path $PSHOME 'pwsh'
     if($IsWindows){$exe+='.exe'}
-    foreach($unit in Get-PscFacultyUnits){
-        if($unit.Name -ceq 'ScriptType'){
-            # The coordinator has not loaded the other faculties; this avoids a native CLI
-            # array-argument transport and preserves the complete typed contract input list.
-            Build-PscFaculty -Faculty $unit.Name -RuntimeDirectory $RuntimeDirectory -ContractPaths $ContractPaths -ContractReferences $ContractReferences
-            continue
+    $transport=[IO.Path]::GetTempFileName()
+    try{
+        # A data-only length-prefixed path manifest, not source or scriptblocks.
+        $writer=[IO.BinaryWriter]::new([IO.File]::Open($transport,[IO.FileMode]::Truncate,[IO.FileAccess]::Write,[IO.FileShare]::None))
+        try{
+            $writer.Write([int]$ContractPaths.Length)
+            foreach($path in $ContractPaths){$writer.Write([string]$path)}
+            $writer.Write([int]$ContractReferences.Length)
+            foreach($path in $ContractReferences){$writer.Write([string]$path)}
+        }finally{$writer.Dispose()}
+        foreach($unit in Get-PscFacultyUnits){
+            $arguments=@('-NoProfile','-File',$PSCommandPath,'-Mode','BuildFaculty','-Faculty',$unit.Name,'-RuntimeDirectory',$RuntimeDirectory)
+            if($unit.Name -ceq 'ScriptType'){$arguments+=@('-ContractInputsPath',$transport)}
+            & $exe @arguments
+            if($LASTEXITCODE -ne 0){throw "PSC faculty build failed: $($unit.Name)"}
         }
-        # Separate processes keep each emitted assembly's identity independent of the authoring mirrors.
-        & $exe -NoProfile -File $PSCommandPath -Mode BuildFaculty -Faculty $unit.Name -RuntimeDirectory $RuntimeDirectory
-        if($LASTEXITCODE -ne 0){throw "PSC faculty build failed: $($unit.Name)"}
-    }
+    }finally{[IO.File]::Delete($transport)}
+}
+function Read-PscContractInputs([string]$Path){
+    $reader=[IO.BinaryReader]::new([IO.File]::OpenRead($Path))
+    try{
+        $count=$reader.ReadInt32();if($count -lt 0 -or $count -gt 65536){throw 'Invalid contract source count'}
+        $sources=[string[]]::new($count);for($i=0;$i -lt $count;$i++){$sources[$i]=$reader.ReadString()}
+        $count=$reader.ReadInt32();if($count -lt 0 -or $count -gt 65536){throw 'Invalid contract reference count'}
+        $references=[string[]]::new($count);for($i=0;$i -lt $count;$i++){$references[$i]=$reader.ReadString()}
+        if($reader.BaseStream.Position -ne $reader.BaseStream.Length){throw 'Trailing contract input data'}
+        return @{Sources=$sources;References=$references}
+    }finally{$reader.Dispose()}
 }
 
 Set-StrictMode -Version Latest
@@ -11903,7 +11954,7 @@ function Get-PscApi {
     $api.Parameters = [PscParameter[]]@(foreach ($parameter in $ast.ParamBlock.Parameters) { Get-PscApiParameter $parameter })
     $api.Measures = [PscSource]::new($PSCommandPath).Measures
     $api.Functions = [string[]]@($functions.Keys)
-    $api.Classes = [string[]]@($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.TypeDefinitionAst] }, $true) | ForEach-Object Name)
+    $api.Classes = [string[]]@($ast.BeginBlock.FindAll({ param($node) $node -is [System.Management.Automation.Language.TypeDefinitionAst] }, $false) | ForEach-Object Name)
     $api.Environment = $script:PscEnvironment
     $api.Ast = $ast
     $api
@@ -12908,13 +12959,16 @@ class PscQueryCursor : IDisposable {
     hidden [string] NextPath(){
         while($true){
             if($null -ne $this.Files){
-                if($this.Files.MoveNext()){return $this.Files.Current}
+                try{if($this.Files.MoveNext()){return $this.Files.Current}}
+                catch{$this.Counts.ReadFailures++;$this.Errors.Add($_.Exception.Message)}
                 $this.Files.Dispose();$this.Files=$null
             }
             if($this.PathIndex -ge $this.Paths.Length){return $null}
             $next=[IO.Path]::GetFullPath($this.Paths[$this.PathIndex]);$this.PathIndex++
-            if([IO.Directory]::Exists($next)){$options=[IO.EnumerationOptions]::new();$options.RecurseSubdirectories=$true;$options.IgnoreInaccessible=$false;$options.AttributesToSkip=[IO.FileAttributes]::ReparsePoint;$this.Files=[IO.Directory]::EnumerateFiles($next,'*',$options).GetEnumerator()}
-            else{return $next}
+            if([IO.Directory]::Exists($next)){
+                try{$options=[IO.EnumerationOptions]::new();$options.RecurseSubdirectories=$true;$options.IgnoreInaccessible=$false;$options.AttributesToSkip=[IO.FileAttributes]::ReparsePoint;$this.Files=[IO.Directory]::EnumerateFiles($next,'*',$options).GetEnumerator()}
+                catch{$this.Counts.ReadFailures++;$this.Errors.Add($next+': '+$_.Exception.Message)}
+            }else{return $next}
         }
         return $null
     }
@@ -12957,7 +13011,10 @@ class PscQueryCursor : IDisposable {
             }
             if(!$this.Methods.MoveNext()){return $null}
             $handle=[Reflection.Metadata.MethodDefinitionHandle]$this.Methods.Current;$def=$this.Metadata.GetMethodDefinition($handle);$this.Counts.MethodsExamined++
-            $typeDef=$this.Metadata.GetTypeDefinition($def.GetDeclaringType());$this.MethodOwner=$this.Metadata.GetString($typeDef.Name);$this.MethodName=$this.Metadata.GetString($def.Name);$ns=$this.Metadata.GetString($typeDef.Namespace)
+            $typeDef=$this.Metadata.GetTypeDefinition($def.GetDeclaringType());$this.MethodOwner=$this.Metadata.GetString($typeDef.Name);$this.MethodName=$this.Metadata.GetString($def.Name)
+            $outer=$typeDef.GetDeclaringType()
+            while(!$outer.IsNil){$typeDef=$this.Metadata.GetTypeDefinition($outer);$this.MethodOwner=$this.Metadata.GetString($typeDef.Name)+'+'+$this.MethodOwner;$outer=$typeDef.GetDeclaringType()}
+            $ns=$this.Metadata.GetString($typeDef.Namespace)
             if($ns.Length){$this.MethodOwner=$ns+'.'+$this.MethodOwner}
             $this.MethodToken=[Reflection.Metadata.Ecma335.MetadataTokens]::GetToken([Reflection.Metadata.EntityHandle]$handle)
             if($this.Spec.Kind -eq [PscQueryKind]::CilMethod){if($this.Spec.Matches($this.MethodName,$this.MethodOwner,$true)){return $this.CilHit($null,$def)};$this.Counts.MethodsSkipped++;continue}
@@ -12999,18 +13056,21 @@ class PscQueryLease : IDisposable {
     hidden [object] $Space
     hidden [uint64] $Handle
     hidden [bool] $Disposed
+    hidden [PscQueryCoverage] $LastCoverage
     PscQueryLease([object]$space,[uint64]$owner,[PscQueryCursor]$cursor){
-        $this.Space=$space
+        $this.Space=$space;$this.LastCoverage=$cursor.Coverage()
         try{$this.Handle=$space.Register($owner,$cursor,[PscQueryCursor],[Action]$cursor.Dispose)}catch{$cursor.Dispose();throw}
     }
     [uint64] Identity(){return $this.Handle}
     [PscMatch[]] Pull([int]$limit){
         if($this.Disposed){throw [ObjectDisposedException]::new('PscQueryLease')}
         $lease=$this.Space.Open($this.Handle,[PscQueryCursor])
-        try{return ([PscQueryCursor]$lease.Value).Pull($limit)}finally{$this.Space.Close($lease)}
+        try{return ([PscQueryCursor]$lease.Value).Pull($limit)}finally{
+            try{$this.LastCoverage=([PscQueryCursor]$lease.Value).Coverage()}finally{$this.Space.Close($lease)}
+        }
     }
     [PscQueryCoverage] Coverage(){
-        if($this.Disposed){throw [ObjectDisposedException]::new('PscQueryLease')}
+        if($this.Disposed){return $this.LastCoverage}
         $lease=$this.Space.Open($this.Handle,[PscQueryCursor])
         try{return ([PscQueryCursor]$lease.Value).Coverage()}finally{$this.Space.Close($lease)}
     }
@@ -15795,7 +15855,14 @@ process {
     if ($PSBoundParameters.Count -eq 0) { return Get-PscApi }
     switch ($Mode) {
         'Api' { Get-PscApi }
-        'BuildFaculty' { Build-PscFaculty -Faculty $Faculty -RuntimeDirectory ([IO.Path]::GetFullPath($RuntimeDirectory)) -ContractPaths $ContractPaths -ContractReferences $ContractReferences }
+        'BuildFaculty' {
+            if($ContractInputsPath){
+                if($Faculty -cne 'ScriptType' -or $ContractPaths.Count -or $ContractReferences.Count){throw 'ContractInputsPath is exclusive to the ScriptType child build.'}
+                $inputs=Read-PscContractInputs $ContractInputsPath
+                $ContractPaths=$inputs.Sources;$ContractReferences=$inputs.References
+            }
+            Build-PscFaculty -Faculty $Faculty -RuntimeDirectory ([IO.Path]::GetFullPath($RuntimeDirectory)) -ContractPaths $ContractPaths -ContractReferences $ContractReferences
+        }
         'BuildRuntime' { Build-PscRuntime -RuntimeDirectory ([IO.Path]::GetFullPath($RuntimeDirectory)) -ContractPaths $ContractPaths -ContractReferences $ContractReferences }
         'Query' { if(!$QueryPath){throw 'Query requires -QueryPath.'}; $cursor=[PscQueryCursor]::new($QueryPath,[PscQuerySpec]::new([PscQueryKind]$QueryKind,$QueryName,$QueryOwner,$QueryTake)); if($null -ne $QuerySpace){return [PscQueryLease]::new($QuerySpace,$QueryOwnerHandle,$cursor)};return $cursor }
         'PowerShell' { Get-PinnedPowerShell -ArchivePath $ArchivePath }
