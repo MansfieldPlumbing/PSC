@@ -405,7 +405,7 @@ SOFTWARE.
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Compile', 'Api', 'Expression', 'Inspect', 'ImportCil', 'AnalyzeCilIr', 'ImportCilIr', 'NativeCil', 'VerifyNativeLeaf', 'Query', 'Capability', 'Link', 'PowerShell', 'Graph', 'Lint', 'Guard', 'Profile', 'Report', 'Verify', 'Readme', 'Investigate', 'Consolidate', 'Records', 'Run', 'BuildRuntime', 'BuildFaculty', 'UnCollate', 'Collate', 'Status', 'Diff', 'Edit')]
+    [ValidateSet('Compile', 'Api', 'Expression', 'Inspect', 'ImportCil', 'AnalyzeCilIr', 'ImportCilIr', 'NativeCil', 'VerifyNativeLeaf', 'Query', 'Capability', 'Link', 'PowerShell', 'Graph', 'Lint', 'Guard', 'Profile', 'Report', 'Verify', 'Conform', 'Readme', 'Investigate', 'Consolidate', 'Records', 'Run', 'BuildRuntime', 'BuildFaculty', 'UnCollate', 'Collate', 'Status', 'Diff', 'Edit')]
     [string] $Mode = 'Compile',
     # Run: the parameters the source is run with, by name.
     [hashtable] $RunParameters = @{},
@@ -417,6 +417,10 @@ param(
     [switch] $LintEdit,
     # Guard: the checker hash kept outside this machine; a running checker with another hash fails every file.
     [string] $CheckerHash,
+    # Guard/Conform: tracked canonical path at Git HEAD, not the working copy.
+    [string] $AgainstPath,
+    # Conform: omit the historical Verify suite explicitly; never implies full verification.
+    [switch] $DevelopmentOnly,
     [string[]] $InvestigatePath,
     [string] $ProfilePath,
     [string] $SourcePath,
@@ -887,6 +891,8 @@ Collate is fail-closed: missing and untracked files, manifest edits, declaration
 ### Structural editing
 
 The API is available with `-Mode Api` (or no arguments). `SourceFormats` and `SourceExecutionContract` describe the SM contract; `AssertSurface()` checks mode admission against the dispatcher. `OpenQuery(paths, kind, name, owner, literal, take)` is a lazy AST query with optional ordinal literal containment within each matched extent; the CLI equivalent is `-QueryLiteral`. `OpenDocument(path)` opens a revision-bound editor. Its `Find(kind, name, owner, literal, limit)` returns editable witnesses with the same filter applied before the limit. Literal containment may include comments or strings *inside* the selected extent; it is not a semantic interpretation of the literal. Use Git for repository history, PSC for structural selection and validated edits. `UnCollate`, `Collate`, `Status`, `Diff` and `Verify` are also available directly on the API. `SourceExtensions` describes source discovery, including legacy PowerShell inputs.
+
+Candidate verification: `-Mode Guard -LintFiles ./PSC.next.ps1 -AgainstPath ./PSC.ps1` compares against the committed canonical path, not its working copy. `-Mode Conform -SourcePath ./PSC.next.ps1 -AgainstPath ./PSC.ps1` runs the protected Guard, candidate API, projection, embedded document/worktree/SM fixtures and historical Verify in independent processes. `-DevelopmentOnly` explicitly skips historical Verify and returns an incomplete report. No candidate is promoted automatically. The report carries the candidate digest, committed baseline and stage outputs; use the trusted baseline compiler to evaluate candidates when possible.
 
 
 `Edit` opens a single file as a document with its own identity, immutable original buffer, append-only insertion buffer and grouped undo/redo journal. Query returns typed AST witnesses bound to the document identity, SHA-256 and revision. Use a complete matching AST extent as the replacement boundary; no regex or line-based rewrite is performed.
@@ -4297,6 +4303,9 @@ class PscGuardVerdict {
     [string[]] $Reasons
     [string[]] $CheckerChanged
     [string] $CheckerHash
+    [string] $BaselineCommit
+    [string] $BaselinePath
+    [string] $CandidateSha256
 }
 
 # The functions of a script marked [PscChecker()].
@@ -4343,6 +4352,100 @@ function Test-SmaGuard {
     foreach ($name in $changed) { $reasons.Add(('checker function {0} differs from HEAD' -f $name)) }
     if ($expectedHash -and $expectedHash -ne $hash) { $reasons.Add(('checker hash {0} is not the expected {1}' -f $hash, $expectedHash)) }
     [PscGuardVerdict]@{ File = $file; Passed = $reasons.Count -eq 0; Reasons = $reasons; CheckerChanged = $changed; CheckerHash = $hash }
+}
+
+# Compare a candidate under the canonical filename in an isolated Git repository.
+# The protected checker is unchanged; the baseline comes from the actual committed object, not the working copy.
+function Test-PscCandidateGuard {
+    param([string]$candidate,[string]$Baseline,[string]$expectedHash)
+    $candidateFile=[IO.Path]::GetFullPath($candidate);$baselineFile=[IO.Path]::GetFullPath($Baseline)
+    $baselineDirectory=[IO.Path]::GetDirectoryName($baselineFile);$baselineLeaf=[IO.Path]::GetFileName($baselineFile)
+    $commitId=git -C $baselineDirectory rev-parse --verify HEAD 2>$null
+    if($LASTEXITCODE -ne 0 -or !$commitId){throw 'Candidate Guard requires a committed Git baseline.'}
+    $baselineLines=@(git -C $baselineDirectory show ($commitId+':./'+$baselineLeaf) 2>$null)
+    if($LASTEXITCODE -ne 0){throw 'Candidate Guard baseline path is not present in the selected commit.'}
+    $candidateBytes=[IO.File]::ReadAllBytes($candidateFile)
+    $candidateDigest=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($candidateBytes))
+    $stage=[IO.Path]::Combine([IO.Path]::GetTempPath(),'psc-guard-'+[Guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($stage)
+    try{
+        $fixtureFile=[IO.Path]::Combine($stage,$baselineLeaf)
+        $empty=[IO.Directory]::CreateDirectory([IO.Path]::Combine($stage,'empty')).FullName
+        git -C $stage init --quiet --template=$empty
+        if($LASTEXITCODE -ne 0){throw 'Candidate Guard could not initialize its isolated Git baseline.'}
+        [IO.File]::WriteAllText($fixtureFile,($baselineLines -join "`n"),[Text.UTF8Encoding]::new($false))
+        git -C $stage -c core.autocrlf=false add -- $baselineLeaf
+        if($LASTEXITCODE -ne 0){throw 'Candidate Guard could not stage its baseline.'}
+        git -C $stage -c user.name=PSC -c user.email=psc@localhost -c commit.gpgsign=false -c core.hooksPath=$empty commit --quiet --no-verify -m 'Isolated committed baseline'
+        if($LASTEXITCODE -ne 0){throw 'Candidate Guard could not establish its baseline.'}
+        [IO.File]::WriteAllBytes($fixtureFile,$candidateBytes)
+        $verdict=Test-SmaGuard $fixtureFile $expectedHash
+        $verdict.File=$candidateFile;$verdict.BaselineCommit=$commitId;$verdict.BaselinePath=$baselineFile;$verdict.CandidateSha256=$candidateDigest
+        if((Get-FileHash -LiteralPath $candidateFile).Hash -cne $candidateDigest){throw 'Candidate changed during Guard.'}
+        return $verdict
+    }finally{[IO.Directory]::Delete($stage,$true)}
+}
+
+class PscConformanceStage {
+    [string] $Name
+    [string] $State
+    [int] $ExitCode
+    [string] $StandardOutput
+    [string] $StandardError
+    [double] $Milliseconds
+}
+class PscConformanceReport {
+    [string] $candidate
+    [string] $candidateSha256
+    [PscGuardVerdict] $Guard
+    [PscConformanceStage[]] $Stages
+    [bool] $Passed
+    [bool] $Complete
+}
+function Invoke-PscConformanceStage {
+    param([string]$Label,[string[]]$Arguments)
+    $stageResult=[PscConformanceStage]::new();$stageResult.Name=$Label
+    $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=(Get-Process -Id $PID).Path
+    $info.UseShellExecute=$false;$info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
+    foreach($argument in @('-NoProfile','-NonInteractive')+$Arguments){$info.ArgumentList.Add($argument)}
+    $watch=[Diagnostics.Stopwatch]::StartNew()
+    $child=[Diagnostics.Process]::Start($info)
+    try{
+        $standard=$child.StandardOutput.ReadToEndAsync();$diagnostic=$child.StandardError.ReadToEndAsync()
+        $child.WaitForExit();$stageResult.StandardOutput=$standard.GetAwaiter().GetResult();$stageResult.StandardError=$diagnostic.GetAwaiter().GetResult()
+        $stageResult.ExitCode=$child.ExitCode;$stageResult.State=if($child.ExitCode -eq 0){'Passed'}else{'Failed'}
+    }finally{$stageResult.Milliseconds=$watch.Elapsed.TotalMilliseconds;$child.Dispose()}
+    return $stageResult
+}
+function Invoke-PscConformance {
+    param([string]$candidate,[string]$Baseline,[string]$expectedHash,[switch]$development)
+    $report=[PscConformanceReport]::new();$report.Candidate=[IO.Path]::GetFullPath($candidate)
+    $report.Guard=Test-PscCandidateGuard $report.Candidate $Baseline $expectedHash
+    $report.CandidateSha256=$report.Guard.CandidateSha256
+    $stages=[Collections.Generic.List[PscConformanceStage]]::new()
+    $stage=[IO.Path]::Combine([IO.Path]::GetTempPath(),'psc-conform-'+[Guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($stage)
+    try{
+        if($report.Guard.Passed){
+            $tree=[IO.Path]::Combine($stage,'tree')
+            $stages.Add((Invoke-PscConformanceStage 'Api' @('-File',$report.Candidate,'-Mode','Api')))
+            if($stages[0].State -eq 'Passed'){
+                $stages.Add((Invoke-PscConformanceStage 'Projection' @('-File',$report.Candidate,'-Mode','UnCollate','-TreeDirectory',$tree)))
+                if($stages[1].State -eq 'Passed'){
+                    foreach($fixture in 'Tests/Test-Document.ps1','Tests/Test-Worktree.ps1','SM/Test-Formats.ps1'){
+                        $stages.Add((Invoke-PscConformanceStage $fixture @('-File',[IO.Path]::Combine($tree,$fixture),'-Compiler',$report.Candidate)))
+                    }
+                    if(!$development){$stages.Add((Invoke-PscConformanceStage 'Verify' @('-File',$report.Candidate,'-Mode','Verify')))}
+                    else{$omitted=[PscConformanceStage]::new();$omitted.Name='Verify';$omitted.State='Skipped';$omitted.StandardError='Development scope explicitly requested.';$stages.Add($omitted)}
+                }
+            }
+        }
+        $report.Stages=$stages.ToArray()
+        $report.Passed=$report.Guard.Passed -and $stages.Count -eq 6 -and @($stages | Where-Object State -eq 'Failed').Count -eq 0
+        $report.Complete=$report.Passed -and !$development
+        if((Get-FileHash -LiteralPath $report.Candidate).Hash -cne $report.CandidateSha256){throw 'Candidate changed during conformance.'}
+        return $report
+    }finally{[IO.Directory]::Delete($stage,$true)}
 }
 
 # Graph: one project as live objects, built only from its parsed source. Every fact carries where it was read
@@ -12588,6 +12691,8 @@ class PscApi {
     [PscTreeDelta[]] Diff([string]$root){return $this.Diff($this.Script,$root)}
     [PscTreeDelta[]] Diff([string]$sourceFile,[string]$root){return @(& $this.Script -Mode Diff -SourcePath $sourceFile -TreeDirectory $root)}
     [object[]] Verify(){return @(& $this.Script -Mode Verify)}
+    [PscGuardVerdict] GuardCandidate([string]$candidateFile,[string]$baselineFile,[string]$expectedHash){return & $this.Script -Mode Guard -LintFiles $candidateFile -AgainstPath $baselineFile -CheckerHash $expectedHash}
+    [PscConformanceReport] Conform([string]$candidateFile,[string]$baselineFile,[bool]$development){return & $this.Script -Mode Conform -SourcePath $candidateFile -AgainstPath $baselineFile -DevelopmentOnly:$development}
     [string] $SourceExecutionContract = 'PSC realizes SM source; realized execution is SMA-free. File roles do not prohibit execution. Stock pwsh execution is not a compatibility requirement.'
     [PscDocument] OpenDocument([string]$path){return [PscDocument]::new($path)}
     [PscQueryCursor] OpenQuery([string[]]$paths,[PscQueryKind]$kind,[string]$name,[string]$owner,[string]$literal,[int]$take){
@@ -16972,7 +17077,8 @@ process {
         }
         'Guard' {
             if (-not $LintFiles) { throw 'Guard requires -LintFiles.' }
-            $verdicts = @(foreach ($file in $LintFiles) { Test-SmaGuard ([IO.Path]::GetFullPath($file)) $CheckerHash })
+            if($AgainstPath -and $LintFiles.Count -ne 1){throw 'Candidate Guard requires exactly one candidate.'}
+            $verdicts = @(foreach ($file in $LintFiles) { if($AgainstPath){Test-PscCandidateGuard $file $AgainstPath $CheckerHash}else{Test-SmaGuard ([IO.Path]::GetFullPath($file)) $CheckerHash} })
             $verdicts
             $failed = @($verdicts | Where-Object { -not $_.Passed })
             if ($failed.Count) { throw ('Guard: {0}' -f (@($failed | ForEach-Object { '{0}: {1}' -f $_.File, ($_.Reasons -join '; ') }) -join ' | ')) }
@@ -16984,6 +17090,12 @@ process {
             Get-SmaReport @(Get-SmaUnits $profiled) $profiled
         }
         'Verify' { Test-SmaGraph }
+        'Conform' {
+            if(!$SourcePath -or !$AgainstPath){throw 'Conform requires -SourcePath and -AgainstPath.'}
+            $report=Invoke-PscConformance $SourcePath $AgainstPath $CheckerHash -Development:$DevelopmentOnly
+            $report
+            if(!$report.Passed){throw 'Candidate conformance failed; inspect the Guard and stage receipts.'}
+        }
         'Consolidate' {
             if (-not $SourcePath -or -not $OutputPath) { throw 'Consolidate requires -SourcePath (the entry script) and -OutputPath (the single script to write).' }
             ConvertTo-PscSingleScript -Path $SourcePath -OutputPath $OutputPath
