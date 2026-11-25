@@ -405,7 +405,7 @@ SOFTWARE.
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Compile', 'Api', 'Expression', 'Inspect', 'ImportCil', 'AnalyzeCilIr', 'ImportCilIr', 'NativeCil', 'VerifyNativeLeaf', 'Query', 'Capability', 'Link', 'PowerShell', 'Graph', 'Lint', 'Guard', 'Profile', 'Report', 'Verify', 'Readme', 'Investigate', 'Consolidate', 'Records', 'Run', 'BuildRuntime', 'BuildFaculty')]
+    [ValidateSet('Compile', 'Api', 'Expression', 'Inspect', 'ImportCil', 'AnalyzeCilIr', 'ImportCilIr', 'NativeCil', 'VerifyNativeLeaf', 'Query', 'Capability', 'Link', 'PowerShell', 'Graph', 'Lint', 'Guard', 'Profile', 'Report', 'Verify', 'Readme', 'Investigate', 'Consolidate', 'Records', 'Run', 'BuildRuntime', 'BuildFaculty', 'UnCollate', 'Collate', 'Status', 'Diff', 'Edit')]
     [string] $Mode = 'Compile',
     # Run: the parameters the source is run with, by name.
     [hashtable] $RunParameters = @{},
@@ -471,6 +471,7 @@ param(
     [ValidateSet('Console', 'Windows')]
     [string] $Subsystem = 'Console',
     [long] $StackReserve = 0x100000,
+    [string] $TreeDirectory,
     [string] $Faculty,
     [string] $RuntimeDirectory = '',
     [string[]] $ContractPaths = @(),
@@ -480,6 +481,717 @@ param(
 )
 
 begin {
+
+# A worktree is an ordered projection of the authored file, not a second compiler.
+# Only parser-owned boundaries split executable source. Gaps retain all trivia.
+class PscTreeUnit {
+    [string] $Kind
+    [string] $Path
+    [int] $Start
+    [int] $End
+    [int] $DeclarationStart = -1
+    [string] $Baseline
+    [string] $Current
+    [string] $State
+    hidden [string] $Text
+    PscTreeUnit([string]$kind,[string]$path,[int]$start,[int]$end){
+        $this.Kind=$kind; $this.Path=$path; $this.Start=$start; $this.End=$end
+    }
+}
+class PscTreeSnapshot {
+    [string] $Root
+    [string] $BaseSha256
+    hidden [PscTreeUnit[]] $Units
+    [string[]] $Untracked = @()
+    [string] $DestinationState
+    [int] $UnitCount
+    [PscTreeUnit[]] $Changes = @()
+    hidden [string] $Source
+    [string] $SourceSha256
+}
+class PscTreeDelta {
+    [string] $Path
+    [string] $Kind
+    [string] $State
+    [string] $Before
+    [string] $After
+}
+class PscSourceResource {
+    [string] $Path
+    [string] $Text
+    PscSourceResource([string]$path,[string]$text){$this.Path=$path;$this.Text=$text}
+}
+class PscTreeText {
+    static [Text.UTF8Encoding] Encoding(){return [Text.UTF8Encoding]::new($false,$true)}
+    static [string] Read([string]$path){
+        $text=[PscTreeText]::Encoding().GetString([IO.File]::ReadAllBytes($path))
+        if($text.Length -and $text[0] -eq [char]0xfeff){throw "UTF-8 BOM not admitted: $path"}
+        return $text
+    }
+    static [string] Hash([string]$text){return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([PscTreeText]::Encoding().GetBytes($text)))}
+    static [void] Write([string]$path,[string]$text){
+        [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path))
+        [IO.File]::WriteAllText($path,$text,[PscTreeText]::Encoding())
+    }
+    static [bool] IsHash([string]$hash){
+        if($hash.Length -ne 64){return $false}
+        foreach($c in $hash.ToCharArray()){if('0123456789ABCDEF'.IndexOf($c) -lt 0){return $false}}
+        return $true
+    }
+    static [string] SafePath([string]$root,[string]$path){
+        if(!$path -or [IO.Path]::IsPathRooted($path) -or $path.Contains('\') -or $path.Contains(':')){throw "Invalid tree path: $path"}
+        $next=$root
+        foreach($part in $path.Split('/')){
+            if(!$part -or $part -in '.','..','.git' -or $part.EndsWith('.') -or $part.EndsWith(' ')){throw "Invalid tree path: $path"}
+            foreach($c in $part.ToCharArray()){if(![char]::IsAsciiLetterOrDigit($c) -and $c -notin '-','_','.') {throw "Invalid tree path: $path"}}
+            $next=[IO.Path]::Combine($next,$part)
+            if(([IO.File]::Exists($next) -or [IO.Directory]::Exists($next)) -and ([IO.File]::GetAttributes($next) -band [IO.FileAttributes]::ReparsePoint)){throw "Reparse point in tree: $path"}
+        }
+        return $next
+    }
+    static [void] CheckRoot([string]$root){
+        if(![IO.Directory]::Exists($root)){throw "Tree does not exist: $root"}
+        if([IO.File]::GetAttributes($root) -band [IO.FileAttributes]::ReparsePoint){throw "Reparse point tree root: $root"}
+    }
+}
+function Read-PscTreeAst {
+    [OutputType([System.Management.Automation.Language.ScriptBlockAst])]
+    param([string]$Text,[string]$Path,[switch]$Resource)
+    $tokens=$null;$errors=$null
+    $root=[System.Management.Automation.Language.Parser]::ParseInput($Text,$Path,[ref]$tokens,[ref]$errors)
+    foreach($err in $errors){
+        # A resource may deliberately name a faculty not loaded in the authoring process.
+        if($Resource -and $err.ErrorId -ceq 'TypeNotFound'){continue}
+        throw "Invalid source $Path at $($err.Extent.StartLineNumber): $($err.Message)"
+    }
+    return $root
+}
+function Add-PscTreeUnit {
+    param([Collections.Generic.List[PscTreeUnit]]$Units,[string]$Kind,[string]$Path,[int]$Start,[int]$End)
+    if($End -lt $Start){throw "Overlapping source extents: $Path"}
+    if($End -gt $Start -or $Kind -ceq 'Resource'){$Units.Add([PscTreeUnit]::new($Kind,$Path,$Start,$End))}
+}
+function Add-PscTreeDeclarations {
+    param([Collections.Generic.List[PscTreeUnit]]$Units,[System.Management.Automation.Language.StatementAst[]]$Statements,[int]$Start,[int]$End,[string]$Scope,[Collections.Generic.Dictionary[string,string]]$Faculties)
+    $at=$Start;$ordinal=0
+    foreach($node in $Statements){
+        $limit=$node.Extent.EndOffset
+        if($node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -cin 'Get-PscFacultyDeclarations','Get-PscOtherFacultyDeclarations'){
+            $children=$node.Body.EndBlock.Statements
+            $inner=$children[0].Extent.StartOffset
+            Add-PscTreeUnit $Units 'Fragment' ('Layout/'+$node.Name+'-open.ps1part') $at $inner
+            Add-PscTreeDeclarations $Units $children $inner $limit $node.Name $Faculties
+        } elseif($node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-PscEmbeddedSources'){
+            $cursor=$at;$i=0
+            foreach($statement in $node.Body.EndBlock.Statements){
+                if($statement -isnot [System.Management.Automation.Language.PipelineAst] -or $statement.PipelineElements.Count -ne 1 -or $statement.PipelineElements[0] -isnot [System.Management.Automation.Language.CommandExpressionAst]){throw 'Invalid SM resource declaration.'}
+                $call=$statement.PipelineElements[0].Expression
+                if($call -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst] -or !$call.Static -or $call.Expression -isnot [System.Management.Automation.Language.TypeExpressionAst] -or $call.Expression.TypeName.FullName -cne 'PscSourceResource' -or $call.Member.Value -cne 'new' -or $call.Arguments.Count -ne 2){throw 'Invalid SM resource declaration.'}
+                $name=$call.Arguments[0];$literal=$call.Arguments[1]
+                if($name -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -or $literal -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -or $literal.StringConstantType -ne [System.Management.Automation.Language.StringConstantType]::SingleQuotedHereString -or !($name.Value.StartsWith('SM/',[StringComparison]::Ordinal) -or $name.Value.StartsWith('Tests/',[StringComparison]::Ordinal))){throw 'SM resources require a literal path and single-quoted here-string.'}
+                $raw=$literal.Extent.Text
+                $opening=if($raw.StartsWith("@'`r`n",[StringComparison]::Ordinal)){4}elseif($raw.StartsWith("@'`n",[StringComparison]::Ordinal)){3}else{throw 'Invalid SM resource opener.'}
+                $closing=if($raw.EndsWith("`r`n'@",[StringComparison]::Ordinal)){4}elseif($raw.EndsWith("`n'@",[StringComparison]::Ordinal)){3}else{throw 'Invalid SM resource closer.'}
+                $start=$literal.Extent.StartOffset+$opening;$finish=$literal.Extent.EndOffset-$closing
+                if($finish -lt $start -or $raw.Substring($opening,$finish-$start) -cne $literal.Value){throw 'Resource payload differs from parser value.'}
+                Add-PscTreeUnit $Units 'Fragment' ('Layout/SM-'+$i+'.ps1part') $cursor $start
+                Add-PscTreeUnit $Units 'Resource' $name.Value $start $finish
+                $cursor=$finish;$i++
+            }
+            Add-PscTreeUnit $Units 'Fragment' 'Layout/SM-close.ps1part' $cursor $limit
+        } elseif($node -is [System.Management.Automation.Language.TypeDefinitionAst]){
+            $path='Compiler/Types/'+$node.Name+'.ps1'
+            if($Faculties.ContainsKey($node.Name) -and $Scope -cne 'Compiler'){$path='Faculties/'+$Faculties[$node.Name]+'/'+$node.Name+'.ps1'}
+            Add-PscTreeUnit $Units 'Fragment' $path $at $limit
+            $Units[$Units.Count-1].DeclarationStart=$node.Extent.StartOffset
+        } elseif($node -is [System.Management.Automation.Language.FunctionDefinitionAst]){
+            $path='Compiler/Functions/'+$node.Name+'.ps1'
+            if($Scope -cne 'Compiler'){$path='Faculties/Authoring/'+$node.Name+'.ps1'}
+            Add-PscTreeUnit $Units 'Fragment' $path $at $limit
+            $Units[$Units.Count-1].DeclarationStart=$node.Extent.StartOffset
+        } else {
+            Add-PscTreeUnit $Units 'Fragment' ('Layout/'+$Scope+'-statement-'+$ordinal+'.ps1part') $at $limit
+        }
+        $at=$limit;$ordinal++
+    }
+    Add-PscTreeUnit $Units 'Fragment' ('Layout/'+$Scope+'-close.ps1part') $at $End
+}
+function Get-PscTreeProjection {
+    [OutputType([PscTreeSnapshot])]
+    param([string]$SourceFile,[AllowEmptyString()][string]$Text)
+    if(!$PSBoundParameters.ContainsKey('Text')){$Text=[PscTreeText]::Read($SourceFile)}
+    $ast=Read-PscTreeAst $Text $SourceFile
+    if(!$ast.BeginBlock -or !$ast.BeginBlock.Statements.Count){throw 'Worktree projection requires PSC begin/process source.'}
+    $units=[Collections.Generic.List[PscTreeUnit]]::new()
+    $faculties=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach($faculty in Get-PscFacultyUnits){foreach($name in $faculty.Declarations){$faculties.Add($name,$faculty.Name)}}
+    $first=$ast.BeginBlock.Statements[0].Extent.StartOffset
+    Add-PscTreeUnit $units 'Fragment' 'Layout/Header.ps1part' 0 $first
+    Add-PscTreeDeclarations $units $ast.BeginBlock.Statements $first $text.Length 'Compiler' $faculties
+    $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $at=0
+    foreach($unit in $units){
+        if($unit.Start -ne $at -or !$seen.Add($unit.Path)){throw "Ambiguous projection: $($unit.Path)"}
+        $unit.Text=$text.Substring($unit.Start,$unit.End-$unit.Start)
+        $unit.Baseline=[PscTreeText]::Hash($unit.Text);$unit.Current=$unit.Baseline;$unit.State='Clean';$at=$unit.End
+    }
+    if($at -ne $text.Length){throw 'Projection does not cover source.'}
+    $snapshot=[PscTreeSnapshot]::new();$snapshot.BaseSha256=[PscTreeText]::Hash($text);$snapshot.Units=$units.ToArray();$snapshot.UnitCount=$units.Count;$snapshot.Source=$text;$snapshot.SourceSha256=$snapshot.BaseSha256
+    return $snapshot
+}
+function New-PscSourceTree {
+    [OutputType([PscTreeSnapshot])]
+    param([string]$SourceFile,[string]$Root)
+    $root=[IO.Path]::GetFullPath($Root)
+    if([IO.Directory]::Exists($root) -or [IO.File]::Exists($root)){throw 'UnCollate destination must not exist.'}
+    $snapshot=Get-PscTreeProjection $SourceFile;$snapshot.Root=$root
+    $stage=$root+'.psc-'+[Guid]::NewGuid().ToString('N')
+    [void][IO.Directory]::CreateDirectory($stage)
+    try{
+        $manifest=[Text.StringBuilder]::new()
+        foreach($unit in $snapshot.Units){
+            $path=[PscTreeText]::SafePath($stage,$unit.Path)
+            [PscTreeText]::Write($path,$unit.Text)
+            [void]$manifest.Append($unit.Kind).Append("`t").Append($unit.Path).Append("`t").Append($unit.Baseline).Append("`n")
+        }
+        $body=$manifest.ToString()
+        [PscTreeText]::Write([IO.Path]::Combine($stage,'PSC.tree'),("PSC-WORKTREE`t1`t"+$snapshot.BaseSha256+"`t"+[PscTreeText]::Hash($body)+"`n"+$body))
+        [IO.Directory]::Move($stage,$root)
+    }finally{if([IO.Directory]::Exists($stage)){[IO.Directory]::Delete($stage,$true)}}
+    return $snapshot
+}
+function Read-PscSourceTree {
+    [OutputType([PscTreeSnapshot])]
+    param([string]$Root)
+    $root=[IO.Path]::GetFullPath($Root);[PscTreeText]::CheckRoot($root)
+    $manifest=[PscTreeText]::Read([PscTreeText]::SafePath($root,'PSC.tree'))
+    $newline=$manifest.IndexOf("`n",[StringComparison]::Ordinal)
+    if($newline -lt 0){throw 'Invalid manifest.'}
+    $body=$manifest.Substring($newline+1)
+    $lines=$manifest.Split("`n",[StringSplitOptions]::RemoveEmptyEntries)
+    if($lines.Length -lt 2){throw 'Empty worktree manifest.'}
+    $header=$lines[0].Split("`t")
+    if($header.Length -ne 4 -or $header[0] -cne 'PSC-WORKTREE' -or $header[1] -cne '1' -or ![PscTreeText]::IsHash($header[2]) -or $header[3] -cne [PscTreeText]::Hash($body)){throw 'Invalid worktree manifest header.'}
+    $snapshot=[PscTreeSnapshot]::new();$snapshot.Root=$root;$snapshot.BaseSha256=$header[2]
+    $units=[Collections.Generic.List[PscTreeUnit]]::new();$tracked=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase);[void]$tracked.Add('PSC.tree')
+    for($i=1;$i -lt $lines.Length;$i++){
+        $fields=$lines[$i].Split("`t")
+        if($fields.Length -ne 3 -or $fields[0] -cnotin 'Fragment','Resource' -or ![PscTreeText]::IsHash($fields[2]) -or !$tracked.Add($fields[1])){throw "Invalid worktree entry $i"}
+        $path=[PscTreeText]::SafePath($root,$fields[1]);$unit=[PscTreeUnit]::new($fields[0],$fields[1],0,0);$unit.Baseline=$fields[2]
+        if([IO.File]::Exists($path)){$unit.Text=[PscTreeText]::Read($path);$unit.Current=[PscTreeText]::Hash($unit.Text);$unit.State=if($unit.Current -ceq $unit.Baseline){'Clean'}else{'Modified'}}else{$unit.State='Deleted'}
+        $units.Add($unit)
+    }
+    $snapshot.Units=$units.ToArray();$snapshot.UnitCount=$units.Count
+    $snapshot.Changes=@(foreach($unit in $snapshot.Units){if($unit.State -cne 'Clean'){$unit}})
+    $unknown=[Collections.Generic.List[string]]::new();$pending=[Collections.Generic.Stack[string]]::new();$pending.Push($root)
+    while($pending.Count){
+        foreach($path in [IO.Directory]::EnumerateFileSystemEntries($pending.Pop())){
+            $relative=[IO.Path]::GetRelativePath($root,$path).Replace('\','/')
+            if($relative -ceq '.git'){continue}
+            $attributes=[IO.File]::GetAttributes($path)
+            if($attributes -band [IO.FileAttributes]::ReparsePoint){$unknown.Add($relative);continue}
+            if($attributes -band [IO.FileAttributes]::Directory){$pending.Push($path)}elseif(!$tracked.Contains($relative)){$unknown.Add($relative)}
+        }
+    }
+    $snapshot.Untracked=$unknown.ToArray()
+    return $snapshot
+}
+function Compare-PscSourceTree {
+    [OutputType([PscTreeDelta])]
+    param([string]$Root,[string]$SourceFile)
+    $snapshot=Read-PscSourceTree $Root
+    $base=Get-PscTreeProjection $SourceFile
+    if($base.BaseSha256 -cne $snapshot.BaseSha256 -or $base.Units.Length -ne $snapshot.Units.Length){throw 'Diff requires the original canonical base.'}
+    for($i=0;$i -lt $base.Units.Length;$i++){
+        $before=$base.Units[$i];$after=$snapshot.Units[$i]
+        if($before.Path -cne $after.Path -or $before.Kind -cne $after.Kind -or $before.Baseline -cne $after.Baseline){throw 'Manifest differs from canonical base.'}
+        if($after.State -cne 'Clean'){
+            $delta=[PscTreeDelta]::new();$delta.Path=$after.Path;$delta.Kind=$after.Kind;$delta.State=$after.State;$delta.Before=$before.Text;$delta.After=$after.Text
+            $delta
+        }
+    }
+    foreach($path in $snapshot.Untracked){$delta=[PscTreeDelta]::new();$delta.Path=$path;$delta.State='Untracked';$delta}
+}
+function Join-PscSourceTree {
+    [OutputType([PscTreeSnapshot])]
+    param([string]$Root)
+    $snapshot=Read-PscSourceTree $Root
+    if($snapshot.Untracked.Length){throw ('Untracked worktree paths: '+[string]::Join(', ',$snapshot.Untracked))}
+    $builder=[Text.StringBuilder]::new()
+    foreach($unit in $snapshot.Units){
+        if($unit.State -ceq 'Deleted'){throw "Missing worktree unit: $($unit.Path)"}
+        $unit.Start=$builder.Length
+        if($unit.Kind -ceq 'Resource' -and [IO.Path]::GetExtension($unit.Path) -in '.sm1','.srm1','.sexe','.ps1','.psm1'){$null=Read-PscTreeAst $unit.Text $unit.Path -Resource}
+        [void]$builder.Append($unit.Text)
+        $unit.End=$builder.Length
+    }
+    $snapshot.Source=$builder.ToString();$snapshot.SourceSha256=[PscTreeText]::Hash($snapshot.Source)
+    if(@($snapshot.Units | Where-Object State -ne 'Clean').Count -eq 0 -and $snapshot.SourceSha256 -cne $snapshot.BaseSha256){throw 'Manifest order or baseline has changed.'}
+    $check=Get-PscTreeProjection -SourceFile 'PSC.ps1' -Text $snapshot.Source
+    if($check.Units.Length -ne $snapshot.Units.Length){throw 'Collate changed declaration boundaries; edit the canonical file for additions or removals.'}
+    for($i=0;$i -lt $check.Units.Length;$i++){
+        $a=$snapshot.Units[$i];$b=$check.Units[$i]
+        if($a.Path -cne $b.Path -or $a.Kind -cne $b.Kind){throw "Collate changed structural identity: $($a.Path)"}
+        if($b.Kind -ceq 'Resource' -and $a.Current -cne $b.Current){throw "Resource escaped its projected extent: $($a.Path)"}
+        if($b.DeclarationStart -ge 0 -and ($b.DeclarationStart -lt $a.Start -or $b.End -gt $a.End)){throw "Declaration escaped its projected extent: $($a.Path)"}
+    }
+    return $snapshot
+}
+function Write-PscSourceTree {
+    [OutputType([PscTreeSnapshot])]
+    param([string]$Root,[string]$Destination)
+    $snapshot=Join-PscSourceTree $Root
+    $path=[IO.Path]::GetFullPath($Destination)
+    $relative=[IO.Path]::GetRelativePath($snapshot.Root,$path)
+    if(![IO.Path]::IsPathRooted($relative) -and $relative -ne '..' -and !$relative.StartsWith('..'+[IO.Path]::DirectorySeparatorChar,[StringComparison]::Ordinal)){throw 'Collate destination must be outside the worktree.'}
+    if([IO.File]::Exists($path)){
+        if([IO.File]::GetAttributes($path) -band [IO.FileAttributes]::ReparsePoint){throw 'Refusing reparse-point destination.'}
+        $old=[PscTreeText]::Hash([PscTreeText]::Read($path))
+        if($old -ceq $snapshot.SourceSha256){return $snapshot}
+        if($old -cne $snapshot.BaseSha256){throw 'Collate conflict: destination no longer matches the worktree base.'}
+    }
+    $temp=$path+'.psc-'+[Guid]::NewGuid().ToString('N')
+    try{[PscTreeText]::Write($temp,$snapshot.Source);[IO.File]::Move($temp,$path,$true)}finally{if([IO.File]::Exists($temp)){[IO.File]::Delete($temp)}}
+    return $snapshot
+}
+
+function Get-PscEmbeddedSources {
+    [OutputType([PscSourceResource])]
+    param()
+    [PscSourceResource]::new('SM/Calibration.sexe', @'
+# One application translation unit: entry parameters, behavior and specialization.
+[CmdletBinding()]
+param(
+    [double] $Value = 2.5,
+    [ValidateSet('Compact', 'Detailed')][string] $Presentation = 'Compact'
+)
+
+class SmApplianceKernel {
+    static [double] Apply([double] $value) {
+        return $value * 4.0 + 1.25
+    }
+}
+
+function Write-Detailed {
+    [OutputType([void])]
+    param([double] $Result)
+    [Console]::WriteLine('Calibrated value:')
+    [Console]::WriteLine($Result)
+}
+
+[double] $result = [SmApplianceKernel]::Apply($Value)
+if ($Presentation -eq 'Detailed') {
+    Write-Detailed -Result $result
+} else {
+    [Console]::WriteLine($result)
+}
+
+'@)
+    [PscSourceResource]::new('SM/Calibration.sm1', @'
+# Portable calculation source. No PSC-specific bootstrap is required by its semantics.
+[CmdletBinding()]
+param([double] $Value = 2.5)
+
+class SmCalibrationProvider {
+    [double] Apply([double] $value) {
+        return $value * 4.0 + 1.25
+    }
+
+    static [object] ApplyThunk([object] $receiver, [object[]] $arguments) {
+        return ([SmCalibrationProvider] $receiver).Apply([double] $arguments[0])
+    }
+}
+
+[Console]::WriteLine([SmCalibrationProvider]::new().Apply($Value))
+
+'@)
+    [PscSourceResource]::new('SM/Calibration.srm1', @'
+# A structural contract, not a provider implementation.
+# PSC materializes its semantic descriptor in the compiled ScriptType catalog.
+class SmCalibrationContract {
+    [double] Apply([double] $value) {
+        throw [NotSupportedException]::new('A contract must be realized by a provider.')
+    }
+}
+
+# The declared consumer records which operation the contract requires.
+class SmCalibrationUse {
+    static [double] Measure([SmCalibrationContract] $calibration, [double] $value) {
+        return $calibration.Apply($value)
+    }
+}
+
+'@)
+    [PscSourceResource]::new('SM/CalibrationClient.sm1', @'
+# Same grammar as Calibration.sm1, but requires PSC's compiled runtime faculties.
+class SmCalibrationClient {
+    static [double] Measure([ScriptTypeRole] $role, [double] $value) {
+        return [double][ScriptTypeReflection]::InvokeRole($role, 'SmCalibrationContract', 'Apply', [object[]]@($value))
+    }
+}
+
+'@)
+    [PscSourceResource]::new('SM/README.md', @'
+# SM — Semantics Management (exploratory)
+
+These are experiments within PSC, not a separate compiler, package system or grammar. PSC.ps1 remains the authoritative production source. The `1` suffix identifies the source-format generation, not the execution backend.
+
+## Why three source formats?
+
+| Format | Role under investigation | Concrete experiment |
+| --- | --- | --- |
+| `.sm1` | Executable semantics, with independently declared runtime requirements | `Calibration.sm1` runs in stock Pwsh and compiles through PSC; `CalibrationClient.sm1` needs the compiled ScriptType faculty and its VOM-published role. |
+| `.srm1` | Script Resource Module: semantic declarations, reusable contracts, resources and potentially executable faculties | `Calibration.srm1` is consumed by PSC's existing contract authoring path. Its required operation becomes a typed descriptor in ScriptType.dll, without emitting or executing the contract's placeholder class. |
+| `.sexe` | Self-contained application translation unit, with entry parameters and realization policy | `Calibration.sexe` builds as a parameterized program; fixing Presentation specializes its entry interface. A scalar kernel from the same source can also be acquired and emitted as a native shared library. |
+
+The file role does not establish parser compatibility or runtime independence. Both `.sm1` examples use existing SMA grammar. One runs without additional types; the other requires PSC-built types, not a new parser. A compiled client and catalog do not reference SMA. The runtime assemblies are still managed assemblies.
+
+An SRM contract is a declaration of an operation, not an implementation of it: a provider compiled from `.sm1` supplies the behavior, and VOM controls the lifetime of its realization. The fixture explicitly publishes the role; there is no automatic module loader or import syntax. The two source types do not need a nominal inheritance relationship. The resource and provider can therefore be acquired independently.
+
+A `.sexe` is source, not a PE/ELF image. The fixture produces managed application images using `-Program`, plus an import-free Linux x64 native leaf using `NativeCil`. It does not claim a standalone PSC-native application or that a native compiler DLL already exists. The existing NativeAOT executable target remains available separately.
+
+## Reproduce
+
+PowerShell 7.7 / .NET 11:
+
+```powershell
+pwsh -NoProfile -File ./PSC.ps1 -Mode UnCollate -TreeDirectory ./psc-tree
+pwsh -NoProfile -File ./psc-tree/SM/Test-Formats.ps1 -Compiler ./PSC.ps1
+```
+
+The test builds seven runtime faculties in a new temporary directory, materializes the SRM contract, compares the portable script and its compiled entry point, exercises a published and revoked role, tests application specialization, and checks native kernel results on Linux x64. It cleans temporary outputs on exit. Other targets skip native loader execution rather than reporting parity without execution.
+
+`PSC.ps1 -Mode Query` admits `.sm1`, `.srm1` and `.sexe` as source candidates using the existing parser and extent witnesses. This is intentionally an inquiry change only; legacy Graph, Lint and Investigate discovery policies remain unchanged. There is no automatic inference of compilation mode from the extension and no extension-based semantic restriction yet.
+
+## Development worktree
+
+The authoritative source of every SM file is the literal resource declaration in `PSC.ps1`. Use the projected files for development, not as an additional permanent source tree.
+
+```powershell
+$tree = & ./PSC.ps1 -Mode UnCollate -TreeDirectory ./psc-tree
+(& ./PSC.ps1 -Mode Status -TreeDirectory ./psc-tree).Changes
+& ./PSC.ps1 -Mode Diff -TreeDirectory ./psc-tree
+& ./PSC.ps1 -Mode Collate -TreeDirectory ./psc-tree -OutputPath ./PSC.next.ps1
+pwsh -NoProfile -File ./psc-tree/SM/Test-Formats.ps1 -Compiler ./PSC.next.ps1
+```
+
+A worktree records the ordered source fragments and baseline SHA-256 values in `PSC.tree`. Compiler functions and types have declaration-derived paths; layout fragments preserve the surrounding syntax and trivia. Resources are exact literal payloads, not evaluated scripts. The tree can be inspected with Git or PSC Query; isolated compiler fragments are not independent compilation units and may require their surrounding declarations for complete semantic analysis.
+
+Collate is fail-closed: missing and untracked files, manifest edits, declaration-boundary changes, resource-literal escapes, parse failures and a divergent existing output are refused. Existing declaration bodies and resources can be edited. Trailing comments and whitespace may be attributed to the following unit on re-projection; declaration extents must remain inside their original units. Additions, deletions and renames require an explicit canonical-source edit in this first version. Diff compares changed structural units against the original canonical source; it is not a semantic equivalence proof. After adopting a new canonical source, create a fresh worktree to establish a new baseline. Do not commit both representations.
+
+### Structural editing
+
+`Edit` opens a single file as a document with its own identity, immutable original buffer, append-only insertion buffer and grouped undo/redo journal. Query returns typed AST witnesses bound to the document identity, SHA-256 and revision. Use a complete matching AST extent as the replacement boundary; no regex or line-based rewrite is performed.
+
+```powershell
+$doc = & ./PSC.ps1 -Mode Edit -SourcePath ./psc-tree/SM/Calibration.sm1
+$hit = $doc.Query('Declaration','Apply','SmCalibrationProvider',1)[0]
+$doc.Replace($hit,$hit.Target.Extent.Text.Replace('4.0 + 1.25','4.0 + 2.25'))
+$doc.Undo()
+$doc.Redo()
+$doc.Save()
+```
+
+All paired replacements in a group are checked for overlapping extents and parsed together before updating the journal. Re-query after any change, undo or redo. Save refuses a changed on-disk file and uses a sibling temporary file; it is not a cross-process locking protocol. Document query requires a fully parsed source unit; incomplete fragments may instead be edited in an external editor and checked by Collate. The piece-table model is adapted from Notepad.ps1 at 17b76e2, not its cached find/replace UI logic. Dirty state compares content hashes, including after a new branch of edits.
+
+To reproduce the editing and projection fixtures, first UnCollate and run `Tests/Test-Document.ps1` and `Tests/Test-Worktree.ps1` in the projected tree, passing `-Compiler ./PSC.ps1`.
+
+## Development criteria
+
+Extend a format when it exposes a semantic requirement not represented by the current compiler: resource identity and composition, explicit bootstrap requirements, or application realization and specialization. Do not duplicate the compiler to implement those roles. Prefer executable comparisons, including absent-capability and withdrawal cases, over new grammar or naming alone.
+
+'@)
+    [PscSourceResource]::new('SM/Test-Formats.ps1', @'
+#requires -Version 7.7
+[CmdletBinding()]
+param([string] $Compiler = (Join-Path (Split-Path -Parent $PSScriptRoot) 'PSC.ps1'))
+$ErrorActionPreference = 'Stop'
+$Compiler = [IO.Path]::GetFullPath($Compiler)
+$pwsh = (Get-Process -Id $PID).Path
+$work = Join-Path ([IO.Path]::GetTempPath()) ('psc-sm-' + [Guid]::NewGuid().ToString('N'))
+[void][IO.Directory]::CreateDirectory($work)
+
+function Assert-Pass([bool] $Condition, [string] $Description) {
+    if (!$Condition) { throw $Description }
+    [Console]::WriteLine('PASS ' + $Description)
+}
+function Invoke-Entry([Reflection.Assembly] $Assembly, [string[]] $Arguments) {
+    $previous = [Console]::Out
+    $capture = [IO.StringWriter]::new([Globalization.CultureInfo]::CurrentCulture)
+    try {
+        [Console]::SetOut($capture)
+        [void]$Assembly.EntryPoint.Invoke($null, [object[]]@(,$Arguments))
+        return $capture.ToString().TrimEnd("`r", "`n")
+    } finally { [Console]::SetOut($previous); $capture.Dispose() }
+}
+# Test-only native call adapter. The production code and image are emitted by PSC.
+function New-NativeOracleDelegate {
+    $ab = [Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly([Reflection.AssemblyName]::new('SmTestNativeDelegate'), [Reflection.Emit.AssemblyBuilderAccess]::Run)
+    $tb = $ab.DefineDynamicModule('Oracle').DefineType('SmTestNativeDelegate', [Reflection.TypeAttributes]'Public,Sealed', [MulticastDelegate])
+    $ctor = $tb.DefineConstructor([Reflection.MethodAttributes]'Public,HideBySig,RTSpecialName', [Reflection.CallingConventions]::Standard, [type[]]@([object], [IntPtr]))
+    $ctor.SetImplementationFlags([Reflection.MethodImplAttributes]::Runtime)
+    $invoke = $tb.DefineMethod('Invoke', [Reflection.MethodAttributes]'Public,HideBySig,NewSlot,Virtual', [double], [type[]]@([double]))
+    $invoke.SetImplementationFlags([Reflection.MethodImplAttributes]::Runtime)
+    return $tb.CreateType()
+}
+try {
+    $script = Join-Path $PSScriptRoot 'Calibration.sm1'
+    $contractSource = Join-Path $PSScriptRoot 'Calibration.srm1'
+    $clientSource = Join-Path $PSScriptRoot 'CalibrationClient.sm1'
+    $appliance = Join-Path $PSScriptRoot 'Calibration.sexe'
+    $runtime = Join-Path $work 'runtime'
+    $expected = ([double]41.25).ToString([Globalization.CultureInfo]::CurrentCulture)
+    $portable = & $pwsh -NoProfile -File $script -Value 10
+    Assert-Pass ($LASTEXITCODE -eq 0 -and $portable -ceq $expected) 'portable .sm1 executes directly in stock Pwsh'
+    $unbootstrapped = & $pwsh -NoProfile -File $clientSource 2>&1
+    Assert-Pass ($LASTEXITCODE -ne 0 -and ($unbootstrapped | Out-String).Contains('ScriptTypeRole')) 'PSC-dependent .sm1 fails without its declared runtime types'
+
+    # Explicit paths, before any runtime load: the query gate accepts each format.
+    foreach ($entry in @(@($script, 'SmCalibrationProvider'), @($contractSource, 'SmCalibrationContract'), @($appliance, 'SmApplianceKernel'))) {
+        $q = & $Compiler -Mode Query -QueryPath $entry[0] -QueryKind Declaration -QueryName $entry[1] -QueryTake 1
+        try {
+            Assert-Pass ($q.Coverage().ArtifactsOpened -eq 0) "lazy query opens no $([IO.Path]::GetExtension($entry[0])) at creation"
+            $hits = $q.Pull(1)
+            Assert-Pass ($hits.Length -eq 1 -and $hits[0].Name -ceq $entry[1] -and $hits[0].ArtifactSha256 -ceq (Get-FileHash -LiteralPath $entry[0]).Hash -and !$hits[0].ParseIncomplete) "structural witness for $([IO.Path]::GetExtension($entry[0]))"
+        } finally { $q.Dispose() }
+    }
+    $q = & $Compiler -Mode Query -QueryPath $PSScriptRoot -QueryKind Declaration -QueryName SmApplianceKernel
+    try { $hits = $q.Pull(64); Assert-Pass ($hits.Length -eq 1 -and $q.Coverage().Exhausted) 'directory query discovers .sexe without filename rewriting' } finally { $q.Dispose() }
+
+    # All runtime dependencies are built from the same authoritative PSC.ps1.
+    & $Compiler -Mode BuildRuntime -RuntimeDirectory $runtime -ContractPaths $contractSource | Out-Null
+    Assert-Pass ([IO.Directory]::GetFiles($runtime, '*.dll').Length -eq 7) 'clean seven-faculty runtime with .srm1 contract input'
+    Assert-Pass (@([AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { $_.GetName().Name -in 'Vom', 'ScriptType', 'InquiryPrimitives' }).Count -eq 0) 'runtime build does not contaminate coordinator identities'
+    $providerPath = Join-Path $work 'Provider.dll'
+    $portablePath = Join-Path $work 'Portable.dll'
+    $clientPath = Join-Path $work 'Client.dll'
+    $applicationPath = Join-Path $work 'Application.dll'
+    $compactPath = Join-Path $work 'Compact.dll'
+    & $Compiler -SourcePath $script -DeclarationsOnly -ClassName SmCalibrationProvider -OutputPath $providerPath | Out-Null
+    & $Compiler -SourcePath $script -Program -OutputPath $portablePath | Out-Null
+    & $Compiler -SourcePath $appliance -Program -OutputPath $applicationPath | Out-Null
+    & $Compiler -SourcePath $appliance -Program -FixedParameters @{ Presentation = 'Compact' } -OutputPath $compactPath | Out-Null
+    $portableAssembly = [Reflection.Assembly]::LoadFrom($portablePath)
+    Assert-Pass ((Invoke-Entry $portableAssembly @('-Value', '10')) -ceq $portable) 'compiled portable .sm1 agrees with unmodified Pwsh'
+    $application = [Reflection.Assembly]::LoadFrom($applicationPath)
+    $compact = [Reflection.Assembly]::LoadFrom($compactPath)
+    Assert-Pass ((Invoke-Entry $application @('-Value', '10')) -ceq $expected) 'one-file .sexe default application entry point'
+    Assert-Pass ((Invoke-Entry $application @('-Value', '10', '-Presentation', 'Detailed')) -ceq ('Calibrated value:' + [Environment]::NewLine + $expected)) 'one-file .sexe alternative application behavior'
+    Assert-Pass ((Invoke-Entry $compact @('-Value', '10')) -ceq $expected) 'specialized .sexe retains behavior of selected mode'
+    $rejected = $false
+    try { $null = Invoke-Entry $compact @('-Value', '10', '-Presentation', 'Detailed') } catch { $rejected = $_.Exception.GetBaseException().Message.Contains('Presentation') }
+    Assert-Pass $rejected 'fixed appliance parameter cannot be overridden at execution'
+
+    foreach ($name in 'Vom', 'InquiryPrimitives', 'ScriptType') { [void][Reflection.Assembly]::LoadFrom((Join-Path $runtime ($name + '.dll'))) }
+    & $Compiler -SourcePath $clientSource -DeclarationsOnly -ClassName SmCalibrationClient -OutputPath $clientPath | Out-Null
+    $client = [Reflection.Assembly]::LoadFrom($clientPath).GetType('SmCalibrationClient', $true)
+    $providerType = [Reflection.Assembly]::LoadFrom($providerPath).GetType('SmCalibrationProvider', $true)
+    $provider = [Activator]::CreateInstance($providerType)
+    $descriptor = [ScriptTypeCatalog]::Find('SmCalibrationContract')
+    $member = $descriptor.FindResolved('Apply', [type[]]@([double]))
+    Assert-Pass ($null -ne $member -and $member.Required -and $member.ResultTypeIdentity -ceq [double].AssemblyQualifiedName) '.srm1 produces a typed required contract operation'
+    Assert-Pass ($null -eq [ScriptTypeCatalog].Assembly.GetType('SmCalibrationContract') -and $null -eq [ScriptTypeCatalog].Assembly.GetType('SmCalibrationUse')) '.srm1 catalog retains semantic descriptors rather than executable contract classes'
+    $space = [Vom]::new()
+    $owner = $space.Register(0, [object]::new(), [object], $null)
+    try {
+        $realization = [ScriptTypeRealization]::new()
+        $realization.ContractHandle = $space.Register($owner, $descriptor, [ScriptTypeContract], $null)
+        $realization.ReceiverHandle = $space.Register($owner, $provider, [object], $null)
+        $thunk = $providerType.GetMethod('ApplyThunk').CreateDelegate([Func[object,object[],object]])
+        $realization.Calls = [ScriptTypeCall[]]@([ScriptTypeCall]::new($member, [type[]]@([double]), $thunk))
+        $handle = $space.Register($owner, $realization, [ScriptTypeRealization], $null)
+        [void]$space.Rebind($owner, 'calibration', 0, $handle)
+        $role = [ScriptTypeRole]::new($space, $owner, 'calibration')
+        $measure = $client.GetMethod('Measure')
+        foreach ($value in [double[]]@(-10, 0, 2.5, 10, 127.125)) {
+            $reference = $providerType.GetMethod('Apply').Invoke($provider, [object[]]@($value))
+            Assert-Pass ($measure.Invoke($null, [object[]]@($role, $value)) -eq $reference) "bootstrapped .sm1 resolves .srm1 contract and invokes provider ($value)"
+        }
+        [void]$space.Revoke($handle)
+        $denied = $false
+        try { [void]$measure.Invoke($null, [object[]]@($role, [double]10)) } catch { $denied = $true }
+        Assert-Pass $denied 'withdrawn role denies the same compiled SM client'
+    } finally { [void]$space.Revoke($owner) }
+    Assert-Pass ('System.Management.Automation' -notin $client.Assembly.GetReferencedAssemblies().Name -and 'System.Management.Automation' -notin [ScriptTypeCatalog].Assembly.GetReferencedAssemblies().Name) 'PSC-dependent SM client and catalog have no SMA reference'
+
+    if ($IsLinux -and [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq [Runtime.InteropServices.Architecture]::X64) {
+        $library = Join-Path $work 'ApplianceKernel.so'
+        & $Compiler -Mode NativeCil -AssemblyPath $applicationPath -ClassName SmApplianceKernel -MethodNames Apply -RuntimeDirectory $runtime -OutputPath $library | Out-Null
+        $native = [Runtime.InteropServices.NativeLibrary]::Load($library)
+        try {
+            $invoke = [Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer([Runtime.InteropServices.NativeLibrary]::GetExport($native, 'Apply'), (New-NativeOracleDelegate))
+            $method = $application.GetType('SmApplianceKernel', $true).GetMethod('Apply')
+            foreach ($value in [double[]]@(-10, 0, 2.5, 10, 127.125)) {
+                $reference = [double]$method.Invoke($null, [object[]]@($value))
+                $actual = [double]$invoke.DynamicInvoke([object[]]@($value))
+                Assert-Pass ([BitConverter]::DoubleToInt64Bits($actual) -eq [BitConverter]::DoubleToInt64Bits($reference)) "native .sexe kernel agrees with managed realization ($value)"
+            }
+        } finally { [Runtime.InteropServices.NativeLibrary]::Free($native) }
+    } else { [Console]::WriteLine('SKIP direct-native kernel execution requires Linux x64') }
+} finally { [IO.Directory]::Delete($work, $true) }
+
+'@)
+    [PscSourceResource]::new('Tests/Test-Document.ps1', @'
+#requires -Version 7.7
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$Compiler)
+$ErrorActionPreference='Stop'
+$compiler=[IO.Path]::GetFullPath($Compiler);$dir=[IO.Path]::Combine([IO.Path]::GetTempPath(),'psc-document-'+[Guid]::NewGuid().ToString('N'))
+[void][IO.Directory]::CreateDirectory($dir)
+$encoding=[Text.UTF8Encoding]::new($false,$true)
+function Assert-Document([bool]$Condition,[string]$Message){if(!$Condition){throw $Message};[Console]::WriteLine('PASS '+$Message)}
+try{
+    $path=Join-Path $dir 'source.sm1';$foreign=Join-Path $dir 'other.sm1'
+    $original="# Write-Output 'ignore'`r`nWrite-Output 'a'`r`nWrite-Output 'b'`r`n`$s = `"Write-Output 'text'`"`r`n"
+    [IO.File]::WriteAllText($path,$original,$encoding);[IO.File]::WriteAllText($foreign,$original,$encoding)
+    $doc=& $compiler -Mode Edit -SourcePath $path
+    $hits=$doc.Query('Call','Write-Output','',2)
+    Assert-Document ($hits.Length -eq 2 -and $hits[0].StartOffset -eq 25 -and $hits[1].SourceRevision -eq 0) 'query uses structural call witnesses, excluding comment and string'
+    $same=& $compiler -Mode Edit -SourcePath $path
+    $otherRevision=$same.Query('Call','Write-Output','',1)
+    $rejected=$false;try{$doc.Replace($otherRevision[0],"Write-Output 'other session'")}catch{$rejected=$true}
+    Assert-Document $rejected 'same path and bytes do not confer document-session identity'
+    $doc.Replace($hits,[string[]]@("Write-Output 'longer'","Write-Output 'c'"))
+    $changed=$original.Replace("Write-Output 'a'","Write-Output 'longer'").Replace("Write-Output 'b'","Write-Output 'c'")
+    Assert-Document ($doc.Text() -ceq $changed -and $doc.Revision -eq 1 -and $doc.Modified()) 'batch replacement preserves untouched CRLF bytes and shifts later extents correctly'
+    $rejected=$false;try{$doc.Replace($hits[0],"Write-Output 'stale'")}catch{$rejected=$_.Exception.Message.Contains('Stale or foreign')}
+    Assert-Document ($rejected -and $doc.Text() -ceq $changed -and $doc.Revision -eq 1) 'stale match cannot change edited document'
+    Assert-Document ($doc.Undo() -and $doc.Text() -ceq $original -and !$doc.Modified()) 'one undo restores grouped changes exactly'
+    $rejected=$false;try{$doc.Replace($hits[0],"Write-Output 'stale'")}catch{$rejected=$_.Exception.Message.Contains('Stale or foreign')}
+    Assert-Document $rejected 'undo does not revive stale witness revision'
+    Assert-Document ($doc.Redo() -and $doc.Text() -ceq $changed) 'one redo reapplies grouped edits exactly'
+    $fresh=$doc.Query('Call','Write-Output','',2)
+    $rejected=$false;try{$doc.Replace($fresh[0],'class {')}catch{$rejected=$_.Exception.Message.Contains('parse failed')}
+    Assert-Document ($rejected -and $doc.Text() -ceq $changed -and $doc.Revision -eq 3) 'invalid replacement leaves document and journal unchanged'
+    $rejected=$false;try{$doc.Replace(@($fresh[0],$fresh[0]),[string[]]@('1','2'))}catch{$rejected=$_.Exception.Message.Contains('Overlapping')}
+    Assert-Document $rejected 'duplicate or overlapping witnesses rejected'
+    $doc.Save();Assert-Document (!$doc.Modified() -and [IO.File]::ReadAllText($path) -ceq $changed) 'saved content is clean'
+    $null=$doc.Undo();$fresh=$doc.Query('Call','Write-Output','',1);$doc.Replace($fresh[0],"Write-Output 'branch'")
+    Assert-Document ($doc.Modified() -and !$doc.Redo()) 'branch after undo does not reuse saved journal identity'
+    [IO.File]::WriteAllText($path,'42',$encoding)
+    $rejected=$false;try{$doc.Save()}catch{$rejected=$_.Exception.Message.Contains('save conflict')}
+    Assert-Document ($rejected -and [IO.File]::ReadAllText($path) -ceq '42') 'external revision prevents save without overwriting disk'
+    $other=& $compiler -Mode Edit -SourcePath $foreign
+    $otherHits=$other.Query('Call','Write-Output','',1)
+    $rejected=$false;try{$doc.Replace($otherHits[0],"Write-Output 'foreign'")}catch{$rejected=$true}
+    Assert-Document $rejected 'foreign document witness rejected'
+}finally{[IO.Directory]::Delete($dir,$true)}
+
+'@)
+    [PscSourceResource]::new('Tests/Test-Worktree.ps1', @'
+#requires -Version 7.7
+[CmdletBinding()]
+param([Parameter(Mandatory)][string] $Compiler)
+$ErrorActionPreference = 'Stop'
+$compiler = [IO.Path]::GetFullPath($Compiler)
+$work = Join-Path ([IO.Path]::GetTempPath()) ('psc-tree-test-' + [Guid]::NewGuid().ToString('N'))
+$encoding = [Text.UTF8Encoding]::new($false, $true)
+[void][IO.Directory]::CreateDirectory($work)
+function Assert-Tree([bool] $Condition, [string] $Description) {
+    if (!$Condition) { throw $Description }
+    [Console]::WriteLine('PASS ' + $Description)
+}
+function Read-Text([string] $Path) { return $encoding.GetString([IO.File]::ReadAllBytes($Path)) }
+function Write-Text([string] $Path, [string] $Text) { [IO.File]::WriteAllText($Path, $Text, $encoding) }
+function Get-Hash([string] $Path) { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash }
+try {
+    $base = Join-Path $work 'PSC.base.ps1'
+    [IO.File]::Copy($compiler, $base)
+    $hash = Get-Hash $base
+    $tree = Join-Path $work 'tree'
+    $out = Join-Path $work 'PSC.next.ps1'
+    $snapshot = & $compiler -Mode UnCollate -TreeDirectory $tree -SourcePath $base
+    Assert-Tree ($snapshot.UnitCount -gt 400 -and $snapshot.BaseSha256 -ceq $hash) 'canonical PSC projects into ordered AST units'
+    Assert-Tree ([IO.File]::Exists((Join-Path $tree 'Faculties/Vom/Vom.ps1')) -and [IO.File]::Exists((Join-Path $tree 'Compiler/Functions/ConvertTo-PscIr.ps1'))) 'compiler and runtime faculty have stable declaration paths'
+    Assert-Tree ([IO.File]::Exists((Join-Path $tree 'SM/Calibration.srm1')) -and [IO.File]::Exists((Join-Path $tree 'Tests/Test-Worktree.ps1'))) 'SM and worktree tests materialize from the canonical source'
+    $status = & $compiler -Mode Status -TreeDirectory $tree -SourcePath $base
+    Assert-Tree ($status.Changes.Count -eq 0 -and $status.Untracked.Count -eq 0 -and $status.DestinationState -ceq 'Base') 'clean status and canonical base agreement'
+    Assert-Tree (@(& $compiler -Mode Diff -TreeDirectory $tree -SourcePath $base).Count -eq 0) 'clean structural diff is empty'
+    $receipt = & $compiler -Mode Collate -TreeDirectory $tree -OutputPath $out
+    Assert-Tree ((Get-Hash $out) -ceq $hash -and $receipt.SourceSha256 -ceq $hash) 'clean collate reproduces exact canonical bytes'
+    $again = Join-Path $work 'again'
+    $reproject = & $out -Mode UnCollate -TreeDirectory $again
+    Assert-Tree ((Read-Text (Join-Path $tree 'PSC.tree')) -ceq (Read-Text (Join-Path $again 'PSC.tree'))) 'collated compiler projects itself identically'
+    $q = & $compiler -Mode Query -QueryPath (Join-Path $tree 'SM') -QueryKind Declaration -QueryName SmCalibrationProvider -QueryTake 1
+    try { $hits = $q.Pull(1); Assert-Tree ($hits.Length -eq 1 -and $hits[0].Name -ceq 'SmCalibrationProvider') 'existing lazy query discovers projected SM source' } finally { $q.Dispose() }
+    $resource = Join-Path $tree 'SM/Calibration.sm1'; $original = Read-Text $resource
+    $modified = $original.Replace('4.0 + 1.25', '4.0 + 2.25')
+    Assert-Tree ($modified -cne $original) 'test resource perturbation is effective'
+    $doc = & $compiler -Mode Edit -SourcePath $resource
+    $hit = $doc.Query('Declaration','Apply','SmCalibrationProvider',1)
+    $doc.Replace($hit[0],$hit[0].Target.Extent.Text.Replace('4.0 + 1.25','4.0 + 2.25'))
+    $doc.Save()
+    Assert-Tree ((Read-Text $resource) -ceq $modified) 'structural document edit updates projected resource without changing trivia'
+    $status = & $compiler -Mode Status -TreeDirectory $tree -SourcePath $base
+    Assert-Tree ($status.Changes.Count -eq 1 -and $status.Changes[0].Path -ceq 'SM/Calibration.sm1') 'resource edit is localized by structural path'
+    $delta = @(& $compiler -Mode Diff -TreeDirectory $tree -SourcePath $base)
+    Assert-Tree ($delta.Count -eq 1 -and $delta[0].Before -ceq $original -and $delta[0].After -ceq $modified) 'diff returns exact before and after payloads'
+    $receipt = & $compiler -Mode Collate -TreeDirectory $tree -OutputPath $out
+    $changedHash = Get-Hash $out
+    Assert-Tree ($changedHash -cne $hash) 'edited resource changes canonical bytes'
+    $changedTree = Join-Path $work 'changed'
+    $null = & $out -Mode UnCollate -TreeDirectory $changedTree
+    Assert-Tree ((Read-Text (Join-Path $changedTree 'SM/Calibration.sm1')) -ceq $modified) 'edited resource survives re-projection'
+    $stock = & (Get-Process -Id $PID).Path -NoProfile -File (Join-Path $changedTree 'SM/Calibration.sm1') -Value 10
+    Assert-Tree ($LASTEXITCODE -eq 0 -and [double]$stock -eq 42.25) 'edited resource has observable execution behavior'
+    Write-Text $resource $original
+    $rejected = $false
+    try { $null = & $compiler -Mode Collate -TreeDirectory $tree -OutputPath $out } catch { $rejected = $_.Exception.Message.Contains('conflict') }
+    Assert-Tree ($rejected -and (Get-Hash $out) -ceq $changedHash) 'stale canonical destination rejects overwrite without data loss'
+    $status = & $compiler -Mode Status -TreeDirectory $tree -SourcePath $out
+    Assert-Tree ($status.DestinationState -ceq 'Diverged') 'status reports divergent canonical source'
+    $rejected = $false
+    try { $null = & $compiler -Mode Diff -TreeDirectory $tree -SourcePath $out } catch { $rejected = $_.Exception.Message.Contains('original canonical base') }
+    Assert-Tree $rejected 'diff refuses wrong base'
+    $candidate = Join-Path $work 'Candidate.ps1'
+    $fragment = Join-Path $tree 'Compiler/Functions/Get-PscTreeProjection.ps1'
+    $originalFragment = Read-Text $fragment
+    Write-Text $fragment ($originalFragment + "`n# worktree test comment`n")
+    $null = & $compiler -Mode Collate -TreeDirectory $tree -OutputPath $candidate
+    Assert-Tree ((Get-Hash $candidate) -cne $hash) 'compiler fragment edit collates'
+    Write-Text $fragment $originalFragment
+    [IO.File]::Delete($candidate)
+    Write-Text $resource ($original + "`nclass {`n")
+    $rejected = $false
+    try { $null = & $compiler -Mode Collate -TreeDirectory $tree -OutputPath $candidate } catch { $rejected = $true }
+    Assert-Tree ($rejected -and ![IO.File]::Exists($candidate)) 'malformed SM source rejected before publication'
+    Write-Text $resource ($original + "`n'@`n[Console]::WriteLine('escape')`n@'`n")
+    $rejected = $false
+    try { $null = & $compiler -Mode Collate -TreeDirectory $tree -OutputPath $candidate } catch { $rejected = $true }
+    Assert-Tree ($rejected -and ![IO.File]::Exists($candidate)) 'resource delimiter escape rejected'
+    Write-Text $resource $original
+    [IO.File]::Delete($resource)
+    $status = & $compiler -Mode Status -TreeDirectory $tree -SourcePath $base
+    Assert-Tree ($status.Changes.Count -eq 1 -and $status.Changes[0].State -ceq 'Deleted') 'missing resource reported'
+    $rejected = $false
+    try { $null = & $compiler -Mode Collate -TreeDirectory $tree -OutputPath $candidate } catch { $rejected = $_.Exception.Message.Contains('Missing worktree unit') }
+    Assert-Tree ($rejected -and ![IO.File]::Exists($candidate)) 'missing unit prevents collate'
+    Write-Text $resource $original
+    $unknown = Join-Path $tree 'SM/Unknown.sm1'; Write-Text $unknown '42'
+    $status = & $compiler -Mode Status -TreeDirectory $tree -SourcePath $base
+    Assert-Tree ($status.Untracked.Count -eq 1 -and $status.Untracked[0] -ceq 'SM/Unknown.sm1') 'untracked resource reported'
+    $rejected = $false
+    try { $null = & $compiler -Mode Collate -TreeDirectory $tree -OutputPath $candidate } catch { $rejected = $_.Exception.Message.Contains('Untracked') }
+    Assert-Tree ($rejected -and ![IO.File]::Exists($candidate)) 'untracked source is not silently discarded'
+    [IO.File]::Delete($unknown)
+    $manifest = Join-Path $tree 'PSC.tree'; $manifestText = Read-Text $manifest
+    Write-Text $manifest ($manifestText.Replace('SM/Calibration.sm1', 'SM/Altered.sm1'))
+    $rejected = $false
+    try { $null = & $compiler -Mode Status -TreeDirectory $tree -SourcePath $base } catch { $rejected = $_.Exception.Message.Contains('manifest header') }
+    Assert-Tree $rejected 'manifest edit detected'
+    Write-Text $manifest $manifestText
+    $rejected = $false
+    try { $null = & $compiler -Mode UnCollate -TreeDirectory $tree -SourcePath $base } catch { $rejected = $_.Exception.Message.Contains('must not exist') }
+    Assert-Tree $rejected 'uncollate refuses existing worktree'
+    $crlf = Join-Path $work 'PSC.crlf.ps1'; Write-Text $crlf ((Read-Text $base).Replace("`r`n", "`n").Replace("`n", "`r`n"))
+    $crlfTree = Join-Path $work 'crlf'; $crlfOut = Join-Path $work 'PSC.crlf.out.ps1'
+    $null = & $compiler -Mode UnCollate -TreeDirectory $crlfTree -SourcePath $crlf
+    $null = & $compiler -Mode Collate -TreeDirectory $crlfTree -OutputPath $crlfOut
+    Assert-Tree ((Get-Hash $crlf) -ceq (Get-Hash $crlfOut)) 'CRLF canonical source round trips byte-for-byte'
+} finally { [IO.Directory]::Delete($work, $true) }
+
+'@)
+}
 
 # PSC-owned source faculties. The holder provides real parser-visible declarations, not executable text.
 function Get-PscFacultyDeclarations {
@@ -12779,6 +13491,8 @@ class PscMatch {
     [int] $MethodToken
     [object] $Target
     [bool] $ParseIncomplete
+    [int] $SourceRevision = -1
+    [Guid] $DocumentIdentity
 }
 class PscQueryCoverage {
     [int] $ArtifactsOpened
@@ -12887,6 +13601,158 @@ class PscSourceQueryVisitor : System.Management.Automation.Language.AstVisitor2 
         return [System.Management.Automation.Language.AstVisitAction]::Continue
     }
 }
+# Document core follows Notepad.ps1 (17b76e2), NotepadPiece/NotepadEdit/NotepadDocument:
+# immutable original storage, append-only insertion storage, ordered pieces and a grouped journal.
+# The search/UI layer is not imported. A replacement consumes structural witnesses of this revision.
+class PscDocumentPiece {
+    [int] $Buffer
+    [int] $Start
+    [int] $Length
+    PscDocumentPiece([int]$buffer,[int]$start,[int]$length){
+        $this.Buffer=$buffer; $this.Start=$start; $this.Length=$length
+    }
+}
+class PscDocumentEdit {
+    [int] $Position
+    [PscDocumentPiece[]] $Removed
+    [PscDocumentPiece[]] $Inserted
+    PscDocumentEdit([int]$position,[PscDocumentPiece[]]$removed,[PscDocumentPiece[]]$inserted){
+        $this.Position=$position; $this.Removed=$removed; $this.Inserted=$inserted
+    }
+}
+class PscDocumentGroup {
+    [Collections.Generic.List[PscDocumentEdit]] $Edits = [Collections.Generic.List[PscDocumentEdit]]::new()
+}
+class PscDocument {
+    [string] $Path
+    [int] $Revision
+    [int] $Length
+    hidden [string] $Original
+    hidden [Text.StringBuilder] $Added = [Text.StringBuilder]::new()
+    hidden [Collections.Generic.List[PscDocumentPiece]] $Pieces = [Collections.Generic.List[PscDocumentPiece]]::new()
+    hidden [Collections.Generic.List[PscDocumentGroup]] $Journal = [Collections.Generic.List[PscDocumentGroup]]::new()
+    hidden [int] $JournalPosition
+    hidden [string] $SavedHash
+    hidden [Guid] $Identity = [Guid]::NewGuid()
+    PscDocument([string]$path){
+        $this.Path=[IO.Path]::GetFullPath($path)
+        $this.Original=[PscTreeText]::Read($this.Path); $this.Length=$this.Original.Length
+        $this.SavedHash=[PscTreeText]::Hash($this.Original)
+        if($this.Length){$this.Pieces.Add([PscDocumentPiece]::new(0,0,$this.Length))}
+    }
+    [string] Text(){
+        $builder=[Text.StringBuilder]::new($this.Length)
+        foreach($piece in $this.Pieces){
+            if($piece.Buffer -eq 0){[void]$builder.Append($this.Original,$piece.Start,$piece.Length)}
+            else{[void]$builder.Append($this.Added.ToString($piece.Start,$piece.Length))}
+        }
+        return $builder.ToString()
+    }
+    [bool] Modified(){return [PscTreeText]::Hash($this.Text()) -cne $this.SavedHash}
+    hidden [System.Management.Automation.Language.ScriptBlockAst] Parse([string]$text){
+        $tokens=$null; $errors=$null
+        $ast=[System.Management.Automation.Language.Parser]::ParseInput($text,$this.Path,[ref]$tokens,[ref]$errors)
+        if($errors.Count){throw "Document parse failed at $($errors[0].Extent.StartLineNumber): $($errors[0].Message)"}
+        return $ast
+    }
+    [PscMatch[]] Query([PscQueryKind]$kind,[string]$name,[string]$owner,[int]$limit){
+        if($limit -lt 1 -or $limit -gt 256 -or $kind -in [PscQueryKind]::CilMethod,[PscQueryKind]::CilOp){throw 'Document query requires a source kind and a limit of 1..256.'}
+        $text=$this.Text(); $ast=$this.Parse($text)
+        $visitor=[PscSourceQueryVisitor]::new(); $visitor.Spec=[PscQuerySpec]::new($kind,$name,$owner,$limit)
+        $visitor.Path=$this.Path; $visitor.Digest=[PscTreeText]::Hash($text); $visitor.Limit=$limit
+        $ast.Visit($visitor)
+        foreach($hit in $visitor.Hits){$hit.SourceRevision=$this.Revision;$hit.DocumentIdentity=$this.Identity}
+        return $visitor.Hits.ToArray()
+    }
+    hidden [int] SplitAt([int]$position){
+        $offset=0
+        for($i=0;$i -lt $this.Pieces.Count;$i++){
+            $piece=$this.Pieces[$i]
+            if($position -eq $offset){return $i}
+            if($position -lt $offset+$piece.Length){
+                $left=$position-$offset
+                $this.Pieces[$i]=[PscDocumentPiece]::new($piece.Buffer,$piece.Start,$left)
+                $this.Pieces.Insert($i+1,[PscDocumentPiece]::new($piece.Buffer,$piece.Start+$left,$piece.Length-$left))
+                return $i+1
+            }
+            $offset+=$piece.Length
+        }
+        return $this.Pieces.Count
+    }
+    hidden [int] PiecesLength([PscDocumentPiece[]]$pieces){
+        $total=0; foreach($piece in $pieces){$total+=$piece.Length}; return $total
+    }
+    hidden [PscDocumentPiece[]] ReplacePieces([int]$position,[int]$length,[PscDocumentPiece[]]$inserted){
+        if($position -lt 0 -or $length -lt 0 -or $position -gt $this.Length-$length){throw 'Invalid document extent.'}
+        $first=$this.SplitAt($position); $last=$this.SplitAt($position+$length)
+        $removed=$this.Pieces.GetRange($first,$last-$first).ToArray()
+        $this.Pieces.RemoveRange($first,$last-$first); $this.Pieces.InsertRange($first,$inserted)
+        $this.Length=$this.Length-$length+$this.PiecesLength($inserted)
+        return $removed
+    }
+    [void] Replace([PscMatch]$match,[string]$replacement){$this.Replace([PscMatch[]]@($match),[string[]]@($replacement))}
+    [void] Replace([PscMatch[]]$matches,[string[]]$replacements){
+        if(!$matches.Length -or $matches.Length -gt 256 -or $matches.Length -ne $replacements.Length){throw 'Replacement requires 1..256 paired witnesses and payloads.'}
+        $text=$this.Text(); $digest=[PscTreeText]::Hash($text)
+        $order=[Collections.Generic.SortedDictionary[int,int]]::new()
+        for($i=0;$i -lt $matches.Length;$i++){
+            $hit=$matches[$i]
+            if($null -eq $hit -or $hit.Domain -cne 'SourceAst' -or $hit.ParseIncomplete -or $hit.ArtifactPath -cne $this.Path -or $hit.ArtifactSha256 -cne $digest -or $hit.SourceRevision -ne $this.Revision -or $hit.DocumentIdentity -ne $this.Identity){throw 'Stale or foreign document witness.'}
+            if($hit.Target -isnot [System.Management.Automation.Language.Ast] -or $hit.StartOffset -lt 0 -or $hit.EndOffset -le $hit.StartOffset -or $hit.EndOffset -gt $text.Length){throw 'Invalid document witness extent.'}
+            $extent=([System.Management.Automation.Language.Ast]$hit.Target).Extent
+            if($extent.StartOffset -ne $hit.StartOffset -or $extent.EndOffset -ne $hit.EndOffset -or $extent.Text -cne $text.Substring($hit.StartOffset,$hit.EndOffset-$hit.StartOffset)){throw 'Witness extent differs from source.'}
+            if($order.ContainsKey($hit.StartOffset)){throw 'Overlapping document witnesses.'}
+            $order.Add($hit.StartOffset,$i)
+        }
+        $candidate=[Text.StringBuilder]::new(); $at=0
+        $keys=[int[]]::new($order.Count); $order.Keys.CopyTo($keys,0)
+        foreach($key in $keys){
+            $i=$order[$key];$hit=$matches[$i]
+            if($key -lt $at){throw 'Overlapping document witnesses.'}
+            [void]$candidate.Append($text,$at,$key-$at).Append($replacements[$i]);$at=$hit.EndOffset
+        }
+        [void]$candidate.Append($text,$at,$text.Length-$at)
+        $nextText=$candidate.ToString()
+        if($nextText -ceq $text){return}
+        $null=$this.Parse($nextText)
+        # Only after the complete candidate has passed admission is the journal modified.
+        $group=[PscDocumentGroup]::new()
+        for($k=$keys.Length-1;$k -ge 0;$k--){
+            $i=$order[$keys[$k]]; $hit=$matches[$i]; $replacement=$replacements[$i]
+            $inserted=[PscDocumentPiece[]]::new(0)
+            if($replacement.Length){$start=$this.Added.Length;[void]$this.Added.Append($replacement);$inserted=[PscDocumentPiece[]]@([PscDocumentPiece]::new(1,$start,$replacement.Length))}
+            $removed=$this.ReplacePieces($hit.StartOffset,$hit.EndOffset-$hit.StartOffset,$inserted)
+            $group.Edits.Add([PscDocumentEdit]::new($hit.StartOffset,$removed,$inserted))
+        }
+        if($this.JournalPosition -lt $this.Journal.Count){$this.Journal.RemoveRange($this.JournalPosition,$this.Journal.Count-$this.JournalPosition)}
+        $this.Journal.Add($group);$this.JournalPosition=$this.Journal.Count;$this.Revision++
+    }
+    [bool] Undo(){
+        if(!$this.JournalPosition){return $false}
+        $this.JournalPosition--; $group=$this.Journal[$this.JournalPosition]
+        for($i=$group.Edits.Count-1;$i -ge 0;$i--){$edit=$group.Edits[$i];$null=$this.ReplacePieces($edit.Position,$this.PiecesLength($edit.Inserted),$edit.Removed)}
+        $this.Revision++;return $true
+    }
+    [bool] Redo(){
+        if($this.JournalPosition -eq $this.Journal.Count){return $false}
+        $group=$this.Journal[$this.JournalPosition]
+        foreach($edit in $group.Edits){$null=$this.ReplacePieces($edit.Position,$this.PiecesLength($edit.Removed),$edit.Inserted)}
+        $this.JournalPosition++;$this.Revision++;return $true
+    }
+    [void] Save(){
+        $text=$this.Text();$null=$this.Parse($text)
+        if([PscTreeText]::Hash([PscTreeText]::Read($this.Path)) -cne $this.SavedHash){throw 'Document save conflict: file changed since opening or saving.'}
+        $hash=[PscTreeText]::Hash($text);if($hash -ceq $this.SavedHash){return}
+        if([IO.File]::GetAttributes($this.Path) -band [IO.FileAttributes]::ReparsePoint){throw 'Refusing reparse-point document.'}
+        $temporary=$this.Path+'.psc-'+[Guid]::NewGuid().ToString('N')
+        try{
+            [PscTreeText]::Write($temporary,$text)
+            if([PscTreeText]::Hash([PscTreeText]::Read($this.Path)) -cne $this.SavedHash){throw 'Document save conflict: file changed while preparing save.'}
+            [IO.File]::Move($temporary,$this.Path,$true);$this.SavedHash=$hash
+        }finally{if([IO.File]::Exists($temporary)){[IO.File]::Delete($temporary)}}
+    }
+}
+
 # Shared opcode identity and byte extent, independent of import admission.
 # Raw token operands are not resolved or loaded by structural inquiry.
 class PscCilByteCursor {
@@ -15916,6 +16782,31 @@ process {
     if ($PSBoundParameters.Count -eq 0) { return Get-PscApi }
     switch ($Mode) {
         'Api' { Get-PscApi }
+        'Edit' {
+            if(!$SourcePath){throw 'Edit requires -SourcePath.'}
+            return [PscDocument]::new($SourcePath)
+        }
+        'UnCollate' {
+            if(!$TreeDirectory){throw 'UnCollate requires -TreeDirectory.'}
+            $file=if($SourcePath){[IO.Path]::GetFullPath($SourcePath)}else{$PSCommandPath}
+            New-PscSourceTree -SourceFile $file -Root $TreeDirectory
+        }
+        'Collate' {
+            if(!$TreeDirectory -or !$OutputPath){throw 'Collate requires -TreeDirectory and -OutputPath.'}
+            Write-PscSourceTree -Root $TreeDirectory -Destination $OutputPath
+        }
+        'Status' {
+            if(!$TreeDirectory){throw 'Status requires -TreeDirectory.'}
+            $status=Read-PscSourceTree $TreeDirectory
+            $file=if($SourcePath){[IO.Path]::GetFullPath($SourcePath)}else{$PSCommandPath}
+            $status.DestinationState=if(![IO.File]::Exists($file)){'Missing'}elseif([PscTreeText]::Hash([PscTreeText]::Read($file)) -ceq $status.BaseSha256){'Base'}else{'Diverged'}
+            $status
+        }
+        'Diff' {
+            if(!$TreeDirectory){throw 'Diff requires -TreeDirectory.'}
+            $file=if($SourcePath){[IO.Path]::GetFullPath($SourcePath)}else{$PSCommandPath}
+            Compare-PscSourceTree -Root $TreeDirectory -SourceFile $file
+        }
         'BuildFaculty' {
             if($ContractInputsPath){
                 if($Faculty -cne 'ScriptType' -or $ContractPaths.Count -or $ContractReferences.Count){throw 'ContractInputsPath is exclusive to the ScriptType child build.'}

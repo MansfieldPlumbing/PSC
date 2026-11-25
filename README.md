@@ -2,6 +2,30 @@
 
 The Treachery of Images. Magritte painted a pipe and wrote beneath it "Ceci n'est pas une pipe": the picture is not the pipe. PSC works by the same distinction. A handle is not what it identifies, #FF8000 is not the colour, a script's text is not its meaning, and a measurement is a picture of what happened, not what happened.
 
+## Single-file development worktree
+
+`PSC.ps1` is the consolidated production source, including the experimental SM (.sm1, .srm1, .sexe) files and their development tests. Do not maintain a second source tree alongside it. The legacy `Invoke-PSC.ps1` entrypoint remains unchanged; the older API inventory below describes that version.
+
+```powershell
+./PSC.ps1 -Mode UnCollate -TreeDirectory ./psc-tree
+(./PSC.ps1 -Mode Status -TreeDirectory ./psc-tree).Changes
+./PSC.ps1 -Mode Diff -TreeDirectory ./psc-tree
+./PSC.ps1 -Mode Collate -TreeDirectory ./psc-tree -OutputPath ./PSC.next.ps1
+```
+
+UnCollate projects ordered AST declarations, layout fragments and literal resources. Query searches their structure. Edit opens a document with revision-bound AST witnesses, grouped undo/redo and save conflict checks. Collate re-parses and validates the combined source before publishing it; a divergent existing destination is refused. The initial worktree supports edits within existing declarations/resources; additions, renames and deletions require an explicit canonical-source edit. See the projected `SM/README.md` for the editing API and format experiments.
+
+Run the projected development tests with PowerShell 7.7:
+
+```powershell
+pwsh -NoProfile -File ./psc-tree/Tests/Test-Worktree.ps1 -Compiler ./PSC.ps1
+pwsh -NoProfile -File ./psc-tree/Tests/Test-Document.ps1 -Compiler ./PSC.ps1
+pwsh -NoProfile -File ./psc-tree/SM/Test-Formats.ps1 -Compiler ./PSC.ps1
+```
+
+The generated worktree is disposable and excluded from the repository. Review the candidate single file before adopting it; establish a fresh worktree after updating the canonical source.
+
+
 | Synopsis | Script | SourceSha512 | DefaultMode | Environment |
 |---|---|---|---|---|
 | A Pwsh script designed to amortize. | C:\Dev\PSC\Invoke-PSC.ps1 | CEF736ED670ACF2B9CC3C85D87D9C428E7EC579D8666E970E856947D32A22354503DFF775D60A334FB63649433EBADF41126782872A00AF56837E55979C5F21D | Compile | PscEnvironment |

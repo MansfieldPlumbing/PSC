@@ -10,3 +10,7 @@ Thumbs.db
 # Pinned Native AOT toolchain (ILC, its build files, the Native AOT runtime, MSVC and Windows SDK libraries): never committed.
 /NativeAOT/*/
 /conformance/
+
+# Disposable PSC development projections.
+/psc-tree/
+/PSC.next.ps1
