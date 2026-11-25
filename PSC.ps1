@@ -2055,6 +2055,14 @@ try {
         '    [Peer] Echo([Peer]$value){return $value}'
         '    [int] Echo([int]$value){return $value}'
         '    [Peer[]] Echo([Peer[]]$value){return $value}'
+        '    Owner(){}'
+        '    Owner([Peer]$value){}'
+        '    static [Peer] Choose([Peer]$value){return $value}'
+        '    static [int] Choose([int]$value){return $value}'
+        '}'
+        'class Child : Owner {'
+        '    Child(){}'
+        '    static [Peer] Choose([Peer]$value){return $value}'
         '}'
     ))
     $hostPath=[Environment]::ProcessPath
@@ -2070,11 +2078,26 @@ try {
     if(![object]::ReferenceEquals($single.ResultReference.Definition,$peer) -or !$single.ResultReference.Same($single.ParameterReferences[0])){throw 'Peer signature lost'}
     if(!$array.ResultReference.Same($array.ParameterReferences[0]) -or $array.ResultReference.Same($owner.Find('Grid').ResultReference)){throw 'Array identity or rank mismatch'}
     if(![object]::ReferenceEquals($owner.FindReference('Echo',$single.ParameterReferences),$single) -or ![object]::ReferenceEquals($owner.FindReference('Echo',$scalar.ParameterReferences),$scalar) -or ![object]::ReferenceEquals($owner.FindReference('Echo',$array.ParameterReferences),$array)){throw 'Reference-based binding mismatch'}
+    $child=[ScriptTypeCatalog]::Find('Child')
+    $ctor=$owner.Find('Owner',[string[]]@('Peer'));$empty=$owner.Find('Owner',[string[]]@())
+    $choice=$owner.Find('Choose',[string[]]@('Peer'));$numeric=$owner.Find('Choose',[string[]]@('int'));$shadow=$child.Find('Choose',[string[]]@('Peer'))
+    if(!$ctor.Constructor -or $ctor.Static -or !$choice.Static -or $choice.Constructor){throw 'Member kind lost'}
+    if(![object]::ReferenceEquals($owner.FindReference('Owner',$ctor.ParameterReferences,$false,$true),$ctor) -or ![object]::ReferenceEquals($owner.FindReference('Owner',$empty.ParameterReferences,$false,$true),$empty)){throw 'Constructor binding mismatch'}
+    if($null -ne $child.FindReference('Owner',$ctor.ParameterReferences,$false,$true) -or $null -ne $child.FindReference('Child',$ctor.ParameterReferences,$false,$true)){throw 'Inherited constructor admitted'}
+    if(![object]::ReferenceEquals($owner.FindReference('choose',$choice.ParameterReferences,$true,$false),$choice) -or ![object]::ReferenceEquals($child.FindReference('Choose',$choice.ParameterReferences,$true,$false),$shadow) -or ![object]::ReferenceEquals($child.FindReference('Choose',$numeric.ParameterReferences,$true,$false),$numeric)){throw 'Static binding or shadowing mismatch'}
+    if(![object]::ReferenceEquals($child.FindReference('Echo',$single.ParameterReferences),$single)){throw 'Inherited instance binding mismatch'}
+    if($null -ne $owner.FindReference('Choose',$choice.ParameterReferences) -or $null -ne $owner.FindReference('Echo',$single.ParameterReferences,$true,$false) -or $null -ne $owner.FindReference('Owner',$ctor.ParameterReferences,$true,$true) -or $null -ne $owner.FindReference('Self',[ScriptTypeReference[]]@(),$false,$false)){throw 'Wrong member kind admitted'}
+    $saved=$child.Members
+    try{
+        $child.Members=[ScriptTypeMember[]]@($saved+@($shadow))
+        if($null -ne $child.FindReference('Choose',$choice.ParameterReferences,$true,$false)){throw 'Ambiguous static signature admitted or fell through to base'}
+    }finally{$child.Members=$saved}
     if($single.ResultTypeIdentity -or $array.ResultTypeIdentity -or $scalar.ResultTypeIdentity -cne [int].AssemblyQualifiedName){throw 'Legacy mapping changed'}
     $generic=$owner.Find('List').ResultReference
     if($generic.Arguments.Length -ne 1 -or ![object]::ReferenceEquals($generic.Arguments[0].Definition,$peer) -or !$generic.Element.ClrIdentity -or $generic.ClrIdentity){throw 'Generic reference mismatch'}
-    if($null -ne $a.GetType('Owner') -or $null -ne $a.GetType('Peer') -or 'System.Management.Automation' -in $a.GetReferencedAssemblies().Name){throw 'Foreign realization dependency'}
+    if($null -ne $a.GetType('Owner') -or $null -ne $a.GetType('Peer') -or $null -ne $a.GetType('Child') -or 'System.Management.Automation' -in $a.GetReferencedAssemblies().Name){throw 'Foreign realization dependency'}
     'PASS emitted STS contract graph restores shared referents, signature binding, array rank and generic structure without realizing source types or referencing SMA'
+    'PASS STS member kinds: constructors, static overloads, source inheritance, shadowing and ambiguity refusal'
 } finally { [IO.Directory]::Delete($work,$true) }
 '@)
     [PscSourceResource]::new('Tests/Test-ScriptTypeCompiler.ps1', @'
@@ -2319,15 +2342,20 @@ class ScriptTypeContract {
         return $result
     }
     [ScriptTypeMember] FindReference([string]$Name,[ScriptTypeReference[]]$Parameters){
+        return $this.FindReference($Name,$Parameters,$false,$false)
+    }
+    # Constructors are local declarations; static and instance methods may have source bases.
+    [ScriptTypeMember] FindReference([string]$Name,[ScriptTypeReference[]]$Parameters,[bool]$Static,[bool]$Constructor){
+        if($Static -and $Constructor){return $null}
         [ScriptTypeMember]$result=$null
         foreach($member in $this.Members){
-            if(![string]::Equals($member.Name,$Name,[StringComparison]::OrdinalIgnoreCase) -or !$member.Operation -or $member.Constructor -or $member.Static -or $null -eq $member.ParameterReferences -or $member.ParameterReferences.Length -ne $Parameters.Length){continue}
+            if(![string]::Equals($member.Name,$Name,[StringComparison]::OrdinalIgnoreCase) -or !$member.Operation -or $member.Constructor -ne $Constructor -or $member.Static -ne $Static -or $null -eq $member.ParameterReferences -or $member.ParameterReferences.Length -ne $Parameters.Length){continue}
             [bool]$same=$true
             for([int]$i=0;$i -lt $Parameters.Length;$i++){if(!$member.ParameterReferences[$i].Same($Parameters[$i])){$same=$false;break}}
             if($same){if($null -ne $result){return $null};$result=$member}
         }
         if($null -ne $result){return $result}
-        if($null -ne $this.BaseContracts -and $this.BaseContracts.Length -eq 1){return $this.BaseContracts[0].FindReference($Name,$Parameters)}
+        if(!$Constructor -and $null -ne $this.BaseContracts -and $this.BaseContracts.Length -eq 1){return $this.BaseContracts[0].FindReference($Name,$Parameters,$Static,$Constructor)}
         return $null
     }
     # CLR compatibility queries use normalized assembly-qualified signatures, not source
