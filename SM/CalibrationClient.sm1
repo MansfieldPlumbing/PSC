@@ -1,0 +1,6 @@
+# Same grammar as Calibration.sm1, but requires PSC's compiled runtime faculties.
+class SmCalibrationClient {
+    static [double] Measure([ScriptTypeRole] $role, [double] $value) {
+        return [double][ScriptTypeReflection]::InvokeRole($role, 'SmCalibrationContract', 'Apply', [object[]]@($value))
+    }
+}

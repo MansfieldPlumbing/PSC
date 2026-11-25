@@ -1,0 +1,26 @@
+# One application translation unit: entry parameters, behavior and specialization.
+[CmdletBinding()]
+param(
+    [double] $Value = 2.5,
+    [ValidateSet('Compact', 'Detailed')][string] $Presentation = 'Compact'
+)
+
+class SmApplianceKernel {
+    static [double] Apply([double] $value) {
+        return $value * 4.0 + 1.25
+    }
+}
+
+function Write-Detailed {
+    [OutputType([void])]
+    param([double] $Result)
+    [Console]::WriteLine('Calibrated value:')
+    [Console]::WriteLine($Result)
+}
+
+[double] $result = [SmApplianceKernel]::Apply($Value)
+if ($Presentation -eq 'Detailed') {
+    Write-Detailed -Result $result
+} else {
+    [Console]::WriteLine($result)
+}

@@ -12989,7 +12989,7 @@ class PscQueryCursor : IDisposable {
             $this.CloseArtifact();$next=$null;try{$next=$this.NextPath()}catch{$this.Counts.ReadFailures++;$this.Errors.Add($_.Exception.Message);$this.Counts.Exhausted=$true;return $false}
             if([string]::IsNullOrEmpty($next)){$this.Counts.Exhausted=$true;return $false}
             $ext=[IO.Path]::GetExtension($next).ToLowerInvariant();$binary=$this.Spec.Kind -in [PscQueryKind]::CilMethod,[PscQueryKind]::CilOp
-            if(($binary -and $ext -notin '.dll','.exe') -or (!$binary -and $ext -notin '.ps1','.psm1')){$this.Counts.SkippedByDomain++;continue}
+            if(($binary -and $ext -notin '.dll','.exe') -or (!$binary -and $ext -notin '.ps1','.psm1','.sm1','.srm1','.sexe')){$this.Counts.SkippedByDomain++;continue}
             $this.Path=$next;$this.Counts.ArtifactsOpened++
             try{
                 $bytes=[IO.File]::ReadAllBytes($next);$this.Digest=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))

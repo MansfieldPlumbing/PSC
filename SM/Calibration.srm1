@@ -1,0 +1,14 @@
+# A structural contract, not a provider implementation.
+# PSC materializes its semantic descriptor in the compiled ScriptType catalog.
+class SmCalibrationContract {
+    [double] Apply([double] $value) {
+        throw [NotSupportedException]::new('A contract must be realized by a provider.')
+    }
+}
+
+# The declared consumer records which operation the contract requires.
+class SmCalibrationUse {
+    static [double] Measure([SmCalibrationContract] $calibration, [double] $value) {
+        return $calibration.Apply($value)
+    }
+}
