@@ -452,6 +452,8 @@ param(
     [ValidateSet('Call','MemberAccess','Declaration','Index','CilMethod','CilOp')][string] $QueryKind = 'Call',
     [string] $QueryName,
     [string] $QueryOwner,
+    # Ordinal literal containment within the matched AST extent, before the result limit.
+    [string] $QueryLiteral,
     [int] $QueryTake = 2147483647,
     [object] $QuerySpace,
     [uint64] $QueryOwnerHandle,
@@ -832,17 +834,20 @@ class SmCalibrationClient {
 
 '@)
     [PscSourceResource]::new('SM/README.md', @'
-# SM — Semantics Management (exploratory)
+# SM — Semantics Management
 
 These are experiments within PSC, not a separate compiler, package system or grammar. PSC.ps1 remains the authoritative production source. The `1` suffix identifies the source-format generation, not the execution backend.
 
-## Why three source formats?
+## Source format contract
 
-| Format | Role under investigation | Concrete experiment |
+PSC is the execution authority for all three formats, whether hosted as PSC.ps1 or eventually realized as PSC.dll or PSC.exe. SM source uses the current parser substrate without requiring stock pwsh execution. Realized code must be SMA-free; the existing Run mode is an SMA reference path, not that realization path. All three formats may execute independently through PSC when their explicit dependencies are satisfied. The format does not itself forbid executable behavior. Direct one-shot SMA-free launch through PSC remains to be implemented.
+
+
+| Format | Canonical role | Concrete experiment |
 | --- | --- | --- |
-| `.sm1` | Executable semantics, with independently declared runtime requirements | `Calibration.sm1` runs in stock Pwsh and compiles through PSC; `CalibrationClient.sm1` needs the compiled ScriptType faculty and its VOM-published role. |
-| `.srm1` | Script Resource Module: semantic declarations, reusable contracts, resources and potentially executable faculties | `Calibration.srm1` is consumed by PSC's existing contract authoring path. Its required operation becomes a typed descriptor in ScriptType.dll, without emitting or executing the contract's placeholder class. |
-| `.sexe` | Self-contained application translation unit, with entry parameters and realization policy | `Calibration.sexe` builds as a parameterized program; fixing Presentation specializes its entry interface. A scalar kernel from the same source can also be acquired and emitted as a native shared library. |
+| `.sm1` | Script, analogous to `.ps1`; independent executable source | `Calibration.sm1` runs in stock Pwsh and compiles through PSC; `CalibrationClient.sm1` needs the compiled ScriptType faculty and its VOM-published role. |
+| `.srm1` | Script Resource Module, analogous to `.psm1`; reusable behavior, contracts, types and resources | `Calibration.srm1` is consumed by PSC's existing contract authoring path. Its required operation becomes a typed descriptor in ScriptType.dll, without emitting or executing the contract's placeholder class. |
+| `.sexe` | Script Executable, analogous to `.exe` before realization; one-shot executable appliance | `Calibration.sexe` builds as a parameterized program; fixing Presentation specializes its entry interface. A scalar kernel from the same source can also be acquired and emitted as a native shared library. |
 
 The file role does not establish parser compatibility or runtime independence. Both `.sm1` examples use existing SMA grammar. One runs without additional types; the other requires PSC-built types, not a new parser. A compiled client and catalog do not reference SMA. The runtime assemblies are still managed assemblies.
 
@@ -880,6 +885,9 @@ A worktree records the ordered source fragments and baseline SHA-256 values in `
 Collate is fail-closed: missing and untracked files, manifest edits, declaration-boundary changes, resource-literal escapes, parse failures and a divergent existing output are refused. Existing declaration bodies and resources can be edited. Trailing comments and whitespace may be attributed to the following unit on re-projection; declaration extents must remain inside their original units. Additions, deletions and renames require an explicit canonical-source edit in this first version. Diff compares changed structural units against the original canonical source; it is not a semantic equivalence proof. After adopting a new canonical source, create a fresh worktree to establish a new baseline. Do not commit both representations.
 
 ### Structural editing
+
+The API is available with `-Mode Api` (or no arguments). `SourceFormats` and `SourceExecutionContract` describe the SM contract; `AssertSurface()` checks mode admission against the dispatcher. `OpenQuery(paths, kind, name, owner, literal, take)` is a lazy AST query with optional ordinal literal containment within each matched extent; the CLI equivalent is `-QueryLiteral`. `OpenDocument(path)` opens a revision-bound editor. Its `Find(kind, name, owner, literal, limit)` returns editable witnesses with the same filter applied before the limit. Literal containment may include comments or strings *inside* the selected extent; it is not a semantic interpretation of the literal. Use Git for repository history, PSC for structural selection and validated edits.
+
 
 `Edit` opens a single file as a document with its own identity, immutable original buffer, append-only insertion buffer and grouped undo/redo journal. Query returns typed AST witnesses bound to the document identity, SHA-256 and revision. Use a complete matching AST extent as the replacement boundary; no regex or line-based rewrite is performed.
 
@@ -1047,6 +1055,11 @@ try{
     $doc=& $compiler -Mode Edit -SourcePath $path
     $hits=$doc.Query('Call','Write-Output','',2)
     Assert-Document ($hits.Length -eq 2 -and $hits[0].StartOffset -eq 25 -and $hits[1].SourceRevision -eq 0) 'query uses structural call witnesses, excluding comment and string'
+    $literal=$doc.Find('Call','Write-Output','',"'b'",1)
+    Assert-Document ($literal.Length -eq 1 -and $literal[0].StartOffset -eq $hits[1].StartOffset) 'literal filter precedes the structural result limit'
+    Assert-Document ($doc.Find('Call','Write-Output','',"'text'",1).Length -eq 0) 'literal in unrelated string is not a call witness'
+    $q=& $compiler -Mode Query -QueryPath $path -QueryKind Call -QueryName Write-Output -QueryLiteral "'b'" -QueryTake 1
+    try{Assert-Document ($q.Pull(1)[0].StartOffset -eq $hits[1].StartOffset) 'lazy cursor and document agree on literal-filtered extent'}finally{$q.Dispose()}
     $same=& $compiler -Mode Edit -SourcePath $path
     $otherRevision=$same.Query('Call','Write-Output','',1)
     $rejected=$false;try{$doc.Replace($otherRevision[0],"Write-Output 'other session'")}catch{$rejected=$true}
@@ -12534,7 +12547,36 @@ function ConvertTo-PscLeasedStructuralSource {
     return [PscLeasedStructuralRewrite]::new($erased,$calls,[ScriptTypeRole],[ScriptTypeReflection]).Rebuild($Root)
 }
 
+class PscSourceFormat {
+    [string] $Extension
+    [string] $Role
+    [string] $Analogue
+    [string] $Intent
+    PscSourceFormat([string]$extension,[string]$role,[string]$analogue,[string]$intent){
+        $this.Extension=$extension;$this.Role=$role;$this.Analogue=$analogue;$this.Intent=$intent
+    }
+}
+
 class PscApi {
+    [PscSourceFormat[]] $SourceFormats = @(
+        [PscSourceFormat]::new('.sm1','Script','.ps1','Independent executable source')
+        [PscSourceFormat]::new('.srm1','Script Resource Module','.psm1','Reusable behavior, contracts, types and resources')
+        [PscSourceFormat]::new('.sexe','Script Executable','.exe','One-shot executable appliance before realization')
+    )
+    [string] $SourceExecutionContract = 'PSC realizes SM source; realized execution is SMA-free. File roles do not prohibit execution. Stock pwsh execution is not a compatibility requirement.'
+    [PscDocument] OpenDocument([string]$path){return [PscDocument]::new($path)}
+    [PscQueryCursor] OpenQuery([string[]]$paths,[PscQueryKind]$kind,[string]$name,[string]$owner,[string]$literal,[int]$take){
+        if($literal -and $kind -in [PscQueryKind]::CilMethod,[PscQueryKind]::CilOp){throw 'Literal containment requires a source query.'}
+        $spec=[PscQuerySpec]::new($kind,$name,$owner,$take);$spec.Literal=$literal
+        return [PscQueryCursor]::new($paths,$spec)
+    }
+    [void] AssertSurface(){
+        $allowed=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $dispatched=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach($parameter in $this.Parameters){if($parameter.Name -eq 'Mode'){foreach($value in $parameter.AllowedValues){if(!$allowed.Add([string]$value)){throw 'Duplicate admitted mode.'}}}}
+        foreach($operation in $this.Modes){if(!$dispatched.Add($operation.Mode)){throw 'Duplicate dispatched mode.'}}
+        if(!$allowed.SetEquals($dispatched) -or !$allowed.Contains($this.DefaultMode)){throw 'PSC mode admission and dispatch disagree.'}
+    }
     [string] $Synopsis
     [string] $Script
     [string] $SourceSha512
@@ -12681,6 +12723,7 @@ function Get-PscApi {
     $api.Classes = [string[]]@($ast.BeginBlock.FindAll({ param($node) $node -is [System.Management.Automation.Language.TypeDefinitionAst] }, $false) | ForEach-Object Name)
     $api.Environment = $script:PscEnvironment
     $api.Ast = $ast
+    $api.AssertSurface()
     $api
 }
 
@@ -13519,6 +13562,7 @@ class PscQuerySpec {
     [string] $Name
     [string] $Owner
     [int] $Take = [int]::MaxValue
+    [string] $Literal
     PscQuerySpec([PscQueryKind]$kind,[string]$name,[string]$owner,[int]$take){
         if($take -lt 1){throw [ArgumentOutOfRangeException]::new('take')}
         $this.Kind=$kind;$this.Name=$name;$this.Owner=$owner;$this.Take=$take
@@ -13558,7 +13602,7 @@ class PscSourceQueryVisitor : System.Management.Automation.Language.AstVisitor2 
         if($this.Seen -le $this.Resume){return [System.Management.Automation.Language.AstVisitAction]::Continue}
         if($dynamic){$this.Unknown++;return [System.Management.Automation.Language.AstVisitAction]::Continue}
         $owner=[PscSourceQueryVisitor]::OwnerOf($node)
-        if($this.Spec.Matches($name,$owner,$false)){
+        if($this.Spec.Matches($name,$owner,$false) -and (!$this.Spec.Literal -or $node.Extent.Text.Contains($this.Spec.Literal,[StringComparison]::Ordinal))){
             $hit=[PscMatch]::new();$hit.Domain='SourceAst';$hit.ArtifactPath=$this.Path;$hit.ArtifactSha256=$this.Digest;$hit.Owner=$owner;$hit.Kind=$this.Spec.Kind;$hit.Name=$name
             $hit.StartOffset=$node.Extent.StartOffset;$hit.EndOffset=$node.Extent.EndOffset;$hit.Line=$node.Extent.StartLineNumber;$hit.Column=$node.Extent.StartColumnNumber;$hit.Target=$node;$hit.ParseIncomplete=$this.ParseIncomplete
             $this.Hits.Add($hit)
@@ -13656,10 +13700,13 @@ class PscDocument {
         return $ast
     }
     [PscMatch[]] Query([PscQueryKind]$kind,[string]$name,[string]$owner,[int]$limit){
+        return $this.Find($kind,$name,$owner,'',$limit)
+    }
+    [PscMatch[]] Find([PscQueryKind]$kind,[string]$name,[string]$owner,[string]$literal,[int]$limit){
         if($limit -lt 1 -or $limit -gt 256 -or $kind -in [PscQueryKind]::CilMethod,[PscQueryKind]::CilOp){throw 'Document query requires a source kind and a limit of 1..256.'}
         $text=$this.Text(); $ast=$this.Parse($text)
         $visitor=[PscSourceQueryVisitor]::new(); $visitor.Spec=[PscQuerySpec]::new($kind,$name,$owner,$limit)
-        $visitor.Path=$this.Path; $visitor.Digest=[PscTreeText]::Hash($text); $visitor.Limit=$limit
+        $visitor.Spec.Literal=$literal; $visitor.Path=$this.Path; $visitor.Digest=[PscTreeText]::Hash($text); $visitor.Limit=$limit
         $ast.Visit($visitor)
         foreach($hit in $visitor.Hits){$hit.SourceRevision=$this.Revision;$hit.DocumentIdentity=$this.Identity}
         return $visitor.Hits.ToArray()
@@ -16816,7 +16863,7 @@ process {
             Build-PscFaculty -Faculty $Faculty -RuntimeDirectory ([IO.Path]::GetFullPath($RuntimeDirectory)) -ContractPaths $ContractPaths -ContractReferences $ContractReferences
         }
         'BuildRuntime' { Build-PscRuntime -RuntimeDirectory ([IO.Path]::GetFullPath($RuntimeDirectory)) -ContractPaths $ContractPaths -ContractReferences $ContractReferences }
-        'Query' { if(!$QueryPath){throw 'Query requires -QueryPath.'}; $cursor=[PscQueryCursor]::new($QueryPath,[PscQuerySpec]::new([PscQueryKind]$QueryKind,$QueryName,$QueryOwner,$QueryTake)); if($null -ne $QuerySpace){return [PscQueryLease]::new($QuerySpace,$QueryOwnerHandle,$cursor)};return $cursor }
+        'Query' { if(!$QueryPath){throw 'Query requires -QueryPath.'}; if($QueryLiteral -and $QueryKind -in 'CilMethod','CilOp'){throw 'QueryLiteral requires a source query.'}; $spec=[PscQuerySpec]::new([PscQueryKind]$QueryKind,$QueryName,$QueryOwner,$QueryTake); $spec.Literal=$QueryLiteral; $cursor=[PscQueryCursor]::new($QueryPath,$spec); if($null -ne $QuerySpace){return [PscQueryLease]::new($QuerySpace,$QueryOwnerHandle,$cursor)};return $cursor }
         'PowerShell' { Get-PinnedPowerShell -ArchivePath $ArchivePath }
         'Compile' {
             if ($FixedParametersPath) {
