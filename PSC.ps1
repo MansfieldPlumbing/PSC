@@ -2077,6 +2077,76 @@ try {
     'PASS emitted STS contract graph restores shared referents, signature binding, array rank and generic structure without realizing source types or referencing SMA'
 } finally { [IO.Directory]::Delete($work,$true) }
 '@)
+    [PscSourceResource]::new('Tests/Test-ScriptTypeCompiler.ps1', @'
+#requires -Version 7.7
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$Compiler)
+$ErrorActionPreference='Stop'
+$compilerPath=[IO.Path]::GetFullPath($Compiler)
+$work=[IO.Directory]::CreateTempSubdirectory('psc-sts-compiler-').FullName
+try {
+    $path=Join-Path $work 'Signature.sm1'
+    [IO.File]::WriteAllLines($path,[string[]]@(
+        'enum SignatureMode { Add; Subtract }'
+        'class SignaturePeer {'
+        '    [SignatureOwner] $Owner'
+        '    [int] $Value'
+        '    SignaturePeer([int]$value){$this.Value=$value}'
+        '}'
+        'class SignatureOwner {'
+        '    [SignatureOwner] $Self'
+        '    [SignaturePeer[]] $Peers'
+        '    [SignaturePeer[,]] $Grid'
+        '    [System.Collections.Generic.List[SignaturePeer]] $List'
+        '    [SignatureMode] $Mode'
+        '    [SignaturePeer] Echo([SignaturePeer]$value){return $value}'
+        '    [int] Echo([int]$value){return $value}'
+        '    [SignaturePeer[]] Echo([SignaturePeer[]]$value){return $value}'
+        '    [System.Runtime.InteropServices.LibraryImport("fixture-native",EntryPoint="fixture_add")]'
+        '    static [int] External([int]$value){throw "Native import requires compiled execution."}'
+        '}'
+    ))
+    $null=. $compilerPath -Mode Api
+    $tokens=$null;$errors=$null
+    $root=[System.Management.Automation.Language.Parser]::ParseFile($path,[ref]$tokens,[ref]$errors)
+    if($errors.Count){throw 'Fixture parse failed'}
+    $classes=[System.Management.Automation.Language.TypeDefinitionAst[]]@($root.EndBlock.Statements | Where-Object {$_ -is [System.Management.Automation.Language.TypeDefinitionAst] -and $_.IsClass})
+    # The explicit mapping is deliberately different from the source spellings.
+    # No source runtime classes are necessary to realize these signatures.
+    $types=@{'SignaturePeer'=[int];'SignatureOwner'=[string]}
+    $script:LoweringClassTypes=@{'SignatureMode'=[byte]}
+    $signatures=@(Get-PscFacultyDeclarations -CompilerClassAsts $classes -MaterializedTypes $types)
+    $ownerField=@($signatures | Where-Object {$_.Declaration.Name -ceq 'Owner'})
+    $peers=@($signatures | Where-Object {$_.Declaration.Name -ceq 'Peers'})
+    $grid=@($signatures | Where-Object {$_.Declaration.Name -ceq 'Grid'})
+    $list=@($signatures | Where-Object {$_.Declaration.Name -ceq 'List'})
+    $modeField=@($signatures | Where-Object {$_.Declaration.Name -ceq 'Mode'})
+    if($ownerField.Count -ne 1 -or $ownerField[0].Result -ne [string] -or ![object]::ReferenceEquals($ownerField[0].Declaration,$classes[0].Members[0])){throw 'Explicit source mapping or AST identity lost'}
+    if($peers[0].Result -ne [int[]] -or $grid[0].Result -ne [int[,]] -or $list[0].Result -ne [System.Collections.Generic.List[int]] -or $modeField[0].Result -ne [byte]){throw 'Composite signature or compatibility resolver mismatch'}
+    $overloads=@($signatures|Where-Object {$_.Declaration.Name -ceq 'Echo'})
+    if($overloads.Length -ne 3 -or $overloads[0].Parameters[0] -ne [int] -or $overloads[1].Parameters[0] -ne [int] -or $overloads[2].Parameters[0] -ne [int[]]){throw 'Signature parameter mapping differs'}
+    $types['SignaturePeer']=[double]
+    $next=@(Get-PscFacultyDeclarations -CompilerClassAsts $classes -MaterializedTypes $types | Where-Object {$_.Declaration.Name -ceq 'Peers'})
+    if($next[0].Result -ne [double[]] -or $peers[0].Result -ne [int[]]){throw 'Signature realization scope leaked'}
+    $types.Remove('SignaturePeer')
+    $refused=$false
+    try{$null=Get-PscFacultyDeclarations -CompilerClassAsts $classes -MaterializedTypes $types}catch{$refused=$true}
+    if(!$refused){throw 'Incomplete source mapping admitted'}
+    'PASS STS source reference mapping, original declaration identity, composite signatures, scope isolation and missing mapping refusal'
+    $output=Join-Path $work 'Signature.dll'
+    & ([Environment]::ProcessPath) -NoProfile -File $compilerPath -Mode Compile -SourcePath $path -ClassName SignatureOwner -OutputPath $output | Out-Null
+    if($LASTEXITCODE -ne 0){throw 'Signature compilation failed'}
+    $assembly=[Reflection.Assembly]::LoadFrom($output)
+    $owner=$assembly.GetType('SignatureOwner',$true);$peer=$assembly.GetType('SignaturePeer',$true)
+    if($owner.GetField('Self').FieldType -ne $owner -or $peer.GetField('Owner').FieldType -ne $owner -or $owner.GetField('Peers').FieldType -ne $peer.MakeArrayType() -or $owner.GetField('Grid').FieldType -ne $peer.MakeArrayType(2) -or $owner.GetField('List').FieldType.GetGenericArguments()[0] -ne $peer){throw 'Emitted type signatures differ'}
+    $instance=[Activator]::CreateInstance($owner)
+    $value=[Activator]::CreateInstance($peer,[object[]]@(41))
+    if(![object]::ReferenceEquals($owner.GetMethod('Echo',[type[]]@($peer)).Invoke($instance,[object[]]@($value)),$value) -or $owner.GetMethod('Echo',[type[]]@([int])).Invoke($instance,[object[]]@(42)) -ne 42){throw 'Emitted overload behavior differs'}
+    $import=[Reflection.CustomAttributeExtensions]::GetCustomAttribute($owner.GetMethod('External'),[System.Runtime.InteropServices.DllImportAttribute])
+    if($null -eq $import -or $import.Value -cne 'fixture-native' -or $import.EntryPoint -cne 'fixture_add'){throw 'Native import signature differs'}
+    'PASS emitted recursive types, overload behavior and native linkage metadata'
+} finally { [IO.Directory]::Delete($work,$true) }
+'@)
     [PscSourceResource]::new('Tests/Test-Redundancy.ps1', @'
 #requires -Version 7.7
 [CmdletBinding()]
@@ -2116,8 +2186,14 @@ try{
 }
 
 # PSC-owned source faculties. The holder provides real parser-visible declarations, not executable text.
+# CLR signature adapter output; semantic references remain in the STS authoring scope.
+class PscMaterializedSignature {
+    [System.Management.Automation.Language.MemberAst] $Declaration
+    [type] $Result
+    [type[]] $Parameters
+}
 function Get-PscFacultyDeclarations {
-    param([string[]]$ContractPaths)
+    param([string[]]$ContractPaths,[System.Management.Automation.Language.TypeDefinitionAst[]]$CompilerClassAsts,[hashtable]$MaterializedTypes)
 
 # Only descriptor types are realized in the authoring scope. Other faculties must not shadow imported CLR identities.
 # The semantic description and the executable generation are ordinary VOM objects.
@@ -4479,8 +4555,9 @@ function Get-ScriptTypeReference {
     return $reference
 }
 function Get-ScriptTypeContract {
-    param([string[]]$Paths)
+    param([string[]]$Paths,[System.Management.Automation.Language.TypeDefinitionAst[]]$DefinitionAsts,[switch]$SignaturesOnly)
     $definitions=[Collections.Generic.List[System.Management.Automation.Language.TypeDefinitionAst]]::new()
+    if($null -ne $DefinitionAsts -and $DefinitionAsts.Length){$definitions.AddRange($DefinitionAsts)}
     foreach($path in $Paths){
         $tokens=$null;$errors=$null
         $root=[System.Management.Automation.Language.Parser]::ParseFile($path,[ref]$tokens,[ref]$errors)
@@ -4495,7 +4572,7 @@ function Get-ScriptTypeContract {
     }
     foreach($shape in $definitions){
         $required=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-        foreach($owner in $definitions){foreach($method in $owner.Members){
+        if(!$SignaturesOnly){foreach($owner in $definitions){foreach($method in $owner.Members){
             if($method -isnot [System.Management.Automation.Language.FunctionMemberAst]){continue}
             foreach($parameter in $method.Parameters){
                 $constraint=$parameter.Attributes|Where-Object {$_ -is [System.Management.Automation.Language.TypeConstraintAst]}|Select-Object -First 1
@@ -4504,7 +4581,7 @@ function Get-ScriptTypeContract {
                     if($member.Expression -is [System.Management.Automation.Language.VariableExpressionAst] -and $member.Expression.VariablePath.UserPath -ieq $parameter.Name.VariablePath.UserPath -and $member.Member -is [System.Management.Automation.Language.StringConstantExpressionAst]){$null=$required.Add($member.Member.Value)}
                 }
             }
-        }}
+        }}}
         $description=$catalog[$shape.Name];$description.BaseTypes=@($shape.BaseTypes|ForEach-Object {$_.TypeName.FullName})
         $description.BaseReferences=@(foreach($baseType in $shape.BaseTypes){Get-ScriptTypeReference $baseType.TypeName $catalog ([object])})
         $description.Members=@(foreach($member in $shape.Members){
@@ -4513,11 +4590,11 @@ function Get-ScriptTypeContract {
                 $item.Operation=$true;$item.Constructor=$member.IsConstructor;$item.ResultType=if($member.ReturnType){$member.ReturnType.TypeName.FullName}else{'void'}
                 $item.ParameterTypes=@(foreach($parameter in $member.Parameters){$tc=$parameter.Attributes|Where-Object {$_ -is [System.Management.Automation.Language.TypeConstraintAst]}|Select-Object -First 1;if($tc){$tc.TypeName.FullName}else{'object'}})
                 $item.ParameterNames=@($member.Parameters|ForEach-Object {$_.Name.VariablePath.UserPath})
-                $item.ResultReference=Get-ScriptTypeReference $member.ReturnType.TypeName $catalog ([void])
-                $item.ParameterReferences=@(foreach($parameter in $member.Parameters){$tc=$parameter.Attributes|Where-Object {$_ -is [System.Management.Automation.Language.TypeConstraintAst]}|Select-Object -First 1;Get-ScriptTypeReference $tc.TypeName $catalog ([object])})
+                $item.ResultReference=Get-ScriptTypeReference $(if($member.ReturnType){$member.ReturnType.TypeName}) $catalog ([void])
+                $item.ParameterReferences=@(foreach($parameter in $member.Parameters){$tc=$parameter.Attributes|Where-Object {$_ -is [System.Management.Automation.Language.TypeConstraintAst]}|Select-Object -First 1;Get-ScriptTypeReference $(if($tc){$tc.TypeName}) $catalog ([object])})
                 $item.ResultTypeIdentity=$item.ResultReference.ClrIdentity
                 $item.ParameterTypeIdentities=@(foreach($reference in $item.ParameterReferences){$reference.ClrIdentity})
-            }else{$item.ResultType=if($member.PropertyType){$member.PropertyType.TypeName.FullName}else{'object'};$item.ParameterTypes=@();$item.ParameterNames=@();$item.ParameterTypeIdentities=@();$item.ResultReference=Get-ScriptTypeReference $member.PropertyType.TypeName $catalog ([object]);$item.ResultTypeIdentity=$item.ResultReference.ClrIdentity;$item.ParameterReferences=[ScriptTypeReference[]]::new(0)}
+            }else{$item.ResultType=if($member.PropertyType){$member.PropertyType.TypeName.FullName}else{'object'};$item.ParameterTypes=@();$item.ParameterNames=@();$item.ParameterTypeIdentities=@();$item.ResultReference=Get-ScriptTypeReference $(if($member.PropertyType){$member.PropertyType.TypeName}) $catalog ([object]);$item.ResultTypeIdentity=$item.ResultReference.ClrIdentity;$item.ParameterReferences=[ScriptTypeReference[]]::new(0)}
             $item
         })
     }
@@ -4528,7 +4605,61 @@ function Get-ScriptTypeContract {
     foreach($shape in $definitions){$catalog[$shape.Name]}
 }
 
-    if ($ContractPaths.Count) { Get-ScriptTypeContract -Paths $ContractPaths }
+    # This is a CLR realization adapter, not a semantic binding operation. Only
+    # source-owned leaves use the selected definition map; existing imported and
+    # unsupported type forms retain the compatibility resolver during migration.
+    function ConvertTo-PscMaterializedSignatureType {
+        [OutputType([type])]
+        param([ScriptTypeReference]$Reference,[System.Management.Automation.Language.ITypeName]$Witness,[Collections.Generic.Dictionary[ScriptTypeContract,type]]$Types,[type]$DefaultType)
+        if($Reference.Kind -eq [ScriptTypeReferenceKind]::Source){
+            if(!$Types.ContainsKey($Reference.Definition)){throw 'Missing selected STS definition realization'}
+            return $Types[$Reference.Definition]
+        }
+        if($Reference.Kind -eq [ScriptTypeReferenceKind]::Array){
+            $element=ConvertTo-PscMaterializedSignatureType $Reference.Element $Witness.ElementType $Types ([object])
+            if($Reference.Rank -eq 1){return $element.MakeArrayType()}
+            return $element.MakeArrayType($Reference.Rank)
+        }
+        if($Reference.Kind -eq [ScriptTypeReferenceKind]::Generic){
+            $arguments=[type[]]@(for($index=0;$index -lt $Reference.Arguments.Length;$index++){
+                ConvertTo-PscMaterializedSignatureType $Reference.Arguments[$index] $Witness.GenericArguments[$index] $Types ([object])
+            })
+            $generic=Resolve-AstType ('{0}`{1}' -f $Witness.TypeName.FullName,$arguments.Length)
+            return $generic.MakeGenericType($arguments)
+        }
+        if($null -eq $Witness){return $DefaultType}
+        return Resolve-AstType $Witness
+    }
+    if($null -ne $CompilerClassAsts -and $CompilerClassAsts.Length){
+        if($null -ne $ContractPaths -and $ContractPaths.Length -or $null -eq $MaterializedTypes){throw 'Compiler signature realization requires one selected source scope'}
+        $contracts=@(Get-ScriptTypeContract -DefinitionAsts $CompilerClassAsts -SignaturesOnly)
+        $types=[Collections.Generic.Dictionary[ScriptTypeContract,type]]::new()
+        foreach($contract in $contracts){
+            if(!$MaterializedTypes.ContainsKey($contract.Name)){throw 'Missing selected CLR type builder'}
+            $types.Add($contract,$MaterializedTypes[$contract.Name])
+        }
+        for($ownerIndex=0;$ownerIndex -lt $CompilerClassAsts.Length;$ownerIndex++){
+            $owner=$CompilerClassAsts[$ownerIndex];$contract=$contracts[$ownerIndex]
+            if($owner.Members.Count -ne $contract.Members.Length){throw 'STS member inventory differs from source'}
+            for($memberIndex=0;$memberIndex -lt $owner.Members.Count;$memberIndex++){
+                $member=$owner.Members[$memberIndex];$descriptor=$contract.Members[$memberIndex]
+                $signature=[PscMaterializedSignature]::new();$signature.Declaration=$member
+                if($member -is [System.Management.Automation.Language.FunctionMemberAst]){
+                    $signature.Result=ConvertTo-PscMaterializedSignatureType $descriptor.ResultReference $(if($member.ReturnType){$member.ReturnType.TypeName}) $types ([void])
+                    $isFunction=Test-ScriptFunctionMember $member
+                    $signature.Parameters=@(for($parameterIndex=0;$parameterIndex -lt $member.Parameters.Count;$parameterIndex++){
+                        $constraint=$member.Parameters[$parameterIndex].Attributes|Where-Object {$_ -is [System.Management.Automation.Language.TypeConstraintAst]}|Select-Object -First 1
+                        $realized=ConvertTo-PscMaterializedSignatureType $descriptor.ParameterReferences[$parameterIndex] $(if($constraint){$constraint.TypeName}) $types ([object])
+                        if($isFunction -and $realized -eq [System.Management.Automation.SwitchParameter]){[bool]}else{$realized}
+                    })
+                }else{
+                    $signature.Result=ConvertTo-PscMaterializedSignatureType $descriptor.ResultReference $(if($member.PropertyType){$member.PropertyType.TypeName}) $types ([object])
+                    $signature.Parameters=[type[]]::new(0)
+                }
+                $signature
+            }
+        }
+    }elseif ($ContractPaths.Count) { Get-ScriptTypeContract -Paths $ContractPaths }
 }
 
 # The compilation-unit boundary remains explicit: one physical source does not require one CLR assembly.
@@ -7811,6 +7942,15 @@ function New-ClassMirror {
         $script:LoweringClassTypes[$c.Name] = $builders[$c.Name]
     }
 
+    # Extract the selected definitions from the live AST once. The existing
+    # materializer consumes STS signature references rather than rediscovering
+    # source-owned types from member syntax.
+    $signatures=[Collections.Generic.Dictionary[System.Management.Automation.Language.MemberAst,PscMaterializedSignature]]::new()
+    if($Model.Count){
+        foreach($signature in (Get-PscFacultyDeclarations -CompilerClassAsts @($Model.Ast) -MaterializedTypes $script:LoweringClassTypes)){
+            $signatures.Add($signature.Declaration,$signature)
+        }
+    }
     function Write-ThrowBody([Reflection.Emit.ILGenerator] $IL) {
         $IL.Emit([Reflection.Emit.OpCodes]::Newobj, $notSupported)
         $IL.Emit([Reflection.Emit.OpCodes]::Throw)
@@ -7821,13 +7961,13 @@ function New-ClassMirror {
         foreach ($p in $c.Properties) {
             $attributes = [Reflection.FieldAttributes]::Public
             if ($p.IsStatic) { $attributes = $attributes -bor [Reflection.FieldAttributes]::Static }
-            $null = $tb.DefineField($p.Name, (Resolve-AstType $p.PropertyType.TypeName), $attributes)
+            $null = $tb.DefineField($p.Name, $signatures[$p].Result, $attributes)
         }
         $constructors = @($null)
         if ($c.Constructors.Count) { $constructors = @($c.Constructors) }
         foreach ($ctorAst in $constructors) {
             [Type[]]$constructorParameterTypes = @()
-            if ($ctorAst) { $constructorParameterTypes = Get-ParameterTypes $ctorAst }
+            if ($ctorAst) { $constructorParameterTypes = $signatures[$ctorAst].Parameters }
             $cb = $tb.DefineConstructor([Reflection.MethodAttributes]'Public,HideBySig,SpecialName,RTSpecialName',
                 [Reflection.CallingConventions]::Standard, $constructorParameterTypes)
             $il = $cb.GetILGenerator()
@@ -7836,15 +7976,15 @@ function New-ClassMirror {
             Write-ThrowBody $il
         }
         foreach ($n in $c.NativeImports) {
-            $return = if ($n.Ast.ReturnType) { Resolve-AstType $n.Ast.ReturnType.TypeName } else { [void] }
+            $signature=$signatures[$n.Ast]
             $names = [string[]]@($n.Ast.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
-            $null = Add-NativeImportMethod -TypeBuilder $tb -Name $n.Ast.Name -Import $n.Import -ReturnType $return -ParameterTypes (Get-ParameterTypes $n.Ast) -ParameterNames $names
+            $null = Add-NativeImportMethod -TypeBuilder $tb -Name $n.Ast.Name -Import $n.Import -ReturnType $signature.Result -ParameterTypes $signature.Parameters -ParameterNames $names
         }
         foreach ($m in $c.Methods) {
             $attributes = [Reflection.MethodAttributes]'Public,HideBySig'
             $attributes = $attributes -bor $(if ($m.IsStatic) { [Reflection.MethodAttributes]::Static } else { [Reflection.MethodAttributes]::Virtual })
-            $return = if ($m.ReturnType) { Resolve-AstType $m.ReturnType.TypeName } else { [void] }
-            $mb = $tb.DefineMethod($m.Name, $attributes, $return, (Get-ParameterTypes $m))
+            $signature=$signatures[$m]
+            $mb = $tb.DefineMethod($m.Name, $attributes, $signature.Result, $signature.Parameters)
             Set-NativeCallbackAttribute -Builder $mb -Contract (Get-NativeMethodContract $m)
             Write-ThrowBody $mb.GetILGenerator()
         }
@@ -14571,7 +14711,7 @@ class PscApi {
         $objectives.Add([PscRoadmapObjective]::new('F4',[PscRoadmapState]::Existing,@('F0','F3'),'Structural editing: replacement exists; add insertion, deletion, rename, move and dependency-aware validation, atomic grouped undo/redo and stale-reference refusal. No textual parser or competing authority.',@('PscDocument','PscDocumentEdit'),@(),@('Tests/Test-Document.ps1','Tests/Test-Worktree.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('F5',[PscRoadmapState]::Planned,@('F1','F4'),'Canonical script, ordered tree and artifacts: deterministic realization and independently tested exact source, semantic identity and target realization recovery when requested. Explicit retention policy; development information must not impose execution dependencies. Keep compiled faculties optional.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('F6',[PscRoadmapState]::Planned,@('F0','F2','F4','R1','H1'),'Persistent PscHost, accepted/candidate workspaces, typed operations and PSRP; concurrent sessions, revision leases, restart recovery and constrained write admission. Agents use this same API; no second compiler or string-based control plane.',@(),@(),@()))
-        $objectives.Add([PscRoadmapObjective]::new('L1',[PscRoadmapState]::Existing,@('F1'),'First-class PSC-owned STS and CTS definitions, references, signatures, constraints and compatibility relations; reconcile ScriptType with compiler declarations before extending value/generic types, interfaces, properties, events, visibility and namespaces. Use SMA-visible forms; prove supported definitions independent of runtime materialization.',@('PscAstRebuild','Export-LoweredAssembly','Get-ScriptTypeContract','Get-ScriptTypeReference','ScriptTypeReference'),@('ScriptType'),@('SM/Test-Formats.ps1','Tests/Test-ScriptTypeReference.ps1')))
+        $objectives.Add([PscRoadmapObjective]::new('L1',[PscRoadmapState]::Existing,@('F1'),'First-class PSC-owned STS and CTS definitions, references, signatures, constraints and compatibility relations; reconcile ScriptType with compiler declarations before extending value/generic types, interfaces, properties, events, visibility and namespaces. Use SMA-visible forms; prove supported definitions independent of runtime materialization.',@('PscAstRebuild','Export-LoweredAssembly','Get-ScriptTypeContract','Get-ScriptTypeReference','ScriptTypeReference','PscMaterializedSignature','ConvertTo-PscMaterializedSignatureType'),@('ScriptType'),@('SM/Test-Formats.ps1','Tests/Test-ScriptTypeReference.ps1','Tests/Test-ScriptTypeCompiler.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('L2',[PscRoadmapState]::Planned,@('L1'),'Explicit program semantics profiles; independent typed binding, structural compatibility, inference and conversion; consolidate duplicate binders. Test declared differences from SMA and CTS, null/overflow/conversion/exception semantics, ambiguity and target parity without requiring runtime materialization.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('L3',[PscRoadmapState]::Planned,@('F2','L1','L2'),'Managed CLI realization from bound definitions; close compiler refusals using complete pinned application sources, non-loading metadata and executable repros; no stubs counted as completion. Deterministic PE, entry points, callbacks, static graphs, reachability, dependencies, independent execution and CTS interoperability.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('I1',[PscRoadmapState]::Planned,@('F2','F3'),'Inventory donor declarations and contracts, hashes, dependencies, licenses, historical revisions and evidence; reconcile duplicate mechanisms and admit typed source into PSC only.',@(),@(),@()))
