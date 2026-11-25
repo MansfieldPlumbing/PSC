@@ -1816,6 +1816,32 @@ try{
     [IO.File]::Delete($blobPath)
     Assert-AuthorityRefusal 'missing committed object is not an absent baseline' @{Mode='Guard';LintFiles=$literalPath} 'Git object acquisition failed'
 }finally{[IO.Directory]::Delete($directRoot,$true)}
+# A fixture must not leave another stage executing different compiler bytes, even if
+# a subsequent fixture could restore the initial digest before the final report.
+$driftRoot=[IO.Directory]::CreateTempSubdirectory('psc-stage-drift-').FullName
+try{
+    $driftBase=Join-Path $driftRoot 'source.ps1';$driftCandidate=Join-Path $driftRoot 'candidate.ps1'
+    $payloads=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+    $payloads.Add('Tests/Test-Document.ps1','param([string]$Compiler); [IO.File]::AppendAllText($Compiler,"`n# drift")')
+    $payloads.Add('Tests/Test-Worktree.ps1','param([string]$Compiler); $source=[IO.File]::ReadAllText($Compiler); [IO.File]::WriteAllText($Compiler,$source.Substring(0,$source.Length-8))')
+    $payloads.Add('Tests/Test-Guard.ps1','param([string]$Compiler)')
+    $payloads.Add('SM/Test-Formats.ps1','param([string]$Compiler)')
+    $lines=[Collections.Generic.List[string]]::new()
+    $lines.Add('param([string]$Mode,[string]$TreeDirectory)');$lines.Add('function Get-PscEmbeddedSources {')
+    foreach($entry in $payloads.GetEnumerator()){$lines.Add("[PscSourceResource]::new('$($entry.Key)', @'");$lines.Add($entry.Value);$lines.Add("'@)")}
+    $lines.Add('}')
+    $driftText=$lines -join "`n"
+    [IO.File]::WriteAllText($driftBase,$driftText);[IO.File]::WriteAllText($driftCandidate,$driftText)
+    git -C $driftRoot init -q
+    if($LASTEXITCODE -ne 0){throw 'git init failed'}
+    git -C $driftRoot add source.ps1
+    if($LASTEXITCODE -ne 0){throw 'git add failed'}
+    git -C $driftRoot -c user.name=PSC -c user.email=psc@localhost commit -qm 'stage drift control'
+    if($LASTEXITCODE -ne 0){throw 'git commit failed'}
+    Assert-AuthorityRefusal 'Conform rejects interstage compiler mutation before restoration' @{Mode='Conform';SourcePath=$driftCandidate;AgainstPath=$driftBase;ExpectedRunnerSha256=(Get-FileHash -LiteralPath $compiler).Hash;ExpectedBaselineSha256=(Get-FileHash -LiteralPath $driftBase).Hash;DevelopmentOnly=$true} 'Candidate changed during conformance after Tests/Test-Document.ps1'
+    if((Get-FileHash -LiteralPath $driftCandidate).Hash -ceq (Get-FileHash -LiteralPath $driftBase).Hash){throw 'Restoration fixture executed after mutation.'}
+    'PASS conformance stops before restoration stage'
+}finally{[IO.Directory]::Delete($driftRoot,$true)}
 '@)
 }
 
@@ -5368,7 +5394,9 @@ function Invoke-PscConformance {
             $baselineRoot=[IO.Path]::Combine($stage,'baseline');[void][IO.Directory]::CreateDirectory($baselineRoot)
             $candidateRoot=[IO.Path]::Combine($stage,'candidate');[void][IO.Directory]::CreateDirectory($candidateRoot)
             $report.BaselineResources=@(Get-PscConformanceResources ($committedSource.Text()) $committedSource.Path $baselineRoot)
-            $candidateResources=@(Get-PscConformanceResources ([PscTreeText]::Read($report.Candidate)) $report.Candidate $candidateRoot)
+            $candidateText=[PscTreeText]::Read($report.Candidate)
+            if([PscTreeText]::Hash($candidateText) -cne $report.CandidateSha256){throw 'Candidate changed during conformance resource acquisition.'}
+            $candidateResources=@(Get-PscConformanceResources $candidateText $report.Candidate $candidateRoot)
             $baselineIndex=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
             foreach($unit in $report.BaselineResources){$baselineIndex.Add($unit.Path,$unit.Baseline)}
             $candidateIndex=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
@@ -5400,7 +5428,13 @@ function Invoke-PscConformance {
                 else{$arguments=@('-File',$requirement.SourcePath,'-Compiler',$report.Candidate)}
                 Test-PscConformanceResources $report.BaselineResources $baselineRoot
                 Test-PscConformanceResources $candidateResources $candidateRoot
+                # Fixtures execute the candidate as well as their own source. Both inputs and the runner
+                # must retain their observed identities across each stage, not just at report completion.
+                if((Get-FileHash -LiteralPath $report.Candidate).Hash -cne $report.CandidateSha256){throw "Candidate changed during conformance before $($requirement.Name)."}
+                $null=Assert-PscRunnerIdentity $report.RunnerPath $report.RunnerSha256
                 $observation=Invoke-PscConformanceStage $requirement $arguments
+                if((Get-FileHash -LiteralPath $report.Candidate).Hash -cne $report.CandidateSha256){throw "Candidate changed during conformance after $($requirement.Name)."}
+                $null=Assert-PscRunnerIdentity $report.RunnerPath $report.RunnerSha256
                 $stages.Add($observation)
                 if($requirement.Name -cin 'Api','Projection' -and $observation.State -cne 'Passed'){break}
             }
@@ -14091,7 +14125,7 @@ $result.Stages | Select-Object Name,State,ExitCode
 
 External edits to projected files are also supported. Start with a clean Git baseline and a new or matching projection. Collate needs a fresh candidate destination and rejects missing/untracked units and changed declaration boundaries. Additions, deletions and renames still require explicit canonical edits. Affected reports declared faculty dependencies, not exhaustive semantic or test coverage. No tests are omitted based on Affected.
 
-Conform runs Guard against committed source, the candidate API and projection, then literal regression resources obtained from the same committed baseline without candidate execution. If the embedded resource inventory changes, supplementary candidate regression stages also run. Standalone and candidate Guard consume byte-verified committed source directly, without staging a temporary Git repository. Both record the candidate digest and, when present, the committed path, commit, blob identity and digest. Conform reuses that same committed object. A standalone file without a committed baseline is held to zero findings and an empty verification inventory; failed reads of existing objects are not treated as absence. Guard parses decoded source without line joining; only protected extent comparison normalizes line endings. Unborn Git repositories require Git support for show-ref --exists. The report identifies the runner and resource digests. Required stages are declared before execution, with exact names, provenance, source identity and permitted states; VerifyStages checks the observations against those requirements. Primary fixture stages use baseline resources, and Candidate/ stages identify supplementary tests. The local Git transport still uses git.exe; the byte-level blob identity calculation follows Pwsh prior art. Report consistency does not authenticate the runner or its evidence. This is not full assessment-authority closure: the caller must choose a trusted runner, and historical Verify still executes candidate code. `true` selects development scope and skips historical Windows verification (`Complete = False`); `false` requests the full suite and requires its native toolchain. Review the result before explicitly promoting the candidate. Use `git diff -- PSC.ps1`, commit the reviewed change, verify HEAD, then open a fresh projection. Never silently change protected checkers. See [AGENTS.md](AGENTS.md) for engineering requirements.
+Conform runs Guard against committed source, the candidate API and projection, then literal regression resources obtained from the same committed baseline without candidate execution. If the embedded resource inventory changes, supplementary candidate regression stages also run. Standalone and candidate Guard consume byte-verified committed source directly, without staging a temporary Git repository. Both record the candidate digest and, when present, the committed path, commit, blob identity and digest. Conform reuses that same committed object. A standalone file without a committed baseline is held to zero findings and an empty verification inventory; failed reads of existing objects are not treated as absence. Guard parses decoded source without line joining; only protected extent comparison normalizes line endings. Unborn Git repositories require Git support for show-ref --exists. The report identifies the runner and resource digests. Required stages are declared before execution, with exact names, provenance, source identity and permitted states; VerifyStages checks the observations against those requirements. Primary fixture stages use baseline resources, and Candidate/ stages identify supplementary tests. Candidate resource extraction is checked against the Guard digest; the candidate and complete runner identities are checked before and after each stage. This detects persistent interstage changes, not changes made and restored within one child process. The local Git transport still uses git.exe; the byte-level blob identity calculation follows Pwsh prior art. Report consistency does not authenticate the runner or its evidence. This is not full assessment-authority closure: the caller must choose a trusted runner, and historical Verify still executes candidate code. `true` selects development scope and skips historical Windows verification (`Complete = False`); `false` requests the full suite and requires its native toolchain. Review the result before explicitly promoting the candidate. Use `git diff -- PSC.ps1`, commit the reviewed change, verify HEAD, then open a fresh projection. Never silently change protected checkers. See [AGENTS.md](AGENTS.md) for engineering requirements.
 
 ## Compiler and runtime
 
@@ -14156,7 +14190,7 @@ PSC is the upstream compiler, SDK, semantic development environment and procedur
 
 ### Baseline and objective register
 
-Assessment basis: PSC [5570157](https://github.com/MansfieldPlumbing/PSC/commit/55701570f6346a7f213f75a69e7e5df19be4a37d), reviewed November 25, 2026. Existing implementation is not equivalent to completed acceptance. At this baseline seven faculties, ordered projection, typed query, revision-bound replacement/undo, retained semantic source identity, candidate Guard including embedded source, managed compilation, NativeAOT/COFF and direct x64 ELF leaf emission exist. Development Conform reported 474 passing fixture assertions across ten executed stages; historical Windows Verify was explicitly skipped. Full candidate-independent conformance is not established.
+Assessment basis: PSC [7897b43](https://github.com/MansfieldPlumbing/PSC/commit/7897b4354855e154d459ae8737a45c11ebad67ca), reviewed November 25, 2026. Existing implementation is not equivalent to completed acceptance. At this baseline seven faculties, ordered projection, typed query, revision-bound replacement/undo, retained semantic source identity, candidate Guard including embedded source, managed compilation, NativeAOT/COFF and direct x64 ELF leaf emission exist. The shared byte-exact Guard authority migration reported 345 passing fixture assertions, with separate preceding and revised verifier comparisons; historical Windows Verify was not run. Full candidate-independent conformance is not established.
 
 States: Existing = demonstrated mechanism requiring remaining scope checks; Planned = a defined objective; Research = evidence needed before committing to a design; Accepted = explicitly accepted with revision, evidence, scope, omissions and redundancy disposition. Outstanding prerequisites are computed from the typed register, not hand-maintained readiness labels. They gate acceptance, not all incremental development. An objective is never accepted merely because declarations exist or a conformance stage passes.
 
