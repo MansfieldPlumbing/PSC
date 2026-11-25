@@ -2034,6 +2034,42 @@ try {
 }
 Test-RequiredConformanceScope $compiler
 '@)
+    [PscSourceResource]::new('Tests/Test-Redundancy.ps1', @'
+#requires -Version 7.7
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$Compiler)
+$ErrorActionPreference='Stop'
+$Compiler=[IO.Path]::GetFullPath($Compiler)
+$root=[IO.Directory]::CreateTempSubdirectory('psc-redundancy-').FullName
+try{
+    $path=[IO.Path]::Combine($root,'Probe.ps1')
+    [IO.File]::WriteAllLines($path,[string[]]@(
+        'function Get-ProbeValue { [OutputType([int])] param([int]$value); return $value+1 }'
+        'function Get-ProbeOther { [OutputType([int])] param([int]$value); return $value + 1 }'
+        'function Get-ProbeDifferent { [OutputType([int])] param([int]$value); return $value+2 }'
+        'function Get-ProbeFirst { [OutputType([int])] param([int]$value); $a=Get-ProbeValue $value; $b=Get-ProbeOther $value; return $a+$b }'
+        'function Get-ProbeSecond { [OutputType([int])] param([int]$value); $a=Get-ProbeValue $value; $b=Get-ProbeOther $value; return $a-$b }'
+        'class Probe { [int] First([int]$n){return $n+1} [int] Second([int]$n){return $n+1} }'
+    ))
+    $api=& $Compiler -Mode Api
+    $semanticIndex=$api.OpenSemanticIndex($root)
+    $graph=$semanticIndex.Refresh();$report=$graph.Redundancy('',2,100)
+    if($report.Examined -ne 7 -or $report.TokenizationSkipped -ne 0){throw 'Declaration coverage differs'}
+    $exact=@($report.Findings | Where-Object {$_.First.Name -ceq 'Get-ProbeValue' -and $_.Second.Name -ceq 'Get-ProbeOther'})
+    if($exact.Count -ne 1 -or !$exact[0].IdenticalBodyTokens){throw 'Equivalent body tokens missed'}
+    if(@($report.Findings | Where-Object {$_.First.Name -ceq 'Get-ProbeDifferent' -or $_.Second.Name -ceq 'Get-ProbeDifferent'}).Count){throw 'Different literal falsely identified'}
+    $overlap=@($report.Findings | Where-Object {$_.First.Name -ceq 'Get-ProbeFirst' -and $_.Second.Name -ceq 'Get-ProbeSecond'})
+    if($overlap.Count -ne 1 -or $overlap[0].IdenticalBodyTokens -or $overlap[0].OverlapPercent -ne 100 -or $overlap[0].SharedOperations.Count -ne 2){throw 'Call overlap confused with body equality'}
+    if(@($overlap[0].SharedOperations | Where-Object {!$_.StartsWith('bound:',[StringComparison]::Ordinal)}).Count){throw 'Bound call evidence missing'}
+    if($graph.Redundancy('Probe.First',2,100).Findings.Count -ne 1){throw 'Method selection failed'}
+    if($semanticIndex.Refresh().Redundancy('',2,100).Findings.Count -ne $report.Findings.Count){throw 'Retained source token parity failed'}
+    [IO.File]::WriteAllText($path,[IO.File]::ReadAllText($path).Replace('return $value + 1','return $value + 3'))
+    $updated=$semanticIndex.Refresh().Redundancy('Get-ProbeValue',2,100)
+    if($updated.Findings.Count -ne 0){throw 'Stale token match survived source revision'}
+    if($report.Findings.Count -ne 3 -or !$exact[0].First.Ast.Extent.Text.Contains('$value+1')){throw 'Prior witness was not retained'}
+    'PASS redundancy: exact tokens, negative constant control, bound call overlap, method selection, retained graph parity and revision invalidation'
+}finally{[IO.Directory]::Delete($root,$true)}
+'@)
 }
 
 # PSC-owned source faculties. The holder provides real parser-visible declarations, not executable text.
@@ -5895,6 +5931,7 @@ class SmaSource {
     [string] $Identity; [string] $File; [string] $Sha256; [string] $Provenance
     [string] $ParentIdentity; [object] $Container; [object] $Ast; [object[]] $ParseErrors
     [string] $Boundary; [bool] $Embedded
+    [System.Management.Automation.Language.Token[]] $Tokens
 }
 class SmaCoverage {
     [string] $Root; [string] $Scope; [int] $Sources; [int] $ParseFailures; [int] $UnresolvedEdges
@@ -5907,6 +5944,50 @@ class SmaAbsence {
 }
 class SmaChange {
     [string] $File; [string] $Before; [string] $After; [string] $Kind
+}
+# Advisory comparison of authored bodies and graph call evidence.
+class SmaRedundancyProfile {
+    [SmaUnit] $Unit
+    [string] $BodyTokens
+    [Collections.Generic.HashSet[string]] $Operations = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    static [string] Body([System.Management.Automation.Language.FunctionDefinitionAst]$definition,[System.Management.Automation.Language.Token[]]$tokens){
+        if(!$tokens.Length){return ''}
+        [int]$start=$definition.Body.Extent.StartOffset;[int]$end=$definition.Body.Extent.EndOffset
+        [int]$lo=0;[int]$hi=$tokens.Length
+        while($lo -lt $hi){
+            [int]$mid=[int][Math]::Floor(($lo+$hi)/2)
+            if($tokens[$mid].Extent.StartOffset -lt $start){$lo=$mid+1}else{$hi=$mid}
+        }
+        [Text.StringBuilder]$builder=[Text.StringBuilder]::new()
+        for([int]$index=$lo;$index -lt $tokens.Length;$index++){
+            $token=$tokens[$index];if($token.Extent.StartOffset -ge $end){break}
+            if($token.Extent.EndOffset -gt $end){return ''}
+            if($token.Kind -in [System.Management.Automation.Language.TokenKind]::Comment,[System.Management.Automation.Language.TokenKind]::EndOfInput){continue}
+            $null=$builder.Append([int]$token.Kind).Append(':').Append($token.Text.Length).Append(':').Append($token.Text)
+        }
+        return $builder.ToString()
+    }
+}
+class SmaRedundancyFinding {
+    [SmaUnit] $First
+    [SmaUnit] $Second
+    [bool] $IdenticalBodyTokens
+    [string[]] $SharedOperations
+    [int] $FirstOperationCount
+    [int] $SecondOperationCount
+    [int] $OverlapPercent
+}
+class SmaRedundancyReport {
+    [string] $Selection
+    [int] $MinimumShared
+    [int] $MinimumPercent
+    [int] $Examined
+    [int] $EmbeddedSkipped
+    [int] $IncompleteSkipped
+    [int] $TokenizationSkipped
+    [SmaCoverage] $Coverage
+    [SmaRedundancyFinding[]] $Findings
+    [string] $Scope = 'Nonembedded function and method bodies; identical body tokens or shared call spellings/bound targets. Signatures, context, effects and equivalence are not established. Advisory only.'
 }
 class SmaProject {
     [string] $Root; [string] $Commit; [datetime] $BuiltUtc
@@ -5922,7 +6003,7 @@ class SmaProject {
     [Collections.Generic.List[object]] $Parameters = [Collections.Generic.List[object]]::new()
     [Collections.Generic.List[object]] $Variables = [Collections.Generic.List[object]]::new()
     [string[]] $Files
-    [string[]] $Operations = @('Graph','Find','Callers','Callees','Path','Coverage','Absent','Changes')
+    [string[]] $Operations = @('Graph','Find','Callers','Callees','Path','Coverage','Absent','Changes','Redundancy')
     [Collections.Generic.List[SmaSource]] $Sources = [Collections.Generic.List[SmaSource]]::new()
     [Collections.Generic.List[object]] $Symbols = [Collections.Generic.List[object]]::new()
     [Collections.Generic.List[object]] $TypeReferences = [Collections.Generic.List[object]]::new()
@@ -5931,6 +6012,50 @@ class SmaProject {
     [Collections.Generic.List[object]] $Observations = [Collections.Generic.List[object]]::new()
     [Collections.Generic.Dictionary[System.Management.Automation.Language.Ast,SmaUnit]] $NodeOwners = [Collections.Generic.Dictionary[System.Management.Automation.Language.Ast,SmaUnit]]::new()
     [SmaProject] Graph() { return $this }
+    [SmaRedundancyReport] Redundancy(){return $this.Redundancy('',4,60)}
+    [SmaRedundancyReport] Redundancy([string]$selection,[int]$minimumShared,[int]$minimumPercent){
+        if($minimumShared -lt 1 -or $minimumPercent -lt 1 -or $minimumPercent -gt 100){throw 'Invalid redundancy thresholds.'}
+        [SmaRedundancyReport]$report=[SmaRedundancyReport]::new();$report.Selection=$selection;$report.MinimumShared=$minimumShared;$report.MinimumPercent=$minimumPercent;$report.Coverage=$this.Coverage('Declarations')
+        [Collections.Generic.Dictionary[string,SmaSource]]$sourceIndex=[Collections.Generic.Dictionary[string,SmaSource]]::new([StringComparer]::Ordinal)
+        foreach($source in $this.Sources){$sourceIndex.Add($source.Identity,$source)}
+        [Collections.Generic.List[SmaRedundancyProfile]]$profiles=[Collections.Generic.List[SmaRedundancyProfile]]::new()
+        [Collections.Generic.Dictionary[string,SmaRedundancyProfile]]$byIdentity=[Collections.Generic.Dictionary[string,SmaRedundancyProfile]]::new([StringComparer]::Ordinal)
+        foreach($unit in $this.Units){
+            if($unit.Kind -cnotin 'function','method'){continue}
+            if($unit.Embedded){$report.EmbeddedSkipped++;continue}
+            if(!$sourceIndex.ContainsKey($unit.SourceIdentity) -or $sourceIndex[$unit.SourceIdentity].ParseErrors.Count){$report.IncompleteSkipped++;continue}
+            [SmaRedundancyProfile]$profile=[SmaRedundancyProfile]::new();$profile.Unit=$unit;$profile.BodyTokens=[SmaRedundancyProfile]::Body($unit.Ast,$sourceIndex[$unit.SourceIdentity].Tokens)
+            if(!$profile.BodyTokens){$report.TokenizationSkipped++}
+            $profiles.Add($profile);$byIdentity.Add($unit.Identity,$profile)
+        }
+        foreach($edge in $this.Edges){
+            if(!$byIdentity.ContainsKey($edge.FromIdentity) -or !$edge.To){continue}
+            if($edge.Resolution -eq 'Bound'){$key='bound:'+$edge.ToIdentity}
+            elseif($edge.Kind -cin 'command','static','this-member','member','reflection','delegate-or-reflection'){$key='spelling:'+$edge.Kind+':'+$edge.To}
+            else{continue}
+            $null=$byIdentity[$edge.FromIdentity].Operations.Add($key)
+        }
+        $report.Examined=$profiles.Count
+        if($selection -and !@($profiles | Where-Object {$_.Unit.Name -ieq $selection}).Count){throw 'Selected declaration not present in examined scope.'}
+        [Collections.Generic.List[SmaRedundancyFinding]]$findings=[Collections.Generic.List[SmaRedundancyFinding]]::new()
+        for([int]$i=0;$i -lt $profiles.Count;$i++){
+            $first=$profiles[$i]
+            for([int]$j=$i+1;$j -lt $profiles.Count;$j++){
+                $second=$profiles[$j]
+                if($selection -and $first.Unit.Name -ine $selection -and $second.Unit.Name -ine $selection){continue}
+                [bool]$same=$first.BodyTokens -and $first.BodyTokens -ceq $second.BodyTokens
+                if(!$same -and ($first.Operations.Count -lt $minimumShared -or $second.Operations.Count -lt $minimumShared)){continue}
+                [Collections.Generic.List[string]]$shared=[Collections.Generic.List[string]]::new()
+                foreach($operation in $first.Operations){if($second.Operations.Contains($operation)){$shared.Add($operation)}}
+                [int]$union=$first.Operations.Count+$second.Operations.Count-$shared.Count
+                [int]$percent=0;if($union){$percent=[int][Math]::Floor(100.0*$shared.Count/$union)}
+                if(!$same -and ($shared.Count -lt $minimumShared -or $percent -lt $minimumPercent)){continue}
+                [SmaRedundancyFinding]$finding=[SmaRedundancyFinding]::new();$finding.First=$first.Unit;$finding.Second=$second.Unit;$finding.IdenticalBodyTokens=$same;$finding.SharedOperations=$shared.ToArray();[Array]::Sort($finding.SharedOperations,[StringComparer]::OrdinalIgnoreCase)
+                $finding.FirstOperationCount=$first.Operations.Count;$finding.SecondOperationCount=$second.Operations.Count;$finding.OverlapPercent=$percent;$findings.Add($finding)
+            }
+        }
+        $report.Findings=$findings.ToArray();return $report
+    }
     [SmaCoverage] Coverage() { return $this.Coverage('Execution') }
     [SmaCoverage] Coverage([string] $Scope) {
         if ($Scope -notin 'Declarations','Execution') { throw 'Scope must be Declarations or Execution.' }
@@ -6006,14 +6131,15 @@ class PscIndexedSource {
     [string] $Text
     [System.Management.Automation.Language.ScriptBlockAst] $Ast
     [System.Management.Automation.Language.ParseError[]] $Errors
+    [System.Management.Automation.Language.Token[]] $Tokens
     [bool] $Reusable
     PscIndexedSource([string]$path,[byte[]]$bytes,[string]$digest){
         $this.Sha256=$digest
         $reader=[IO.StreamReader]::new([IO.MemoryStream]::new($bytes,$false),[Text.Encoding]::UTF8,$true)
         try{$this.Text=$reader.ReadToEnd()}finally{$reader.Dispose()}
-        $tokens=$null;$parseErrors=$null
-        $this.Ast=[System.Management.Automation.Language.Parser]::ParseInput($this.Text,$path,[ref]$tokens,[ref]$parseErrors)
-        $this.Errors=$parseErrors
+        $parsedTokens=$null;$parseErrors=$null
+        $this.Ast=[System.Management.Automation.Language.Parser]::ParseInput($this.Text,$path,[ref]$parsedTokens,[ref]$parseErrors)
+        $this.Errors=$parseErrors;$this.Tokens=$parsedTokens
         # External parser context (using module/assembly, requires, unresolved types) is not pinned here.
         $this.Reusable=!$this.Errors.Count -and !$this.Ast.UsingStatements.Count -and $null -eq $this.Ast.ScriptRequirements
     }
@@ -6314,7 +6440,7 @@ function Get-SmaGraph {
             }
             $identity = $relative + ':' + $hash
             $project.Sources.Add([SmaSource]@{ Identity = $identity; File = $relative; Sha256 = $hash; Provenance = $project.Commit
-                Ast = $ast; ParseErrors = @($errors); Boundary = 'PowerShellFile' })
+                Ast = $ast; ParseErrors = @($errors); Tokens = $parsedSource.Tokens; Boundary = 'PowerShellFile' })
             foreach ($errorRecord in $errors) { $project.Diagnostics.Add([pscustomobject]@{ Rule = 'ParseFailure'; File = $relative; Line = $errorRecord.Extent.StartLineNumber; Column = $errorRecord.Extent.StartColumnNumber; Detail = $errorRecord.Message; Ast = $errorRecord.Extent }) }
             Add-SmaGraphSource $project $relative $ast $false 0 $identity
             $encodedOrigins=@(Get-SmaEncodedSourceOrigins $ast $identity)
@@ -14343,7 +14469,7 @@ class PscApi {
         $objectives.Add([PscRoadmapObjective]::new('F0',[PscRoadmapState]::Existing,@(),'Baseline, Guard, checker and fixture dependency closure: independently controlled assessment inputs; candidate cannot silently replace criteria, runner or fixtures. Reject removed, substituted, reordered or dynamically supplied dependencies. Record approved baseline, digests and provenance; verify architectural admission criteria without weakening protected checks; no sandbox claim.',@('Get-SmaChecker','Test-SmaGuard','Get-PscResourceUnits','PscCommittedSource','Read-PscCommittedSource','PscGitExecutable','Resolve-PscGitExecutable','Invoke-PscGitRead','Assert-PscGitEnvironment','Assert-PscRunnerIdentity','Assert-PscStandaloneGitContext','PscConformanceRequirement','Get-PscConformanceResources','Test-PscConformanceResources','Invoke-PscConformance'),@(),@('Tests/Test-Guard.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('F1',[PscRoadmapState]::Existing,@('F0'),'UnCollate/Collate: exact ordered round trip including embedded source, comments, encodings and resources; reject missing, stale, duplicate, ambiguous and untracked units.',@('Get-PscTreeProjection','Write-PscSourceTree'),@(),@('Projection','Tests/Test-Worktree.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('F2',[PscRoadmapState]::Existing,@('F1'),'Typed structural query and live API: AST/CIL identity, owner, extent, scope, bounded coverage and explicit ambiguity; parity with independently obtained observations.',@('PscQueryCursor','PscApi'),@(),@('Api','Tests/Test-Worktree.ps1')))
-        $objectives.Add([PscRoadmapObjective]::new('F3',[PscRoadmapState]::Existing,@('F1','F2'),'Persistent semantic index: retain source evidence and STS/CTS declaration and referent identity independent of AST parentage; extend scope, overloads, cross-unit dependencies and incremental fact invalidation. Compare incremental results with full rebuild, including shadowing and rename.',@('PscSemanticIndex','PscIndexedSource','Get-SmaGraph','Resolve-SmaEdges'),@(),@('Tests/Test-Worktree.ps1')))
+        $objectives.Add([PscRoadmapObjective]::new('F3',[PscRoadmapState]::Existing,@('F1','F2'),'Persistent semantic index: retain source evidence and STS/CTS declaration and referent identity independent of AST parentage; extend scope, overloads, cross-unit dependencies, incremental fact invalidation and advisory redundancy analysis. Compare incremental results with full rebuild, including shadowing and rename; establish independent evidence before enforcing redundancy findings.',@('PscSemanticIndex','PscIndexedSource','Get-SmaGraph','Resolve-SmaEdges','SmaRedundancyReport'),@(),@('Tests/Test-Worktree.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('F4',[PscRoadmapState]::Existing,@('F0','F3'),'Structural editing: replacement exists; add insertion, deletion, rename, move and dependency-aware validation, atomic grouped undo/redo and stale-reference refusal. No textual parser or competing authority.',@('PscDocument','PscDocumentEdit'),@(),@('Tests/Test-Document.ps1','Tests/Test-Worktree.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('F5',[PscRoadmapState]::Planned,@('F1','F4'),'Canonical script, ordered tree and artifacts: deterministic realization and independently tested exact source, semantic identity and target realization recovery when requested. Explicit retention policy; development information must not impose execution dependencies. Keep compiled faculties optional.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('F6',[PscRoadmapState]::Planned,@('F0','F2','F4','R1','H1'),'Persistent PscHost, accepted/candidate workspaces, typed operations and PSRP; concurrent sessions, revision leases, restart recovery and constrained write admission. Agents use this same API; no second compiler or string-based control plane.',@(),@(),@()))
@@ -14509,6 +14635,19 @@ $dev = $api.OpenDevelopment('./psc-tree') # Project the canonical source
 @@TYPESYSTEM@@
 
 This is the architectural mission, not a claim of completed implementation. Reconcile ScriptType, compiler binding and native IR before adding competing representations. Keep the existing NativeAOT path for Notepad and PSNES. Distinguish source evidence from semantic definitions; keep runtime reflection and synthetic execution representations out of semantic authority.
+
+## Advisory redundancy analysis
+
+Use the existing graph to compare authored function and method bodies, including their source identities and locations:
+
+```powershell
+$graph = & ./PSC.ps1 -Mode Graph -ProjectPath .
+$report = $graph.Redundancy()
+$report.Findings
+$graph.Redundancy('Select-PscStructuralNumericOverload', 3, 10)
+```
+
+Identical body tokens use the retained SMA token stream and ignore comments and horizontal trivia but preserve token spellings and newlines. Shared call evidence distinguishes bound targets from unresolved spellings; overlap is intersection divided by union. Findings are investigative, not proof of equivalent signatures, behavior or unnecessary duplication. Embedded and parse-incomplete declarations are excluded and counted. No Guard admission rule is changed; inspect target-specific and independent test implementations before consolidation. Reproduce with the projected `Tests/Test-Redundancy.ps1 -Compiler ./PSC.ps1`; this supplementary fixture is not a mandatory baseline stage.
 
 ## Source formats
 
@@ -14719,7 +14858,7 @@ The API is derived from the running script, so mode names and parameter evidence
     [PscConformanceReport] Conform([string]$candidateFile,[string]$baselineFile,[bool]$development,[string]$expectedRunner,[string]$expectedBaseline,[string]$expectedHost){return $this.Conform($candidateFile,$baselineFile,$development,$expectedRunner,$expectedBaseline,$expectedHost,'')}
     [PscConformanceReport] Conform([string]$candidateFile,[string]$baselineFile,[bool]$development,[string]$expectedRunner,[string]$expectedBaseline,[string]$expectedHost,[string]$expectedGit){return $this.Conform($candidateFile,$baselineFile,$development,$expectedRunner,$expectedBaseline,$expectedHost,$expectedGit,'')}
     [PscConformanceReport] Conform([string]$candidateFile,[string]$baselineFile,[bool]$development,[string]$expectedRunner,[string]$expectedBaseline,[string]$expectedHost,[string]$expectedGit,[string]$expectedRuntime){return & $this.Script -Mode Conform -SourcePath $candidateFile -AgainstPath $baselineFile -DevelopmentOnly:$development -ExpectedRunnerSha256 $expectedRunner -ExpectedBaselineSha256 $expectedBaseline -ExpectedHostSha256 $expectedHost -ExpectedGitSha256 $expectedGit -ExpectedRuntimeSha256 $expectedRuntime}
-    [string] $TypeSystemContract = 'PSC owns first-class typed representations of the ScriptType System (STS) and the Common Type System (CTS). STS supports independently acquired structural contracts, identity, composition, binding, refinement and realization; CTS preserves faithful CLI interoperability. Semantic analysis must not require runtime materialization. Mappings between STS and CTS are explicit, typed and reversible where representable. SMA is the authoring and source-evidence substrate. Managed CLI, NativeAOT and independent native ISA are supported realization paths; neither CLR nor the C runtime is intrinsic to STS. Source, semantic and realization retention are explicit artifact requirements, independent of execution dependencies.'
+    [string] $TypeSystemContract = 'PSC owns first-class typed representations of the ScriptType System (STS) and the Common Type System (CTS). STS supports independently acquired structural contracts, identity, composition, binding, refinement and realization; CTS preserves faithful CLI interoperability. Semantic analysis must not require runtime materialization. Mappings between STS and CTS are explicit, typed and reversible where representable. SMA is the authoring and source-evidence substrate. Managed CLI, NativeAOT and independent native ISA are supported realization paths; neither CLR nor the C runtime is intrinsic to STS. Independent native realization shall support explicit static, dynamic or absent C runtime linkage. Source, semantic and realization retention are explicit artifact requirements, independent of execution dependencies.'
     [string] $SourceExecutionContract = 'PSC realizes SM source; realized execution is SMA-free. File roles do not prohibit execution. Stock pwsh execution is not a compatibility requirement.'
     [PscSemanticIndex] OpenSemanticIndex([string]$root){return [PscSemanticIndex]::new($this.Script,$root)}
     [PscDocument] OpenDocument([string]$path){return [PscDocument]::new($path)}

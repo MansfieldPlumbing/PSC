@@ -15,9 +15,22 @@ $dev = $api.OpenDevelopment('./psc-tree') # Project the canonical source
 
 ## Type system and realization contract
 
-PSC owns first-class typed representations of the ScriptType System (STS) and the Common Type System (CTS). STS supports independently acquired structural contracts, identity, composition, binding, refinement and realization; CTS preserves faithful CLI interoperability. Semantic analysis must not require runtime materialization. Mappings between STS and CTS are explicit, typed and reversible where representable. SMA is the authoring and source-evidence substrate. Managed CLI, NativeAOT and independent native ISA are supported realization paths; neither CLR nor the C runtime is intrinsic to STS. Source, semantic and realization retention are explicit artifact requirements, independent of execution dependencies.
+PSC owns first-class typed representations of the ScriptType System (STS) and the Common Type System (CTS). STS supports independently acquired structural contracts, identity, composition, binding, refinement and realization; CTS preserves faithful CLI interoperability. Semantic analysis must not require runtime materialization. Mappings between STS and CTS are explicit, typed and reversible where representable. SMA is the authoring and source-evidence substrate. Managed CLI, NativeAOT and independent native ISA are supported realization paths; neither CLR nor the C runtime is intrinsic to STS. Independent native realization shall support explicit static, dynamic or absent C runtime linkage. Source, semantic and realization retention are explicit artifact requirements, independent of execution dependencies.
 
 This is the architectural mission, not a claim of completed implementation. Reconcile ScriptType, compiler binding and native IR before adding competing representations. Keep the existing NativeAOT path for Notepad and PSNES. Distinguish source evidence from semantic definitions; keep runtime reflection and synthetic execution representations out of semantic authority.
+
+## Advisory redundancy analysis
+
+Use the existing graph to compare authored function and method bodies, including their source identities and locations:
+
+```powershell
+$graph = & ./PSC.ps1 -Mode Graph -ProjectPath .
+$report = $graph.Redundancy()
+$report.Findings
+$graph.Redundancy('Select-PscStructuralNumericOverload', 3, 10)
+```
+
+Identical body tokens use the retained SMA token stream and ignore comments and horizontal trivia but preserve token spellings and newlines. Shared call evidence distinguishes bound targets from unresolved spellings; overlap is intersection divided by union. Findings are investigative, not proof of equivalent signatures, behavior or unnecessary duplication. Embedded and parse-incomplete declarations are excluded and counted. No Guard admission rule is changed; inspect target-specific and independent test implementations before consolidation. Reproduce with the projected `Tests/Test-Redundancy.ps1 -Compiler ./PSC.ps1`; this supplementary fixture is not a mandatory baseline stage.
 
 ## Source formats
 
@@ -152,7 +165,7 @@ The structural checks reuse the source-query visitor over the API AST and the fa
 | F0 | Existing | — | Baseline, Guard, checker and fixture dependency closure: independently controlled assessment inputs; candidate cannot silently replace criteria, runner or fixtures. Reject removed, substituted, reordered or dynamically supplied dependencies. Record approved baseline, digests and provenance; verify architectural admission criteria without weakening protected checks; no sandbox claim. |
 | F1 | Existing | F0 | UnCollate/Collate: exact ordered round trip including embedded source, comments, encodings and resources; reject missing, stale, duplicate, ambiguous and untracked units. |
 | F2 | Existing | F1 | Typed structural query and live API: AST/CIL identity, owner, extent, scope, bounded coverage and explicit ambiguity; parity with independently obtained observations. |
-| F3 | Existing | F1, F2 | Persistent semantic index: retain source evidence and STS/CTS declaration and referent identity independent of AST parentage; extend scope, overloads, cross-unit dependencies and incremental fact invalidation. Compare incremental results with full rebuild, including shadowing and rename. |
+| F3 | Existing | F1, F2 | Persistent semantic index: retain source evidence and STS/CTS declaration and referent identity independent of AST parentage; extend scope, overloads, cross-unit dependencies, incremental fact invalidation and advisory redundancy analysis. Compare incremental results with full rebuild, including shadowing and rename; establish independent evidence before enforcing redundancy findings. |
 | F4 | Existing | F0, F3 | Structural editing: replacement exists; add insertion, deletion, rename, move and dependency-aware validation, atomic grouped undo/redo and stale-reference refusal. No textual parser or competing authority. |
 | F5 | Planned | F1, F4 | Canonical script, ordered tree and artifacts: deterministic realization and independently tested exact source, semantic identity and target realization recovery when requested. Explicit retention policy; development information must not impose execution dependencies. Keep compiled faculties optional. |
 | F6 | Planned | F0, F2, F4, R1, H1 | Persistent PscHost, accepted/candidate workspaces, typed operations and PSRP; concurrent sessions, revision leases, restart recovery and constrained write admission. Agents use this same API; no second compiler or string-based control plane. |
