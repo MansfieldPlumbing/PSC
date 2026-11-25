@@ -1202,6 +1202,39 @@ try {
     $describedParameter=$api.Parameters[0];$savedDescription=$describedParameter.Description;$describedParameter.Description='';$rejected=$false
     try{$api.AssertSurface()}catch{$rejected=$_.Exception.Message.Contains('Undocumented PSC parameter')}finally{$describedParameter.Description=$savedDescription}
     Assert-Tree $rejected 'API surface rejects undocumented parameters'
+    $objectives=$api.Roadmap();$assessment=$api.AssessRoadmap()
+    Assert-Tree ($objectives.Count -gt 40 -and $assessment.Count -eq $objectives.Count) 'roadmap projects all typed objectives'
+    Assert-Tree ($assessment[0].ObservedDeclarations.Name -contains 'Test-SmaGuard' -and $assessment[0].Stages[0].State -ceq 'NotRun' -and !$assessment[0].ConformanceReported) 'roadmap distinguishes structural witnesses from execution evidence'
+    Assert-Tree ($assessment[1].OutstandingPrerequisites -contains 'F0' -and $assessment[1].Objective.State.ToString() -ceq 'Existing') 'roadmap derives outstanding prerequisites without changing recorded state'
+    $bad=$api.Roadmap();$bad[1].Id=$bad[0].Id;$rejected=$false
+    try{[void]$api.AssessRoadmap($bad,$null)}catch{$rejected=$_.Exception.Message.Contains('Duplicate roadmap objective')}
+    Assert-Tree $rejected 'roadmap rejects duplicate objective identity'
+    $bad=$api.Roadmap();$bad[0].Prerequisites=@('Missing');$rejected=$false
+    try{[void]$api.AssessRoadmap($bad,$null)}catch{$rejected=$_.Exception.Message.Contains('Unknown roadmap prerequisite')}
+    Assert-Tree $rejected 'roadmap rejects missing prerequisites'
+    $bad=$api.Roadmap();$bad[0].Prerequisites=@('F1');$rejected=$false
+    try{[void]$api.AssessRoadmap($bad,$null)}catch{$rejected=$_.Exception.Message.Contains('Cyclic roadmap prerequisites')}
+    Assert-Tree $rejected 'roadmap rejects prerequisite cycles'
+    $bad=$api.Roadmap();$bad[0].Declarations=@('Missing-RoadmapDeclaration');$rejected=$false
+    try{[void]$api.AssessRoadmap($bad,$null)}catch{$rejected=$_.Exception.Message.Contains('Missing roadmap declaration')}
+    Assert-Tree $rejected 'roadmap rejects missing declaration witnesses'
+    $bad=$api.Roadmap();$bad[0].Faculties=@('MissingFaculty');$rejected=$false
+    try{[void]$api.AssessRoadmap($bad,$null)}catch{$rejected=$_.Exception.Message.Contains('Missing roadmap faculty')}
+    Assert-Tree $rejected 'roadmap rejects missing faculty witnesses'
+    $bad=$api.Roadmap();$bad[0].State='Accepted';$rejected=$false
+    try{[void]$api.AssessRoadmap($bad,$null)}catch{$rejected=$_.Exception.Message.Contains('Incomplete roadmap acceptance record')}
+    Assert-Tree $rejected 'roadmap refuses acceptance without evidence and scope'
+    $report=[Activator]::CreateInstance($api.GetType().Assembly.GetType('PscConformanceReport'))
+    $report.Guard=[Activator]::CreateInstance($api.GetType().Assembly.GetType('PscGuardVerdict'))
+    $report.CandidateSha256=$assessment[0].SourceSha256;$report.Guard.CandidateSha256=$report.CandidateSha256
+    $stage=[Activator]::CreateInstance($api.GetType().Assembly.GetType('PscConformanceStage'))
+    $stage.Name='Tests/Test-Guard.ps1';$stage.State='Passed';$report.Stages=@($stage);$report.Guard.Passed=$true
+    $observed=$api.AssessRoadmap($report)
+    Assert-Tree ($observed[0].Stages[0].State -ceq 'Passed' -and $observed[0].ConformanceReported -and !$observed[0].ConformanceComplete -and $observed[0].Objective.State.ToString() -ceq 'Existing') 'roadmap attaches scoped report without accepting an objective'
+    $report.CandidateSha256='Stale';$rejected=$false
+    try{[void]$api.AssessRoadmap($report)}catch{$rejected=$_.Exception.Message.Contains('Conformance report does not identify')}
+    Assert-Tree $rejected 'roadmap rejects evidence from a different revision'
+    Assert-Tree ($api.Guide().Contains('| F0 | Existing |') -and !$api.Guide().Contains('@@ROADMAP@@')) 'guide generates the objective register from typed records'
     Push-Location -LiteralPath $work
     try{
         $relativeDoc=$api.OpenDocument([IO.Path]::GetFileName($base))
@@ -13112,6 +13145,45 @@ class PscDevelopment {
     }
 }
 
+# Campaign objectives are typed configuration records; their witnesses are resolved against the live API.
+# Source presence and scoped conformance observations are not acceptance of the objective.
+enum PscRoadmapState {
+    Existing
+    Planned
+    Research
+    Accepted
+}
+class PscRoadmapObjective {
+    [string] $Id
+    [PscRoadmapState] $State
+    [string[]] $Prerequisites
+    [string] $Criterion
+    [string[]] $Declarations
+    [string[]] $Faculties
+    [string[]] $StageNames
+    [string] $AcceptanceCommit
+    [string] $AcceptanceEvidence
+    [string] $AcceptanceScope
+    [string] $Omissions
+    [string] $RedundancyDisposition
+    PscRoadmapObjective([string]$id,[PscRoadmapState]$state,[string[]]$prerequisites,[string]$criterion,[string[]]$declarations,[string[]]$faculties,[string[]]$stageNames){
+        $this.Id=$id; $this.State=$state; $this.Prerequisites=$prerequisites; $this.Criterion=$criterion
+        $this.Declarations=$declarations; $this.Faculties=$faculties; $this.StageNames=$stageNames
+    }
+}
+class PscRoadmapAssessment {
+    [PscRoadmapObjective] $Objective
+    [string[]] $OutstandingPrerequisites
+    [PscMatch[]] $ObservedDeclarations
+    [PscFacultyUnit[]] $ObservedFaculties
+    [PscConformanceStage[]] $Stages
+    [string] $SourceSha256
+    [bool] $ConformanceReported
+    [bool] $ConformanceComplete
+    [bool] $ConformancePassed
+    [string] $GuardState = 'NotRun'
+}
+
 class PscApi {
     hidden [PscFacultyUnit[]] $FacultyUnits
     [PscDevelopment] OpenDevelopment([string]$base,[string]$tree){return [PscDevelopment]::new($this,$base,$tree)}
@@ -13123,6 +13195,150 @@ class PscApi {
     [PscQueryCursor] Find([string]$declaration){return $this.OpenQuery(@($this.Script),[PscQueryKind]::Declaration,$declaration,'','',[int]::MaxValue)}
     [PscQueryCursor] Search([string]$literal){return $this.OpenQuery(@($this.Script),[PscQueryKind]::Declaration,'','',$literal,[int]::MaxValue)}
     [string] $StartHere = 'Guide() for the development workflow; Describe(mode) for live CLI metadata; Find(name) or Search(literal) for source declarations.'
+    # The register is the sole maintained objective list. The README is generated from these records.
+    [PscRoadmapObjective[]] Roadmap(){
+        $objectives=[Collections.Generic.List[PscRoadmapObjective]]::new()
+        $objectives.Add([PscRoadmapObjective]::new('F0',[PscRoadmapState]::Existing,@(),'Baseline, Guard, checker and fixture dependency closure: independently controlled assessment inputs; candidate cannot silently replace criteria, runner or fixtures. Reject removed, substituted, reordered or dynamically supplied dependencies. Record approved baseline, digests and provenance; no sandbox claim.',@('Get-SmaChecker','Test-SmaGuard','Get-PscResourceUnits','Invoke-PscConformance'),@(),@('Tests/Test-Guard.ps1')))
+        $objectives.Add([PscRoadmapObjective]::new('F1',[PscRoadmapState]::Existing,@('F0'),'UnCollate/Collate: exact ordered round trip including embedded source, comments, encodings and resources; reject missing, stale, duplicate, ambiguous and untracked units.',@('Get-PscTreeProjection','Write-PscSourceTree'),@(),@('Projection','Tests/Test-Worktree.ps1')))
+        $objectives.Add([PscRoadmapObjective]::new('F2',[PscRoadmapState]::Existing,@('F1'),'Typed structural query and live API: AST/CIL identity, owner, extent, scope, bounded coverage and explicit ambiguity; parity with independently obtained observations.',@('PscQueryCursor','PscApi'),@(),@('Api','Tests/Test-Worktree.ps1')))
+        $objectives.Add([PscRoadmapObjective]::new('F3',[PscRoadmapState]::Planned,@('F1','F2'),'Persistent semantic index: scope, overloads, declaration and referent identity, cross-unit dependencies, revision invalidation; compare incremental results with full rebuild, including shadowing and rename.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('F4',[PscRoadmapState]::Existing,@('F0','F3'),'Structural editing: replacement exists; add insertion, deletion, rename, move and dependency-aware validation, atomic grouped undo/redo and stale-reference refusal. No textual parser or competing authority.',@('PscDocument','PscDocumentEdit'),@(),@('Tests/Test-Document.ps1','Tests/Test-Worktree.ps1')))
+        $objectives.Add([PscRoadmapObjective]::new('F5',[PscRoadmapState]::Planned,@('F1','F4'),'Canonical script ↔ ordered tree ↔ compiled assembly carrying recoverable exact source; deterministic realization, round-trip identity and clean reconstruction. Keep compiled faculties optional.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('F6',[PscRoadmapState]::Planned,@('F0','F2','F4','R1','H1'),'Persistent PscHost, accepted/candidate workspaces, typed operations and PSRP; concurrent sessions, revision leases, restart recovery and constrained write admission. Agents use this same API; no second compiler or string-based control plane.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('L1',[PscRoadmapState]::Existing,@('F1'),'Complete declaration forms (value/generic types, interfaces, properties, events, visibility, namespaces) against actual SMA limits; DynamicKeyword/attributes, real metadata and differential tests.',@('PscAstRebuild','Export-LoweredAssembly'),@(),@('SM/Test-Formats.ps1')))
+        $objectives.Add([PscRoadmapObjective]::new('L2',[PscRoadmapState]::Planned,@('L1'),'Explicit program semantics profiles; declared differences from SMA, typed binding and null/overflow/conversion/exception semantics tested across supported realizations.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('L3',[PscRoadmapState]::Planned,@('F2','L1'),'Close compiler refusals using complete pinned application sources, non-loading metadata and executable repros; no stubs counted as completion. Managed deterministic PE, entry points, callbacks, static graphs, reachability, dependencies, independent execution.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('I1',[PscRoadmapState]::Planned,@('F2','F3'),'Inventory donor declarations and contracts, hashes, dependencies, licenses, historical revisions and evidence; reconcile duplicate mechanisms and admit typed source into PSC only.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('I2',[PscRoadmapState]::Existing,@('F2','L1'),'CIL intake: decode metadata, signatures, control flow, exception regions and generics; reconstruct admitted typed source and compare behavior. Retain explicit unsupported cases; not arbitrary decompilation.',@('Import-PscCilAssembly','Read-PscCilMethod'),@(),@('SM/Test-Formats.ps1')))
+        $objectives.Add([PscRoadmapObjective]::new('I3',[PscRoadmapState]::Research,@('F2'),'PDF intake: inventory existing reader; parse document structures, preserve page/extent/provenance, independently compare text and geometry; unsupported encodings explicit.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('I4',[PscRoadmapState]::Planned,@('I1'),'Checkpoint/weight readers from Kokoroku: bounded safe format decoding, shape/dtype/stride validation, truncated and adversarial inputs, typed graph/data output; no arbitrary pickle execution.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('I5',[PscRoadmapState]::Research,@('I1','L1'),'JS/TS and C# intake: reuse TS2PS grammar experiments and CS2PS semantic catalog; external languages are input, not implementation dependencies or a bypass of SMA target admission. Independent semantics tests; no arbitrary translation claim.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('R1',[PscRoadmapState]::Existing,@('I2'),'VOM, structural contracts, dispatch, canonical referents and lifetime: preserve identity/aliasing, test composition, revoke/restore, compiled graph and shared references. Do not recreate these in Student or host.',@('ConvertTo-PscStructuralSource'),@('Vom','ScriptType','ObjectDispatch','InquiryPrimitives'),@('SM/Test-Formats.ps1')))
+        $objectives.Add([PscRoadmapObjective]::new('R2',[PscRoadmapState]::Planned,@('R1'),'Typed handle rights and explicit authority; least privilege, attenuation, negative authorization, stale handle and revocation tests. Discovery is not authorization.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('R3',[PscRoadmapState]::Planned,@('R2'),'Compartments and worker isolation with explicit enforcement boundary; test escaped handles, cancellation, resource bounds, failure and cleanup. In-process policies are not OS isolation.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('R4',[PscRoadmapState]::Planned,@('N1'),'Native link dependencies, C-runtime imports and library provenance; verify resolved symbols, relocations, ABI, initialization and imported closure; remove dependency only when evidence supports it.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('R5',[PscRoadmapState]::Research,@('N1'),'Measure native runtime writable globals, initialization and ownership; test reentrancy, lifetime and concurrency before attempting runtime reduction.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('R6',[PscRoadmapState]::Research,@('D1','R3'),'Android ART/Binder/zygote alternatives and lower-level device access; document permissions, isolation and actual platform interfaces; no bypass of security controls.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('N1',[PscRoadmapState]::Existing,@('F0','L3'),'Native publication: validate COFF/PE, pinned MSVC/ILC package manifests and actual link closure, imports, unwind, entry point, subsystem, atomically publish only verified artifacts; failed build leaves previous output intact.',@('Write-CoffImage','Export-NativeImage'),@(),@('Verify')))
+        $objectives.Add([PscRoadmapObjective]::new('N2',[PscRoadmapState]::Existing,@('N1','L2'),'Direct CIL-to-IR-to-machine-code: x64 leaf path exists; extend A64/A32/Thumb-2 from Pwsh, relocation, branches, calls, register/stack/ABI and eventually non-leaf control flow, unwind and exceptions. Verify decoded bytes and independent execution.',@('ConvertTo-PscIr','Test-PscX64LeafAbi'),@('NativeEncoding','ElfEncoding'),@('SM/Test-Formats.ps1')))
+        $objectives.Add([PscRoadmapObjective]::new('N3',[PscRoadmapState]::Research,@('N2'),'RyuJitDetach bounded leaf experiments as independent reference; prove extent, relocation, no unresolved dependencies and executable behavior before broadening. Keep separate from general native admission.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('D1',[PscRoadmapState]::Planned,@('F0','F2','N1'),'Portable PSC modes and Android runtime: reuse Pwsh CoreCLR host, assembly store, ELF, DEX, AXML, resources, ZIP/APK signing and JNI contracts; verify each format independently, package and launch on supported ABIs.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('D2',[PscRoadmapState]::Planned,@('D1','F6'),'Phone as SDK/server: build on device, typed remote sessions, transport, recovery, service lifecycle and actual resource measurements; supported device matrix.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('D3',[PscRoadmapState]::Planned,@('D2','R2'),'USB AOA fleet, ADB/WinUSB transport and device discovery: reuse Pwsh and Kokoroku transport instead of duplicate clients; test reconnect, cancellation, partial transfer and multi-device routing.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('D4',[PscRoadmapState]::Planned,@('F1','L1','N2'),'Hexagon native backend: acquire typed operand/form catalog, 142 donor records (132 bit patterns, ten fixed group/label records), packet constraints, fixups/layout, ELF and ABI. Encode/decode parity, invalid operands and packets, independent toolchain comparisons and hardware kernels. Coverage is bounded to supported forms.',@(),@('NativeEncoding','ElfEncoding'),@()))
+        $objectives.Add([PscRoadmapObjective]::new('D5',[PscRoadmapState]::Planned,@('L1','L2'),'Portable SIMD: acquire typed Vector128/256/512 kernels and packing, tiling, accumulation and workers from Kokoroku; scalar reference, supported-width dispatch, tails, alignment, NaN/overflow/rounding and independent x64/ARM64 measurements. Extend explicit SSE/AVX/AVX-512/NEON encoding only against ISA evidence. HVX/HMX semantics remain target-specific.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('D6',[PscRoadmapState]::Research,@('D4','D5','R2'),'Lower-level accelerators and memory/queue contracts: DMA, fences, cache ownership, device capability and resource lifetime; reuse DirectPort/DPX mechanisms if verified; explicit failure and synchronization semantics.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('H1',[PscRoadmapState]::Planned,@('F2','L1'),'Console faculty from Pwsh: VT parser, Unicode cells/width, SGR, transcript, edit history, completion, diff, frame publication. Test split input sequences, Unicode and session isolation; prove memory ordering for ring publication. Keep Android presentation outside the model.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('H2',[PscRoadmapState]::Planned,@('L1','R1'),'Presentation and platform faculties from Notepad/QuickPS: input, hit testing, layout, theme, graphics, audio, capture and window contracts; Fluent/Material/Metro styles optional. No app state in shared code. Verify replay, geometry, pixel tolerances, accessibility and native callbacks.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('H3',[PscRoadmapState]::Planned,@('I1','N1'),'Acquisition and deployment: reuse verified package/Git identity, assembly closure, source-bundle and appliance staging; separate integrity from authentication; no hidden toolchain, duplicate linker, or untrusted code execution.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('A1',[PscRoadmapState]::Planned,@('D1','H2','L3'),'Notepad and PSNES on supported targets: full source compile and behavior parity first on existing Windows paths, then Android; UI/input/file/session tests, emulator traces and frame checksums. Preserve application ownership and native size/startup.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('A2',[PscRoadmapState]::Research,@('A1','I3','I5'),'Browser and document presentation: recover existing HTML simulacra and semantic conformance corpus, implement bounded capabilities and test behavior; no complete-browser claim without evidence.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('A3',[PscRoadmapState]::Planned,@('F5','I1','L2'),'API-driven appliance specifications: reconstruct programs with typed contracts, reproducible builds and stated semantics; independently verify outputs without requiring the authoring host at execution.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('X1',[PscRoadmapState]::Planned,@('F0','F2','R1'),'NL1 experience/history: canonical referents and typed observations, provenance, temporal scope, version and persistence; replay with shared identity intact. No new competing object store.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('X2',[PscRoadmapState]::Research,@('X1','L1'),'PSNL: typed meaning and executable binding via admitted SMA forms, explicit proposal and assessment; never treat parse acceptance or linguistic similarity as semantic equivalence.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('X3',[PscRoadmapState]::Research,@('X1','D5','H2'),'CPU 3D scene and observations: reuse QuickPS geometry/rendering, record reproducible controlled scene changes; no duplicate engine unless a measured gap requires it.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('X4',[PscRoadmapState]::Planned,@('X3'),'Anomaly identification over observations; establish reference distributions, controlled changes, false-positive/negative rates and conditions of applicability.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('X5',[PscRoadmapState]::Planned,@('X1','R1','I1'),'Percept acquisition: import Providence typed observations, referent-relative composition, dependency invalidation and PSPerception reversible proposals; test actual PSC AST/CIL referents, counterexamples, reassessment and retained capabilities on unseen cases.',@(),@('InquiryPrimitives','Vom'),@()))
+        $objectives.Add([PscRoadmapObjective]::new('X6',[PscRoadmapState]::Research,@('I3','D4','X2','X5'),'Manuals to experiments: derive explicit testable proposals with source extent, predictions, controls and independent comparison; test ISA facts before admitting encoding capabilities.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('X7',[PscRoadmapState]::Planned,@('X5','X2'),'Names and expression: bind terminology to observed relationships and typed capabilities; distinguish names from referents and test reuse across contexts.',@(),@(),@()))
+        return $objectives.ToArray()
+    }
+    [PscRoadmapAssessment[]] AssessRoadmap(){return $this.AssessRoadmap($this.Roadmap(),$null)}
+    [PscRoadmapAssessment[]] AssessRoadmap([PscConformanceReport]$report){return $this.AssessRoadmap($this.Roadmap(),$report)}
+    [PscRoadmapAssessment[]] AssessRoadmap([PscRoadmapObjective[]]$objectives,[PscConformanceReport]$report){
+        $index=[Collections.Generic.Dictionary[string,PscRoadmapObjective]]::new([StringComparer]::OrdinalIgnoreCase)
+        $declarations=[Collections.Generic.Dictionary[string,PscMatch]]::new([StringComparer]::OrdinalIgnoreCase)
+        $ambiguous=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $faculties=[Collections.Generic.Dictionary[string,PscFacultyUnit]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach($faculty in $this.FacultyUnits){if(!$faculties.TryAdd($faculty.Name,$faculty)){throw "Duplicate faculty: $($faculty.Name)"}}
+        foreach($objective in $objectives){
+            if($null -eq $objective -or [string]::IsNullOrWhiteSpace($objective.Id) -or [string]::IsNullOrWhiteSpace($objective.Criterion) -or ![Enum]::IsDefined([PscRoadmapState],$objective.State)){throw 'Invalid roadmap objective.'}
+            if(!$index.TryAdd($objective.Id,$objective)){throw "Duplicate roadmap objective: $($objective.Id)"}
+        }
+        if(!$index.Count){throw 'The roadmap is empty.'}
+        $stages=[Collections.Generic.Dictionary[string,PscConformanceStage]]::new([StringComparer]::OrdinalIgnoreCase)
+        $bytes=[IO.File]::ReadAllBytes($this.Script)
+        if([Convert]::ToHexString([Security.Cryptography.SHA512]::HashData($bytes)) -cne $this.SourceSha512){throw 'Roadmap API source has changed.'}
+        $sourceHash=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+        # Reuse the structural query visitor over the API's already parsed source. Preserve its actual referents.
+        $visitor=[PscSourceQueryVisitor]::new();$visitor.Spec=[PscQuerySpec]::new([PscQueryKind]::Declaration,'','',[int]::MaxValue)
+        $visitor.Limit=[int]::MaxValue;$visitor.Path=$this.Script;$visitor.Digest=$sourceHash
+        $this.Ast.Visit($visitor)
+        foreach($hit in $visitor.Hits){
+            if($hit.Target -isnot [System.Management.Automation.Language.TypeDefinitionAst] -and $hit.Target -isnot [System.Management.Automation.Language.FunctionDefinitionAst]){continue}
+            if(!$declarations.TryAdd($hit.Name,$hit)){[void]$ambiguous.Add($hit.Name)}
+        }
+        if($null -ne $report){
+            if($report.CandidateSha256 -cne $sourceHash -or $null -eq $report.Guard -or $report.Guard.CandidateSha256 -cne $sourceHash){throw 'Conformance report does not identify this PSC source.'}
+            foreach($stage in $report.Stages){if(!$stages.TryAdd($stage.Name,$stage)){throw "Duplicate conformance stage: $($stage.Name)"}}
+        }
+        $remaining=[Collections.Generic.HashSet[string]]::new($index.Keys,[StringComparer]::OrdinalIgnoreCase)
+        $results=[Collections.Generic.List[PscRoadmapAssessment]]::new()
+        foreach($objective in $objectives){
+            $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $outstanding=[Collections.Generic.List[string]]::new()
+            foreach($dependency in $objective.Prerequisites){
+                if(!$index.ContainsKey($dependency)){throw "Unknown roadmap prerequisite: $dependency"}
+                if(!$seen.Add($dependency)){throw "Repeated roadmap prerequisite: $dependency"}
+                if($index[$dependency].State -ne [PscRoadmapState]::Accepted){$outstanding.Add($dependency)}
+            }
+            $witnessNames=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $witnesses=[Collections.Generic.List[PscMatch]]::new()
+            $observedFaculties=[Collections.Generic.List[PscFacultyUnit]]::new()
+            foreach($name in $objective.Declarations){[void]$witnessNames.Add($name)}
+            foreach($name in $objective.Faculties){
+                if(!$faculties.ContainsKey($name)){throw "Missing roadmap faculty: $name"}
+                $faculty=$faculties[$name];$observedFaculties.Add($faculty)
+                foreach($declaration in $faculty.Declarations){[void]$witnessNames.Add($declaration)}
+            }
+            foreach($name in $witnessNames){
+                if(!$declarations.ContainsKey($name)){throw "Missing roadmap declaration: $name"}
+                if($ambiguous.Contains($name)){throw "Ambiguous roadmap declaration: $name"}
+                $witnesses.Add($declarations[$name])
+            }
+            if($objective.State -eq [PscRoadmapState]::Accepted){
+                if($outstanding.Count -or [string]::IsNullOrWhiteSpace($objective.AcceptanceCommit) -or [string]::IsNullOrWhiteSpace($objective.AcceptanceEvidence) -or [string]::IsNullOrWhiteSpace($objective.AcceptanceScope) -or [string]::IsNullOrWhiteSpace($objective.Omissions) -or [string]::IsNullOrWhiteSpace($objective.RedundancyDisposition)){throw "Incomplete roadmap acceptance record: $($objective.Id)"}
+            }
+            $assessment=[PscRoadmapAssessment]::new()
+            $assessment.Objective=$objective; $assessment.OutstandingPrerequisites=$outstanding.ToArray(); $assessment.SourceSha256=$sourceHash
+            $assessment.ObservedDeclarations=$witnesses.ToArray(); $assessment.ObservedFaculties=$observedFaculties.ToArray()
+            $observations=[Collections.Generic.List[PscConformanceStage]]::new()
+            foreach($stageName in $objective.StageNames){
+                if($stages.ContainsKey($stageName)){$observations.Add($stages[$stageName])}
+                else{$unexecuted=[PscConformanceStage]::new();$unexecuted.Name=$stageName;$unexecuted.State='NotRun';$observations.Add($unexecuted)}
+            }
+            $assessment.Stages=$observations.ToArray()
+            if($null -ne $report){
+                $assessment.ConformanceReported=$true; $assessment.ConformancePassed=$report.Passed; $assessment.ConformanceComplete=$report.Complete
+                if($report.Guard.Passed){$assessment.GuardState='Passed'}else{$assessment.GuardState='Failed'}
+            }
+            $results.Add($assessment)
+        }
+        # Remove nodes whose prerequisites have already been removed. No progress implies a cycle.
+        while($remaining.Count){
+            $before=$remaining.Count
+            foreach($objective in $objectives){
+                if(!$remaining.Contains($objective.Id)){continue}
+                $pending=$false
+                foreach($dependency in $objective.Prerequisites){if($remaining.Contains($dependency)){$pending=$true;break}}
+                if(!$pending){[void]$remaining.Remove($objective.Id)}
+            }
+            if($remaining.Count -eq $before){throw 'Cyclic roadmap prerequisites.'}
+        }
+        return $results.ToArray()
+    }
+    hidden [string] RoadmapMarkdown(){
+        $rows=[Collections.Generic.List[string]]::new()
+        $rows.Add('| ID | State | Outstanding prerequisites | Objective and acceptance condition |')
+        $rows.Add('|---|---|---|---|')
+        foreach($assessment in $this.AssessRoadmap()){
+            $objective=$assessment.Objective
+            $pending=[string]::Join(', ',$assessment.OutstandingPrerequisites)
+            if(!$pending){$pending='—'}
+            $rows.Add('| '+$objective.Id+' | '+$objective.State.ToString()+' | '+$pending+' | '+$objective.Criterion.Replace('|','\|')+' |')
+        }
+        return [string]::Join("`n",$rows)
+    }
     [string] Guide(){
         $formatRows=[Collections.Generic.List[string]]::new()
         $formatRows.Add('| Extension | Role | Analogue | Intent |')
@@ -13237,8 +13453,73 @@ PSC-specific terms retain their distinct meanings:
 | Guard | Candidate admission policy against a committed comparison source and protected checker. |
 | Conform | Orchestrate scoped verification and record its results; acceptance and promotion remain explicit decisions. |
 | Appliance | A one-shot executable unit in source form (.sexe). |
+| Observation | A recorded result of examining or executing against a referent under stated conditions; not a general conclusion. |
+| Percept | A retained, typed recognition of a relationship, grounded in observations with explicit scope and validity; distinct from an executable capability or authority. |
+| Proposal | A candidate explanation, change, or operation to assess; Propose does not establish correctness. |
+| Prediction | An expected observation derived from a proposal before assessment of its outcome. |
+| Assessment | Evaluation of evidence against declared criteria; distinct from admission. |
+| Admission | An explicit decision under a stated policy and authority; not a consequence of discovery alone. |
 
 Use these terms consistently in code, help, results and development discussion. Keep source identity, assessment criteria, observation, outcome and authorization distinct. A successful partial assessment must not be described as complete; an unknown must not be described as absent. Preserve established PSC operation names unless their semantics change.
+
+## Integration roadmap
+
+PSC is the upstream compiler, SDK, semantic development environment and procedural learning substrate for the related repositories. The maintained implementation is PSC.ps1; source projections, compiled faculties, packages and this README are derived representations. Applications retain application-specific state, models, tests and policies. The campaign is a dependency graph, not a linear migration or a mandate to copy every donor. This roadmap supersedes the November 8 roadmap and reconciles the [November 11 campaign](https://github.com/MansfieldPlumbing/Pwsh-Development/blob/403f11a34e56dc2a1f3354d6501c5ab19344be1e/docs/psc-plan/PSC-The-Plan.md). Historical measurements remain at their original revisions.
+
+### Baseline and objective register
+
+Assessment basis: PSC [7a7871f](https://github.com/MansfieldPlumbing/PSC/commit/7a7871f297bd7c5259969191dc31376538b0db82), reviewed November 25, 2026. Existing implementation is not equivalent to completed acceptance. At this baseline seven faculties, ordered projection, typed query, revision-bound replacement/undo, candidate Guard including embedded source, managed compilation, NativeAOT/COFF and direct x64 ELF leaf emission exist. The preceding development assessment reported 144 passing Guard/worktree/document/SM cases; Windows historical Verify was not run in that environment. Full candidate-independent conformance is not established.
+
+States: Existing = demonstrated mechanism requiring remaining scope checks; Planned = a defined objective; Research = evidence needed before committing to a design; Accepted = explicitly accepted with revision, evidence, scope, omissions and redundancy disposition. Outstanding prerequisites are computed from the typed register, not hand-maintained readiness labels. They gate acceptance, not all incremental development. An objective is never accepted merely because declarations exist or a conformance stage passes.
+
+```powershell
+$api.Roadmap()                 # Typed objective declarations
+$api.AssessRoadmap()           # Live structural witnesses and outstanding prerequisites
+$api.AssessRoadmap($result)    # Add a Conform report for this exact source revision
+```
+
+The structural checks reuse the source-query visitor over the API AST and the faculty inventory. ObservedDeclarations carries source-bound PscMatch references, including faculty declarations; ObservedFaculties carries PscFacultyUnit records. Conformance stages are observations only; the report retains its original scope. Without a report, ConformanceReported is false; an unexecuted stage is NotRun, not Passed. Assessment does not promote a candidate or confer authority; acceptance records must be reviewed against independently controlled criteria. The register rejects duplicate IDs, missing or repeated dependencies, cycles, missing declared witnesses and incomplete acceptance records. The generated table below is a projection of the same typed objectives, not a separately maintained list.
+
+@@ROADMAP@@
+
+### Donor acquisition register
+
+These are pinned inspection points, not dependencies to download at runtime. Reuse existing PSC mechanisms before introducing new ones. Each donor inspection ends with a README correction or evidence-backed update (or a recorded reason no change is appropriate), a focused regression/defect fix when practical, and a separate reviewed donor commit. Do not delete donor implementations before downstream reconvergence is verified.
+
+| Donor | Acquirable mechanisms and disposition |
+|---|---|
+| [Pwsh 515a49a](https://github.com/MansfieldPlumbing/Pwsh/tree/515a49aebd6c7494fd27f7a9d0459ecd4f247470) | setup.ps1: host/ELF, A64/A32/x64 portions already acquired, Thumb-2, ABI/layout, XABA, DEX, AXML, resources, APK and signing; modules/Console.psm1 and scripts/console/Start-Console.ps1: 11 console classes and adapters; tools/Get-AssemblyClosure.ps1, adb/usbaoa/CellCanvas/AndroidCanvas. Reconcile, do not clone. |
+| [Kokoroku 690c81b](https://github.com/MansfieldPlumbing/Kokoroku/tree/690c81bfe84882338a41ff1486eda1fb97d9fb82) | Invoke-HexagonDevelopment.ps1 and Test-HexagonEmission: ISA catalog and packetizer; Invoke-KokoroPrecomputedDecoder.ps1: SIMD workers, convolution, dense math, packing; checkpoint reader, audio measurement, AAudio, DSP queue, device evaluator; Providence.Field/Bank, StudentSourceInventory, Invoke-StudentPerceptHunt and seed graph: domain-independent learning. Keep speech-specific generator, tail, phonemizer and prosody in Kokoroku. Do not resurrect the retired neural front end as an architectural requirement. |
+| [Notepad 17b76e2](https://github.com/MansfieldPlumbing/Notepad/tree/17b76e22a5d3132e22c195989aa9dec70dc4ded6) | Piece table and edit journal already adapted; retain revision checks, not stale cached search behavior. Acquire generic presentation, windowing, geometry, hit testing, capture and test instruments. Native app remains an end-to-end corpus. |
+| [PSNES 8165c65](https://github.com/MansfieldPlumbing/PSNES/tree/8165c65e51ea4efbcef0cded7cd2337e336ea8a0) | Full emulator, instruction traces, frame checksums, native executable and throughput regression corpus; keep 6502/NES domain implementation downstream. |
+| [QuickPS eaff8be](https://github.com/MansfieldPlumbing/QuickPS/tree/eaff8be40f9aef44fc3094b4f3badff27fe6249f) | Build-Appliance, native platform bindings, geometry, graphics, composition, audio and capture. Existing PSC native calls supersede dynamic binder where equivalent. No proven general AVX emitter located here. |
+| [PSPerception 398da4e](https://github.com/MansfieldPlumbing/PSPerception/tree/398da4e63344448826176001a379bbdcbc73a821) | Refine.ps1 and PredicateSynthesis.ps1: counterexample localization, reversible proposals, bounded predicate search, objective acceptance, provenance. Merge with X5, not a second learning framework. |
+| [RyuJitDetach 8589c02](https://github.com/MansfieldPlumbing/RyuJitDetach/tree/8589c02f0c12df320477312ef7f70e152f222a91) | Bounded native leaf extraction and PE oracle; not a general compiler. |
+| [CS2PS 9d4ee28](https://github.com/MansfieldPlumbing/CS2PS/tree/9d4ee28ce169e02798fbb60c11d8886fbf15bf19), [TS2PS c22a172](https://github.com/MansfieldPlumbing/TS2PS/tree/c22a172e5de171bc148f59d91f7ec8ed016ccb7c) | Metadata catalog, semantic correspondence, parser scoring and independent translation corpus; acquire useful observations rather than another target-language parser. |
+| [Pwsh-Development 403f11a](https://github.com/MansfieldPlumbing/Pwsh-Development/tree/403f11a34e56dc2a1f3354d6501c5ab19344be1e) | Historical campaign, reference corpus, StudentV3 and recovered Subsystem/QuickPS work; inspect historical branches for missing capability before implementing. Recovered material is reference, not direct build input. |
+| DirectPort, DPX, DirectAI and other historical repositories | Inventory revision and actual implementation before naming reusable device, transport, pipeline or vector mechanisms. No uninspected capability is counted as acquired. |
+
+SIMD evidence: Kokoroku [AVX-512 commit](https://github.com/MansfieldPlumbing/Kokoroku/commit/07a3e4894695acefbd3e82d3e1145f96ccb6105f) and [ARM64 execution](https://github.com/MansfieldPlumbing/Kokoroku/blob/690c81bfe84882338a41ff1486eda1fb97d9fb82/docs/results/frontend-phone-cpu-sm8550-20261027.md) establish donor kernels and portable 128-bit hardware acceleration. Vector256 was not hardware-accelerated on that phone; text encodings differed from host, while tokens/durations/F0/N matched on two sentences. Explicit NEON encoding is not established. Hexagon hardware measurements and generator-only scope must remain distinct from end-to-end speech performance.
+
+### Acquisition, integration and publication procedure
+
+1. Establish the requirement and accepted revision; query PSC first for equivalent types, operations and dependencies. Search donor source, tests, history and documentation, including abandoned approaches and contradictory evidence. Pin repository, commit, blob, extent, license and independent test inputs. Record what is already implemented, missing, refused or unknown. Avoid importing obsolete wrappers, parallel binders, stores, dispatchers or orchestration layers.
+2. Extract the mechanism, not the donor architecture. Reconcile identity, semantics, authority, lifetime, failure, units and numeric representation with existing PSC types. Prefer NIST configuration/assessment/measurement vocabulary, ECMA-335 and ISA terminology in their domains; retain Percept, Referent, Faculty and other precise PSC concepts. Use Propose/Proposal and Investigation; do not introduce donor Hunt terminology. Preserve original names in provenance. Decide whether to extend an existing faculty or introduce a new one by measured dependency/realization needs, not donor file boundaries.
+3. Derive executable acceptance criteria before implementation; preserve independent baseline fixtures and record expected outcomes. First reproduce the donor, then establish equivalence or explicitly document intentional differences. Use typed SMA declarations, AST queries and existing edit/Collate machinery; do not author C#, regex-parse source, hide code in scriptblocks, use JSON as an object graph, or add untyped records. A necessary lowering extension gets its own minimal repro and full application test. Canonical source, tests, comments, guide and roadmap change together; no alternate maintained implementation tree.
+4. Verify at the lowest meaningful boundary and across the complete affected path: parse/type/bind, positive and negative unit cases, independent differential oracle, deliberate perturbation, format/decode/ABI tests, full application source compile and execution, projection/assembly round trips and Guard/Conform. Fuzz bounded parsers/encoders and exercise limits, resource cleanup, error and concurrency paths as appropriate. Affected is advisory, not permission to omit regression stages. Candidate tests supplement protected baseline tests; neither a passing candidate-owned test nor a matching hash proves authorization or semantic correctness. Trusted source only; conformance is not a sandbox.
+5. Measure on identical pinned workloads and conditions: cold/warm elapsed and CPU/device time, peak/retained memory, artifact size, dependencies and throughput; include repetitions, distribution, hardware/runtime, workload, precision, coverage and tolerances. Separate authoring cost, realization cost, execution and transport; test held-out inputs and scalar/portable references. Optimize demonstrated bottlenecks; preserve exactness where required, otherwise establish acceptable error before changes. Report failures and regressions, not just best runs. For procedural learning compare cold investigation, retained observations and retained capabilities on unfamiliar cases; measure acquisition and reuse costs, false acceptance and invalidation. Multiple independent observations are required where possible; statistical thresholds require justified distributions, not a universal three-sigma rule.
+6. Publish a small cohesive candidate after review. Record parent, source/artifact identities, test commands/results, coverage, omissions, measurements and rollback path. Run the full available conformance scope; label unavailable platforms or tools and incomplete checks explicitly. A change to protected assessment authority requires separate explicit approval and old/new comparison, never self-admission. A verified development checkpoint can advance main with incomplete platform verification explicitly disclosed; no release-quality claim until the relevant full scope passes. Use a compare-and-swap/fast-forward main update, never force past another change, and verify remote HEAD and content. Keep main usable; commit each independently verified increment, not one end-of-campaign bulk import. On failure retain the last accepted artifact and diagnose before retry.
+7. Regenerate README from PSC.ps1 with Readme mode, compare exactly, keep examples/API names and progress current, and update source comments where contracts or provenance changed. Do not manually maintain a second roadmap. Donor README updates distinguish reported historical results from current tests, link concrete evidence and the upstream objective, correct stale names/commands and describe remaining work. Avoid gratuitous edits and unsupported marketing. Rebuild downstream against pinned PSC after acquisition; verify equivalence/performance before removing redundant implementations. Record unresolved defects and what remains downstream.
+
+### Near-term execution order
+
+- F0: protect the full conformance dependency graph, including tests and runner, before expanding admission authority. Preserve the existing embedded-source Guard and add negative controls for candidate substitution.
+- F3/F4/F5: extend structural index and edits, then prove the three representations are lossless. N1: harden manifest integrity and atomic publication in parallel.
+- I1/D4/D5/H1/X5: begin donor acquisition in bounded, independently verifiable slices using existing faculty contracts; Hexagon encode/decode/layout before packetization; portable vector kernels before native vector allocation; console parser/model before persistent host; canonical observations and Percepts before automated proposals. None requires waiting for every other campaign objective.
+- F6/D1/H2: integrate persistent hosting, Android deployment and reusable presentation once their contracts pass. Re-run full Notepad/PSNES/Pwsh/Kokoroku application paths as relevant.
+- Continue remaining objectives by dependency readiness, evidence and downstream leverage. Update state and source/receipt links on every accepted increment. Review unresolved dependencies at the start of each development session.
+
+No scheduled background agent or automatic publication is implied. Regular publication occurs at verified development checkpoints during active work. The roadmap is a maintained source-level contract, not proof that planned capabilities exist.
 
 ## Live reference
 
@@ -13255,7 +13536,7 @@ $api | Get-Member
 
 The API is derived from the running script, so mode names and parameter evidence do not depend on a previous session's notes. Use `Describe(mode)` for dispatcher extents and associated definitions. CLI inventory below is generated; source hash, local paths, runtime and measurement values are available from the live API rather than frozen into the README. Regenerate with `& ./PSC.ps1 -Mode Readme`.
 '@
-        return $guideText.Replace('@@FORMATS@@',($formatRows -join "`n"))
+        return $guideText.Replace('@@FORMATS@@',($formatRows -join "`n")).Replace('@@ROADMAP@@',$this.RoadmapMarkdown())
     }
     [PscSourceFormat[]] $SourceFormats = [PscSourceFormat]::SmFormats()
     [string[]] $SourceExtensions = [PscSourceFormat]::Extensions()
@@ -13284,6 +13565,7 @@ The API is derived from the running script, so mode names and parameter evidence
         foreach($operation in $this.Modes){if(!$dispatched.Add($operation.Mode)){throw 'Duplicate dispatched mode.'}}
         if(!$allowed.SetEquals($dispatched) -or !$allowed.Contains($this.DefaultMode)){throw 'PSC mode admission and dispatch disagree.'}
         foreach($parameter in $this.Parameters){if([string]::IsNullOrWhiteSpace($parameter.Description)){throw "Undocumented PSC parameter: $($parameter.Name)"}}
+        [void]$this.AssessRoadmap()
     }
     [string] $Synopsis
     [string] $Script
