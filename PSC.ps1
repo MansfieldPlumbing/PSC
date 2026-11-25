@@ -2226,6 +2226,66 @@ function Recur-Value { Recur-Value }
     $command=$secondClass.Members[1].Body.EndBlock.Statements[0].PipelineElements[0]
     if($null -eq $second -or $second.GetGenericArguments()[1] -ne $secondScope.Types['InferencePeer'] -or $second -eq $next -or ![object]::ReferenceEquals((Find-ScriptFunction $command),$secondClass.Members[0])){throw 'Same-named functions crossed parsed source scopes'}
     'PASS scoped function inference, recursive refusal, generic revision invalidation, caller restoration and same-name source isolation'
+    $operationPath=Join-Path $work 'SourceOperation.sm1'
+    [IO.File]::WriteAllText($operationPath,@"
+class SourceOperationPeer { [int] `$Value }
+class SourceOperationProbe {
+    [int] `$Selected
+    SourceOperationProbe([long]`$n){`$this.Selected=1}
+    SourceOperationProbe([double]`$n){`$this.Selected=2}
+    static [int] Pick([long]`$n){return 10}
+    static [int] Pick([double]`$n){return 20}
+    [int] Choose([long]`$n){return 100}
+    [int] Choose([double]`$n){return 200}
+    static [SourceOperationPeer] Copy([SourceOperationPeer]`$n){return `$n}
+    static [SourceOperationPeer[]] CopyVector([SourceOperationPeer[]]`$n){return `$n}
+    static [SourceOperationPeer[,]] CopyGrid([SourceOperationPeer[,]]`$n){return `$n}
+    static [System.Collections.Generic.List[SourceOperationPeer]] CopyList([System.Collections.Generic.List[SourceOperationPeer]]`$n){return `$n}
+    static [int] Run(){
+        `$receiver=[SourceOperationProbe]::new(7)
+        return `$receiver.Selected+[SourceOperationProbe]::Pick(7)+`$receiver.Choose(7)
+    }
+}
+"@)
+    $operationRoot=[System.Management.Automation.Language.Parser]::ParseFile($operationPath,[ref]$tokens,[ref]$errors)
+    if($errors.Count){throw 'Source operation fixture parse failed'}
+    $operationScope=Get-DeclarationScope -Root $operationRoot
+    $target=$operationScope.Types['SourceOperationProbe']
+    $argumentTypes=[type[]]@([int])
+    $staticMethod=Resolve-MatchingMethod -TargetType $target -MethodName Pick -ArgumentTypes $argumentTypes -IsStatic -SourceAst $operationRoot
+    $instanceMethod=Resolve-MatchingMethod -TargetType $target -MethodName Choose -ArgumentTypes $argumentTypes -SourceAst $operationRoot
+    $constructor=Resolve-MatchingConstructor -TargetType $target -ArgumentTypes $argumentTypes -SourceAst $operationRoot
+    if($staticMethod.GetParameters()[0].ParameterType -ne [long] -or $instanceMethod.GetParameters()[0].ParameterType -ne [long] -or $constructor.GetParameters()[0].ParameterType -ne [long]){throw 'Source numeric operation selection differs'}
+    $peerType=$operationScope.Types['SourceOperationPeer']
+    $copy=Resolve-PscSourceOperation $operationRoot $target 'copy' ([type[]]@($peerType)) $true $false
+    if($null -eq $copy -or $copy.ReturnType -ne $peerType -or $copy.GetParameters()[0].ParameterType -ne $peerType){throw 'Exact source operation projection differs'}
+    $vector=$peerType.MakeArrayType();$grid=$peerType.MakeArrayType(2)
+    $list=[System.Collections.Generic.List`1].MakeGenericType([type[]]@($peerType))
+    foreach($operation in [string[]]@('CopyVector','CopyGrid','CopyList')){
+        $parameterType=switch($operation){'CopyVector'{$vector};'CopyGrid'{$grid};'CopyList'{$list}}
+        $projected=Resolve-MatchingMethod -TargetType $target -MethodName $operation -ArgumentTypes ([type[]]@($parameterType)) -IsStatic -SourceAst $operationRoot
+        if(![object]::ReferenceEquals($projected.ReturnType,$parameterType) -or ![object]::ReferenceEquals($projected.GetParameters()[0].ParameterType,$parameterType)){throw 'Completed compound signature differs'}
+        $witness=@($operationScope.Signatures.Values|Where-Object {$_.Member.Name -ceq $operation})[0]
+        if(![object]::ReferenceEquals($witness.Result,$parameterType) -or ![object]::ReferenceEquals($witness.Parameters[0],$parameterType)){throw 'Builder signature survived projection completion'}
+    }
+    $otherRoot=[System.Management.Automation.Language.Parser]::ParseFile($operationPath,[ref]$tokens,[ref]$errors)
+    $otherScope=Get-DeclarationScope -Root $otherRoot
+    if($null -ne (Resolve-PscSourceOperation $otherRoot $target 'Pick' $argumentTypes $true $false)){throw 'Operation selected across unrelated source scopes'}
+    $contract=$operationScope.Contracts[$operationRoot.EndBlock.Statements[1]]
+    $member=@($contract.Members|Where-Object {$_.Name -eq 'Pick' -and $_.ParameterTypes[0] -eq 'long'})[0]
+    $saved=$contract.Members
+    try{
+        $contract.Members=$saved+@($member)
+        $refused=$false
+        try{$null=Resolve-MatchingMethod -TargetType $target -MethodName Pick -ArgumentTypes $argumentTypes -IsStatic -SourceAst $operationRoot}catch [Reflection.AmbiguousMatchException]{$refused=$true}
+        if(!$refused){throw 'Ambiguous STS operation fell through to CTS'}
+    }finally{$contract.Members=$saved}
+    $operationOutput=Join-Path $work 'SourceOperation.dll'
+    & ([Environment]::ProcessPath) -NoProfile -File $compilerPath -Mode Compile -SourcePath $operationPath -ClassName SourceOperationProbe -OutputPath $operationOutput -Deterministic | Out-Null
+    if($LASTEXITCODE -ne 0){throw 'Source operation compilation failed'}
+    $operationAssembly=[Reflection.Assembly]::LoadFrom($operationOutput)
+    if($operationAssembly.GetType('SourceOperationProbe').GetMethod('Run').Invoke($null,$null) -ne 111){throw 'Emitted source operation selection differs'}
+    'PASS source static, instance and constructor selection, exact identity, scope isolation, ambiguity refusal and emitted execution'
     $output=Join-Path $work 'Signature.dll'
     & ([Environment]::ProcessPath) -NoProfile -File $compilerPath -Mode Compile -SourcePath $path -ClassName SignatureOwner -OutputPath $output | Out-Null
     if($LASTEXITCODE -ne 0){throw 'Signature compilation failed'}
@@ -8106,6 +8166,32 @@ function Get-ParameterTypes([System.Management.Automation.Language.FunctionMembe
     , [Type[]]@($Function.Parameters | ForEach-Object { Get-ParameterType $_ $isFunction })
 }
 
+# A signature initially names TypeBuilders while declarations are being emitted.
+# Complete its CLR representation after every definition has been created; the
+# STS references and their ownership do not change during this transition.
+function Complete-PscProjectionType {
+    [OutputType([type])]
+    param([type]$Type)
+    if($Type -is [Reflection.Emit.TypeBuilder]){return $Type.UnderlyingSystemType}
+    if($Type.HasElementType){
+        $old=$Type.GetElementType();$element=Complete-PscProjectionType $old
+        if([object]::ReferenceEquals($element,$old)){return $Type}
+        if($Type.IsSZArray){return $element.MakeArrayType()}
+        if($Type.IsArray){return $element.MakeArrayType($Type.GetArrayRank())}
+        if($Type.IsByRef){return $element.MakeByRefType()}
+        if($Type.IsPointer){return $element.MakePointerType()}
+    }
+    if($Type.IsConstructedGenericType){
+        $arguments=$Type.GetGenericArguments();$changed=$false
+        for($i=0;$i -lt $arguments.Length;$i++){
+            $next=Complete-PscProjectionType $arguments[$i]
+            if(![object]::ReferenceEquals($next,$arguments[$i])){$arguments[$i]=$next;$changed=$true}
+        }
+        if($changed){return $Type.GetGenericTypeDefinition().MakeGenericType($arguments)}
+    }
+    return $Type
+}
+
 function New-ClrDeclarationProjection {
     <#
     .SYNOPSIS
@@ -8191,6 +8277,10 @@ function New-ClrDeclarationProjection {
 
     foreach ($c in $Model) {
         $script:LoweringClassTypes[$c.Name] = $builders[$c.Name].CreateType()
+    }
+    foreach($signature in $signatures.Values){
+        $signature.Result=Complete-PscProjectionType $signature.Result
+        for($i=0;$i -lt $signature.Parameters.Length;$i++){$signature.Parameters[$i]=Complete-PscProjectionType $signature.Parameters[$i]}
     }
     foreach ($enumAst in $Enums) { $declarationScope.Types[$enumAst.Name] = $script:LoweringClassTypes[$enumAst.Name] }
     foreach ($c in $Model) { $declarationScope.Types[$c.Name] = $script:LoweringClassTypes[$c.Name] }
@@ -9843,14 +9933,90 @@ function Add-GenericInference([Type] $Pattern, [Type] $Actual, [hashtable] $Bind
     return $Pattern.IsAssignableFrom($Actual)
 }
 
+# This adapter recognizes source ownership by the scoped CLR projection's identity,
+# never by a type name alone. The admitted binding profile is exact STS references
+# and the closed numeric compatibility fragment already used by structural calls.
+function Resolve-PscSourceOperation {
+    [OutputType([Reflection.MethodBase])]
+    param([System.Management.Automation.Language.Ast]$SourceAst,[type]$TargetType,[string]$Name,[type[]]$ArgumentTypes,[bool]$Static,[bool]$Constructor)
+    if($null -eq $SourceAst -or !$TargetType.Assembly.IsDynamic){return $null}
+    $root=$SourceAst;while($root.Parent){$root=$root.Parent}
+    $source=$null
+    if(!$script:ScriptFunctionSources.TryGetValue($root,[ref]$source)){$source=$root}
+    $scope=$null
+    if(!$script:DeclarationScopeCache.TryGetValue($source,[ref]$scope)){return $null}
+    $ownerScope=$scope
+    if($scope.Types[$TargetType.Name] -ne $TargetType){
+        $functionClass=$null
+        if(!$script:ScriptFunctionClasses.TryGetValue($source,[ref]$functionClass) -or $null -eq $functionClass){return $null}
+        $functionRoot=$functionClass;while($functionRoot.Parent){$functionRoot=$functionRoot.Parent}
+        if(!$script:DeclarationScopeCache.TryGetValue($functionRoot,[ref]$ownerScope) -or ![object]::ReferenceEquals($ownerScope.Resolving,$scope) -or $ownerScope.Types[$TargetType.Name] -ne $TargetType){return $null}
+    }
+    $ownerAst=$null
+    foreach($definition in $ownerScope.Contracts.Keys){if($definition.Name -ieq $TargetType.Name){$ownerAst=$definition;break}}
+    if($null -eq $ownerAst){return $null}
+    $contract=$ownerScope.Contracts[$ownerAst]
+    $candidates=@(foreach($declaration in $ownerAst.Members){
+        $signature=$ownerScope.Signatures[$declaration]
+        $member=$signature.Member
+        if($member.Operation -and $member.Constructor -eq $Constructor -and $member.Static -eq $Static -and ($Constructor -or $member.Name -ieq $Name) -and $signature.Parameters.Length -eq $ArgumentTypes.Length){$signature}
+    })
+    if(!$candidates.Count){return $null}
+    $exact=@(foreach($candidate in $candidates){
+        $same=$true
+        for($i=0;$i -lt $ArgumentTypes.Length;$i++){if($candidate.Parameters[$i] -ne $ArgumentTypes[$i]){$same=$false;break}}
+        if($same){$candidate}
+    })
+    if($exact.Count -gt 1){throw [Reflection.AmbiguousMatchException]::new('Ambiguous projected source signature')}
+    if($exact.Count -eq 1){$selected=$exact[0]}
+    else{
+        $numeric=[type[]]@($script:IntegralTypes+$script:FloatingTypes)
+        if(!$ArgumentTypes.Length){return $null}
+        foreach($argument in $ArgumentTypes){if($argument -notin $numeric){return $null}}
+        $targets=[type[]]@($numeric+@([object],[string],[bool]))
+        $signatures=[type[][]]::new($candidates.Count)
+        for($i=0;$i -lt $candidates.Count;$i++){
+            $signatures[$i]=$candidates[$i].Parameters
+            foreach($parameter in $signatures[$i]){if($parameter -notin $targets){return $null}}
+        }
+        # Use precisely the shared compatibility selector, including its refusal
+        # of ambiguity. A refused admitted decision must not fall through to CTS.
+        $index=Get-PscFacultyDeclarations -SelectionSignatures $signatures -SelectionSources $ArgumentTypes
+        $selected=$candidates[$index]
+    }
+    $member=$selected.Member
+    # Unresolved references retain their previous CLR compatibility path.
+    foreach($reference in $member.ParameterReferences){if(!$reference.Same($reference)){return $null}}
+    if(![object]::ReferenceEquals($selected.Owner,$contract) -or ![object]::ReferenceEquals($contract.FindReference($member.Name,$member.ParameterReferences,$Static,$Constructor),$member)){
+        throw [Reflection.AmbiguousMatchException]::new('Selected source operation has no unique STS reference')
+    }
+    $flags=[Reflection.BindingFlags]'Public,DeclaredOnly,ExactBinding,IgnoreCase'
+    if($Constructor){$operation=$TargetType.GetConstructor(($flags -bor [Reflection.BindingFlags]::Instance),$null,$selected.Parameters,$null)}
+    else{
+        $flags=$flags -bor $(if($Static){[Reflection.BindingFlags]::Static}else{[Reflection.BindingFlags]::Instance})
+        $operation=$TargetType.GetMethod($member.Name,$flags,$null,$selected.Parameters,$null)
+    }
+    if($null -eq $operation){throw [MissingMethodException]::new('Selected STS operation has no CLR projection')}
+    $parameters=$operation.GetParameters()
+    for($i=0;$i -lt $parameters.Length;$i++){if($parameters[$i].ParameterType -ne $selected.Parameters[$i]){throw [InvalidOperationException]::new('Selected STS operation projection differs')}}
+    if(!$Constructor -and $operation.ReturnType -ne $selected.Result){throw [InvalidOperationException]::new('Selected STS operation result projection differs')}
+    return $operation
+}
+
 function Resolve-MatchingMethod {
     param(
         [Parameter(Mandatory)][Type] $TargetType,
         [Parameter(Mandatory)][string] $MethodName,
         [Parameter(Mandatory)][AllowEmptyCollection()][Type[]] $ArgumentTypes,
         [switch] $IsStatic,
-        [System.Management.Automation.Language.IScriptExtent] $SourceExtent
+        [System.Management.Automation.Language.IScriptExtent] $SourceExtent,
+        [System.Management.Automation.Language.Ast] $SourceAst
     )
+
+    if($null -ne $SourceAst -and $TargetType.Assembly.IsDynamic){
+        $sourceOperation=Resolve-PscSourceOperation $SourceAst $TargetType $MethodName $ArgumentTypes $IsStatic.IsPresent $false
+        if($null -ne $sourceOperation){return [Reflection.MethodInfo]$sourceOperation}
+    }
 
     $flags = [Reflection.BindingFlags]::Public
     if ($IsStatic) {
@@ -9992,8 +10158,14 @@ function Resolve-MatchingMethod {
 function Resolve-MatchingConstructor {
     param(
         [Parameter(Mandatory)][Type] $TargetType,
-        [Parameter(Mandatory)][AllowEmptyCollection()][Type[]] $ArgumentTypes
+        [Parameter(Mandatory)][AllowEmptyCollection()][Type[]] $ArgumentTypes,
+        [System.Management.Automation.Language.Ast] $SourceAst
     )
+
+    if($null -ne $SourceAst -and $TargetType.Assembly.IsDynamic){
+        $sourceOperation=Resolve-PscSourceOperation $SourceAst $TargetType 'new' $ArgumentTypes $false $true
+        if($null -ne $sourceOperation){return [Reflection.ConstructorInfo]$sourceOperation}
+    }
 
     # 1. Exact match
     $exact = $TargetType.GetConstructor($ArgumentTypes)
@@ -11250,7 +11422,7 @@ function Convert-AstExpression {
 
             # Object constructor: [T]::new(...)
             if ($memberName -eq 'new') {
-                $ctor = Resolve-MatchingConstructor -TargetType $targetType -ArgumentTypes $argTypes
+                $ctor = Resolve-MatchingConstructor -TargetType $targetType -ArgumentTypes $argTypes -SourceAst $Node
                 $params = $ctor.GetParameters()
                 for ($i = 0; $i -lt $params.Length; $i++) {
                     if (-not $params[$i].ParameterType.IsByRef -and $argExprs[$i].Type -ne $params[$i].ParameterType) {
@@ -11261,7 +11433,7 @@ function Convert-AstExpression {
             }
 
             # Static method call: [T]::Method(...)
-            $method = Resolve-MatchingMethod -TargetType $targetType -MethodName $memberName -ArgumentTypes $argTypes -IsStatic -SourceExtent $Node.Extent
+            $method = Resolve-MatchingMethod -TargetType $targetType -MethodName $memberName -ArgumentTypes $argTypes -IsStatic -SourceExtent $Node.Extent -SourceAst $Node
             if ($method.IsDefined([Runtime.InteropServices.UnmanagedCallersOnlyAttribute],$false)) {
                 throw ('[{0}:{1}] UnmanagedCallersOnly method cannot be called from managed code.' -f $Node.Extent.StartLineNumber,$Node.Extent.StartColumnNumber)
             }
@@ -11291,7 +11463,7 @@ function Convert-AstExpression {
             if ($targetExpr.Type -eq [System.Management.Automation.PSObject] -and -not (Test-PSObjectView $Node.Expression)) {
                 $targetExpr = [Linq.Expressions.Expression]::Property($targetExpr, 'BaseObject')
             }
-            $method = Resolve-MatchingMethod -TargetType $targetExpr.Type -MethodName $memberName -ArgumentTypes $argTypes
+            $method = Resolve-MatchingMethod -TargetType $targetExpr.Type -MethodName $memberName -ArgumentTypes $argTypes -SourceAst $Node
             if ($method.IsDefined([Runtime.InteropServices.UnmanagedCallersOnlyAttribute],$false)) {
                 throw ('[{0}:{1}] UnmanagedCallersOnly method cannot be called from managed code.' -f $Node.Extent.StartLineNumber,$Node.Extent.StartColumnNumber)
             }
@@ -12135,7 +12307,7 @@ function Convert-AstStatement {
             }
         }
         $parts = [System.Collections.Generic.List[Linq.Expressions.Expression]]::new()
-        $method = Resolve-MatchingMethod -TargetType $script:LoweringClassTypes[$definition.Class] -MethodName $definition.Name -ArgumentTypes ([Type[]]@($arguments | ForEach-Object Type)) -IsStatic
+        $method = Resolve-MatchingMethod -TargetType $script:LoweringClassTypes[$definition.Class] -MethodName $definition.Name -ArgumentTypes ([Type[]]@($arguments | ForEach-Object Type)) -IsStatic -SourceAst $Statement
         $parts.Add([Linq.Expressions.Expression]::Call($method, [Linq.Expressions.Expression[]]$arguments.ToArray()))
         if ($body -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) {
             foreach ($inner in $body.ScriptBlock.EndBlock.Statements) { $parts.Add((Convert-AstStatement -Statement $inner -Scope $Scope)) }
