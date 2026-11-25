@@ -2147,6 +2147,67 @@ try {
     'PASS emitted recursive types, overload behavior and native linkage metadata'
 } finally { [IO.Directory]::Delete($work,$true) }
 '@)
+    [PscSourceResource]::new('Tests/Test-ScriptTypeSelection.ps1', @'
+#requires -Version 7.7
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$Compiler,[string]$RuntimeDirectory)
+$ErrorActionPreference='Stop'
+# SMA is an independent behavioral witness for this bounded compatibility profile.
+class NumericSelectionOracle {
+    [int] Pick([int]$value){return 0}
+    [int] Pick([double]$value){return 1}
+    [int] Pick([string]$value){return 2}
+    [int] Pair([long]$left,[byte]$right){return 0}
+    [int] Pair([decimal]$left,[object]$right){return 1}
+    [int] Pair([string]$left,[long]$right){return 2}
+}
+if($RuntimeDirectory){
+    [void][Reflection.Assembly]::LoadFrom((Join-Path $RuntimeDirectory 'Vom.dll'))
+    [void][Reflection.Assembly]::LoadFrom((Join-Path $RuntimeDirectory 'ScriptType.dll'))
+    $a=[Reflection.Assembly]::LoadFrom((Join-Path $RuntimeDirectory 'PrimitiveConversion.dll'))
+    $s=[type[][]]::new(3);$s[0]=[type[]]@([long],[byte]);$s[1]=[type[]]@([decimal],[object]);$s[2]=[type[]]@([string],[long])
+    $values=[object[]]@([int]2,[byte]2)
+    $calls=[ScriptTypeCall[]]::new(3)
+    for($i=0;$i -lt $s.Length;$i++){$calls[$i]=[ScriptTypeCall]::new($null,$s[$i],$null)}
+    $actual=[ScriptTypePrimitiveConversion]::SelectSignatures($s,[type[]]@([int],[byte]))
+    if($actual -ne 0 -or [ScriptTypePrimitiveConversion]::Select($calls,$values) -ne $actual){throw 'Compiled selection mismatch'}
+    $refused=$false;try{$null=[ScriptTypePrimitiveConversion]::SelectSignatures([type[][]]@($s[0],$s[0]),[type[]]@([int],[byte]))}catch [Reflection.AmbiguousMatchException]{$refused=$true}
+    if(!$refused -or 'System.Management.Automation' -in $a.GetReferencedAssemblies().Name){throw 'Invalid ambiguity or SMA dependency'}
+    'PASS compiled signature selector and runtime dispatch agree; ambiguity refused; SMA-free'
+    return
+}
+$compilerPath=[IO.Path]::GetFullPath($Compiler)
+$null=. $compilerPath -Mode Api
+$tokens=$null;$errors=$null
+$root=[System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath,[ref]$tokens,[ref]$errors)
+if($errors.Count){throw 'Oracle parse error'}
+$definition=@($root.EndBlock.Statements | Where-Object {$_ -is [System.Management.Automation.Language.TypeDefinitionAst] -and $_.Name -ceq 'NumericSelectionOracle'})[0]
+$single=[System.Management.Automation.Language.FunctionMemberAst[]]@($definition.Members | Where-Object Name -ceq 'Pick')
+$pairs=[System.Management.Automation.Language.FunctionMemberAst[]]@($definition.Members | Where-Object Name -ceq 'Pair')
+$receiver=[NumericSelectionOracle]::new()
+$values=[object[]]@([sbyte]2,[byte]2,[short]2,[ushort]2,[int]2,[uint]2,[long]2,[ulong]2,[single]2,[double]2,[decimal]2)
+foreach($value in $values){
+    $choice=Select-PscStructuralNumericOverload $single ([type[]]@($value.GetType()))
+    if([array]::IndexOf($single,$choice) -ne $receiver.Pick($value)){throw 'Single-argument compatibility mismatch'}
+    foreach($other in $values){
+        $choice=Select-PscStructuralNumericOverload $pairs ([type[]]@($value.GetType(),$other.GetType()))
+        if([array]::IndexOf($pairs,$choice) -ne $receiver.Pair($value,$other)){throw 'Two-argument compatibility mismatch'}
+    }
+}
+$refused=$false
+try{$null=Select-PscStructuralNumericOverload ([System.Management.Automation.Language.FunctionMemberAst[]]@($single[0],$single[0])) ([type[]]@([int]))}catch [Reflection.AmbiguousMatchException]{$refused=$true}
+if(!$refused){throw 'Ambiguous signature admitted'}
+'PASS shared primitive selection: 132 SMA execution comparisons and ambiguous candidate refusal'
+$work=[IO.Directory]::CreateTempSubdirectory('psc-selection-').FullName
+try {
+    foreach($faculty in [string[]]@('Vom','ScriptType','PrimitiveConversion')){
+        & ([Environment]::ProcessPath) -NoProfile -File $compilerPath -Mode BuildFaculty -Faculty $faculty -RuntimeDirectory $work | Out-Null
+        if($LASTEXITCODE -ne 0){throw "Faculty build failed: $faculty"}
+    }
+    & ([Environment]::ProcessPath) -NoProfile -File $PSCommandPath -Compiler $compilerPath -RuntimeDirectory $work
+    if($LASTEXITCODE -ne 0){throw 'Compiled selection test failed'}
+}finally{[IO.Directory]::Delete($work,$true)}
+'@)
     [PscSourceResource]::new('Tests/Test-Redundancy.ps1', @'
 #requires -Version 7.7
 [CmdletBinding()]
@@ -2193,7 +2254,7 @@ class PscMaterializedSignature {
     [type[]] $Parameters
 }
 function Get-PscFacultyDeclarations {
-    param([string[]]$ContractPaths,[System.Management.Automation.Language.TypeDefinitionAst[]]$CompilerClassAsts,[hashtable]$MaterializedTypes)
+    param([string[]]$ContractPaths,[System.Management.Automation.Language.TypeDefinitionAst[]]$CompilerClassAsts,[hashtable]$MaterializedTypes,[type[][]]$SelectionSignatures,[type[]]$SelectionSources)
 
 # Only descriptor types are realized in the authoring scope. Other faculties must not shadow imported CLR identities.
 # The semantic description and the executable generation are ordinary VOM objects.
@@ -2323,6 +2384,7 @@ class ScriptTypeContract {
 # Each published call references the original source member and a lowered thunk.
 
 function Get-PscOtherFacultyDeclarations {
+    param([type[][]]$SelectionSignatures,[type[]]$SelectionSources)
 
 # Faculty: Vom.ps1
 # One typed object space. Handle generations describe operational identity, not learning.
@@ -3425,21 +3487,28 @@ class ScriptTypePrimitiveConversion {
                 if(![ScriptTypePrimitiveConversion]::IsAdmitted($sources[$i])){throw [NotSupportedException]::new('Argument outside supported domain')}
             }
         }
+        [type[][]]$signatures=[type[][]]::new($Candidates.Length)
+        for([int]$c=0;$c -lt $Candidates.Length;$c++){$signatures[$c]=$Candidates[$c].Parameters}
+        return [ScriptTypePrimitiveConversion]::SelectSignatures($signatures,$sources)
+    }
+    # Shared fixed-arity primitive compatibility selection; neither samples nor
+    # invocation delegates are needed to select from a statically known signature.
+    static [int] SelectSignatures([type[][]]$Signatures,[type[]]$Sources){
         [int]$best=-1
         [bool]$ambiguous=$false
-        for([int]$c=0;$c -lt $Candidates.Length;$c++){
-            [type[]]$signature=$Candidates[$c].Parameters
-            if($signature.Length -ne $Arguments.Length){throw [ArgumentException]::new('Arity mismatch')}
+        for([int]$c=0;$c -lt $Signatures.Length;$c++){
+            [type[]]$signature=$Signatures[$c]
+            if($signature.Length -ne $Sources.Length){throw [ArgumentException]::new('Arity mismatch')}
             [bool]$valid=$true
             for([int]$i=0;$i -lt $signature.Length;$i++){
                 if(![ScriptTypePrimitiveConversion]::IsAdmitted($signature[$i])){throw [NotSupportedException]::new('Parameter outside supported domain')}
-                [int]$rank=[ScriptTypePrimitiveConversion]::Rank($sources[$i],$signature[$i])
+                [int]$rank=[ScriptTypePrimitiveConversion]::Rank($Sources[$i],$signature[$i])
                 if($rank -lt 0){throw [NotSupportedException]::new('Conversion rank outside supported domain')}
                 if($rank -eq 0){$valid=$false}
             }
             if(!$valid){continue}
             if($best -lt 0){$best=$c;continue}
-            [int]$comparison=[ScriptTypePrimitiveConversion]::Compare($Candidates[$best].Parameters,$signature,$sources)
+            [int]$comparison=[ScriptTypePrimitiveConversion]::Compare($Signatures[$best],$signature,$Sources)
             if($comparison -lt 0){$best=$c;$ambiguous=$false}
             elseif($comparison -eq 0){$ambiguous=$true}
         }
@@ -4522,6 +4591,7 @@ class PscElfImageReader {
         return $r
     }
 }
+    if($null -ne $SelectionSignatures){return [ScriptTypePrimitiveConversion]::SelectSignatures($SelectionSignatures,$SelectionSources)}
 }
 
 # Authoring-time metadata extraction; compiled runtime receives the resulting typed graph.
@@ -4630,6 +4700,7 @@ function Get-ScriptTypeContract {
         if($null -eq $Witness){return $DefaultType}
         return Resolve-AstType $Witness
     }
+    if($null -ne $SelectionSignatures){return Get-PscOtherFacultyDeclarations -SelectionSignatures $SelectionSignatures -SelectionSources $SelectionSources}
     if($null -ne $CompilerClassAsts -and $CompilerClassAsts.Length){
         if($null -ne $ContractPaths -and $ContractPaths.Length -or $null -eq $MaterializedTypes){throw 'Compiler signature realization requires one selected source scope'}
         $contracts=@(Get-ScriptTypeContract -DefinitionAsts $CompilerClassAsts -SignaturesOnly)
@@ -14268,38 +14339,14 @@ function Get-PscStructuralMembers {
     }
 }
 
-# Authoring-time SMA selection for a closed, value-typed numeric call.
-# MethodInformation describes the source signatures, not the CLR provider.
-# Numeric argument ranks are type-dependent; these boxed zeroes are representative values
-# of the already proven argument types, not execution of the source program.
-# The internal SMA ABI is pinned to the compiler's authoring runtime. Nothing
-# from this selector is emitted into the specialized assembly.
+# Closed numeric source operations use the same primitive compatibility
+# ranking as runtime ScriptType dispatch. CLR types describe only this
+# admitted compatibility fragment; no provider methods participate.
 function Select-PscStructuralNumericOverload {
     param([System.Management.Automation.Language.FunctionMemberAst[]]$Candidates,[type[]]$ArgumentTypes)
-    $sma=[psobject].Assembly
-    $mi=$sma.GetType('System.Management.Automation.MethodInformation',$true)
-    $pi=$sma.GetType('System.Management.Automation.ParameterInformation',$true)
-    $flags=[Reflection.BindingFlags]'Public,NonPublic,Instance'
-    $pc=$pi.GetConstructor($flags,$null,[type[]]@([type],[bool],[object],[bool]),$null)
-    $mc=$mi.GetConstructor($flags,$null,[type[]]@([bool],[bool],$pi.MakeArrayType()),$null)
-    $best=$sma.GetType('System.Management.Automation.Adapter',$true).GetMethod('FindBestMethod',[Reflection.BindingFlags]'NonPublic,Static')
-    if(!$pc -or !$mc -or !$best){throw 'Unsupported SMA authoring binder ABI.'}
-    $infos=[Array]::CreateInstance($mi,$Candidates.Length)
-    for($i=0;$i -lt $Candidates.Length;$i++){
-        $signature=Get-ParameterTypes $Candidates[$i]
-        $parameters=[Array]::CreateInstance($pi,$signature.Length)
-        for($j=0;$j -lt $signature.Length;$j++){
-            $parameters.SetValue($pc.Invoke([object[]]@($signature[$j],$false,$null,$false)), $j)
-        }
-        $infos.SetValue($mc.Invoke([object[]]@($false,$false,$parameters)), $i)
-    }
-    $sampleArguments=[object[]]::new($ArgumentTypes.Length)
-    for($i=0;$i -lt $ArgumentTypes.Length;$i++){$sampleArguments[$i]=[Activator]::CreateInstance($ArgumentTypes[$i])}
-    $invoke=[object[]]@($infos,$null,$false,$sampleArguments,$null,$null,$false,$false)
-    $selected=$best.Invoke($null,$invoke)
-    if($null -eq $selected){throw "Missing or ambiguous source operation: $($invoke[4]): $($invoke[5])"}
-    $index=[Array]::IndexOf($infos,$selected)
-    if($index -lt 0 -or $invoke[6] -or $invoke[7]){throw 'SMA selection requires an unsupported invocation form.'}
+    $signatures=[type[][]]::new($Candidates.Length)
+    for($candidateIndex=0;$candidateIndex -lt $Candidates.Length;$candidateIndex++){$signatures[$candidateIndex]=Get-ParameterTypes $Candidates[$candidateIndex]}
+    $index=Get-PscFacultyDeclarations -SelectionSignatures $signatures -SelectionSources $ArgumentTypes
     return $Candidates[$index]
 }
 
@@ -14712,7 +14759,7 @@ class PscApi {
         $objectives.Add([PscRoadmapObjective]::new('F5',[PscRoadmapState]::Planned,@('F1','F4'),'Canonical script, ordered tree and artifacts: deterministic realization and independently tested exact source, semantic identity and target realization recovery when requested. Explicit retention policy; development information must not impose execution dependencies. Keep compiled faculties optional.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('F6',[PscRoadmapState]::Planned,@('F0','F2','F4','R1','H1'),'Persistent PscHost, accepted/candidate workspaces, typed operations and PSRP; concurrent sessions, revision leases, restart recovery and constrained write admission. Agents use this same API; no second compiler or string-based control plane.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('L1',[PscRoadmapState]::Existing,@('F1'),'First-class PSC-owned STS and CTS definitions, references, signatures, constraints and compatibility relations; reconcile ScriptType with compiler declarations before extending value/generic types, interfaces, properties, events, visibility and namespaces. Use SMA-visible forms; prove supported definitions independent of runtime materialization.',@('PscAstRebuild','Export-LoweredAssembly','Get-ScriptTypeContract','Get-ScriptTypeReference','ScriptTypeReference','PscMaterializedSignature','ConvertTo-PscMaterializedSignatureType'),@('ScriptType'),@('SM/Test-Formats.ps1','Tests/Test-ScriptTypeReference.ps1','Tests/Test-ScriptTypeCompiler.ps1')))
-        $objectives.Add([PscRoadmapObjective]::new('L2',[PscRoadmapState]::Planned,@('L1'),'Explicit program semantics profiles; independent typed binding, structural compatibility, inference and conversion; consolidate duplicate binders. Test declared differences from SMA and CTS, null/overflow/conversion/exception semantics, ambiguity and target parity without requiring runtime materialization.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('L2',[PscRoadmapState]::Planned,@('L1'),'Explicit program semantics profiles; independent typed binding, structural compatibility, inference and conversion; consolidate duplicate binders. Test declared differences from SMA and CTS, null/overflow/conversion/exception semantics, ambiguity and target parity without requiring runtime materialization.',@('ScriptTypePrimitiveConversion','Select-PscStructuralNumericOverload'),@('PrimitiveConversion'),@('Tests/Test-ScriptTypeSelection.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('L3',[PscRoadmapState]::Planned,@('F2','L1','L2'),'Managed CLI realization from bound definitions; close compiler refusals using complete pinned application sources, non-loading metadata and executable repros; no stubs counted as completion. Deterministic PE, entry points, callbacks, static graphs, reachability, dependencies, independent execution and CTS interoperability.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('I1',[PscRoadmapState]::Planned,@('F2','F3'),'Inventory donor declarations and contracts, hashes, dependencies, licenses, historical revisions and evidence; reconcile duplicate mechanisms and admit typed source into PSC only.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('I2',[PscRoadmapState]::Existing,@('F2','L1'),'CTS metadata and CIL intake into PSC-owned definitions without runtime materialization: decode signatures, control flow, exception regions and generics; reconstruct admitted typed source and compare behavior and retained semantic identity. Retain explicit unsupported cases; not arbitrary decompilation.',@('Import-PscCilAssembly','Read-PscCilMethod'),@(),@('SM/Test-Formats.ps1')))
