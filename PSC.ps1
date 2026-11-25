@@ -458,7 +458,9 @@ param(
     [int] $NativeFrameBytes,
     [int] $NativeIntegerArguments,
     [int] $NativeFloatArguments,
-    [ValidateSet('I32','F64','Void')][string] $NativeReturnKind = 'I32',
+    # Explicit SysV leaf ABI: first parameter is a caller-pinned, nonnull float cell.
+    [switch] $NativeBorrowedCell,
+    [ValidateSet('I32','F32','F64','Void')][string] $NativeReturnKind = 'I32',
     [string[]] $LinkInput,
     [string[]] $LibraryDirectory,
     [string[]] $DefaultLibrary,
@@ -2241,13 +2243,20 @@ class PscNativeEncoding {
         elseif($op -eq 'jz' -or $op -eq 'jnz' -or $op -eq 'jae'){$out.Add(0x0F);[byte]$cc=0x84;if($op -eq 'jnz'){$cc=0x85}elseif($op -eq 'jae'){$cc=0x83};$out.Add($cc);$out.AddRange([PscNativeEncoding]::X64Imm32($RipDisplacement))}
         elseif($op -eq 'jmp'){$out.Add(0xE9);$out.AddRange([PscNativeEncoding]::X64Imm32($RipDisplacement))}
         elseif($op -eq 'call-import' -or $op -eq 'call-data' -or $op -eq 'tail'){$out.Add(0xFF);if($op -eq 'tail'){$out.Add(0x25)}else{$out.Add(0x15)};$out.AddRange([PscNativeEncoding]::X64Imm32($RipDisplacement))}
-        elseif($op -in 'load32-stack','store32-stack','loadsd-stack','storesd-stack'){
-            [int]$reg=$s.Dst;[bool]$store=$op -in 'store32-stack','storesd-stack';if($store){$reg=$s.Src}
+        elseif($op -in 'load32-stack','store32-stack','loadsd-stack','storesd-stack','loadss-stack','storess-stack'){
+            [int]$reg=$s.Dst;[bool]$store=$op -in 'store32-stack','storesd-stack','storess-stack';if($store){$reg=$s.Src}
             [PscNativeEncoding]::Range($s.Disp,0,2147483647L)
-            [bool]$fp=$op -in 'loadsd-stack','storesd-stack';if($fp){$out.Add(0xF2)}
+            [bool]$fp=$op -in 'loadsd-stack','storesd-stack','loadss-stack','storess-stack';if($fp){if($op -in 'loadss-stack','storess-stack'){$out.Add(0xF3)}else{$out.Add(0xF2)}}
             $out.AddRange([PscNativeEncoding]::X64Rex($false,$reg,0,$false))
             if($fp){$out.Add(0x0F);if($store){$out.Add(0x11)}else{$out.Add(0x10)}}elseif($store){$out.Add(0x89)}else{$out.Add(0x8B)}
             $out.Add([PscNativeEncoding]::X64ModRm(2,$reg -band 7,4));$out.Add(0x24);$out.AddRange([PscNativeEncoding]::X64Imm32($s.Disp))
+        }
+        elseif($op -in 'loadss-cell','storess-cell'){
+            [int]$reg=$s.Dst;[bool]$store=$op -eq 'storess-cell';if($store){$reg=$s.Src}
+            $out.Add(0xF3);$out.AddRange([PscNativeEncoding]::X64Rex($false,$reg,0,$false));$out.Add(0x0F);if($store){$out.Add(0x11)}else{$out.Add(0x10)}
+            # Only [rdi], no offset or index. The native leaf gate admits this
+            # operand exclusively under the explicit borrowed-cell signature.
+            $out.Add([PscNativeEncoding]::X64ModRm(0,$reg -band 7,7))
         }
         elseif($op -in 'sub-rsp32','add-rsp32'){
             [PscNativeEncoding]::Range($s.Imm,0,2147483647L);$out.Add(0x48);$out.Add(0x81);if($op -eq 'sub-rsp32'){$out.Add(0xEC)}else{$out.Add(0xC4)};$out.AddRange([PscNativeEncoding]::X64Imm32($s.Imm))
@@ -2262,9 +2271,9 @@ class PscNativeEncoding {
             $out.Add(0x0F);if($op -eq 'setl-al'){$out.Add(0x9C)}elseif($op -eq 'setg-al'){$out.Add(0x9F)}else{$out.Add(0x94)};$out.Add(0xC0)
         }
         elseif($op -eq 'movzx-eax-al'){$out.Add(0x0F);$out.Add(0xB6);$out.Add(0xC0)}
-        elseif($op -in 'addsd','subsd','mulsd','divsd'){
-            $out.Add(0xF2);$out.AddRange([PscNativeEncoding]::X64Rex($false,$s.Dst,$s.Src,$false));$out.Add(0x0F)
-            if($op -eq 'addsd'){$out.Add(0x58)}elseif($op -eq 'mulsd'){$out.Add(0x59)}elseif($op -eq 'subsd'){$out.Add(0x5C)}else{$out.Add(0x5E)}
+        elseif($op -in 'addsd','subsd','mulsd','divsd','addss','subss','mulss','divss','cvtss2sd','cvtsd2ss','cvtsi2ss','cvtsi2sd'){
+            if($op -in 'addss','subss','mulss','divss','cvtss2sd','cvtsi2ss'){$out.Add(0xF3)}else{$out.Add(0xF2)};$out.AddRange([PscNativeEncoding]::X64Rex($false,$s.Dst,$s.Src,$false));$out.Add(0x0F)
+            if($op -in 'addsd','addss'){$out.Add(0x58)}elseif($op -in 'mulsd','mulss'){$out.Add(0x59)}elseif($op -in 'subsd','subss'){$out.Add(0x5C)}elseif($op -in 'divsd','divss'){$out.Add(0x5E)}elseif($op -in 'cvtss2sd','cvtsd2ss'){$out.Add(0x5A)}else{$out.Add(0x2A)}
             $out.Add([PscNativeEncoding]::X64ModRm(3,$s.Dst -band 7,$s.Src -band 7))
         }
         elseif($op -eq 'ret'){$out.Add(0xC3)}
@@ -2276,17 +2285,20 @@ class PscNativeEncoding {
     }
     static [PscNativeInstruction] ReadX64([byte[]]$Image,[int]$At){
         [PscNativeEncoding]::RequireBytes($Image,$At,1)
-        [int]$p=$At;[int]$w=0;[int]$r=0;[int]$b=0;[bool]$fp=$Image[$p] -eq 0xF2;if($fp){$p++;[PscNativeEncoding]::RequireBytes($Image,$p,1)}
+        [int]$p=$At;[int]$w=0;[int]$r=0;[int]$b=0;[bool]$single=$Image[$p] -eq 0xF3;[bool]$fp=$single -or $Image[$p] -eq 0xF2;if($fp){$p++;[PscNativeEncoding]::RequireBytes($Image,$p,1)}
         if(($Image[$p] -band 0xF0) -eq 0x40){[int]$rex=$Image[$p];if(($rex -band 2) -ne 0){throw [NotSupportedException]::new('REX.X not admitted')};$w=($rex -shr 3) -band 1;$r=(($rex -shr 2) -band 1)*8;$b=($rex -band 1)*8;$p++;[PscNativeEncoding]::RequireBytes($Image,$p,1)}
         [int]$op=$Image[$p];[PscNativeInstruction]$s=[PscNativeInstruction]::new('');$s.Is64=$w -ne 0;[int]$end=$p+1
         if($fp){
             [PscNativeEncoding]::RequireBytes($Image,$p,3);if($op -ne 0x0F -or $w -ne 0){throw [NotSupportedException]::new('Invalid SSE2 prefix')}
             [int]$second=$Image[$p+1];[int]$m=$Image[$p+2];[int]$reg=(($m -shr 3) -band 7)+$r;[int]$rm=($m -band 7)+$b
-            if($second -eq 0x10 -or $second -eq 0x11){
+            if($single -and ($second -eq 0x10 -or $second -eq 0x11) -and ($m -shr 6) -eq 0 -and $rm -eq 7){
+                $s.Op='loadss-cell';$s.Dst=$reg;$s.Base=7;if($second -eq 0x11){$s.Op='storess-cell';$s.Src=$reg};$end=$p+3
+            }
+            elseif($second -eq 0x10 -or $second -eq 0x11){
                 [PscNativeEncoding]::RequireBytes($Image,$p,8);if(($m -shr 6) -ne 2 -or $rm -ne 4 -or $Image[$p+3] -ne 0x24){throw [NotSupportedException]::new('Unsupported SSE2 stack form')}
-                $s.Op='loadsd-stack';$s.Dst=$reg;if($second -eq 0x11){$s.Op='storesd-stack';$s.Src=$reg};$s.Disp=[BitConverter]::ToInt32($Image,$p+4);$end=$p+8
+                $s.Op='loadsd-stack';if($single){$s.Op='loadss-stack'};$s.Dst=$reg;if($second -eq 0x11){$s.Op='storesd-stack';if($single){$s.Op='storess-stack'};$s.Src=$reg};$s.Disp=[BitConverter]::ToInt32($Image,$p+4);$end=$p+8
             }elseif(($m -shr 6) -eq 3){
-                if($second -eq 0x58){$s.Op='addsd'}elseif($second -eq 0x59){$s.Op='mulsd'}elseif($second -eq 0x5C){$s.Op='subsd'}elseif($second -eq 0x5E){$s.Op='divsd'}else{throw [NotSupportedException]::new('Unsupported SSE2 operation')}
+                if($second -eq 0x58){$s.Op='addsd';if($single){$s.Op='addss'}}elseif($second -eq 0x59){$s.Op='mulsd';if($single){$s.Op='mulss'}}elseif($second -eq 0x5C){$s.Op='subsd';if($single){$s.Op='subss'}}elseif($second -eq 0x5E){$s.Op='divsd';if($single){$s.Op='divss'}}elseif($second -eq 0x5A){$s.Op='cvtsd2ss';if($single){$s.Op='cvtss2sd'}}elseif($second -eq 0x2A){$s.Op='cvtsi2sd';if($single){$s.Op='cvtsi2ss'}}else{throw [NotSupportedException]::new('Unsupported SSE2 operation')}
                 $s.Dst=$reg;$s.Src=$rm;$end=$p+3
             }else{throw [NotSupportedException]::new('Unsupported SSE2 addressing')}
         }
@@ -13090,10 +13102,13 @@ function Assert-PscCilType([type] $Type,[Reflection.Assembly] $Source) {
     if ($Type.HasElementType) { Assert-PscCilType $Type.GetElementType() $Source }
     if ($Type.IsGenericType) { foreach ($argument in $Type.GetGenericArguments()) { Assert-PscCilType $argument $Source } }
 }
-function Read-PscCilMethod([Reflection.MethodInfo] $Method) {
+function Read-PscCilMethod([Reflection.MethodInfo] $Method,[switch]$BorrowedCell) {
     if (!$Method.IsStatic -or !$Method.IsPublic -or $Method.IsGenericMethod -or $Method.ContainsGenericParameters) { throw 'CIL import requires a public nongeneric static method.' }
     Assert-PscCilType $Method.ReturnType $Method.Module.Assembly
-    foreach ($p in $Method.GetParameters()) { Assert-PscCilType $p.ParameterType $Method.Module.Assembly }
+    foreach ($p in $Method.GetParameters()) {
+        if($BorrowedCell -and $p.Position -eq 0 -and $p.ParameterType -eq [float].MakeByRefType()){continue}
+        Assert-PscCilType $p.ParameterType $Method.Module.Assembly
+    }
     $body = $Method.GetMethodBody()
     if ($null -eq $body) { throw 'No managed CIL body.' }
     $bytes = $body.GetILAsByteArray()
@@ -13107,6 +13122,7 @@ function Read-PscCilMethod([Reflection.MethodInfo] $Method) {
     foreach ($local in $result.Locals) { if ($local.IsPinned) { throw 'Pinned CIL local not yet admitted.' }; Assert-PscCilType $local.LocalType $Method.Module.Assembly }
     # Admit the concrete projection instruction family; extend only with tests.
     $allowed=[Collections.Generic.HashSet[string]]::new([string[]]('add add.ovf br br.s brfalse brfalse.s brtrue brtrue.s call callvirt castclass ceq cgt cgt.un clt conv.i4 conv.r4 conv.r8 div dup endfinally isinst ldarg.0 ldarg.1 ldarg.2 ldarg.3 ldarg ldarg.s ldc.i4 ldc.i4.m1 ldc.i4.0 ldc.i4.1 ldc.i4.2 ldc.i4.3 ldc.i4.4 ldc.i4.5 ldc.i4.6 ldc.i4.7 ldc.i4.8 ldc.i4.s ldc.r8 ldc.r4 ldc.i8 ldelem.r4 ldelem.ref ldfld ldlen ldloc.0 ldloc.1 ldloc.2 ldloc.3 ldloc.s ldloc ldnull leave leave.s mul mul.ovf neg newarr nop pop ret stelem.r4 stloc.0 stloc.1 stloc.2 stloc.3 stloc.s stloc sub sub.ovf'.Split(' ')),[StringComparer]::Ordinal)
+    if($BorrowedCell){[void]$allowed.Add('ldind.r4');[void]$allowed.Add('stind.r4')}
     $list=[Collections.Generic.List[PscCilInstruction]]::new(); $i=0; $decoder=[PscCilByteCursor]::new($bytes)
     while ($i -lt $bytes.Length) {
         $r=$decoder.Next();$i=$r.Offset+$r.Opcode.Size; if (!$allowed.Contains($r.Opcode.Name)) { throw "Unsupported CIL opcode $($r.Opcode.Name) at $($r.Offset)." }
@@ -13263,6 +13279,11 @@ function ConvertTo-PscIr([PscCilMethod]$Body) {
             elseif($n -in 'castclass','isinst'){$node.Inputs=Pop-PscIrValues $stack 1 $c.Offset;$type=[type]$c.Operand}
             elseif($n -eq 'newarr'){$node.Inputs=Pop-PscIrValues $stack 1 $c.Offset;Assert-PscIrAssignment $ir.Types[$node.Inputs[0]] ([int]) $c.Offset;$element=$c.Operand;$type=$element.MakeArrayType()}
             elseif($n -eq 'ldlen'){$node.Inputs=Pop-PscIrValues $stack 1 $c.Offset;if(!$ir.Types[$node.Inputs[0]].IsArray){throw 'ldlen requires array'};$type=[UIntPtr]}
+            elseif($n -in 'ldind.r4','stind.r4'){
+                $count=1;if($n -eq 'stind.r4'){$count=2};$node.Inputs=Pop-PscIrValues $stack $count $c.Offset
+                if($ir.Types[$node.Inputs[0]] -ne [float].MakeByRefType()){throw 'Indirect scalar access requires float&'}
+                if($n -eq 'ldind.r4'){$type=[float]}elseif($ir.Types[$node.Inputs[1]] -ne [float]){throw 'Indirect scalar store requires explicit float value'}
+            }
             elseif($n -in 'ldelem.r4','ldelem.ref','stelem.r4'){
                 $count=2;if($n -eq 'stelem.r4'){$count=3};$node.Inputs=Pop-PscIrValues $stack $count $c.Offset;$arr=$ir.Types[$node.Inputs[0]];if(!$arr.IsArray){throw 'Array operation requires array'};Assert-PscIrAssignment $ir.Types[$node.Inputs[1]] ([int]) $c.Offset
                 if($n -eq 'ldelem.ref'){$type=$arr.GetElementType();if($type.IsValueType){throw 'ldelem.ref requires reference elements'}}else{if($arr -ne [float[]]){throw 'Expected float array'};if($n -eq 'ldelem.r4'){$type=[float]}else{Assert-PscIrAssignment $ir.Types[$node.Inputs[2]] ([float]) $c.Offset}}
@@ -13308,12 +13329,13 @@ function ConvertTo-PscIr([PscCilMethod]$Body) {
     $ir.Types=$finalTypes
     return $ir
 }
-function Assert-PscScalarIr([PscIrMethod]$Ir) {
+function Assert-PscScalarIr([PscIrMethod]$Ir,[switch]$BorrowedCell) {
     if($Ir.Source.Handlers.Length){throw 'Scalar lowering does not support exception regions'}
     foreach($t in @($Ir.Types)+@($Ir.Source.Method.GetParameters() | ForEach-Object ParameterType)+@($Ir.Source.Locals | ForEach-Object LocalType)+@($Ir.Source.Method.ReturnType)){
-        if($t -notin [int],[long],[double],[void]){throw "Scalar lowering does not admit $t"}
+        if($BorrowedCell -and $t -eq [float].MakeByRefType()){continue}
+        if($t -notin [int],[long],[float],[double],[void]){throw "Scalar lowering does not admit $t"}
     }
-    foreach($block in $Ir.Blocks){foreach($n in $block.Instructions){if($n.Operation -notin 'arg','local.read','local.write','constant','add','sub','mul','div','add.ovf','sub.ovf','mul.ovf','ceq','clt','cgt','cgt.un','neg','conv.i4','conv.r8','jump','branch','return','pop','nop'){throw "Scalar lowering does not admit $($n.Operation)"}}}
+    foreach($block in $Ir.Blocks){foreach($n in $block.Instructions){if($BorrowedCell -and $n.Operation -in 'ldind.r4','stind.r4'){continue};if($n.Operation -notin 'arg','local.read','local.write','constant','add','sub','mul','div','add.ovf','sub.ovf','mul.ovf','ceq','clt','cgt','cgt.un','neg','conv.i4','conv.r4','conv.r8','jump','branch','return','pop','nop'){throw "Scalar lowering does not admit $($n.Operation)"}}}
 }
 function Write-PscIrEdge($IL,[PscIrEdge]$Edge,$Blocks,$Values,$Labels){
     $dest=$Blocks[$Edge.Target];foreach($id in $Edge.Arguments){$IL.Emit([Reflection.Emit.OpCodes]::Ldloc,$Values[$id])}
@@ -13341,7 +13363,7 @@ function Write-PscScalarIr([PscIrMethod]$Ir,[Reflection.Emit.MethodBuilder]$Buil
                 'arg'{$il.Emit([Reflection.Emit.OpCodes]::Ldarg,[int16]$n.Operand)}
                 'local.read'{$il.Emit([Reflection.Emit.OpCodes]::Ldloc,$locals[[int]$n.Operand])}
                 'local.write'{$il.Emit([Reflection.Emit.OpCodes]::Stloc,$locals[[int]$n.Operand])}
-                'constant'{if($Ir.Types[$n.Result] -eq [int]){$il.Emit([Reflection.Emit.OpCodes]::Ldc_I4,[int]$n.Operand)}elseif($Ir.Types[$n.Result] -eq [long]){$il.Emit([Reflection.Emit.OpCodes]::Ldc_I8,[long]$n.Operand)}else{$il.Emit([Reflection.Emit.OpCodes]::Ldc_R8,[double]$n.Operand)}}
+                'constant'{if($Ir.Types[$n.Result] -eq [int]){$il.Emit([Reflection.Emit.OpCodes]::Ldc_I4,[int]$n.Operand)}elseif($Ir.Types[$n.Result] -eq [long]){$il.Emit([Reflection.Emit.OpCodes]::Ldc_I8,[long]$n.Operand)}elseif($Ir.Types[$n.Result] -eq [float]){$il.Emit([Reflection.Emit.OpCodes]::Ldc_R4,[float]$n.Operand)}else{$il.Emit([Reflection.Emit.OpCodes]::Ldc_R8,[double]$n.Operand)}}
                 'return'{$il.Emit([Reflection.Emit.OpCodes]::Ret);$terminated=$true}
                 default{$il.Emit($n.Opcode)}
             }
@@ -13371,10 +13393,10 @@ function Add-PscX64IrStep([PscX64IrPlan]$Plan,[string]$Op,[int]$Dst=0,[int]$Src=
 }
 function Add-PscX64IrLabel([PscX64IrPlan]$Plan,[int]$Label){$s=[PscX64IrStep]::new();$s.Label=$Label;$Plan.Steps.Add($s)}
 function Add-PscX64IrLoad([PscX64IrPlan]$Plan,[type]$Type,[int]$Reg,[int]$Slot){
-    $op='load32-stack';if($Type -eq [double]){$op='loadsd-stack'};Add-PscX64IrStep $Plan $op $Reg 0 (8*$Slot)
+    $op='load32-stack';if($Type -eq [double]){$op='loadsd-stack'}elseif($Type -eq [float]){$op='loadss-stack'};Add-PscX64IrStep $Plan $op $Reg 0 (8*$Slot)
 }
 function Add-PscX64IrStore([PscX64IrPlan]$Plan,[type]$Type,[int]$Reg,[int]$Slot){
-    $op='store32-stack';if($Type -eq [double]){$op='storesd-stack'};Add-PscX64IrStep $Plan $op 0 $Reg (8*$Slot)
+    $op='store32-stack';if($Type -eq [double]){$op='storesd-stack'}elseif($Type -eq [float]){$op='storess-stack'};Add-PscX64IrStep $Plan $op 0 $Reg (8*$Slot)
 }
 function Add-PscX64IrEdge([PscX64IrPlan]$Plan,[PscIrMethod]$Ir,[PscIrEdge]$Edge,$Blocks,[int]$ValueBase,[int]$EdgeBase){
     $dest=$Blocks[$Edge.Target]
@@ -13384,15 +13406,36 @@ function Add-PscX64IrEdge([PscX64IrPlan]$Plan,[PscIrMethod]$Ir,[PscIrEdge]$Edge,
     for($i=0;$i -lt $dest.Parameters.Length;$i++){$id=$dest.Parameters[$i];Add-PscX64IrLoad $Plan $Ir.Types[$id] 0 ($EdgeBase+$i);Add-PscX64IrStore $Plan $Ir.Types[$id] 0 ($ValueBase+$id)}
     Add-PscX64IrStep $Plan 'jmp' -Target $Edge.Target
 }
-function ConvertTo-PscX64IrPlan([PscIrMethod]$Ir){
-    Assert-PscScalarIr $Ir
+function ConvertTo-PscX64IrPlan([PscIrMethod]$Ir,[switch]$BorrowedCell){
+    Assert-PscScalarIr $Ir -BorrowedCell:$BorrowedCell
     $signature=[type[]]@($Ir.Source.Method.GetParameters() | ForEach-Object ParameterType);$returnType=$Ir.Source.Method.ReturnType
-    foreach($t in @($signature)+@($Ir.Source.Locals | ForEach-Object LocalType)+@($Ir.Types)+@($returnType)){if($t -notin [int],[double],[void]){throw "SysV leaf does not admit $t"}}
+    $cellType=[float].MakeByRefType()
+    if($BorrowedCell){
+        if(!$signature.Length -or $signature[0] -ne $cellType){throw 'Borrowed-cell leaf requires a first float& parameter'}
+        for($i=1;$i -lt $signature.Length;$i++){if($signature[$i].IsByRef){throw 'Only one borrowed cell is admitted'}}
+        foreach($l in $Ir.Source.Locals){if($l.LocalType.IsByRef){throw 'Borrowed cell cannot be stored in locals'}}
+        if($returnType.IsByRef){throw 'Borrowed cell cannot escape as return value'}
+    }
+    foreach($t in @($signature)+@($Ir.Source.Locals | ForEach-Object LocalType)+@($Ir.Types)+@($returnType)){
+        if($BorrowedCell -and $t -eq $cellType){continue};if($t -notin [int],[float],[double],[void]){throw "SysV leaf does not admit $t"}
+    }
+    # The cell is never materialized into a virtual-value slot. Each indirect
+    # instruction must consume a direct, block-local ldarg.0 identity.
+    $cellValues=[Collections.Generic.HashSet[int]]::new()
+    foreach($b in $Ir.Blocks){
+        foreach($id in $b.Parameters){if($Ir.Types[$id].IsByRef){throw 'Borrowed cell cannot cross an IR edge'}}
+        foreach($n in $b.Instructions){if($n.Result -ge 0 -and $Ir.Types[$n.Result].IsByRef){if(!$BorrowedCell -or $n.Operation -ne 'arg' -or [int]$n.Operand -ne 0){throw 'Borrowed cell origin not admitted'};[void]$cellValues.Add($n.Result)}}
+    }
     if(!$Ir.Source.InitLocals -and $Ir.Source.Locals.Length){throw 'Uninitialized local storage not admitted by native leaf'}
     foreach($b in $Ir.Blocks){foreach($n in $b.Instructions){
-        if($n.Operation -notin 'arg','local.read','local.write','constant','add','sub','mul','div','ceq','clt','cgt','jump','branch','return','pop','nop'){throw "SysV leaf does not admit $($n.Operation) at CIL $($n.Offset)"}
+        for($i=0;$i -lt $n.Inputs.Length;$i++){if($Ir.Types[$n.Inputs[$i]].IsByRef -and (!$BorrowedCell -or $i -ne 0 -or $n.Operation -notin 'ldind.r4','stind.r4' -or !$cellValues.Contains($n.Inputs[$i]))){throw 'Borrowed cell use would escape the admitted indirect operation'}}
+        if($BorrowedCell -and $n.Operation -in 'ldind.r4','stind.r4'){continue}
+        if($n.Operation -notin 'arg','local.read','local.write','constant','add','sub','mul','div','ceq','clt','cgt','conv.r4','conv.r8','jump','branch','return','pop','nop'){throw "SysV leaf does not admit $($n.Operation) at CIL $($n.Offset)"}
         if($n.Operation -in 'ceq','clt','cgt','branch' -and $Ir.Types[$n.Inputs[0]] -ne [int]){throw 'Native floating comparison not yet admitted'}
-        if($n.Operation -eq 'div' -and $Ir.Types[$n.Result] -ne [double]){throw 'Native integer division needs exception realization'}
+        if($n.Operation -eq 'div' -and $Ir.Types[$n.Result] -notin [float],[double]){throw 'Native integer division needs exception realization'}
+        if($n.Operation -in 'add','sub','mul','div' -and $Ir.Types[$n.Inputs[0]] -ne $Ir.Types[$n.Inputs[1]]){throw 'Mixed precision arithmetic requires explicit conversion'}
+        if($n.Operation -eq 'local.write' -and $Ir.Types[$n.Inputs[0]] -ne $Ir.Source.Locals[[int]$n.Operand].LocalType){throw 'Mixed precision local write requires explicit conversion'}
+        if($n.Operation -eq 'return' -and $n.Inputs.Length -and $Ir.Types[$n.Inputs[0]] -ne $returnType){throw 'Mixed precision return requires explicit conversion'}
     }}
     $plan=[PscX64IrPlan]::new();$argCount=$signature.Length;$localBase=$argCount;$valueBase=$localBase+$Ir.Source.Locals.Length;$edgeBase=$valueBase+$Ir.Types.Count;$plan.ValueSlots=$Ir.Types.Count
     $maxEdge=0;$blocks=[Collections.Generic.Dictionary[int,PscIrBlock]]::new()
@@ -13402,8 +13445,9 @@ function ConvertTo-PscX64IrPlan([PscIrMethod]$Ir){
     $integerRegisters=[int[]]@(7,6,2,1,8,9);$integerAt=0;$fpAt=0
     Add-PscX64IrStep $plan 'sub-rsp32' -Immediate $plan.FrameBytes
     for($i=0;$i -lt $argCount;$i++){
+        if($BorrowedCell -and $signature[$i] -eq $cellType){$integerAt++;continue}
         if($signature[$i] -eq [int]){if($integerAt -ge $integerRegisters.Length){throw 'Stack-passed integer arguments not yet admitted'};Add-PscX64IrStore $plan ([int]) $integerRegisters[$integerAt] $i;$integerAt++}
-        else{if($fpAt -ge 8){throw 'Stack-passed floating arguments not yet admitted'};Add-PscX64IrStore $plan ([double]) $fpAt $i;$fpAt++}
+        else{if($fpAt -ge 8){throw 'Stack-passed floating arguments not yet admitted'};Add-PscX64IrStore $plan $signature[$i] $fpAt $i;$fpAt++}
     }
     if($Ir.Source.Locals.Length){Add-PscX64IrStep $plan 'xor32' 0;for($i=0;$i -lt $Ir.Source.Locals.Length;$i++){Add-PscX64IrStore $plan ([int]) 0 ($localBase+$i);if($Ir.Source.Locals[$i].LocalType -eq [double]){Add-PscX64IrStep $plan 'store32-stack' -Src 0 -Immediate (8*($localBase+$i)+4)}}}
     $nextLabel=$Ir.Source.Length+1
@@ -13412,6 +13456,9 @@ function ConvertTo-PscX64IrPlan([PscIrMethod]$Ir){
         foreach($n in $b.Instructions){
             $op=$n.Operation
             if($op -eq 'nop' -or $op -eq 'pop'){continue}
+            if($BorrowedCell -and $op -eq 'arg' -and $cellValues.Contains($n.Result)){continue}
+            if($op -eq 'ldind.r4'){Add-PscX64IrStep $plan 'loadss-cell';Add-PscX64IrStore $plan ([float]) 0 ($valueBase+$n.Result);continue}
+            if($op -eq 'stind.r4'){Add-PscX64IrLoad $plan ([float]) 0 ($valueBase+$n.Inputs[1]);Add-PscX64IrStep $plan 'storess-cell';continue}
             if($op -eq 'jump'){Add-PscX64IrEdge $plan $Ir $b.Edges[0] $blocks $valueBase $edgeBase;$terminated=$true;continue}
             if($op -eq 'branch'){
                 Add-PscX64IrLoad $plan ([int]) 0 ($valueBase+$n.Inputs[0]);Add-PscX64IrStep $plan 'test32' 0
@@ -13428,13 +13475,19 @@ function ConvertTo-PscX64IrPlan([PscIrMethod]$Ir){
             elseif($op -eq 'local.read'){Add-PscX64IrLoad $plan $type 0 ($localBase+[int]$n.Operand)}
             elseif($op -eq 'constant'){
                 if($type -eq [double]){[byte[]]$bits=[BitConverter]::GetBytes([double]$n.Operand);$disp=8*($valueBase+$n.Result);Add-PscX64IrStep $plan 'movimm32' 0 -Immediate ([BitConverter]::ToInt32($bits,0));Add-PscX64IrStep $plan 'store32-stack' -Src 0 -Immediate $disp;Add-PscX64IrStep $plan 'movimm32' 0 -Immediate ([BitConverter]::ToInt32($bits,4));Add-PscX64IrStep $plan 'store32-stack' -Src 0 -Immediate ($disp+4);continue}
+                if($type -eq [float]){Add-PscX64IrStep $plan 'movimm32' 0 -Immediate ([BitConverter]::SingleToInt32Bits([float]$n.Operand));Add-PscX64IrStep $plan 'store32-stack' -Src 0 -Immediate (8*($valueBase+$n.Result));continue}
                 Add-PscX64IrStep $plan 'movimm32' 0 -Immediate ([int]$n.Operand)
+            }
+            elseif($op -in 'conv.r4','conv.r8'){
+                $a=$n.Inputs[0];$from=$Ir.Types[$a];Add-PscX64IrLoad $plan $from 0 ($valueBase+$a)
+                if($from -eq [int]){$conv='cvtsi2sd';if($type -eq [float]){$conv='cvtsi2ss'};Add-PscX64IrStep $plan $conv 0 0}
+                elseif($from -ne $type){$conv='cvtsd2ss';if($type -eq [double]){$conv='cvtss2sd'};Add-PscX64IrStep $plan $conv 0 0}
             }
             else{
                 $a=$n.Inputs[0];$z=$n.Inputs[1];$operandType=$Ir.Types[$a];Add-PscX64IrLoad $plan $operandType 0 ($valueBase+$a);Add-PscX64IrLoad $plan $operandType 1 ($valueBase+$z)
                 if($op -in 'ceq','clt','cgt'){
                     Add-PscX64IrStep $plan 'cmp32' 0 1;$cc='sete-al';if($op -eq 'clt'){$cc='setl-al'}elseif($op -eq 'cgt'){$cc='setg-al'};Add-PscX64IrStep $plan $cc;Add-PscX64IrStep $plan 'movzx-eax-al'
-                }elseif($operandType -eq [double]){Add-PscX64IrStep $plan ($op+'sd') 0 1}
+                }elseif($operandType -eq [double]){Add-PscX64IrStep $plan ($op+'sd') 0 1}elseif($operandType -eq [float]){Add-PscX64IrStep $plan ($op+'ss') 0 1}
                 else{$machineOp=$op+'32';if($op -eq 'mul'){$machineOp='imul32'};Add-PscX64IrStep $plan $machineOp 0 1}
             }
             Add-PscX64IrStore $plan $type 0 ($valueBase+$n.Result)
@@ -13469,8 +13522,9 @@ class PscX64LeafState {
         return $before -ne ($this.Gpr.Count+$this.Xmm.Count+$this.Words.Count) -or $priorFlags -ne $this.Flags -or $priorAl -ne $this.Al
     }
 }
-function Test-PscX64LeafAbi([byte[]]$Code,[int]$FrameBytes,[int]$IntegerArguments=0,[int]$FloatArguments=0,[string]$ReturnKind='I32'){
-    if($IntegerArguments -lt 0 -or $IntegerArguments -gt 6 -or $FloatArguments -lt 0 -or $FloatArguments -gt 8 -or $ReturnKind -notin 'I32','F64','Void'){throw 'Invalid SysV leaf signature'}
+function Test-PscX64LeafAbi([byte[]]$Code,[int]$FrameBytes,[int]$IntegerArguments=0,[int]$FloatArguments=0,[string]$ReturnKind='I32',[switch]$BorrowedCell){
+    if($BorrowedCell -and $IntegerArguments -lt 1){throw 'Borrowed cell requires the first integer-class ABI argument'}
+    if($IntegerArguments -lt 0 -or $IntegerArguments -gt 6 -or $FloatArguments -lt 0 -or $FloatArguments -gt 8 -or $ReturnKind -notin 'I32','F32','F64','Void'){throw 'Invalid SysV leaf signature'}
     $decoded=[Collections.Generic.Dictionary[int,object]]::new();$pc=0
     while($pc -lt $Code.Length){$d=[PscNativeEncoding]::ReadX64($Code,$pc);if($d.Length -le 0 -or $d.Length -gt $Code.Length-$pc){throw 'Bad instruction length'};$decoded.Add($pc,$d);$pc+=$d.Length}
     if(!$decoded.Count -or $decoded[0].Op -ne 'sub-rsp32' -or $decoded[0].Imm -ne $FrameBytes -or $FrameBytes -lt 0 -or ($FrameBytes -band 15) -ne 0 -or $FrameBytes -gt 4096){throw 'Invalid leaf frame prologue'}
@@ -13482,21 +13536,27 @@ function Test-PscX64LeafAbi([byte[]]$Code,[int]$FrameBytes,[int]$IntegerArgument
         switch($d.Op){
             'sub-rsp32'{if($pc -ne 0 -or $s.Depth -ne 0){throw 'Unexpected stack allocation'};$s.Depth+=[int]$d.Imm;$s.Flags=$true}
             'add-rsp32'{if($s.Depth -ne $FrameBytes -or $d.Imm -ne $FrameBytes){throw 'Unbalanced stack release'};$s.Depth-=[int]$d.Imm;$s.Flags=$true;if(!$decoded.ContainsKey($next) -or $decoded[$next].Op -ne 'ret'){throw 'Stack release must lead directly to ret'}}
-            'ret'{if($s.Depth -ne 0){throw 'Unbalanced stack at return'};if(($ReturnKind -eq 'I32' -and !$s.Gpr.Contains(0)) -or ($ReturnKind -eq 'F64' -and !$s.Xmm.Contains(0))){throw 'Undefined ABI return register'};$returns++}
-            {$_ -in 'load32-stack','store32-stack','loadsd-stack','storesd-stack'}{
-                $width=4;$reg=$d.Dst;$store=$_ -in 'store32-stack','storesd-stack';if($store){$reg=$d.Src};$fp=$_ -in 'loadsd-stack','storesd-stack'
-                if($fp){$width=8;if($reg -lt 0 -or $reg -gt 15){throw 'Invalid XMM register'};$defined=$s.Xmm}else{if($reg -notin $gpr){throw 'Invalid leaf GPR'};$defined=$s.Gpr}
+            'ret'{if($s.Depth -ne 0){throw 'Unbalanced stack at return'};if(($ReturnKind -eq 'I32' -and !$s.Gpr.Contains(0)) -or ($ReturnKind -in 'F32','F64' -and !$s.Xmm.Contains(0))){throw 'Undefined ABI return register'};$returns++}
+            {$_ -in 'loadss-cell','storess-cell'}{
+                if(!$BorrowedCell -or !$s.Gpr.Contains(7) -or $d.Base -ne 7){throw 'Indirect memory access requires the admitted borrowed cell'}
+                if($_ -eq 'loadss-cell'){[void]$s.Xmm.Add($d.Dst)}elseif(!$s.Xmm.Contains($d.Src)){throw 'Indirect store reads undefined XMM register'}
+            }
+            {$_ -in 'load32-stack','store32-stack','loadsd-stack','storesd-stack','loadss-stack','storess-stack'}{
+                $width=4;$reg=$d.Dst;$store=$_ -in 'store32-stack','storesd-stack','storess-stack';if($store){$reg=$d.Src};$fp=$_ -in 'loadsd-stack','storesd-stack','loadss-stack','storess-stack'
+                if($fp){if($_ -in 'loadsd-stack','storesd-stack'){$width=8};if($reg -lt 0 -or $reg -gt 15){throw 'Invalid XMM register'};$defined=$s.Xmm}else{if($reg -notin $gpr){throw 'Invalid leaf GPR'};if($BorrowedCell -and $reg -eq 7){throw 'Borrowed cell register cannot be spilled or overwritten'};$defined=$s.Gpr}
                 if($s.Depth -ne $FrameBytes -or $d.Disp -lt 0 -or ($d.Disp -band ($width-1)) -ne 0 -or $d.Disp -gt $s.Depth-$width){throw 'Stack access outside active frame'}
                 $word=[int]$d.Disp -shr 2
                 if($store){if(!$defined.Contains($reg)){throw 'Store from undefined register'};[void]$s.Words.Add($word);if($width -eq 8){[void]$s.Words.Add($word+1)}}else{if(!$s.Words.Contains($word) -or ($width -eq 8 -and !$s.Words.Contains($word+1))){throw 'Load from undefined stack slot'};[void]$defined.Add($reg);if(!$fp -and $reg -eq 0){$s.Al=$true}}
             }
             {$_ -in 'movimm32','xor32','add32','sub32','cmp32','imul32'}{
-                if($d.Dst -notin $gpr -or $d.Src -notin $gpr){throw 'Callee-saved or stack register used by leaf'}
+                if($d.Dst -notin $gpr -or $d.Src -notin $gpr){throw 'Callee-saved or stack register used by leaf'};if($BorrowedCell -and ($d.Dst -eq 7 -or $d.Src -eq 7)){throw 'Borrowed cell register cannot participate in integer arithmetic'}
                 if($_ -eq 'movimm32' -or ($_ -eq 'xor32' -and $d.Dst -eq $d.Src)){[void]$s.Gpr.Add($d.Dst);if($d.Dst -eq 0){$s.Al=$true};if($_ -eq 'xor32'){$s.Flags=$true}}
                 else{if(!$s.Gpr.Contains($d.Dst) -or !$s.Gpr.Contains($d.Src)){throw 'Arithmetic reads undefined register'};$s.Flags=$_ -ne 'imul32';if($_ -ne 'cmp32' -and $d.Dst -eq 0){$s.Al=$true}}
             }
-            'test32'{if($d.Reg -notin $gpr -or !$s.Gpr.Contains($d.Reg)){throw 'Test reads undefined register'};$s.Flags=$true}
-            {$_ -in 'addsd','subsd','mulsd','divsd'}{if(!$s.Xmm.Contains($d.Dst) -or !$s.Xmm.Contains($d.Src)){throw 'SSE2 arithmetic reads undefined register'}}
+            'test32'{if($BorrowedCell -and $d.Reg -eq 7){throw 'Borrowed cell register cannot participate in integer test'};if($d.Reg -notin $gpr -or !$s.Gpr.Contains($d.Reg)){throw 'Test reads undefined register'};$s.Flags=$true}
+            {$_ -in 'addsd','subsd','mulsd','divsd','addss','subss','mulss','divss'}{if(!$s.Xmm.Contains($d.Dst) -or !$s.Xmm.Contains($d.Src)){throw 'SSE2 arithmetic reads undefined register'}}
+            {$_ -in 'cvtss2sd','cvtsd2ss'}{if(!$s.Xmm.Contains($d.Src)){throw 'SSE2 conversion reads undefined XMM register'};[void]$s.Xmm.Add($d.Dst)}
+            {$_ -in 'cvtsi2ss','cvtsi2sd'}{if($BorrowedCell -and $d.Src -eq 7){throw 'Borrowed cell register cannot participate in conversion'};if($d.Src -notin $gpr -or !$s.Gpr.Contains($d.Src)){throw 'SSE2 conversion reads undefined GPR'};[void]$s.Xmm.Add($d.Dst)}
             {$_ -in 'setl-al','setg-al','sete-al'}{if(!$s.Flags){throw 'Conditional result reads undefined flags'};$s.Al=$true}
             'movzx-eax-al'{if(!$s.Al){throw 'Undefined low byte'};[void]$s.Gpr.Add(0)}
             {$_ -in 'jmp','jz','jnz'}{if($_ -ne 'jmp' -and !$s.Flags){throw 'Conditional branch reads undefined flags'};$target=$next+[int]$d.Disp;if($target -eq 0){throw 'Branch to prologue'};$targets.Add($target)}
@@ -13550,7 +13610,8 @@ function Write-PscAcquiredCil([PscCilMethod] $Body,[Reflection.Emit.MethodBuilde
     }
 }
 
-function Import-PscCilAssembly([string] $AssemblyPath,[string] $ClassName,[string[]] $MethodNames,[string] $OutputPath,[bool] $Deterministic,[switch]$Ir,[switch]$Analyze,[switch]$NativeLeaf) {
+function Import-PscCilAssembly([string] $AssemblyPath,[string] $ClassName,[string[]] $MethodNames,[string] $OutputPath,[bool] $Deterministic,[switch]$Ir,[switch]$Analyze,[switch]$NativeLeaf,[switch]$BorrowedCell) {
+    if($BorrowedCell -and !$NativeLeaf){throw 'Borrowed cell ABI requires NativeCil'}
     if (!$AssemblyPath -or !$ClassName -or !$MethodNames.Length -or (!$OutputPath -and !$Analyze)) { throw 'ImportCil requires AssemblyPath, ClassName, MethodNames and OutputPath.' }
     $inputPath=[IO.Path]::GetFullPath($AssemblyPath);$output='';if(!$Analyze){$output=[IO.Path]::GetFullPath($OutputPath)}
     if ($inputPath -eq $output) { throw 'Cannot overwrite the input assembly.' }
@@ -13563,15 +13624,15 @@ function Import-PscCilAssembly([string] $AssemblyPath,[string] $ClassName,[strin
     foreach ($name in $MethodNames) {
         $members=@($type.GetMethods([Reflection.BindingFlags]'Public,Static,DeclaredOnly') | Where-Object Name -CEQ $name)
         if ($members.Count -ne 1) { throw "Expected one admitted source method named $name." }
-        $bodies.Add((Read-PscCilMethod $members[0]))
+        $bodies.Add((Read-PscCilMethod $members[0] -BorrowedCell:$BorrowedCell))
     }
     $graphs=[Collections.Generic.List[PscIrMethod]]::new()
-    if($Ir -or $Analyze -or $NativeLeaf){foreach($b in $bodies){$g=ConvertTo-PscIr $b;$graphs.Add($g);[Console]::WriteLine("IR $($b.Method.Name): blocks=$($g.Blocks.Length) values=$($g.Types.Count) edges=$(@($g.Blocks.Edges).Count) exception_regions=$($b.Handlers.Length)")}}
+    if($Ir -or $Analyze -or $NativeLeaf){foreach($b in $bodies){$g=ConvertTo-PscIr $b;$graphs.Add($g);$edgeCount=0;foreach($block in $g.Blocks){$edgeCount+=$block.Edges.Length};[Console]::WriteLine("IR $($b.Method.Name): blocks=$($g.Blocks.Length) values=$($g.Types.Count) edges=$edgeCount exception_regions=$($b.Handlers.Length)")}}
     if($Analyze){return $graphs.ToArray()}
     if($NativeLeaf){
         foreach($name in 'NativeEncoding','ElfEncoding'){[void][Reflection.Assembly]::LoadFrom((Join-Path $RuntimeDirectory ($name+'.dll')))}
         $exports=[Collections.Generic.List[PscElfExport]]::new()
-        foreach($g in $graphs){$plan=ConvertTo-PscX64IrPlan $g;$bytes=ConvertTo-PscX64IrBytes $plan;$integerArgs=0;$floatArgs=0;foreach($paramInfo in $g.Source.Method.GetParameters()){if($paramInfo.ParameterType -eq [double]){$floatArgs++}else{$integerArgs++}};$kind='I32';if($g.Source.Method.ReturnType -eq [double]){$kind='F64'}elseif($g.Source.Method.ReturnType -eq [void]){$kind='Void'};$decoded=Test-PscX64LeafAbi $bytes $plan.FrameBytes $integerArgs $floatArgs $kind;$exports.Add([PscElfExport]::new($g.Source.Method.Name,$bytes));[Console]::WriteLine("Native $($g.Source.Method.Name): frame=$($plan.FrameBytes) code=$($bytes.Length) decoded=$decoded value_slots=$($plan.ValueSlots) edge_slots=$($plan.EdgeSlots)")}
+        foreach($g in $graphs){$plan=ConvertTo-PscX64IrPlan $g -BorrowedCell:$BorrowedCell;$bytes=ConvertTo-PscX64IrBytes $plan;$integerArgs=0;$floatArgs=0;foreach($paramInfo in $g.Source.Method.GetParameters()){if($paramInfo.ParameterType -in [float],[double]){$floatArgs++}else{$integerArgs++}};$kind='I32';if($g.Source.Method.ReturnType -eq [double]){$kind='F64'}elseif($g.Source.Method.ReturnType -eq [float]){$kind='F32'}elseif($g.Source.Method.ReturnType -eq [void]){$kind='Void'};$decoded=Test-PscX64LeafAbi $bytes $plan.FrameBytes $integerArgs $floatArgs $kind -BorrowedCell:$BorrowedCell;$exports.Add([PscElfExport]::new($g.Source.Method.Name,$bytes));[Console]::WriteLine("Native $($g.Source.Method.Name): frame=$($plan.FrameBytes) code=$($bytes.Length) decoded=$decoded value_slots=$($plan.ValueSlots) edge_slots=$($plan.EdgeSlots)")}
         $image=[PscElfCodeLibrary]::Build(64,62,0,[IO.Path]::GetFileName($output),$exports.ToArray(),4096)
         [void][PscElfImageReader]::Validate($image,64,62,0,[IO.Path]::GetFileName($output),$exports.ToArray())
         [IO.File]::WriteAllBytes($output,$image)
@@ -13582,7 +13643,7 @@ function Import-PscCilAssembly([string] $AssemblyPath,[string] $ClassName,[strin
     $destName=$type.Name+'Imported';$tb=$session.Module.DefineType($destName,[Reflection.TypeAttributes]'Public,Abstract,Sealed');$session.Types.Add($destName,$tb)
     $graphIndex=0
     foreach ($b in $bodies) {
-        $signature=[type[]]@($b.Method.GetParameters().ParameterType)
+        $signature=[type[]]@($b.Method.GetParameters() | ForEach-Object ParameterType)
         $mb=$tb.DefineMethod($b.Method.Name,[Reflection.MethodAttributes]'Public,Static,HideBySig',$b.Method.ReturnType,$signature)
         if($Ir){Write-PscScalarIr $graphs[$graphIndex] $mb;$graphIndex++}else{Write-PscAcquiredCil $b $mb}
     }
@@ -15932,8 +15993,8 @@ process {
             ConvertTo-TypedExpression -MethodAst $MethodAst
         }
         'AnalyzeCilIr' { Import-PscCilAssembly -AssemblyPath $AssemblyPath -ClassName $ClassName -MethodNames $MethodNames -Analyze }
-        'VerifyNativeLeaf' { [void][Reflection.Assembly]::LoadFrom((Join-Path $RuntimeDirectory 'NativeEncoding.dll')); Test-PscX64LeafAbi ([IO.File]::ReadAllBytes([IO.Path]::GetFullPath($AssemblyPath))) $NativeFrameBytes $NativeIntegerArguments $NativeFloatArguments $NativeReturnKind }
-        'NativeCil' { Import-PscCilAssembly -AssemblyPath $AssemblyPath -ClassName $ClassName -MethodNames $MethodNames -OutputPath $OutputPath -Deterministic $Deterministic -NativeLeaf }
+        'VerifyNativeLeaf' { [void][Reflection.Assembly]::LoadFrom((Join-Path $RuntimeDirectory 'NativeEncoding.dll')); Test-PscX64LeafAbi ([IO.File]::ReadAllBytes([IO.Path]::GetFullPath($AssemblyPath))) $NativeFrameBytes $NativeIntegerArguments $NativeFloatArguments $NativeReturnKind -BorrowedCell:$NativeBorrowedCell }
+        'NativeCil' { Import-PscCilAssembly -AssemblyPath $AssemblyPath -ClassName $ClassName -MethodNames $MethodNames -OutputPath $OutputPath -Deterministic $Deterministic -NativeLeaf -BorrowedCell:$NativeBorrowedCell }
         'ImportCilIr' { Import-PscCilAssembly -AssemblyPath $AssemblyPath -ClassName $ClassName -MethodNames $MethodNames -OutputPath $OutputPath -Deterministic $Deterministic -Ir }
         'ImportCil' { Import-PscCilAssembly -AssemblyPath $AssemblyPath -ClassName $ClassName -MethodNames $MethodNames -OutputPath $OutputPath -Deterministic $Deterministic }
         'Inspect' { Test-LoweredAssembly -AssemblyPath $AssemblyPath -ClassName $ClassName -MethodNames $MethodNames }
