@@ -2217,6 +2217,15 @@ function Copy-Peer { [OutputType([RetainedPeer])] param([RetainedPeer]`$value); 
     $emptyScope=Get-DeclarationScope -Root $empty
     if($emptyScope.Contracts.Count -ne 0 -or $emptyScope.Signatures.Count -ne 0 -or !$emptyScope.Types['ProjectionOnly'].IsEnum){throw 'Enum-only scope inventory failed'}
     'PASS cached STS graph, empty class, exact member identity, dependent function scope, independent roots and revision invalidation'
+    $dependencyContracts=Get-PscFacultyDeclarations -CompilerClassAsts @($peerAst) -DependencyContractsOnly -RetainedDependencyScopes @($declarationScope)
+    if(![object]::ReferenceEquals($dependencyContracts[$peerAst],$peerContract)){throw 'Dependency import reacquired the original semantic contract'}
+    $refused=$false
+    try{$null=Get-PscFacultyDeclarations -CompilerClassAsts @($peerAst) -DependencyContractsOnly -RetainedDependencyScopes @($otherScope)}catch{$refused=$_.Exception.Message.Contains('Missing retained dependency contract')}
+    if(!$refused){throw 'Same-named foreign scope admitted as dependency'}
+    $refused=$false
+    try{$null=Get-PscFacultyDeclarations -CompilerClassAsts @($peerAst) -DependencyContractsOnly -RetainedDependencyScopes @($declarationScope,$rebuilt)}catch{$refused=$_.Exception.Message.Contains('Ambiguous retained dependency contract')}
+    if(!$refused){throw 'Competing revisions admitted as dependency'}
+    'PASS retained dependency import preserves exact contracts and rejects foreign and competing scopes'
     $inferenceSource=@"
 class InferencePeer { [int] `$Value }
 function Copy-Value { [OutputType([System.Collections.Generic.Dictionary[string,InferencePeer]])] param([System.Collections.Generic.Dictionary[string,InferencePeer]]`$value); return `$value }
@@ -2449,7 +2458,7 @@ class PscDeclarationScope {
     [Collections.Generic.Dictionary[System.Management.Automation.Language.FunctionMemberAst,type]] $FunctionOutputTypes = [Collections.Generic.Dictionary[System.Management.Automation.Language.FunctionMemberAst,type]]::new()
 }
 function Get-PscFacultyDeclarations {
-    param([string[]]$ContractPaths,[System.Management.Automation.Language.TypeDefinitionAst[]]$CompilerClassAsts,[hashtable]$MaterializedTypes,[type[][]]$SelectionSignatures,[type[]]$SelectionSources,[PscDeclarationScope]$DeclarationScope,[System.Management.Automation.Language.TypeDefinitionAst]$BindingOwner,[string]$BindingName,[type[]]$BindingArguments,[bool]$BindingStatic,[bool]$BindingConstructor,[PscDeclarationScope[]]$BindingScopes,[ScriptTypeReference]$ComparisonLeft,[ScriptTypeReference]$ComparisonRight,[ScriptTypeContract]$ReferenceContract,[string]$ReferenceName,[ScriptTypeReference[]]$ReferenceParameters,[bool]$ReferenceStatic,[bool]$ReferenceConstructor,[switch]$DependencyContractsOnly)
+    param([string[]]$ContractPaths,[System.Management.Automation.Language.TypeDefinitionAst[]]$CompilerClassAsts,[hashtable]$MaterializedTypes,[type[][]]$SelectionSignatures,[type[]]$SelectionSources,[PscDeclarationScope]$DeclarationScope,[System.Management.Automation.Language.TypeDefinitionAst]$BindingOwner,[string]$BindingName,[type[]]$BindingArguments,[bool]$BindingStatic,[bool]$BindingConstructor,[PscDeclarationScope[]]$BindingScopes,[ScriptTypeReference]$ComparisonLeft,[ScriptTypeReference]$ComparisonRight,[ScriptTypeContract]$ReferenceContract,[string]$ReferenceName,[ScriptTypeReference[]]$ReferenceParameters,[bool]$ReferenceStatic,[bool]$ReferenceConstructor,[switch]$DependencyContractsOnly,[PscDeclarationScope[]]$RetainedDependencyScopes)
 
 # Only descriptor types are realized in the authoring scope. Other faculties must not shadow imported CLR identities.
 # The semantic description and the executable generation are ordinary HandleTable objects.
@@ -5073,9 +5082,22 @@ function Get-ScriptTypeContract {
     }
     if($null -ne $SelectionSignatures){return Get-PscOtherFacultyDeclarations -SelectionSignatures $SelectionSignatures -SelectionSources $SelectionSources}
     if($DependencyContractsOnly){
-        $contracts=@(Get-ScriptTypeContract -DefinitionAsts $CompilerClassAsts -SignaturesOnly)
         $retained=[Collections.Generic.Dictionary[System.Management.Automation.Language.TypeDefinitionAst,ScriptTypeContract]]::new()
-        for($index=0;$index -lt $CompilerClassAsts.Length;$index++){$retained.Add($CompilerClassAsts[$index],$contracts[$index])}
+        if($null -ne $RetainedDependencyScopes){
+            foreach($definition in $CompilerClassAsts){
+                $contract=$null
+                foreach($dependencyScope in $RetainedDependencyScopes){
+                    if(!$dependencyScope.Contracts.ContainsKey($definition)){continue}
+                    if($null -ne $contract){throw "Ambiguous retained dependency contract: $($definition.Name)"}
+                    $contract=$dependencyScope.Contracts[$definition]
+                }
+                if($null -eq $contract){throw "Missing retained dependency contract: $($definition.Name)"}
+                $retained.Add($definition,$contract)
+            }
+        }else{
+            $contracts=@(Get-ScriptTypeContract -DefinitionAsts $CompilerClassAsts -SignaturesOnly)
+            for($index=0;$index -lt $CompilerClassAsts.Length;$index++){$retained.Add($CompilerClassAsts[$index],$contracts[$index])}
+        }
         return $retained
     }
     if($null -ne $DeclarationScope -or ($null -ne $CompilerClassAsts -and $CompilerClassAsts.Length)){
@@ -5144,7 +5166,9 @@ function Get-PscFacultyUnits {
     [PscFacultyUnit]::new('ElfEncoding','PscElfEncoding',@('PscElfLayout','PscElfStringTable','PscElfEncoding','PscElfExport','PscElfCodeLibrary','PscElfProgramRecord','PscElfSectionRecord','PscElfSymbolRecord','PscElfImageRecord','PscElfImageReader'),@())
 }
 function Build-PscFaculty {
-    param([string]$Faculty,[string]$RuntimeDirectory,[string[]]$ContractPaths,[string[]]$ContractReferences,[PscSource]$RetainedSource)
+    param([string]$Faculty,[string]$RuntimeDirectory,[string[]]$ContractPaths,[string[]]$ContractReferences,[PscSource]$RetainedSource,[Collections.Generic.Dictionary[string,PscDeclarationScope]]$RetainedScopes)
+    if($null -ne $RetainedScopes -and $null -eq $RetainedSource){throw 'Retained faculty scopes require the original source.'}
+    if($null -ne $RetainedScopes -and $RetainedScopes.ContainsKey($Faculty)){throw "Faculty '$Faculty' already realized in this coordinator."}
     $units=@(Get-PscFacultyUnits)
     $unit = @($units | Where-Object Name -ceq $Faculty)
     if ($unit.Count -ne 1) { throw "Unknown PSC faculty: $Faculty" }
@@ -5176,7 +5200,13 @@ function Build-PscFaculty {
     }
     $imports=[PscDeclarationScope]::new()
     $importedClasses=[Collections.Generic.List[System.Management.Automation.Language.TypeDefinitionAst]]::new()
+    $dependencyScopes=[Collections.Generic.List[PscDeclarationScope]]::new()
     foreach($dependency in $unit.Dependencies){
+        if($null -ne $RetainedScopes){
+            $retainedScope=$null
+            if(!$RetainedScopes.TryGetValue($dependency,[ref]$retainedScope)){throw "Dependency '$dependency' has not been realized in this coordinator."}
+            $dependencyScopes.Add($retainedScope)
+        }
         $dependencyUnit=@($units | Where-Object Name -ceq $dependency)
         if($dependencyUnit.Count -ne 1){throw "Unknown dependency '$dependency'."}
         $path=[IO.Path]::GetFullPath((Join-Path $RuntimeDirectory ($dependency+'.dll')))
@@ -5197,9 +5227,16 @@ function Build-PscFaculty {
         if($ContractPaths.Count){$data['ScriptTypeCatalog.Contracts']=@(Get-PscFacultyDeclarations -ContractPaths $ContractPaths)}
         else{$data['ScriptTypeCatalog.Contracts']=[object[]]@()}
     }
-    if($importedClasses.Count){$imports.Contracts=Get-PscFacultyDeclarations -CompilerClassAsts $importedClasses.ToArray() -DependencyContractsOnly}
+    if($importedClasses.Count){
+        if($null -ne $RetainedScopes){$imports.Contracts=Get-PscFacultyDeclarations -CompilerClassAsts $importedClasses.ToArray() -DependencyContractsOnly -RetainedDependencyScopes $dependencyScopes.ToArray()}
+        else{$imports.Contracts=Get-PscFacultyDeclarations -CompilerClassAsts $importedClasses.ToArray() -DependencyContractsOnly}
+    }
     else{$imports=$null}
     Export-LoweredAssembly -SourceAst $holder -DeclarationsOnly -ClassName $unit.Primary -ClassNames $unit.Declarations -ScopeDeclarations $definitions.ToArray() -DependencyScope $imports -StaticData $data -OutputPath (Join-Path $RuntimeDirectory ($Faculty+'.dll')) -Deterministic
+    if($null -ne $RetainedScopes){
+        $scope=Get-DeclarationScope -Root $holder
+        $RetainedScopes.Add($Faculty,$scope)
+    }
 }
 function Build-PscRuntime {
     param([string]$RuntimeDirectory,[string[]]$ContractPaths,[string[]]$ContractReferences,[string]$ContractInputsPath)
@@ -5240,11 +5277,12 @@ function Build-PscRuntime {
         }
         $source=[PscSource]::new($PSCommandPath,$false)
         if($source.ParseErrors.Count){throw 'Faculty source is not parseable.'}
+        $retainedScopes=[Collections.Generic.Dictionary[string,PscDeclarationScope]]::new([StringComparer]::Ordinal)
         foreach($unit in $ordered){
             if($unit.Name -ceq 'ScriptType'){
-                Build-PscFaculty -Faculty $unit.Name -RuntimeDirectory $RuntimeDirectory -RetainedSource $source -ContractPaths $ContractPaths -ContractReferences $ContractReferences
+                Build-PscFaculty -Faculty $unit.Name -RuntimeDirectory $RuntimeDirectory -RetainedSource $source -RetainedScopes $retainedScopes -ContractPaths $ContractPaths -ContractReferences $ContractReferences
             }else{
-                Build-PscFaculty -Faculty $unit.Name -RuntimeDirectory $RuntimeDirectory -RetainedSource $source
+                Build-PscFaculty -Faculty $unit.Name -RuntimeDirectory $RuntimeDirectory -RetainedSource $source -RetainedScopes $retainedScopes
             }
         }
         return
@@ -15699,7 +15737,7 @@ Conform streams child stdout and stderr to the invoking host as they become avai
 
 - **Managed:** SMA AST and typed expression lowering, deterministic IL emission, static graph/data realization, reachability and fixed-parameter specialization.
 - **Native:** pinned Windows NativeAOT compiler plus PSC COFF linker; direct CIL-to-IR-to-x64 ELF leaf emission and decoded-byte ABI checks. The direct backend does not yet replace ILC for general programs.
-- **Faculties:** `HandleTable`, `InquiryPrimitives`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding; imported executable member calls still use the CLR compatibility boundary. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. This is build integration, not normal-startup activation. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
+- **Faculties:** `HandleTable`, `InquiryPrimitives`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding; imported executable member calls still use the CLR compatibility boundary. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. This is build integration, not normal-startup activation. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
 - **Evidence:** differential tests, structural lint, Guard, non-loading binary queries and coverage. An observed call is not a universal binding proof; an ABI check is not a proof of arithmetic equivalence.
 
 ## Trust and security
