@@ -25,6 +25,8 @@ This is the architectural mission, not a claim of completed implementation. Reco
 
 HandleTable's internal lookup, pinning, retention, name resolution and ownership traversal operations now take an explicit typed table participant. Fourteen additional public operations (including collection, withdrawal, succession, retention, pair leasing and rebinding) now require an explicit HandleTable participant. Register, Open, Close and Revoke also take an explicit table participant. The authoring-side query lease acquires exact CLR operation signatures once from the loaded faculty; compiled consumers use typed static calls. The existing IDisposable and cursor instance entry points remain compatibility boundaries. Lease and retention records use explicit typed Create operations; the fence Completed and Signal operations take an explicit fence participant. Rebuild callers of the changed operations. `ScriptTypeBindingExtension.SelectBound(extension, candidates, arguments)` is a static operation with an explicit extension participant; rebuild consumers of the previous instance signature. The existing selector memo and lease semantics are retained.
 
+ScriptTypeContract reflection and binding operations now take an explicit contract participant. Rebuild callers of the previous instance signatures; the binding still retains the original owner, member and argument references.
+
 ## Advisory redundancy analysis
 
 Use the existing graph to compare authored function and method bodies, including their source identities and locations:

@@ -1100,7 +1100,7 @@ try {
     $providerType = [Reflection.Assembly]::LoadFrom($providerPath).GetType('SmCalibrationProvider', $true)
     $provider = [Activator]::CreateInstance($providerType)
     $descriptor = [ScriptTypeCatalog]::Find('SmCalibrationContract')
-    $member = $descriptor.FindResolved('Apply', [type[]]@([double]))
+    $member = [ScriptTypeContract]::FindResolved($descriptor, 'Apply', [type[]]@([double]))
     Assert-Pass ($null -ne $member -and $member.Required -and $member.ResultTypeIdentity -ceq [double].AssemblyQualifiedName) '.srm1 produces a typed required contract operation'
     Assert-Pass ($null -eq [ScriptTypeCatalog].Assembly.GetType('SmCalibrationContract') -and $null -eq [ScriptTypeCatalog].Assembly.GetType('SmCalibrationUse')) '.srm1 catalog retains semantic descriptors rather than executable contract classes'
     $space = [HandleTable]::new()
@@ -2075,38 +2075,38 @@ try {
     [void][Reflection.Assembly]::LoadFrom((Join-Path $work 'HandleTable.dll'))
     $a=[Reflection.Assembly]::LoadFrom((Join-Path $work 'ScriptType.dll'))
     $owner=[ScriptTypeCatalog]::Find('Owner');$peer=[ScriptTypeCatalog]::Find('Peer')
-    $single=$owner.Find('Echo',[string[]]@('Peer'));$scalar=$owner.Find('Echo',[string[]]@('int'));$array=$owner.Find('Echo',[string[]]@('Peer[]'))
-    if(![object]::ReferenceEquals($owner.Find('Self').ResultReference.Definition,$owner) -or ![object]::ReferenceEquals($peer.Find('Owner').ResultReference.Definition,$owner)){throw 'Self or forward identity lost'}
+    $single=[ScriptTypeContract]::Find($owner, 'Echo',[string[]]@('Peer'));$scalar=[ScriptTypeContract]::Find($owner, 'Echo',[string[]]@('int'));$array=[ScriptTypeContract]::Find($owner, 'Echo',[string[]]@('Peer[]'))
+    if(![object]::ReferenceEquals([ScriptTypeContract]::Find($owner, 'Self').ResultReference.Definition,$owner) -or ![object]::ReferenceEquals([ScriptTypeContract]::Find($peer, 'Owner').ResultReference.Definition,$owner)){throw 'Self or forward identity lost'}
     if(![object]::ReferenceEquals($single.ResultReference.Definition,$peer) -or ![ScriptTypeReference]::Same($single.ResultReference,$single.ParameterReferences[0])){throw 'Peer signature lost'}
-    if(![ScriptTypeReference]::Same($array.ResultReference,$array.ParameterReferences[0]) -or [ScriptTypeReference]::Same($array.ResultReference,$owner.Find('Grid').ResultReference)){throw 'Array identity or rank mismatch'}
-    if(![object]::ReferenceEquals($owner.FindReference('Echo',$single.ParameterReferences),$single) -or ![object]::ReferenceEquals($owner.FindReference('Echo',$scalar.ParameterReferences),$scalar) -or ![object]::ReferenceEquals($owner.FindReference('Echo',$array.ParameterReferences),$array)){throw 'Reference-based binding mismatch'}
+    if(![ScriptTypeReference]::Same($array.ResultReference,$array.ParameterReferences[0]) -or [ScriptTypeReference]::Same($array.ResultReference,[ScriptTypeContract]::Find($owner, 'Grid').ResultReference)){throw 'Array identity or rank mismatch'}
+    if(![object]::ReferenceEquals([ScriptTypeContract]::FindReference($owner, 'Echo',$single.ParameterReferences),$single) -or ![object]::ReferenceEquals([ScriptTypeContract]::FindReference($owner, 'Echo',$scalar.ParameterReferences),$scalar) -or ![object]::ReferenceEquals([ScriptTypeContract]::FindReference($owner, 'Echo',$array.ParameterReferences),$array)){throw 'Reference-based binding mismatch'}
     $child=[ScriptTypeCatalog]::Find('Child')
-    $ctor=$owner.Find('Owner',[string[]]@('Peer'));$empty=$owner.Find('Owner',[string[]]@())
-    $choice=$owner.Find('Choose',[string[]]@('Peer'));$numeric=$owner.Find('Choose',[string[]]@('int'));$shadow=$child.Find('Choose',[string[]]@('Peer'))
+    $ctor=[ScriptTypeContract]::Find($owner, 'Owner',[string[]]@('Peer'));$empty=[ScriptTypeContract]::Find($owner, 'Owner',[string[]]@())
+    $choice=[ScriptTypeContract]::Find($owner, 'Choose',[string[]]@('Peer'));$numeric=[ScriptTypeContract]::Find($owner, 'Choose',[string[]]@('int'));$shadow=[ScriptTypeContract]::Find($child, 'Choose',[string[]]@('Peer'))
     if(!$ctor.Constructor -or $ctor.Static -or !$choice.Static -or $choice.Constructor){throw 'Member kind lost'}
-    if(![object]::ReferenceEquals($owner.FindReference('Owner',$ctor.ParameterReferences,$false,$true),$ctor) -or ![object]::ReferenceEquals($owner.FindReference('Owner',$empty.ParameterReferences,$false,$true),$empty)){throw 'Constructor binding mismatch'}
-    if($null -ne $child.FindReference('Owner',$ctor.ParameterReferences,$false,$true) -or $null -ne $child.FindReference('Child',$ctor.ParameterReferences,$false,$true)){throw 'Inherited constructor admitted'}
-    if(![object]::ReferenceEquals($owner.FindReference('choose',$choice.ParameterReferences,$true,$false),$choice) -or ![object]::ReferenceEquals($child.FindReference('Choose',$choice.ParameterReferences,$true,$false),$shadow) -or ![object]::ReferenceEquals($child.FindReference('Choose',$numeric.ParameterReferences,$true,$false),$numeric)){throw 'Static binding or shadowing mismatch'}
-    if(![object]::ReferenceEquals($child.FindReference('Echo',$single.ParameterReferences),$single)){throw 'Inherited instance binding mismatch'}
-    if($null -ne $owner.FindReference('Choose',$choice.ParameterReferences) -or $null -ne $owner.FindReference('Echo',$single.ParameterReferences,$true,$false) -or $null -ne $owner.FindReference('Owner',$ctor.ParameterReferences,$true,$true) -or $null -ne $owner.FindReference('Self',[ScriptTypeReference[]]@(),$false,$false)){throw 'Wrong member kind admitted'}
+    if(![object]::ReferenceEquals([ScriptTypeContract]::FindReference($owner, 'Owner',$ctor.ParameterReferences,$false,$true),$ctor) -or ![object]::ReferenceEquals([ScriptTypeContract]::FindReference($owner, 'Owner',$empty.ParameterReferences,$false,$true),$empty)){throw 'Constructor binding mismatch'}
+    if($null -ne [ScriptTypeContract]::FindReference($child, 'Owner',$ctor.ParameterReferences,$false,$true) -or $null -ne [ScriptTypeContract]::FindReference($child, 'Child',$ctor.ParameterReferences,$false,$true)){throw 'Inherited constructor admitted'}
+    if(![object]::ReferenceEquals([ScriptTypeContract]::FindReference($owner, 'choose',$choice.ParameterReferences,$true,$false),$choice) -or ![object]::ReferenceEquals([ScriptTypeContract]::FindReference($child, 'Choose',$choice.ParameterReferences,$true,$false),$shadow) -or ![object]::ReferenceEquals([ScriptTypeContract]::FindReference($child, 'Choose',$numeric.ParameterReferences,$true,$false),$numeric)){throw 'Static binding or shadowing mismatch'}
+    if(![object]::ReferenceEquals([ScriptTypeContract]::FindReference($child, 'Echo',$single.ParameterReferences),$single)){throw 'Inherited instance binding mismatch'}
+    if($null -ne [ScriptTypeContract]::FindReference($owner, 'Choose',$choice.ParameterReferences) -or $null -ne [ScriptTypeContract]::FindReference($owner, 'Echo',$single.ParameterReferences,$true,$false) -or $null -ne [ScriptTypeContract]::FindReference($owner, 'Owner',$ctor.ParameterReferences,$true,$true) -or $null -ne [ScriptTypeContract]::FindReference($owner, 'Self',[ScriptTypeReference[]]@(),$false,$false)){throw 'Wrong member kind admitted'}
     $saved=$child.Members
     try{
         $child.Members=[ScriptTypeMember[]]@($saved+@($shadow))
-        if($null -ne $child.FindReference('Choose',$choice.ParameterReferences,$true,$false)){throw 'Ambiguous static signature admitted or fell through to base'}
+        if($null -ne [ScriptTypeContract]::FindReference($child, 'Choose',$choice.ParameterReferences,$true,$false)){throw 'Ambiguous static signature admitted or fell through to base'}
     }finally{$child.Members=$saved}
     if($single.ResultTypeIdentity -or $array.ResultTypeIdentity -or $scalar.ResultTypeIdentity -cne [int].AssemblyQualifiedName){throw 'Legacy mapping changed'}
-    $generic=$owner.Find('List').ResultReference
+    $generic=[ScriptTypeContract]::Find($owner, 'List').ResultReference
     if($generic.Arguments.Length -ne 1 -or ![object]::ReferenceEquals($generic.Arguments[0].Definition,$peer) -or !$generic.Element.ClrIdentity -or $generic.ClrIdentity){throw 'Generic reference mismatch'}
     if($null -ne $a.GetType('Owner') -or $null -ne $a.GetType('Peer') -or $null -ne $a.GetType('Child') -or 'System.Management.Automation' -in $a.GetReferencedAssemblies().Name){throw 'Foreign realization dependency'}
     'PASS emitted STS contract graph restores shared referents, signature binding, array rank and generic structure without realizing source types or referencing SMA'
     'PASS STS member kinds: constructors, static overloads, source inheritance, shadowing and ambiguity refusal'
-    $binding=$owner.BindDeclared('Echo',$single.ParameterReferences,$false,$false)
+    $binding=[ScriptTypeContract]::BindDeclared($owner, 'Echo',$single.ParameterReferences,$false,$false)
     if(![object]::ReferenceEquals($binding.Owner,$owner) -or ![object]::ReferenceEquals($binding.Member,$single) -or ![object]::ReferenceEquals($binding.Arguments[0],$single.ParameterReferences[0])){throw 'Semantic binding did not retain its witnesses'}
-    if($null -ne $child.BindDeclared('Echo',$single.ParameterReferences,$false,$false)){throw 'Declared binding traversed a base'}
+    if($null -ne [ScriptTypeContract]::BindDeclared($child, 'Echo',$single.ParameterReferences,$false,$false)){throw 'Declared binding traversed a base'}
     $saved=$owner.Members
     try{
         $owner.Members=[ScriptTypeMember[]]@($saved+@($single));$refused=$false
-        try{$null=$owner.BindDeclared('Echo',$single.ParameterReferences,$false,$false)}catch [Reflection.AmbiguousMatchException]{$refused=$true}
+        try{$null=[ScriptTypeContract]::BindDeclared($owner, 'Echo',$single.ParameterReferences,$false,$false)}catch [Reflection.AmbiguousMatchException]{$refused=$true}
         if(!$refused){throw 'Semantic ambiguity became absence'}
     }finally{$owner.Members=$saved}
     'PASS projection-free emitted exact binding retains owner, member and ordered argument references; ambiguity is distinct from absence'
@@ -2115,7 +2115,7 @@ try {
     $primitive=[Reflection.Assembly]::LoadFrom((Join-Path $work 'PrimitiveConversion.dll'))
     $argument=[ScriptTypeReference]::new();$argument.Kind=[ScriptTypeReferenceKind]::Clr;$argument.ClrIdentity=[byte].AssemblyQualifiedName
     if($null -ne [ScriptTypePrimitiveConversion]::BindDeclared($owner,'Choose',[ScriptTypeReference[]]@($argument),$true,$false)){throw 'Mixed source and primitive overloads exceeded admitted profile'}
-    $number=$owner.Find('Number',[string[]]@('long'))
+    $number=[ScriptTypeContract]::Find($owner, 'Number',[string[]]@('long'))
     $numericBinding=[ScriptTypePrimitiveConversion]::BindDeclared($owner,'Number',[ScriptTypeReference[]]@($argument),$true,$false)
     if(![object]::ReferenceEquals($numericBinding.Owner,$owner) -or ![object]::ReferenceEquals($numericBinding.Member,$number) -or ![object]::ReferenceEquals($numericBinding.Arguments[0],$argument)){throw 'Projection-free primitive binding differs'}
     if('System.Management.Automation' -in $primitive.GetReferencedAssemblies().Name){throw 'Primitive binding acquired SMA dependency'}
@@ -2199,7 +2199,7 @@ function Copy-Peer { [OutputType([RetainedPeer])] param([RetainedPeer]`$value); 
     $peerAst=$sourceClasses[1];$peerContract=$declarationScope.Contracts[$peerAst]
     $method=$declarationScope.Signatures[$peerAst.Members[2]];$field=$declarationScope.Signatures[$peerAst.Members[0]]
     if(![object]::ReferenceEquals($method.Owner,$peerContract) -or ![object]::ReferenceEquals($method.Member,$peerContract.Members[2]) -or ![object]::ReferenceEquals($field.Member.ResultReference.Element.Definition,$peerContract)){throw 'Declaration scope detached original semantic members'}
-    if(![object]::ReferenceEquals($peerContract.FindReference('Identity',$method.Member.ParameterReferences,$true,$false),$method.Member)){throw 'Cached exact reference binding failed'}
+    if(![object]::ReferenceEquals((Get-PscFacultyDeclarations -ReferenceContract $peerContract -ReferenceName Identity -ReferenceParameters $method.Member.ParameterReferences -ReferenceStatic $true -ReferenceConstructor $false),$method.Member)){throw 'Cached exact reference binding failed'}
     Use-DeclarationScope -Ast $scope
     $dependent=Get-DeclarationScope -Root $functionRoot -Resolving $declarationScope
     $functionSignature=$dependent.Signatures[$functionClass.Members[0]]
@@ -2449,7 +2449,7 @@ class PscDeclarationScope {
     [Collections.Generic.Dictionary[System.Management.Automation.Language.FunctionMemberAst,type]] $FunctionOutputTypes = [Collections.Generic.Dictionary[System.Management.Automation.Language.FunctionMemberAst,type]]::new()
 }
 function Get-PscFacultyDeclarations {
-    param([string[]]$ContractPaths,[System.Management.Automation.Language.TypeDefinitionAst[]]$CompilerClassAsts,[hashtable]$MaterializedTypes,[type[][]]$SelectionSignatures,[type[]]$SelectionSources,[PscDeclarationScope]$DeclarationScope,[System.Management.Automation.Language.TypeDefinitionAst]$BindingOwner,[string]$BindingName,[type[]]$BindingArguments,[bool]$BindingStatic,[bool]$BindingConstructor,[PscDeclarationScope[]]$BindingScopes,[ScriptTypeReference]$ComparisonLeft,[ScriptTypeReference]$ComparisonRight)
+    param([string[]]$ContractPaths,[System.Management.Automation.Language.TypeDefinitionAst[]]$CompilerClassAsts,[hashtable]$MaterializedTypes,[type[][]]$SelectionSignatures,[type[]]$SelectionSources,[PscDeclarationScope]$DeclarationScope,[System.Management.Automation.Language.TypeDefinitionAst]$BindingOwner,[string]$BindingName,[type[]]$BindingArguments,[bool]$BindingStatic,[bool]$BindingConstructor,[PscDeclarationScope[]]$BindingScopes,[ScriptTypeReference]$ComparisonLeft,[ScriptTypeReference]$ComparisonRight,[ScriptTypeContract]$ReferenceContract,[string]$ReferenceName,[ScriptTypeReference[]]$ReferenceParameters,[bool]$ReferenceStatic,[bool]$ReferenceConstructor)
 
 # Only descriptor types are realized in the authoring scope. Other faculties must not shadow imported CLR identities.
 # The semantic description and the executable generation are ordinary HandleTable objects.
@@ -2513,9 +2513,9 @@ class ScriptTypeContract {
     [string[]] $BaseTypes
     [ScriptTypeContract[]] $BaseContracts
     [ScriptTypeReference[]] $BaseReferences
-    [ScriptTypeMember] Find([string]$Name){
+    static [ScriptTypeMember] Find([ScriptTypeContract]$Contract, [string]$Name){
         [ScriptTypeMember]$result=$null
-        foreach($member in $this.Members){
+        foreach($member in $Contract.Members){
             if([string]::Equals($member.Name,$Name,[StringComparison]::OrdinalIgnoreCase)){
                 if($null -ne $result){return $null}
                 $result=$member
@@ -2523,15 +2523,15 @@ class ScriptTypeContract {
         }
         return $result
     }
-    [ScriptTypeMember] FindReference([string]$Name,[ScriptTypeReference[]]$Parameters){
-        return $this.FindReference($Name,$Parameters,$false,$false)
+    static [ScriptTypeMember] FindReference([ScriptTypeContract]$Contract, [string]$Name,[ScriptTypeReference[]]$Parameters){
+        return [ScriptTypeContract]::FindReference($Contract, $Name,$Parameters,$false,$false)
     }
     # The local declaration boundary is also used by the compiler's binding
     # profile. Ambiguity is distinct from absence and cannot trigger fallback.
-    hidden [ScriptTypeMember] FindDeclaredReference([string]$Name,[ScriptTypeReference[]]$Parameters,[bool]$Static,[bool]$Constructor){
+    hidden static [ScriptTypeMember] FindDeclaredReference([ScriptTypeContract]$Contract, [string]$Name,[ScriptTypeReference[]]$Parameters,[bool]$Static,[bool]$Constructor){
         if($Static -and $Constructor){return $null}
         [ScriptTypeMember]$result=$null
-        foreach($member in $this.Members){
+        foreach($member in $Contract.Members){
             if(![string]::Equals($member.Name,$Name,[StringComparison]::OrdinalIgnoreCase) -or !$member.Operation -or $member.Constructor -ne $Constructor -or $member.Static -ne $Static -or $null -eq $member.ParameterReferences -or $member.ParameterReferences.Length -ne $Parameters.Length){continue}
             [bool]$same=$true
             for([int]$i=0;$i -lt $Parameters.Length;$i++){if(![ScriptTypeReference]::Same($member.ParameterReferences[$i],$Parameters[$i])){$same=$false;break}}
@@ -2539,25 +2539,25 @@ class ScriptTypeContract {
         }
         return $result
     }
-    [ScriptTypeBinding] BindDeclared([string]$Name,[ScriptTypeReference[]]$Parameters,[bool]$Static,[bool]$Constructor){
-        [ScriptTypeMember]$result=$this.FindDeclaredReference($Name,$Parameters,$Static,$Constructor)
+    static [ScriptTypeBinding] BindDeclared([ScriptTypeContract]$Contract, [string]$Name,[ScriptTypeReference[]]$Parameters,[bool]$Static,[bool]$Constructor){
+        [ScriptTypeMember]$result=[ScriptTypeContract]::FindDeclaredReference($Contract, $Name,$Parameters,$Static,$Constructor)
         if($null -eq $result){return $null}
-        return [ScriptTypeBinding]::new($this,$result,$Parameters)
+        return [ScriptTypeBinding]::new($Contract,$result,$Parameters)
     }
     # Constructors are local declarations; static and instance methods may have source bases.
-    [ScriptTypeMember] FindReference([string]$Name,[ScriptTypeReference[]]$Parameters,[bool]$Static,[bool]$Constructor){
+    static [ScriptTypeMember] FindReference([ScriptTypeContract]$Contract, [string]$Name,[ScriptTypeReference[]]$Parameters,[bool]$Static,[bool]$Constructor){
         if($Static -and $Constructor){return $null}
         [ScriptTypeMember]$result=$null
-        try{$result=$this.FindDeclaredReference($Name,$Parameters,$Static,$Constructor)}catch [Reflection.AmbiguousMatchException]{return $null}
+        try{$result=[ScriptTypeContract]::FindDeclaredReference($Contract, $Name,$Parameters,$Static,$Constructor)}catch [Reflection.AmbiguousMatchException]{return $null}
         if($null -ne $result){return $result}
-        if(!$Constructor -and $null -ne $this.BaseContracts -and $this.BaseContracts.Length -eq 1){return $this.BaseContracts[0].FindReference($Name,$Parameters,$Static,$Constructor)}
+        if(!$Constructor -and $null -ne $Contract.BaseContracts -and $Contract.BaseContracts.Length -eq 1){return [ScriptTypeContract]::FindReference($Contract.BaseContracts[0], $Name,$Parameters,$Static,$Constructor)}
         return $null
     }
     # CLR compatibility queries use normalized assembly-qualified signatures, not source
     # spelling. Publication still owns runtime identity through HandleTable handles.
-    [ScriptTypeMember] FindResolved([string]$Name,[type[]]$Parameters){
+    static [ScriptTypeMember] FindResolved([ScriptTypeContract]$Contract, [string]$Name,[type[]]$Parameters){
         [ScriptTypeMember]$result=$null
-        foreach($member in $this.Members){
+        foreach($member in $Contract.Members){
             if(![string]::Equals($member.Name,$Name,[StringComparison]::OrdinalIgnoreCase) -or !$member.Operation -or $member.Constructor -or $member.Static -or $member.ParameterTypeIdentities.Length -ne $Parameters.Length){continue}
             [bool]$same=$true
             for([int]$i=0;$i -lt $Parameters.Length;$i++){
@@ -2566,12 +2566,12 @@ class ScriptTypeContract {
             if($same){if($null -ne $result){return $null};$result=$member}
         }
         if($null -ne $result){return $result}
-        if($null -ne $this.BaseContracts -and $this.BaseContracts.Length -eq 1){return $this.BaseContracts[0].FindResolved($Name,$Parameters)}
+        if($null -ne $Contract.BaseContracts -and $Contract.BaseContracts.Length -eq 1){return [ScriptTypeContract]::FindResolved($Contract.BaseContracts[0], $Name,$Parameters)}
         return $null
     }
-    [ScriptTypeMember[]] Candidates([string]$Name,[int]$Arity){
+    static [ScriptTypeMember[]] Candidates([ScriptTypeContract]$Contract, [string]$Name,[int]$Arity){
         [Collections.Generic.List[ScriptTypeMember]]$items=[Collections.Generic.List[ScriptTypeMember]]::new()
-        [ScriptTypeContract]$current=$this
+        [ScriptTypeContract]$current=$Contract
         while($null -ne $current){
             foreach($member in $current.Members){
                 if(!$member.Operation -or $member.Static -or $member.Constructor -or ![string]::Equals($member.Name,$Name,[StringComparison]::OrdinalIgnoreCase) -or $member.ParameterTypes.Length -ne $Arity){continue}
@@ -2591,9 +2591,9 @@ class ScriptTypeContract {
         }
         return $items.ToArray()
     }
-    [ScriptTypeMember] Find([string]$Name,[string[]]$Parameters){
+    static [ScriptTypeMember] Find([ScriptTypeContract]$Contract, [string]$Name,[string[]]$Parameters){
         [ScriptTypeMember]$result=$null
-        foreach($member in $this.Members){
+        foreach($member in $Contract.Members){
             if(![string]::Equals($member.Name,$Name,[StringComparison]::OrdinalIgnoreCase) -or !$member.Operation -or $member.ParameterTypes.Length -ne $Parameters.Length){continue}
             [bool]$same=$true
             for([int]$i=0;$i -lt $Parameters.Length;$i++){
@@ -3397,7 +3397,7 @@ class ScriptTypeRealization {
                     if([string]::IsNullOrEmpty($member.ParameterTypeIdentities[$i])){throw [NotSupportedException]::new('Symbolic signature not admitted')}
                     $signature[$i]=[type]::GetType($member.ParameterTypeIdentities[$i],$true)
                 }
-                if(![object]::ReferenceEquals($Contract.FindResolved($member.Name,$signature),$member)){continue}
+                if(![object]::ReferenceEquals([ScriptTypeContract]::FindResolved($Contract, $member.Name,$signature),$member)){continue}
                 [Reflection.MethodInfo]$method=$Thunks.GetMethod([ScriptTypeMember]::ThunkName($member),[Reflection.BindingFlags]'Public,Static')
                 if($null -eq $method){throw [MissingMethodException]::new($member.Name)}
                 [Func[object,object[],object]]$target=$method.CreateDelegate([Func[object,object[],object]])
@@ -3410,7 +3410,7 @@ class ScriptTypeRealization {
         $this.Calls=$items.ToArray()
     }
     [ScriptTypeCall[]] Candidates([ScriptTypeContract]$Contract,[string]$Name,[int]$Arity){
-        [ScriptTypeMember[]]$members=$Contract.Candidates($Name,$Arity)
+        [ScriptTypeMember[]]$members=[ScriptTypeContract]::Candidates($Contract, $Name,$Arity)
         if($members.Length -eq 0){throw [MissingMethodException]::new($Name)}
         [ScriptTypeCall[]]$result=[ScriptTypeCall[]]::new($members.Length)
         for([int]$i=0;$i -lt $members.Length;$i++){
@@ -3789,7 +3789,7 @@ class ScriptTypePrimitiveConversion {
     }
     static [ScriptTypeBinding] BindDeclared([ScriptTypeContract]$Owner,[string]$Name,[ScriptTypeReference[]]$Arguments,[bool]$Static,[bool]$Constructor){
         if($Static -and $Constructor){return $null}
-        [ScriptTypeBinding]$exact=$Owner.BindDeclared($Name,$Arguments,$Static,$Constructor)
+        [ScriptTypeBinding]$exact=[ScriptTypeContract]::BindDeclared($Owner, $Name,$Arguments,$Static,$Constructor)
         if($null -ne $exact){return $exact}
         if($Arguments.Length -eq 0){return $null}
         [type[]]$sources=[type[]]::new($Arguments.Length)
@@ -5039,6 +5039,7 @@ function Get-ScriptTypeContract {
         if(!$reference.ClrIdentity){return $null};return $reference
     }
     if($PSBoundParameters.ContainsKey('ComparisonLeft')){return [ScriptTypeReference]::Same($ComparisonLeft,$ComparisonRight)}
+    if($PSBoundParameters.ContainsKey('ReferenceContract')){return [ScriptTypeContract]::FindReference($ReferenceContract,$ReferenceName,$ReferenceParameters,$ReferenceStatic,$ReferenceConstructor)}
     if($null -ne $BindingOwner){
         $contract=$DeclarationScope.Contracts[$BindingOwner]
         $references=[ScriptTypeReference[]]::new($BindingArguments.Length)
@@ -5046,7 +5047,7 @@ function Get-ScriptTypeContract {
             $references[$i]=ConvertTo-PscBindingReference $BindingArguments[$i] $BindingScopes
             if($null -eq $references[$i]){return $null}
         }
-        $exact=$contract.BindDeclared($BindingName,$references,$BindingStatic,$BindingConstructor)
+        $exact=[ScriptTypeContract]::BindDeclared($contract, $BindingName,$references,$BindingStatic,$BindingConstructor)
         if($null -ne $exact){return $exact}
         return Get-PscOtherFacultyDeclarations -BindingContract $contract -BindingName $BindingName -BindingReferences $references -BindingStatic $BindingStatic -BindingConstructor $BindingConstructor
     }
@@ -15141,7 +15142,7 @@ function New-PscStructuralThunkSource {
             $signature=Get-ParameterTypes $declaration
             $result=if($declaration.ReturnType){Resolve-AstType $declaration.ReturnType.TypeName}else{[void]}
             if(@($signature|Where-Object {$_.IsByRef -or $_.IsPointer -or $_.IsByRefLike}).Count -or $result.IsByRef -or $result.IsPointer -or $result.IsByRefLike){throw 'Unsupported thunk signature.'}
-            $descriptor=$contract.FindResolved($memberName,$signature)
+            $descriptor=[ScriptTypeContract]::FindResolved($contract, $memberName,$signature)
             if($null -eq $descriptor -or $descriptor.ResultTypeIdentity -cne $result.AssemblyQualifiedName){throw "Catalog mismatch '$name.$memberName'."}
             $matches=@(foreach($candidate in $actual.GetMethods([Reflection.BindingFlags]'Public,Instance')){
                 if($candidate.Name -ine $memberName -or $candidate.ContainsGenericParameters -or $candidate.ReturnType -ne $result){continue}
@@ -15583,6 +15584,8 @@ This is the architectural mission, not a claim of completed implementation. Reco
 `ScriptTypeReflection.InvokeBound(role, binding, arguments)` consumes an exact locally declared `ScriptTypeBinding` with its original member reference, checks the role's realized contract, acquires the provider and dependency leases, and invokes the selected compiled target without a second name or overload search. It refuses unmaterialized signatures, nonexact argument representations, unrelated contract/member identities and unavailable realizations. The current profile does not yet admit inherited bindings, conversion plans or symbolic argument storage. `HandleTable` uses CoreLib collections for allocation, ownership traversal and deferred reclamation. `HandleCollector.Collect(table)` owns eligible cleanup execution, completion and free-slot recycling, using the existing table gate and storage. HandleTable owns eligibility, leases and dependency edges and calls the collector when lifetime operations release work. Both are realized in HandleTable.dll because the current synchronous lifetime contract is mutually dependent; no independent collector assembly or tracing GC is claimed. A bounded standalone CoreCLR control has exercised runtime definition construction, binding, replacement and withdrawal using only CoreLib and compiled PSC assemblies. ScriptType's generated-thunk naming still references `System.Security.Cryptography`; full module closure has not been established. The target is a lowered reflective runspace that parses `.ps1` without the SMA assembly, using acquired PowerShell language semantics rather than a second grammar. Independent parser realization is not implemented; current PSC authoring and compilation still acquire source using SMA.
 
 HandleTable's internal lookup, pinning, retention, name resolution and ownership traversal operations now take an explicit typed table participant. Fourteen additional public operations (including collection, withdrawal, succession, retention, pair leasing and rebinding) now require an explicit HandleTable participant. Register, Open, Close and Revoke also take an explicit table participant. The authoring-side query lease acquires exact CLR operation signatures once from the loaded faculty; compiled consumers use typed static calls. The existing IDisposable and cursor instance entry points remain compatibility boundaries. Lease and retention records use explicit typed Create operations; the fence Completed and Signal operations take an explicit fence participant. Rebuild callers of the changed operations. `ScriptTypeBindingExtension.SelectBound(extension, candidates, arguments)` is a static operation with an explicit extension participant; rebuild consumers of the previous instance signature. The existing selector memo and lease semantics are retained.
+
+ScriptTypeContract reflection and binding operations now take an explicit contract participant. Rebuild callers of the previous instance signatures; the binding still retains the original owner, member and argument references.
 
 ## Advisory redundancy analysis
 
