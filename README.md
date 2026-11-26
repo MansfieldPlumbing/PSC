@@ -29,6 +29,10 @@ ScriptTypeContract reflection and binding operations now take an explicit contra
 
 ScriptTypeRealization binding, candidate lookup and operation lookup take an explicit realization participant. ScriptTypeBinding, ScriptTypeCall and ScriptTypeRole use typed Create operations rather than implicit receiver constructors. Rebuild callers of the changed signatures.
 
+ScriptTypeSmaSelector now takes an explicit adapter participant. A closed delegate binds that participant to the static selection method without changing the binding extension contract. The canonical ScriptType faculty contains no implicit receiver references.
+
+InquiryPrimitives uses explicit typed record creation for clean references, predictive scalars and when clauses. InquiryCase.Find(case, axis) retains reference-identity lookup and first matching reading selection. Rebuild callers of the previous constructors and Find instance signature.
+
 ## Advisory redundancy analysis
 
 Use the existing graph to compare authored function and method bodies, including their source identities and locations:

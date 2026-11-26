@@ -3170,11 +3170,9 @@ class InquirySourceCleanReference {
     [string] $OriginalTypeName
     [long] $ClrIdentityHash
     [string] $SourceKey
-    InquirySourceCleanReference([string]$typeName, [long]$hash, [string]$key) {
-        $this.OriginalTypeName = $typeName
-        $this.ClrIdentityHash = $hash
-        $this.SourceKey = $key
-    }
+    static [InquirySourceCleanReference] Create([string]$typeName, [long]$hash, [string]$key){ [InquirySourceCleanReference]$recordValue=[InquirySourceCleanReference]::new(); $recordValue.OriginalTypeName = $typeName
+        $recordValue.ClrIdentityHash = $hash
+        $recordValue.SourceKey = $key; return $recordValue }
 }
 
 class InquiryAxis {
@@ -3186,7 +3184,7 @@ class InquiryAxis {
 
 class InquiryPredictiveScalar {
     [int] $Value
-    InquiryPredictiveScalar([int]$value) { $this.Value=$value }
+    static [InquiryPredictiveScalar] Create([int]$value){ [InquiryPredictiveScalar]$recordValue=[InquiryPredictiveScalar]::new(); $recordValue.Value=$value; return $recordValue }
 }
 
 class InquiryOrigin {
@@ -3213,8 +3211,8 @@ class InquiryCase {
     [InquiryBlock] $Block
     [InquiryReading[]] $Readings = @()
     [bool] $Synthetic
-    [InquiryReading] Find([InquiryAxis] $Axis) {
-        foreach ($reading in $this.Readings) {
+    static [InquiryReading] Find([InquiryCase]$Case, [InquiryAxis] $Axis) {
+        foreach ($reading in $Case.Readings) {
             if ([object]::ReferenceEquals($reading.Axis, $Axis)) { return $reading }
         }
         return $null
@@ -3238,12 +3236,10 @@ class InquiryWhenClause {
     [System.Reflection.MemberInfo] $SemanticMember
     [string] $Operator             # '>=', '<=', '==', '!='
     [object] $Value
-    InquiryWhenClause([string]$memberName, [System.Reflection.MemberInfo]$member, [string]$op, [object]$val) {
-        $this.MemberName = $memberName
-        $this.SemanticMember = $member
-        $this.Operator = $op
-        $this.Value = $val
-    }
+    static [InquiryWhenClause] Create([string]$memberName, [System.Reflection.MemberInfo]$member, [string]$op, [object]$val){ [InquiryWhenClause]$recordValue=[InquiryWhenClause]::new(); $recordValue.MemberName = $memberName
+        $recordValue.SemanticMember = $member
+        $recordValue.Operator = $op
+        $recordValue.Value = $val; return $recordValue }
 }
 
 class InquiryJudgment {
@@ -3351,20 +3347,20 @@ class ScriptTypeSmaSelector {
     [Reflection.ConstructorInfo] $MethodConstructor
     [Reflection.ConstructorInfo] $ParameterConstructor
     [Reflection.MethodInfo] $FindBestMethod
-    [int] Select([ScriptTypeCall[]]$Candidates,[object[]]$Arguments){
-        [Array]$infos=[Array]::CreateInstance($this.MethodInformationType,$Candidates.Length)
+    static [int] Select([ScriptTypeSmaSelector]$Selector, [ScriptTypeCall[]]$Candidates,[object[]]$Arguments){
+        [Array]$infos=[Array]::CreateInstance($Selector.MethodInformationType,$Candidates.Length)
         for([int]$i=0;$i -lt $Candidates.Length;$i++){
             [type[]]$signature=$Candidates[$i].Parameters
-            [Array]$parameters=[Array]::CreateInstance($this.ParameterInformationType,$signature.Length)
+            [Array]$parameters=[Array]::CreateInstance($Selector.ParameterInformationType,$signature.Length)
             for([int]$j=0;$j -lt $signature.Length;$j++){
                 [object[]]$parameterArgs=@($signature[$j],$false,$null,$false)
-                $parameters.SetValue($this.ParameterConstructor.Invoke($parameterArgs),$j)
+                $parameters.SetValue($Selector.ParameterConstructor.Invoke($parameterArgs),$j)
             }
             [object[]]$methodArgs=@($false,$false,$parameters)
-            $infos.SetValue($this.MethodConstructor.Invoke($methodArgs),$i)
+            $infos.SetValue($Selector.MethodConstructor.Invoke($methodArgs),$i)
         }
         [object[]]$invoke=@($infos,$null,$false,$Arguments,$null,$null,$false,$false)
-        [object]$selected=$this.FindBestMethod.Invoke($null,$invoke)
+        [object]$selected=$Selector.FindBestMethod.Invoke($null,$invoke)
         if([bool]$invoke[6] -or [bool]$invoke[7]){throw [NotSupportedException]::new('Unsupported dynamic operation')}
         if($null -eq $selected){
             if($null -ne $invoke[5] -and ([string]$invoke[5]).StartsWith('Multiple ambiguous overloads',[StringComparison]::Ordinal)){throw [Reflection.AmbiguousMatchException]::new('Ambiguous dynamic operation')}
@@ -3518,10 +3514,10 @@ class ScriptTypeReflection {
     hidden static [object] InvokeSelected([ScriptTypeBindingExtension]$Extension,[ScriptTypeCall]$Selected,[object]$Receiver,[object[]]$Arguments){
         [object[]]$values=[object[]]::new($Arguments.Length)
         for([int]$i=0;$i -lt $values.Length;$i++){
-            if($null -ne $Arguments[$i] -and $Arguments[$i].GetType() -eq $selected.Parameters[$i]){$values[$i]=$Arguments[$i]}
-            else{$values[$i]=$Extension.Convert.Invoke($Arguments[$i],$selected.Parameters[$i])}
+            if($null -ne $Arguments[$i] -and $Arguments[$i].GetType() -eq $Selected.Parameters[$i]){$values[$i]=$Arguments[$i]}
+            else{$values[$i]=$Extension.Convert.Invoke($Arguments[$i],$Selected.Parameters[$i])}
         }
-        return $selected.Target.Invoke($Receiver,$values)
+        return $Selected.Target.Invoke($Receiver,$values)
     }
     # Shape comparisons use runtime Type identity, not names. All references to
     # arbitrary types and targets in this path are local to the admitted region.
@@ -15584,6 +15580,10 @@ HandleTable's internal lookup, pinning, retention, name resolution and ownership
 ScriptTypeContract reflection and binding operations now take an explicit contract participant. Rebuild callers of the previous instance signatures; the binding still retains the original owner, member and argument references.
 
 ScriptTypeRealization binding, candidate lookup and operation lookup take an explicit realization participant. ScriptTypeBinding, ScriptTypeCall and ScriptTypeRole use typed Create operations rather than implicit receiver constructors. Rebuild callers of the changed signatures.
+
+ScriptTypeSmaSelector now takes an explicit adapter participant. A closed delegate binds that participant to the static selection method without changing the binding extension contract. The canonical ScriptType faculty contains no implicit receiver references.
+
+InquiryPrimitives uses explicit typed record creation for clean references, predictive scalars and when clauses. InquiryCase.Find(case, axis) retains reference-identity lookup and first matching reading selection. Rebuild callers of the previous constructors and Find instance signature.
 
 ## Advisory redundancy analysis
 
