@@ -3107,7 +3107,7 @@ class Vom {
     }
 }
 
-# Optional timeline object; not a Student clock or training epoch. All CPU fences share a
+# Optional monotone timeline object. All CPU fences share a
 # monitor so a single quorum primitive handles Any/All/N with monotone unsigned values.
 class VomFence {
     hidden static [object] $Gate = [object]::new()
@@ -15225,25 +15225,25 @@ class PscApi {
         $objectives.Add([PscRoadmapObjective]::new('F3',[PscRoadmapState]::Existing,@('F1','F2'),'Persistent semantic index: retain source evidence and STS/CTS declaration and referent identity independent of AST parentage; extend scope, overloads, cross-unit dependencies, incremental fact invalidation and advisory redundancy analysis. Compare incremental results with full rebuild, including shadowing and rename; establish independent evidence before enforcing redundancy findings.',@('PscSemanticIndex','PscIndexedSource','Get-SmaGraph','Resolve-SmaEdges','SmaRedundancyReport'),@(),@('Tests/Test-Worktree.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('F4',[PscRoadmapState]::Existing,@('F0','F3'),'Structural editing: replacement exists; add insertion, deletion, rename, move and dependency-aware validation, atomic grouped undo/redo and stale-reference refusal. No textual parser or competing authority.',@('PscDocument','PscDocumentEdit'),@(),@('Tests/Test-Document.ps1','Tests/Test-Worktree.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('F5',[PscRoadmapState]::Planned,@('F1','F4'),'Canonical script, ordered tree and artifacts: deterministic realization and independently tested exact source, semantic identity and target realization recovery when requested. Explicit retention policy; development information must not impose execution dependencies. Keep compiled faculties optional.',@(),@(),@()))
-        $objectives.Add([PscRoadmapObjective]::new('F6',[PscRoadmapState]::Planned,@('F0','F2','F4','R1','H1'),'Persistent PscHost, accepted/candidate workspaces, typed operations and PSRP; concurrent sessions, revision leases, restart recovery and constrained write admission. Agents use this same API; no second compiler or string-based control plane.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('F6',[PscRoadmapState]::Planned,@('F0','F2','F4','R1','H1'),'Persistent PscHost, retained API and compiled self-consumption, accepted/candidate workspaces, typed operations and PSRP; concurrent sessions, revision leases, restart recovery and constrained write admission. Agents use this same API; no second compiler or string-based control plane.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('L1',[PscRoadmapState]::Existing,@('F1'),'First-class PSC-owned STS and CTS definitions, references, signatures, constraints and compatibility relations; reconcile ScriptType with compiler declarations before extending value/generic types, interfaces, properties, events, visibility and namespaces. Use SMA-visible forms; prove supported definitions independent of runtime materialization.',@('PscAstRebuild','Export-LoweredAssembly','Get-ScriptTypeContract','Get-ScriptTypeReference','ScriptTypeReference','PscMaterializedSignature','ConvertTo-PscMaterializedSignatureType','PscDeclarationScope','Get-DeclarationScope'),@('ScriptType'),@('SM/Test-Formats.ps1','Tests/Test-ScriptTypeReference.ps1','Tests/Test-ScriptTypeCompiler.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('L2',[PscRoadmapState]::Planned,@('L1'),'Explicit program semantics profiles; independent typed binding, structural compatibility, inference and conversion; consolidate duplicate binders. Test declared differences from SMA and CTS, null/overflow/conversion/exception semantics, ambiguity and target parity without requiring runtime materialization.',@('ScriptTypePrimitiveConversion','Select-PscStructuralNumericOverload'),@('PrimitiveConversion'),@('Tests/Test-ScriptTypeSelection.ps1')))
-        $objectives.Add([PscRoadmapObjective]::new('L3',[PscRoadmapState]::Planned,@('F2','L1','L2'),'Managed CLI realization from bound definitions; close compiler refusals using complete pinned application sources, non-loading metadata and executable repros; no stubs counted as completion. Deterministic PE, entry points, callbacks, static graphs, reachability, dependencies, independent execution and CTS interoperability.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('L3',[PscRoadmapState]::Planned,@('F2','L1','L2'),'Managed CLI realization from bound definitions; progressively self-compile PSC.dll, and close compiler refusals using complete pinned application sources, non-loading metadata and executable repros; no stubs counted as completion. Deterministic PE, entry points, callbacks, static graphs, reachability, dependencies, independent execution and CTS interoperability.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('I1',[PscRoadmapState]::Planned,@('F2','F3'),'Inventory donor declarations and contracts, hashes, dependencies, licenses, historical revisions and evidence; reconcile duplicate mechanisms and admit typed source into PSC only.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('I2',[PscRoadmapState]::Existing,@('F2','L1'),'CTS metadata and CIL intake into PSC-owned definitions without runtime materialization: decode signatures, control flow, exception regions and generics; reconstruct admitted typed source and compare behavior and retained semantic identity. Retain explicit unsupported cases; not arbitrary decompilation.',@('Import-PscCilAssembly','Read-PscCilMethod'),@(),@('SM/Test-Formats.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('I3',[PscRoadmapState]::Research,@('F2'),'PDF intake: inventory existing reader; parse document structures, preserve page/extent/provenance, independently compare text and geometry; unsupported encodings explicit.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('I4',[PscRoadmapState]::Planned,@('I1'),'Checkpoint/weight readers from Kokoroku: bounded safe format decoding, shape/dtype/stride validation, truncated and adversarial inputs, typed graph/data output; no arbitrary pickle execution.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('I5',[PscRoadmapState]::Research,@('I1','L1'),'JS/TS and C# intake: reuse TS2PS grammar experiments and CS2PS semantic catalog; external languages are input, not implementation dependencies or a bypass of SMA target admission. Independent semantics tests; no arbitrary translation claim.',@(),@(),@()))
-        $objectives.Add([PscRoadmapObjective]::new('R1',[PscRoadmapState]::Existing,@('L1','L2'),'VOM, STS structural contracts, dispatch, canonical referents and lifetime: preserve identity/aliasing across independent realizations, test composition, revoke/restore, compiled graph and shared references. Keep CLR interoperability explicit; do not recreate these in Student or host.',@('ConvertTo-PscStructuralSource'),@('Vom','ScriptType','ObjectDispatch','InquiryPrimitives'),@('SM/Test-Formats.ps1')))
+        $objectives.Add([PscRoadmapObjective]::new('R1',[PscRoadmapState]::Existing,@('L1','L2'),'Vom, STS dynamic typing and classes, structural contracts, dispatch, canonical referents and lifetime: preserve identity/aliasing across independent realizations, test composition, revoke/restore, leases, compiled graph and shared references. Mitigate overload before exhaustion with explicit degradation evidence. Keep CLR interoperability explicit; do not recreate these in a separate host.',@('ConvertTo-PscStructuralSource'),@('Vom','ScriptType','ObjectDispatch','InquiryPrimitives'),@('SM/Test-Formats.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('R2',[PscRoadmapState]::Planned,@('R1'),'Typed handle rights and explicit authority; least privilege, attenuation, negative authorization, stale handle and revocation tests. Discovery is not authorization.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('R3',[PscRoadmapState]::Planned,@('R2'),'Compartments and worker isolation with explicit enforcement boundary; test escaped handles, cancellation, resource bounds, failure and cleanup. In-process policies are not OS isolation.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('R4',[PscRoadmapState]::Planned,@('N1'),'Native link dependencies, C-runtime imports and library provenance; verify resolved symbols, relocations, ABI, initialization and imported closure; remove dependency only when evidence supports it.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('R5',[PscRoadmapState]::Research,@('N1'),'Measure native runtime writable globals, initialization and ownership; test reentrancy, lifetime and concurrency before attempting runtime reduction.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('R6',[PscRoadmapState]::Research,@('D1','R3'),'Android ART/Binder/zygote alternatives and lower-level device access; document permissions, isolation and actual platform interfaces; no bypass of security controls.',@(),@(),@()))
-        $objectives.Add([PscRoadmapObjective]::new('N1',[PscRoadmapState]::Existing,@('F0','L3'),'NativeAOT and native publication: retain ILC integration and PSC COFF/PE linker; validate pinned tool manifests, actual link closure, imports, unwind, entry point and subsystem; atomically publish only verified artifacts; failed build leaves previous output intact. NativeAOT is a supported backend, not a requirement of direct ISA compilation.',@('Write-CoffImage','Export-NativeImage'),@(),@('Verify')))
-        $objectives.Add([PscRoadmapObjective]::new('N2',[PscRoadmapState]::Existing,@('F0','L2'),'Independent native lowering from PSC-owned bound operations and explicit signatures, storage and ABI without mandatory CIL, ILC, CLR or CRT; retain CIL intake as a producer. Extend existing x64 leaf path, A64/A32/Thumb-2, relocation, branches, calls, register/stack/ABI, non-leaf control flow, unwind and exceptions. Verify decoded bytes and independent execution.',@('ConvertTo-PscIr','Test-PscX64LeafAbi'),@('NativeEncoding','ElfEncoding'),@('SM/Test-Formats.ps1')))
+        $objectives.Add([PscRoadmapObjective]::new('N1',[PscRoadmapState]::Existing,@('F0','L3'),'NativeAOT and native publication: retain and improve ILC integration and PSC COFF/PE linker; self-host PSC.exe; validate pinned tool manifests, actual link closure, imports, unwind, entry point and subsystem; atomically publish only verified artifacts; failed build leaves previous output intact. NativeAOT is a supported backend, not a requirement of direct ISA compilation.',@('Write-CoffImage','Export-NativeImage'),@(),@('Verify')))
+        $objectives.Add([PscRoadmapObjective]::new('N2',[PscRoadmapState]::Existing,@('F0','L2'),'Independent native lowering and self-hosting (PSC executable and shared library) from PSC-owned bound operations and explicit signatures, storage and ABI without mandatory CIL, ILC, CLR or CRT; retain CIL intake as a producer. Extend existing x64 leaf path, A64/A32/Thumb-2, relocation, branches, calls, register/stack/ABI, non-leaf control flow, unwind and exceptions. Verify decoded bytes and independent execution.',@('ConvertTo-PscIr','Test-PscX64LeafAbi'),@('NativeEncoding','ElfEncoding'),@('SM/Test-Formats.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('N3',[PscRoadmapState]::Research,@('N2'),'RyuJitDetach bounded leaf experiments as independent reference; prove extent, relocation, no unresolved dependencies and executable behavior before broadening. Keep separate from general native admission.',@(),@(),@()))
-        $objectives.Add([PscRoadmapObjective]::new('D1',[PscRoadmapState]::Planned,@('F0','F2','N1'),'Portable PSC modes and Android runtime: reuse Pwsh CoreCLR host, assembly store, ELF, DEX, AXML, resources, ZIP/APK signing and JNI contracts; verify each format independently, package and launch on supported ABIs.',@(),@(),@()))
+        $objectives.Add([PscRoadmapObjective]::new('D1',[PscRoadmapState]::Planned,@('F0','F2','N1'),'Portable PSC modes and Android runtime, including self-hosted PSC.apk: reuse Pwsh CoreCLR host, assembly store, ELF, DEX, AXML, resources, ZIP/APK signing and JNI contracts; verify each format independently, package and launch on supported ABIs.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('D2',[PscRoadmapState]::Planned,@('D1','F6'),'Phone as SDK/server: build on device, typed remote sessions, transport, recovery, service lifecycle and actual resource measurements; supported device matrix.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('D3',[PscRoadmapState]::Planned,@('D2','R2'),'USB AOA fleet, ADB/WinUSB transport and device discovery: reuse Pwsh and Kokoroku transport instead of duplicate clients; test reconnect, cancellation, partial transfer and multi-device routing.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('D4',[PscRoadmapState]::Planned,@('F1','L1','N2'),'Hexagon native backend: acquire typed operand/form catalog, 142 donor records (132 bit patterns, ten fixed group/label records), packet constraints, fixups/layout, ELF and ABI. Encode/decode parity, invalid operands and packets, independent toolchain comparisons and hardware kernels. Coverage is bounded to supported forms.',@(),@('NativeEncoding','ElfEncoding'),@()))
@@ -15259,7 +15259,7 @@ class PscApi {
         $objectives.Add([PscRoadmapObjective]::new('X2',[PscRoadmapState]::Research,@('X1','L1'),'PSNL: typed meaning and executable binding via admitted SMA forms, explicit proposal and assessment; never treat parse acceptance or linguistic similarity as semantic equivalence.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('X3',[PscRoadmapState]::Research,@('X1','D5','H2'),'CPU 3D scene and observations: reuse QuickPS geometry/rendering, record reproducible controlled scene changes; no duplicate engine unless a measured gap requires it.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('X4',[PscRoadmapState]::Planned,@('X3'),'Anomaly identification over observations; establish reference distributions, controlled changes, false-positive/negative rates and conditions of applicability.',@(),@(),@()))
-        $objectives.Add([PscRoadmapObjective]::new('X5',[PscRoadmapState]::Planned,@('X1','R1','I1'),'Percept acquisition: import Providence typed observations, referent-relative composition, dependency invalidation and PSPerception reversible proposals; test actual PSC AST/CIL referents, counterexamples, reassessment and retained capabilities on unseen cases.',@(),@('InquiryPrimitives','Vom'),@()))
+        $objectives.Add([PscRoadmapObjective]::new('X5',[PscRoadmapState]::Planned,@('X1','R1','I1'),'Percept acquisition: typed observations, referent-relative composition, dependency invalidation and reversible proposals; test actual PSC AST/CIL referents, counterexamples, reassessment and retained capabilities on unseen cases.',@(),@('InquiryPrimitives','Vom'),@()))
         $objectives.Add([PscRoadmapObjective]::new('X6',[PscRoadmapState]::Research,@('I3','D4','X2','X5'),'Manuals to experiments: derive explicit testable proposals with source extent, predictions, controls and independent comparison; test ISA facts before admitting encoding capabilities.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('X7',[PscRoadmapState]::Planned,@('X5','X2'),'Names and expression: bind terminology to observed relationships and typed capabilities; distinguish names from referents and test reuse across contexts.',@(),@(),@()))
         return $objectives.ToArray()
@@ -15537,14 +15537,14 @@ These are pinned inspection points, not dependencies to download at runtime. Reu
 | Donor | Acquirable mechanisms and disposition |
 |---|---|
 | [Pwsh 515a49a](https://github.com/MansfieldPlumbing/Pwsh/tree/515a49aebd6c7494fd27f7a9d0459ecd4f247470) | setup.ps1: host/ELF, A64/A32/x64 portions already acquired, Thumb-2, ABI/layout, XABA, DEX, AXML, resources, APK and signing; modules/Console.psm1 and scripts/console/Start-Console.ps1: 11 console classes and adapters; tools/Get-AssemblyClosure.ps1, adb/usbaoa/CellCanvas/AndroidCanvas. Reconcile, do not clone. |
-| [Kokoroku 690c81b](https://github.com/MansfieldPlumbing/Kokoroku/tree/690c81bfe84882338a41ff1486eda1fb97d9fb82) | Invoke-HexagonDevelopment.ps1 and Test-HexagonEmission: ISA catalog and packetizer; Invoke-KokoroPrecomputedDecoder.ps1: SIMD workers, convolution, dense math, packing; checkpoint reader, audio measurement, AAudio, DSP queue, device evaluator; Providence.Field/Bank, StudentSourceInventory, Invoke-StudentPerceptHunt and seed graph: domain-independent learning. Keep speech-specific generator, tail, phonemizer and prosody in Kokoroku. Do not resurrect the retired neural front end as an architectural requirement. |
+| [Kokoroku 690c81b](https://github.com/MansfieldPlumbing/Kokoroku/tree/690c81bfe84882338a41ff1486eda1fb97d9fb82) | Invoke-HexagonDevelopment.ps1 and Test-HexagonEmission: ISA catalog and packetizer; Invoke-KokoroPrecomputedDecoder.ps1: SIMD workers, convolution, dense math, packing; checkpoint reader, audio measurement, AAudio, DSP queue, device evaluator; Typed observation, source inventory, referent-relative discovery and retained seed graphs: domain-independent discovery. Keep speech-specific generator, tail, phonemizer and prosody in Kokoroku. Do not resurrect the retired neural front end as an architectural requirement. |
 | [Notepad 17b76e2](https://github.com/MansfieldPlumbing/Notepad/tree/17b76e22a5d3132e22c195989aa9dec70dc4ded6) | Piece table and edit journal already adapted; retain revision checks, not stale cached search behavior. Acquire generic presentation, windowing, geometry, hit testing, capture and test instruments. Native app remains an end-to-end corpus. |
 | [PSNES 8165c65](https://github.com/MansfieldPlumbing/PSNES/tree/8165c65e51ea4efbcef0cded7cd2337e336ea8a0) | Full emulator, instruction traces, frame checksums, native executable and throughput regression corpus; keep 6502/NES domain implementation downstream. |
 | [QuickPS eaff8be](https://github.com/MansfieldPlumbing/QuickPS/tree/eaff8be40f9aef44fc3094b4f3badff27fe6249f) | Build-Appliance, native platform bindings, geometry, graphics, composition, audio and capture. Existing PSC native calls supersede dynamic binder where equivalent. No proven general AVX emitter located here. |
 | [PSPerception 398da4e](https://github.com/MansfieldPlumbing/PSPerception/tree/398da4e63344448826176001a379bbdcbc73a821) | Refine.ps1 and PredicateSynthesis.ps1: counterexample localization, reversible proposals, bounded predicate search, objective acceptance, provenance. Merge with X5, not a second learning framework. |
 | [RyuJitDetach 8589c02](https://github.com/MansfieldPlumbing/RyuJitDetach/tree/8589c02f0c12df320477312ef7f70e152f222a91) | Bounded native leaf extraction and PE oracle; not a general compiler. |
 | [CS2PS 9d4ee28](https://github.com/MansfieldPlumbing/CS2PS/tree/9d4ee28ce169e02798fbb60c11d8886fbf15bf19), [TS2PS c22a172](https://github.com/MansfieldPlumbing/TS2PS/tree/c22a172e5de171bc148f59d91f7ec8ed016ccb7c) | Metadata catalog, semantic correspondence, parser scoring and independent translation corpus; acquire useful observations rather than another target-language parser. |
-| [Pwsh-Development 403f11a](https://github.com/MansfieldPlumbing/Pwsh-Development/tree/403f11a34e56dc2a1f3354d6501c5ab19344be1e) | Historical campaign, reference corpus, StudentV3 and recovered Subsystem/QuickPS work; inspect historical branches for missing capability before implementing. Recovered material is reference, not direct build input. |
+| [Pwsh-Development 403f11a](https://github.com/MansfieldPlumbing/Pwsh-Development/tree/403f11a34e56dc2a1f3354d6501c5ab19344be1e) | Historical campaign, reference corpus, discovery experiments and recovered Subsystem/QuickPS work; inspect historical branches for missing capability before implementing. Recovered material is reference, not direct build input. |
 | DirectPort, DPX, DirectAI and other historical repositories | Inventory revision and actual implementation before naming reusable device, transport, pipeline or vector mechanisms. No uninspected capability is counted as acquired. |
 
 SIMD evidence: Kokoroku [AVX-512 commit](https://github.com/MansfieldPlumbing/Kokoroku/commit/07a3e4894695acefbd3e82d3e1145f96ccb6105f) and [ARM64 execution](https://github.com/MansfieldPlumbing/Kokoroku/blob/690c81bfe84882338a41ff1486eda1fb97d9fb82/docs/results/frontend-phone-cpu-sm8550-20261027.md) establish donor kernels and portable 128-bit hardware acceleration. Vector256 was not hardware-accelerated on that phone; text encodings differed from host, while tokens/durations/F0/N matched on two sentences. Explicit NEON encoding is not established. Hexagon hardware measurements and generator-only scope must remain distinct from end-to-end speech performance.
@@ -15575,14 +15575,14 @@ No scheduled background agent or automatic publication is implied. Regular publi
 $api.AssertSurface()
 $api.Modes
 $api.Parameters
-$api.Measures
+$api.Measures() # Demand-driven measurements of the acquired source revision
 $api.Functions
 $api.Classes
 $api | Get-Member
 & ./PSC.ps1 -Mode Capability
 ```
 
-The API is derived from the running script, so mode names and parameter evidence do not depend on a previous session's notes. Use `Describe(mode)` for dispatcher extents and associated definitions. CLI inventory below is generated; source hash, local paths, runtime and measurement values are available from the live API rather than frozen into the README. Regenerate with `& ./PSC.ps1 -Mode Readme`.
+The API retains the acquired source revision. Eligible queries reuse its AST after byte-identity verification; measurements are acquired only on the first Measures() call. ReadSource(path) still acquires all measurements. The API is derived from the running script, so mode names and parameter evidence do not depend on a previous session's notes. Use `Describe(mode)` for dispatcher extents and associated definitions. CLI inventory below is generated; source hash, local paths, runtime and measurement values are available from the live API rather than frozen into the README. Regenerate with `& ./PSC.ps1 -Mode Readme`.
 '@
         return $guideText.Replace('@@TYPESYSTEM@@',$this.TypeSystemContract).Replace('@@FORMATS@@',($formatRows -join "`n")).Replace('@@ROADMAP@@',$this.RoadmapMarkdown())
     }
@@ -15620,7 +15620,7 @@ The API is derived from the running script, so mode names and parameter evidence
     [PscQueryCursor] OpenQuery([string[]]$paths,[PscQueryKind]$kind,[string]$name,[string]$owner,[string]$literal,[int]$take){
         if($literal -and $kind -in [PscQueryKind]::CilMethod,[PscQueryKind]::CilOp){throw 'Literal containment requires a source query.'}
         $spec=[PscQuerySpec]::new($kind,$name,$owner,$take);$spec.Literal=$literal
-        return [PscQueryCursor]::new($paths,$spec)
+        return [PscQueryCursor]::new($paths,$spec,$this.Source)
     }
     [void] AssertSurface(){
         $allowed=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -15637,7 +15637,8 @@ The API is derived from the running script, so mode names and parameter evidence
     [string] $DefaultMode
     [PscOperation[]] $Modes
     [PscParameter[]] $Parameters
-    [PscMeasure[]] $Measures
+    hidden [PscSource] $Source
+    [PscMeasure[]] Measures(){return $this.Source.Measure()}
     [string[]] $Functions
     [string[]] $Classes
     [PscEnvironment] $Environment
@@ -15724,7 +15725,7 @@ function Get-PscApi {
     [CmdletBinding()]
     [OutputType([PscApi])]
     param()
-    $source = [PscSource]::new($PSCommandPath)
+    $source = [PscSource]::new($PSCommandPath,$false)
     $ast = $source.Ast
     if ($source.ParseErrors.Count) { throw 'This script has parse errors; its API cannot be described.' }
     $help = $ast.GetHelpContent()
@@ -15774,7 +15775,7 @@ function Get-PscApi {
     $api.DefaultMode = $scriptParameters['Mode'].DefaultValue.SafeGetValue()
     $api.Modes = $operations.ToArray()
     $api.Parameters = [PscParameter[]]@(foreach ($parameter in $ast.ParamBlock.Parameters) { Get-PscApiParameter $parameter $help.Parameters[$parameter.Name.VariablePath.UserPath.ToUpperInvariant()] })
-    $api.Measures = $source.Measures
+    $api.Source = $source
     $api.Functions = [string[]]@($functions.Keys)
     $api.Classes = [string[]]@($ast.BeginBlock.FindAll({ param($node) $node -is [System.Management.Automation.Language.TypeDefinitionAst] }, $false) | ForEach-Object Name)
     $api.Environment = $script:PscEnvironment
@@ -16993,6 +16994,7 @@ class PscCilByteCursor {
 }
 class PscQueryCursor : IDisposable {
     hidden [PscQuerySpec] $Spec
+    hidden [PscSource] $RetainedSource
     hidden [string[]] $Paths
     hidden [int] $PathIndex
     hidden [Collections.Generic.IEnumerator[string]] $Files
@@ -17013,6 +17015,9 @@ class PscQueryCursor : IDisposable {
     hidden [bool] $Disposed
     PscQueryCursor([string[]]$paths,[PscQuerySpec]$spec){
         $this.Paths=[string[]]::new($paths.Length);for($n=0;$n -lt $paths.Length;$n++){$this.Paths[$n]=[PscTreeText]::FullPath($paths[$n])};$this.Spec=$spec
+    }
+    PscQueryCursor([string[]]$paths,[PscQuerySpec]$spec,[PscSource]$source){
+        $this.Paths=[string[]]::new($paths.Length);for($n=0;$n -lt $paths.Length;$n++){$this.Paths[$n]=[PscTreeText]::FullPath($paths[$n])};$this.Spec=$spec;$this.RetainedSource=$source
     }
     hidden [void] CloseArtifact(){
         $this.Ast=$null;$this.Resume=0;$this.ParseIncomplete=$false;$this.Body=$null;$this.Methods=$null;$this.Metadata=$null
@@ -17049,6 +17054,8 @@ class PscQueryCursor : IDisposable {
                     $this.Pe=[Reflection.PortableExecutable.PEReader]::new([IO.MemoryStream]::new($bytes,$false))
                     $this.Metadata=[Reflection.Metadata.PEReaderExtensions]::GetMetadataReader($this.Pe)
                     $this.Methods=[Collections.IEnumerator]$this.Metadata.MethodDefinitions.GetEnumerator()
+                }elseif($null -ne $this.RetainedSource -and $this.RetainedSource.Path -ceq $next -and $this.RetainedSource.Sha256 -ceq $this.Digest -and !$this.RetainedSource.ParseErrors.Count -and !$this.RetainedSource.Ast.UsingStatements.Count -and $null -eq $this.RetainedSource.Ast.ScriptRequirements){
+                    $this.Ast=$this.RetainedSource.Ast
                 }else{
                     $reader=[IO.StreamReader]::new([IO.MemoryStream]::new($bytes,$false),[Text.Encoding]::UTF8,$true)
                     $source="";try{$source=$reader.ReadToEnd()}finally{$reader.Dispose()}
@@ -18727,21 +18734,33 @@ class PscMeasure {
 class PscSource {
     [string] $Path
     [string] $Sha512
+    [string] $Sha256
     [System.Management.Automation.Language.ScriptBlockAst] $Ast
     [System.Management.Automation.Language.Token[]] $Tokens
     [System.Management.Automation.Language.ParseError[]] $ParseErrors
     [PscMeasure[]] $Measures
 
-    PscSource([string] $path) {
-        $this.Path = $path
-        $this.Sha512 = (Get-FileHash -LiteralPath $path -Algorithm SHA512).Hash
+    PscSource([string] $path) { $this.Initialize($path); $null=$this.Measure() }
+    PscSource([string] $path,[bool] $measure) { $this.Initialize($path); if($measure){$null=$this.Measure()} }
+    hidden [void] Initialize([string] $path) {
+        $this.Path = [PscTreeText]::FullPath($path)
+        $bytes = [IO.File]::ReadAllBytes($this.Path)
+        $this.Sha512 = [Convert]::ToHexString([Security.Cryptography.SHA512]::HashData($bytes))
+        $this.Sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+        $reader=[IO.StreamReader]::new([IO.MemoryStream]::new($bytes,$false),[Text.Encoding]::UTF8,$true)
+        $text='';try{$text=$reader.ReadToEnd()}finally{$reader.Dispose()}
         $parsedTokens = $null; $parsedErrors = $null
-        $this.Ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$parsedTokens, [ref]$parsedErrors)
+        $this.Ast = [System.Management.Automation.Language.Parser]::ParseInput($text,$this.Path,[ref]$parsedTokens,[ref]$parsedErrors)
         $this.Tokens = $parsedTokens
         $this.ParseErrors = $parsedErrors
-        $found = [System.Collections.Generic.List[PscMeasure]]::new()
-        foreach ($method in [PscMeasurementMethod]::All()) { $found.Add($method.Measure($this)) }
-        $this.Measures = $found.ToArray()
+    }
+    [PscMeasure[]] Measure() {
+        if($null -eq $this.Measures){
+            $found = [System.Collections.Generic.List[PscMeasure]]::new()
+            foreach ($method in [PscMeasurementMethod]::All()) { $found.Add($method.Measure($this)) }
+            $this.Measures = $found.ToArray()
+        }
+        return $this.Measures
     }
 }
 
