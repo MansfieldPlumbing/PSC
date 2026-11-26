@@ -4951,20 +4951,43 @@ class PscElfImageReader {
 # Scope identity is distinct from AST identity: the same AST may be realized
 # in several independent declaration scopes.
 class PscResidentDeclarationGraph {
-    hidden static [Collections.Generic.List[ScriptTypeContract[]]] $Scopes
-    hidden static [Collections.Generic.List[System.Management.Automation.Language.TypeDefinitionAst[]]] $Definitions
+    # A slot is a session-relative coordinate, not the declaration graph's identity.
+    # Retired coordinates are never recycled; imported scopes must remain live.
+    hidden static [Collections.Generic.Dictionary[int,Tuple[ScriptTypeContract[],System.Management.Automation.Language.TypeDefinitionAst[],int[]]]] $Scopes
+    hidden static [int] $NextScope
+    static [bool] Live([int]$Scope){
+        return $null -ne [PscResidentDeclarationGraph]::Scopes -and [PscResidentDeclarationGraph]::Scopes.ContainsKey($Scope)
+    }
+    static [Tuple[int,string]] Release([int]$Scope){
+        try{
+            if(![PscResidentDeclarationGraph]::Live($Scope)){return [Tuple[int,string]]::new(0,'Scope is not live')}
+            [int[]]$keys=[int[]]::new([PscResidentDeclarationGraph]::Scopes.Count)
+            [PscResidentDeclarationGraph]::Scopes.Keys.CopyTo($keys,0)
+            foreach($key in $keys){
+                foreach($dependency in [PscResidentDeclarationGraph]::Scopes[$key].Item3){
+                    if($dependency -eq $Scope){return [Tuple[int,string]]::new(4,'Scope has a live importing scope')}
+                }
+            }
+            if(![PscResidentDeclarationGraph]::Scopes.Remove($Scope)){return [Tuple[int,string]]::new(4,'Scope withdrawal failed')}
+            return [Tuple[int,string]]::new(1,'')
+        }catch [Exception]{return [Tuple[int,string]]::new(4,$_.Exception.Message)}
+        return [Tuple[int,string]]::new(4,'Scope withdrawal did not complete')
+    }
     static [Tuple[int,int,string]] Acquire([System.Management.Automation.Language.TypeDefinitionAst[]]$Definitions,[int[]]$Imports){
         try {
-            if($null -eq [PscResidentDeclarationGraph]::Scopes){[PscResidentDeclarationGraph]::Scopes=[Collections.Generic.List[ScriptTypeContract[]]]::new();[PscResidentDeclarationGraph]::Definitions=[Collections.Generic.List[System.Management.Automation.Language.TypeDefinitionAst[]]]::new()}
+            if($null -eq [PscResidentDeclarationGraph]::Scopes){[PscResidentDeclarationGraph]::Scopes=[Collections.Generic.Dictionary[int,Tuple[ScriptTypeContract[],System.Management.Automation.Language.TypeDefinitionAst[],int[]]]]::new()}
             [Collections.Generic.List[ScriptTypeContract]]$imported=[Collections.Generic.List[ScriptTypeContract]]::new()
             foreach($slot in $Imports){
-                if($slot -lt 0 -or $slot -ge [PscResidentDeclarationGraph]::Scopes.Count){return [Tuple[int,int,string]]::new(4,-1,'Invalid imported scope')}
-                $imported.AddRange([PscResidentDeclarationGraph]::Scopes[$slot])
+                if(![PscResidentDeclarationGraph]::Live($slot)){return [Tuple[int,int,string]]::new(4,-1,'Invalid imported scope')}
+                $imported.AddRange([PscResidentDeclarationGraph]::Scopes[$slot].Item1)
             }
             [ScriptTypeContract[]]$contracts=[PscScriptTypeAcquisition]::Acquire($Definitions,$imported.ToArray())
-            [int]$scope=[PscResidentDeclarationGraph]::Scopes.Count
-            [PscResidentDeclarationGraph]::Scopes.Add($contracts)
-            [PscResidentDeclarationGraph]::Definitions.Add($Definitions)
+            if([PscResidentDeclarationGraph]::NextScope -eq [int]::MaxValue){return [Tuple[int,int,string]]::new(4,-1,'Scope coordinate capacity exhausted')}
+            [int]$scope=[PscResidentDeclarationGraph]::NextScope
+            [int[]]$dependencies=[int[]]::new($Imports.Length)
+            [Array]::Copy($Imports,$dependencies,$Imports.Length)
+            [PscResidentDeclarationGraph]::Scopes.Add($scope,[Tuple[ScriptTypeContract[],System.Management.Automation.Language.TypeDefinitionAst[],int[]]]::new($contracts,$Definitions,$dependencies))
+            [PscResidentDeclarationGraph]::NextScope=$scope+1
             return [Tuple[int,int,string]]::new(1,$scope,'')
         }catch [Exception]{return [Tuple[int,int,string]]::new(4,-1,$_.Exception.Message)}
         return [Tuple[int,int,string]]::new(4,-1,'Acquisition did not complete')
@@ -4992,8 +5015,8 @@ class PscResidentDeclarationGraph {
         }
         if($Owners.ContainsKey($Type)){
             [Tuple[int,int]]$slot=$Owners[$Type]
-            if($slot.Item1 -lt 0 -or $slot.Item1 -ge [PscResidentDeclarationGraph]::Scopes.Count){throw [InvalidOperationException]::new('Invalid owner scope')}
-            [ScriptTypeContract[]]$contracts=[PscResidentDeclarationGraph]::Scopes[$slot.Item1]
+            if(![PscResidentDeclarationGraph]::Live($slot.Item1)){throw [InvalidOperationException]::new('Invalid owner scope')}
+            [ScriptTypeContract[]]$contracts=[PscResidentDeclarationGraph]::Scopes[$slot.Item1].Item1
             if($slot.Item2 -lt 0 -or $slot.Item2 -ge $contracts.Length){throw [InvalidOperationException]::new('Invalid owner declaration')}
             $reference.Kind=[ScriptTypeReferenceKind]::Source;$reference.Definition=$contracts[$slot.Item2];return $reference
         }
@@ -5011,8 +5034,8 @@ class PscResidentDeclarationGraph {
         return $result
     }
     hidden static [Tuple[int,int,bool[],string[],string]] BindCore([int]$Scope,[int]$Owner,[string]$Name,[type[]]$Arguments,[bool]$Static,[bool]$Constructor,[Collections.Generic.Dictionary[type,Tuple[int,int]]]$Owners){
-            if($null -eq [PscResidentDeclarationGraph]::Scopes -or $Scope -lt 0 -or $Scope -ge [PscResidentDeclarationGraph]::Scopes.Count){return [Tuple[int,int,bool[],string[],string]]::new(4,-1,[bool[]]::new(0),[string[]]::new(0),'Invalid binding scope')}
-            [ScriptTypeContract[]]$contracts=[PscResidentDeclarationGraph]::Scopes[$Scope]
+            if(![PscResidentDeclarationGraph]::Live($Scope)){return [Tuple[int,int,bool[],string[],string]]::new(4,-1,[bool[]]::new(0),[string[]]::new(0),'Invalid binding scope')}
+            [ScriptTypeContract[]]$contracts=[PscResidentDeclarationGraph]::Scopes[$Scope].Item1
             if($Owner -lt 0 -or $Owner -ge $contracts.Length){return [Tuple[int,int,bool[],string[],string]]::new(4,-1,[bool[]]::new(0),[string[]]::new(0),'Invalid binding owner')}
             [ScriptTypeContract]$contract=$contracts[$Owner]
             [ScriptTypeReference[]]$references=[ScriptTypeReference[]]::new($Arguments.Length)
@@ -5099,21 +5122,21 @@ class PscResidentDeclarationGraph {
         return $result
     }
     hidden static [Tuple[int,type,Tuple[type,type[]][],string]] ProjectCore([int]$Scope,[int]$Owner,[Collections.Generic.Dictionary[type,Tuple[int,int]]]$Owners,[Collections.Generic.Dictionary[string,type]]$NamedTypes){
-        if($Scope -lt 0 -or $Scope -ge [PscResidentDeclarationGraph]::Scopes.Count){throw [InvalidOperationException]::new('Invalid projection scope')}
-        [ScriptTypeContract[]]$contracts=[PscResidentDeclarationGraph]::Scopes[$Scope]
+        if(![PscResidentDeclarationGraph]::Live($Scope)){throw [InvalidOperationException]::new('Invalid projection scope')}
+        [ScriptTypeContract[]]$contracts=[PscResidentDeclarationGraph]::Scopes[$Scope].Item1
         if($Owner -lt 0 -or $Owner -ge $contracts.Length){throw [InvalidOperationException]::new('Invalid projection owner')}
         [Collections.Generic.Dictionary[ScriptTypeContract,type]]$types=[Collections.Generic.Dictionary[ScriptTypeContract,type]]::new()
         [type[]]$keys=[type[]]::new($Owners.Count)
         $Owners.Keys.CopyTo($keys,0)
         foreach($key in $keys){
             [Tuple[int,int]]$slot=$Owners[$key]
-            if($slot.Item1 -lt 0 -or $slot.Item1 -ge [PscResidentDeclarationGraph]::Scopes.Count){throw [InvalidOperationException]::new('Invalid realization scope')}
-            [ScriptTypeContract[]]$visible=[PscResidentDeclarationGraph]::Scopes[$slot.Item1]
+            if(![PscResidentDeclarationGraph]::Live($slot.Item1)){throw [InvalidOperationException]::new('Invalid realization scope')}
+            [ScriptTypeContract[]]$visible=[PscResidentDeclarationGraph]::Scopes[$slot.Item1].Item1
             if($slot.Item2 -lt 0 -or $slot.Item2 -ge $visible.Length){throw [InvalidOperationException]::new('Invalid realization owner')}
             $types.Add($visible[$slot.Item2],$key)
         }
         [ScriptTypeContract]$contract=$contracts[$Owner]
-        [System.Management.Automation.Language.TypeDefinitionAst]$definition=[PscResidentDeclarationGraph]::Definitions[$Scope][$Owner]
+        [System.Management.Automation.Language.TypeDefinitionAst]$definition=[PscResidentDeclarationGraph]::Scopes[$Scope].Item2[$Owner]
         [type]$base=$null
         if($contract.BaseReferences.Length -ne 0){
             if($contract.BaseReferences.Length -ne 1 -or $contract.BaseReferences[0].Kind -ne [ScriptTypeReferenceKind]::Source){throw [InvalidOperationException]::new('Base is not an admitted source-owned class: '+$definition.Name)}
@@ -5671,6 +5694,8 @@ class PscRuntimeSelection {
     hidden [Func[System.Management.Automation.Language.TypeDefinitionAst[],int[],Tuple[int,int,string]]] $GraphAcquisition
     hidden [Func[int,int,Collections.Generic.Dictionary[type,Tuple[int,int]],Collections.Generic.Dictionary[string,type],Tuple[int,type,Tuple[type,type[]][],string]]] $GraphProjection
     hidden [Func[int,int,string,type[],bool,bool,Collections.Generic.Dictionary[type,Tuple[int,int]],Tuple[int,int,bool[],string[],string]]] $GraphBinding
+    hidden [Func[int,bool]] $GraphLive
+    hidden [Func[int,Tuple[int,string]]] $GraphRelease
     static [string[]] FacultyNames(){return @('HandleTable','ScriptType','PrimitiveConversion')}
     static [string[]] AdmissionNames(){return @('HandleTable','ScriptType','PrimitiveConversion','CompilerDeclarations')}
     static [string] ArtifactPath([string]$Directory,[string]$Name){
@@ -5737,6 +5762,8 @@ class PscRuntimeSelection {
             $session.GraphAcquisition=$graph.GetMethod('Acquire').CreateDelegate([Func[System.Management.Automation.Language.TypeDefinitionAst[],int[],Tuple[int,int,string]]])
             $session.GraphProjection=$graph.GetMethod('Project').CreateDelegate([Func[int,int,Collections.Generic.Dictionary[type,Tuple[int,int]],Collections.Generic.Dictionary[string,type],Tuple[int,type,Tuple[type,type[]][],string]]])
             $session.GraphBinding=$graph.GetMethod('Bind').CreateDelegate([Func[int,int,string,type[],bool,bool,Collections.Generic.Dictionary[type,Tuple[int,int]],Tuple[int,int,bool[],string[],string]]])
+            $session.GraphLive=$graph.GetMethod('Live').CreateDelegate([Func[int,bool]])
+            $session.GraphRelease=$graph.GetMethod('Release').CreateDelegate([Func[int,Tuple[int,string]]])
             return $session
         }catch{$context.Unload();throw}
     }
@@ -5782,13 +5809,30 @@ class PscRuntimeSelection {
             return $result
         }finally{[Threading.Monitor]::Exit($Session)}
     }
+    static [void] AssertGraph([PscRuntimeSelection]$Session,[int]$Scope){
+        [Threading.Monitor]::Enter($Session)
+        try{
+            [PscRuntimeSelection]::AssertOpen($Session)
+            if(!$Session.GraphLive.Invoke($Scope)){throw [InvalidOperationException]::new('Resident declaration scope is withdrawn')}
+        }finally{[Threading.Monitor]::Exit($Session)}
+    }
+    static [bool] ReleaseGraph([PscRuntimeSelection]$Session,[int]$Scope){
+        [Threading.Monitor]::Enter($Session)
+        try{
+            [PscRuntimeSelection]::AssertOpen($Session)
+            $result=$Session.GraphRelease.Invoke($Scope)
+            if($result.Item1 -eq 0){return $false}
+            if($result.Item1 -ne 1){throw [InvalidOperationException]::new($result.Item2)}
+            return $true
+        }finally{[Threading.Monitor]::Exit($Session)}
+    }
     static [void] Close([PscRuntimeSelection]$Session){
         if($null -eq $Session){return}
         [Threading.Monitor]::Enter($Session)
         try{
             if($null -eq $Session.FacultyContext){return}
             $context=$Session.FacultyContext
-            $Session.GraphAcquisition=$null;$Session.GraphProjection=$null;$Session.GraphBinding=$null;$Session.Scopes=$null
+            $Session.GraphAcquisition=$null;$Session.GraphProjection=$null;$Session.GraphBinding=$null;$Session.GraphLive=$null;$Session.GraphRelease=$null;$Session.Scopes=$null
             $Session.NumericSelector=$null
             $Session.FacultyContext=$null
             $context.Unload()
@@ -9249,7 +9293,10 @@ function Get-PscOperationalScope {
         $scope=$null
         $cache=$script:DeclarationScopeCache
         if($null -ne $RuntimeSelection){[PscRuntimeSelection]::AssertOpen($RuntimeSelection);$cache=$RuntimeSelection.Scopes}
-        if($cache.TryGetValue($Root,[ref]$scope)){return $scope}
+        if($cache.TryGetValue($Root,[ref]$scope)){
+            if($null -ne $RuntimeSelection){[PscRuntimeSelection]::AssertGraph($RuntimeSelection,$scope.ResidentSlot)}
+            return $scope
+        }
         return $null
     }
     Get-DeclarationScope -Root $Root -RuntimeSelection $RuntimeSelection
@@ -9295,7 +9342,13 @@ function Get-DeclarationScope {
     if($null -ne $RuntimeSelection){[PscRuntimeSelection]::AssertOpen($RuntimeSelection);$cache=$RuntimeSelection.Scopes}
     if($null -ne $Resolving){$cache=$Resolving.DependentScopes}
     $declarationScope=$null
-    if(!$selected -and $cache.TryGetValue($Root,[ref]$declarationScope)){return $declarationScope}
+    if(!$selected -and $cache.TryGetValue($Root,[ref]$declarationScope)){
+        if($null -ne $RuntimeSelection){
+            if($declarationScope.ResidentSession -ne $RuntimeSelection.Identity){throw 'Declaration scope belongs to another execution domain'}
+            [PscRuntimeSelection]::AssertGraph($RuntimeSelection,$declarationScope.ResidentSlot)
+        }
+        return $declarationScope
+    }
     $inProgress = $script:LoweringClassTypes
     try {
         $classes = @(if ($PSBoundParameters.ContainsKey('SelectedClassAst')) { $SelectedClassAst }
@@ -10921,6 +10974,7 @@ function Get-PscResidentOwnerMap {
         $visible=$scope
         while($null -ne $visible -and $seen.Add($visible)){
             if($visible.ResidentSlot -lt 0 -or $visible.ResidentSession -ne $RuntimeSelection.Identity){throw 'Unadmitted declaration graph owner'}
+            [PscRuntimeSelection]::AssertGraph($RuntimeSelection,$visible.ResidentSlot)
             $types=$visible.Types
             if([object]::ReferenceEquals($visible,$BuildingScope)){$types=$MaterializedTypes}
             for($i=0;$i -lt $visible.ResidentDefinitions.Length;$i++){
@@ -16392,7 +16446,7 @@ Conform streams child stdout and stderr to the invoking host as they become avai
 
 - **Managed:** SMA AST and typed expression lowering, deterministic IL emission, static graph/data realization, reachability and fixed-parameter specialization.
 - **Native:** pinned Windows NativeAOT compiler plus PSC COFF linker; direct CIL-to-IR-to-x64 ELF leaf emission and decoded-byte ABI checks. The direct backend does not yet replace ILC for general programs.
-- **Faculties:** `HandleTable`, `DiscoveryMechanisms`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. BuildRuntime without contract inputs also builds the compiler-private `compiler/CompilerDeclarations.dll` and writes a version 2 local selection receipt for it and HandleTable, ScriptType and PrimitiveConversion. The seven public faculty files and their dependency closure are unchanged. The compiled selection path verifies source, CoreLib, SMA, the existing TypeConverter framework dependency and all four admitted assembly digests once, loads the exact bytes in a private collectible context, and invokes typed delegates. Version 1 receipts require rebuilding. Missing or incompatible receipts refuse that path; no implicit interpreted fallback is permitted after selection is requested. Without an explicit directory the authoring selector is unchanged. The receipt identifies a trusted local build; it is not a signature or independent admission proof. This is explicit compiler self-consumption, not full startup activation. `PscApi.AcquireSelection(api,directory)` acquires an explicit resident selection session from the API source revision. `PscRuntimeSelection.Select(session,signatures,sources)` reuses the admitted selector without reading artifacts again; `Close(session)` withdraws it and requests context unloading. Resident structural specialization accepts the same session as `-RuntimeSelection`, and does not close a caller-owned session. CLI Compile with an explicit `-RuntimeDirectory` uses `Invoke-PscCompile` to acquire one session before lowering, supply it to both structural specialization and ordinary managed lowering (including the managed precursor of Native), and close it in a finally boundary before returning the managed result. The session remains inside the authoring operation, not the process dispatcher. Even an exact-only compilation refuses a missing or incompatible receipt when explicitly requested. Without an explicit directory CLI Compile retains interpreted selection. The retained session may also be supplied to `Export-LoweredAssembly -RuntimeSelection`: ordinary source static/instance calls and explicit constructors use session-owned compiled STS exact and numeric binding and retain the original CLR projection witnesses. Method closure, initializer lowering and recursive function-output inference use the same session; a selected compilation owns fresh declaration scopes, including their existing inference caches. `PscScriptTypeAcquisition` constructs descriptors directly from the original SMA AST declarations in the selected execution domain. A resident scope stores only its owning session, scope and source coordinates, and CLR projection witnesses; it does not construct an interpreted descriptor graph. The compiled graph retains original imported referents and supplies typed acquisition, projection and binding results across the delegate boundary, with refusal status and diagnostic text instead of collectible exceptions. The authoring caller checks the selected member against its CLR realization. Graph scope slots remain owned until session closure; a resident scope cannot import an authoring descriptor graph. ScriptType.dll remains independent of SMA; only the compiler-side adapter consumes AST evidence. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
+- **Faculties:** `HandleTable`, `DiscoveryMechanisms`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. BuildRuntime without contract inputs also builds the compiler-private `compiler/CompilerDeclarations.dll` and writes a version 2 local selection receipt for it and HandleTable, ScriptType and PrimitiveConversion. The seven public faculty files and their dependency closure are unchanged. The compiled selection path verifies source, CoreLib, SMA, the existing TypeConverter framework dependency and all four admitted assembly digests once, loads the exact bytes in a private collectible context, and invokes typed delegates. Version 1 receipts require rebuilding. Missing or incompatible receipts refuse that path; no implicit interpreted fallback is permitted after selection is requested. Without an explicit directory the authoring selector is unchanged. The receipt identifies a trusted local build; it is not a signature or independent admission proof. This is explicit compiler self-consumption, not full startup activation. `PscApi.AcquireSelection(api,directory)` acquires an explicit resident selection session from the API source revision. `PscRuntimeSelection.Select(session,signatures,sources)` reuses the admitted selector without reading artifacts again; `Close(session)` withdraws it and requests context unloading. Resident structural specialization accepts the same session as `-RuntimeSelection`, and does not close a caller-owned session. CLI Compile with an explicit `-RuntimeDirectory` uses `Invoke-PscCompile` to acquire one session before lowering, supply it to both structural specialization and ordinary managed lowering (including the managed precursor of Native), and close it in a finally boundary before returning the managed result. The session remains inside the authoring operation, not the process dispatcher. Even an exact-only compilation refuses a missing or incompatible receipt when explicitly requested. Without an explicit directory CLI Compile retains interpreted selection. The retained session may also be supplied to `Export-LoweredAssembly -RuntimeSelection`: ordinary source static/instance calls and explicit constructors use session-owned compiled STS exact and numeric binding and retain the original CLR projection witnesses. Method closure, initializer lowering and recursive function-output inference use the same session; a selected compilation owns fresh declaration scopes, including their existing inference caches. `PscScriptTypeAcquisition` constructs descriptors directly from the original SMA AST declarations in the selected execution domain. A resident scope stores only its owning session, scope and source coordinates, and CLR projection witnesses; it does not construct an interpreted descriptor graph. The compiled graph retains original imported referents and supplies typed acquisition, projection and binding results across the delegate boundary, with refusal status and diagnostic text instead of collectible exceptions. The authoring caller checks the selected member against its CLR realization. Graph scopes may be withdrawn individually through `PscRuntimeSelection.ReleaseGraph`; live importing scopes prevent withdrawal, and retired coordinates are never reused. Previously cached scope witnesses refuse subsequent operations rather than silently reacquiring a different semantic graph. A resident scope cannot import an authoring descriptor graph. ScriptType.dll remains independent of SMA; only the compiler-side adapter consumes AST evidence. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
 - **Evidence:** differential tests, structural lint, Guard, non-loading binary queries and coverage. An observed call is not a universal binding proof; an ABI check is not a proof of arithmetic equivalence.
 
 ## Trust and security
