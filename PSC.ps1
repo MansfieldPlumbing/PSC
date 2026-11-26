@@ -2481,7 +2481,7 @@ class PscDeclarationScope {
     [Collections.Generic.Dictionary[System.Management.Automation.Language.FunctionMemberAst,type]] $FunctionOutputTypes = [Collections.Generic.Dictionary[System.Management.Automation.Language.FunctionMemberAst,type]]::new()
 }
 function Get-PscFacultyDeclarations {
-    param([string[]]$ContractPaths,[System.Management.Automation.Language.TypeDefinitionAst[]]$CompilerClassAsts,[hashtable]$MaterializedTypes,[type[][]]$SelectionSignatures,[type[]]$SelectionSources,[PscDeclarationScope]$DeclarationScope,[System.Management.Automation.Language.TypeDefinitionAst]$BindingOwner,[string]$BindingName,[type[]]$BindingArguments,[bool]$BindingStatic,[bool]$BindingConstructor,[PscDeclarationScope[]]$BindingScopes,[ScriptTypeReference]$ComparisonLeft,[ScriptTypeReference]$ComparisonRight,[ScriptTypeContract]$ReferenceContract,[string]$ReferenceName,[ScriptTypeReference[]]$ReferenceParameters,[bool]$ReferenceStatic,[bool]$ReferenceConstructor,[switch]$DependencyContractsOnly,[PscDeclarationScope[]]$RetainedDependencyScopes,[type]$PersistedBindingTarget,[PscRuntimeSelection]$RuntimeSelection)
+    param([string[]]$ContractPaths,[System.Management.Automation.Language.TypeDefinitionAst[]]$CompilerClassAsts,[hashtable]$MaterializedTypes,[type[][]]$SelectionSignatures,[type[]]$SelectionSources,[PscDeclarationScope]$DeclarationScope,[System.Management.Automation.Language.TypeDefinitionAst]$BindingOwner,[string]$BindingName,[type[]]$BindingArguments,[bool]$BindingStatic,[bool]$BindingConstructor,[PscDeclarationScope[]]$BindingScopes,[ScriptTypeReference]$ComparisonLeft,[ScriptTypeReference]$ComparisonRight,[ScriptTypeContract]$ReferenceContract,[string]$ReferenceName,[ScriptTypeReference[]]$ReferenceParameters,[bool]$ReferenceStatic,[bool]$ReferenceConstructor,[switch]$DependencyContractsOnly,[PscDeclarationScope[]]$RetainedDependencyScopes,[type]$PersistedBindingTarget,[PscRuntimeSelection]$RuntimeSelection,[switch]$ReuseResidentGraph)
 
 # Only descriptor types are realized in the authoring scope. Other faculties must not shadow imported CLR identities.
 # The semantic description and the executable generation are ordinary HandleTable objects.
@@ -5443,15 +5443,20 @@ function Get-ScriptTypeContract {
         if($null -ne $ContractPaths -and $ContractPaths.Length -or $null -eq $MaterializedTypes){throw 'Compiler signature realization requires one selected source scope'}
         if($null -ne $RuntimeSelection){
             if($null -eq $DeclarationScope){throw 'Resident acquisition requires an owning declaration scope'}
-            $DeclarationScope.ResidentSession=$RuntimeSelection.Identity
-            $DeclarationScope.ResidentDefinitions=$CompilerClassAsts
-            if($null -eq $DeclarationScope.ResidentDefinitions){$DeclarationScope.ResidentDefinitions=[System.Management.Automation.Language.TypeDefinitionAst[]]::new(0)}
-            $imports=[int[]]::new(0)
-            if($null -ne $DeclarationScope.Resolving){
-                if($DeclarationScope.Resolving.ResidentSession -ne $RuntimeSelection.Identity -or $DeclarationScope.Resolving.ResidentSlot -lt 0){throw 'Resident declaration scope cannot import an authoring descriptor graph'}
-                $imports=[int[]]@($DeclarationScope.Resolving.ResidentSlot)
+            if($ReuseResidentGraph){
+                if($DeclarationScope.ResidentSession -ne $RuntimeSelection.Identity -or ![object]::ReferenceEquals($DeclarationScope.ResidentDefinitions,$CompilerClassAsts)){throw 'Persisted graph witness differs from the admitted source'}
+                [PscRuntimeSelection]::AssertGraph($RuntimeSelection,$DeclarationScope.ResidentSlot)
+            }else{
+                $DeclarationScope.ResidentSession=$RuntimeSelection.Identity
+                $DeclarationScope.ResidentDefinitions=$CompilerClassAsts
+                if($null -eq $DeclarationScope.ResidentDefinitions){$DeclarationScope.ResidentDefinitions=[System.Management.Automation.Language.TypeDefinitionAst[]]::new(0)}
+                $imports=[int[]]::new(0)
+                if($null -ne $DeclarationScope.Resolving){
+                    if($DeclarationScope.Resolving.ResidentSession -ne $RuntimeSelection.Identity -or $DeclarationScope.Resolving.ResidentSlot -lt 0){throw 'Resident declaration scope cannot import an authoring descriptor graph'}
+                    $imports=[int[]]@($DeclarationScope.Resolving.ResidentSlot)
+                }
+                $DeclarationScope.ResidentSlot=[PscRuntimeSelection]::AcquireGraph($RuntimeSelection,$DeclarationScope.ResidentDefinitions,$imports)
             }
-            $DeclarationScope.ResidentSlot=[PscRuntimeSelection]::AcquireGraph($RuntimeSelection,$DeclarationScope.ResidentDefinitions,$imports)
             $owners=Get-PscResidentOwnerMap -RuntimeSelection $RuntimeSelection -Scopes @($DeclarationScope) -BuildingScope $DeclarationScope -MaterializedTypes $MaterializedTypes
             $named=[Collections.Generic.Dictionary[string,type]]::new([StringComparer]::OrdinalIgnoreCase)
             foreach($key in $MaterializedTypes.Keys){$named.Add($key,$MaterializedTypes[$key])}
@@ -10987,6 +10992,55 @@ function Get-PscResidentOwnerMap {
     }
     return $map
 }
+
+# A persisted CLR realization is another witness of the same retained STS graph,
+# not another acquisition of the source definitions. The caller supplies the
+# exact realization map; only source signatures authorize operation selection.
+function New-PscPersistedDeclarationScope {
+    [OutputType([PscDeclarationScope])]
+    param([Parameter(Mandatory)][PscRuntimeSelection]$RuntimeSelection,[Parameter(Mandatory)][PscDeclarationScope]$SourceScope,[Parameter(Mandatory)][hashtable]$Types)
+    [PscRuntimeSelection]::AssertOpen($RuntimeSelection)
+    if($SourceScope.ResidentSlot -lt 0 -or $SourceScope.ResidentSession -ne $RuntimeSelection.Identity){throw 'Persisted realization requires a live resident source graph'}
+    [PscRuntimeSelection]::AssertGraph($RuntimeSelection,$SourceScope.ResidentSlot)
+    $scope=[PscDeclarationScope]::new();$scope.ResidentSession=$SourceScope.ResidentSession;$scope.ResidentSlot=$SourceScope.ResidentSlot
+    $scope.ResidentDefinitions=$SourceScope.ResidentDefinitions;$scope.Resolving=$SourceScope.Resolving
+    foreach($name in $SourceScope.Types.Keys){
+        $type=$Types[$name]
+        if($null -eq $type -or $type -isnot [type] -or $type.Assembly.IsDynamic -or $type.Name -cne $name){throw "Missing exact persisted realization: $name"}
+        if([System.Runtime.Loader.AssemblyLoadContext]::GetLoadContext($type.Assembly) -eq $RuntimeSelection.FacultyContext){throw 'Private compiler types cannot realize a user declaration'}
+        $scope.Types.Add($name,$type)
+    }
+    if($Types.Count -ne $scope.Types.Count){throw 'Unexpected persisted declaration realization'}
+    $materialized=@{}
+    $visible=$scope
+    while($null -ne $visible){foreach($key in $visible.Types.Keys){if(!$materialized.ContainsKey($key)){$materialized.Add($key,$visible.Types[$key])}};$visible=$visible.Resolving}
+    $null=Get-PscFacultyDeclarations -CompilerClassAsts $scope.ResidentDefinitions -MaterializedTypes $materialized -DeclarationScope $scope -RuntimeSelection $RuntimeSelection -ReuseResidentGraph
+    foreach($owner in $scope.ResidentDefinitions){
+        $type=$scope.Types[$owner.Name]
+        if($scope.Bases.ContainsKey($owner) -and $type.BaseType -ne $scope.Bases[$owner]){throw 'Persisted base realization differs'}
+        foreach($member in $owner.Members){
+            $signature=$scope.Signatures[$member]
+            $flags=[Reflection.BindingFlags]'Public,DeclaredOnly,ExactBinding,IgnoreCase'
+            if($member -is [System.Management.Automation.Language.FunctionMemberAst]){
+                if($member.IsConstructor){$operation=$type.GetConstructor(($flags -bor [Reflection.BindingFlags]::Instance),$null,$signature.Parameters,$null)}
+                else{
+                    if($member.IsStatic){$flags=$flags -bor [Reflection.BindingFlags]::Static}else{$flags=$flags -bor [Reflection.BindingFlags]::Instance}
+                    $operation=$type.GetMethod($member.Name,$flags,$null,$signature.Parameters,$null)
+                }
+                if($null -eq $operation){throw 'Persisted method realization differs'}
+                if(!$member.IsConstructor -and $operation.ReturnType -ne $signature.Result){throw 'Persisted method result differs'}
+                $parameters=$operation.GetParameters()
+                if($parameters.Length -ne $signature.Parameters.Length){throw 'Persisted method arity differs'}
+                for($i=0;$i -lt $parameters.Length;$i++){if($parameters[$i].ParameterType -ne $signature.Parameters[$i]){throw 'Persisted method parameter differs'}}
+            }else{
+                if($member.IsStatic){$flags=$flags -bor [Reflection.BindingFlags]::Static}else{$flags=$flags -bor [Reflection.BindingFlags]::Instance}
+                $field=$type.GetField($member.Name,$flags)
+                if($null -eq $field -or $field.FieldType -ne $signature.Result){throw 'Persisted field realization differs'}
+            }
+        }
+    }
+    return $scope
+}
 function Resolve-PscSourceOperation {
     [OutputType([Reflection.MethodBase])]
     param([System.Management.Automation.Language.Ast]$SourceAst,[type]$TargetType,[string]$Name,[type[]]$ArgumentTypes,[bool]$Static,[bool]$Constructor,[PscRuntimeSelection]$RuntimeSelection)
@@ -10996,24 +11050,21 @@ function Resolve-PscSourceOperation {
     if(!$script:ScriptFunctionSources.TryGetValue($root,[ref]$source)){$source=$root}
     $scope=Get-PscOperationalScope -Root $source -ExistingOnly -RuntimeSelection $RuntimeSelection
     if($null -eq $scope){return $null}
-    if(!$TargetType.Assembly.IsDynamic){
-        $dependencyScope=$scope.Resolving
-        while($null -ne $dependencyScope){
-            if($dependencyScope.Types[$TargetType.Name] -eq $TargetType){
-                foreach($definition in $dependencyScope.Contracts.Keys){
-                    if($definition.Name -ine $TargetType.Name){continue}
-                    $operationName=$Name
-                    if($Constructor){$operationName=$definition.Name}
-                    return Get-PscFacultyDeclarations -DeclarationScope $dependencyScope -BindingOwner $definition -BindingName $operationName -BindingArguments $ArgumentTypes -BindingStatic $Static -BindingConstructor $Constructor -BindingScopes @($scope) -PersistedBindingTarget $TargetType -RuntimeSelection $RuntimeSelection
-                }
-                return $null
-            }
-            $dependencyScope=$dependencyScope.Resolving
-        }
-        return $null
-    }
     $ownerScope=$scope
-    if($scope.Types[$TargetType.Name] -ne $TargetType){
+    if(!$TargetType.Assembly.IsDynamic){
+        $ownerScope=$scope.Resolving
+        while($null -ne $ownerScope -and $ownerScope.Types[$TargetType.Name] -ne $TargetType){$ownerScope=$ownerScope.Resolving}
+        if($null -eq $ownerScope){return $null}
+        if($ownerScope.ResidentSlot -lt 0){
+            foreach($definition in $ownerScope.Contracts.Keys){
+                if($definition.Name -ine $TargetType.Name){continue}
+                $operationName=$Name
+                if($Constructor){$operationName=$definition.Name}
+                return Get-PscFacultyDeclarations -DeclarationScope $ownerScope -BindingOwner $definition -BindingName $operationName -BindingArguments $ArgumentTypes -BindingStatic $Static -BindingConstructor $Constructor -BindingScopes @($scope) -PersistedBindingTarget $TargetType -RuntimeSelection $RuntimeSelection
+            }
+            return $null
+        }
+    }elseif($scope.Types[$TargetType.Name] -ne $TargetType){
         $functionClass=$null
         if(!$script:ScriptFunctionClasses.TryGetValue($source,[ref]$functionClass) -or $null -eq $functionClass){return $null}
         $functionRoot=$functionClass;while($functionRoot.Parent){$functionRoot=$functionRoot.Parent}
