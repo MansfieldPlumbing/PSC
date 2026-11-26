@@ -5081,7 +5081,7 @@ function Get-PscFacultyUnits {
     [PscFacultyUnit]::new('ElfEncoding','PscElfEncoding',@('PscElfLayout','PscElfStringTable','PscElfEncoding','PscElfExport','PscElfCodeLibrary','PscElfProgramRecord','PscElfSectionRecord','PscElfSymbolRecord','PscElfImageRecord','PscElfImageReader'),@())
 }
 function Build-PscFaculty {
-    param([string]$Faculty,[string]$RuntimeDirectory,[string[]]$ContractPaths,[string[]]$ContractReferences)
+    param([string]$Faculty,[string]$RuntimeDirectory,[string[]]$ContractPaths,[string[]]$ContractReferences,[PscSource]$RetainedSource)
     $unit = @(Get-PscFacultyUnits | Where-Object Name -ceq $Faculty)
     if ($unit.Count -ne 1) { throw "Unknown PSC faculty: $Faculty" }
     $unit = $unit[0]
@@ -5090,8 +5090,29 @@ function Build-PscFaculty {
     foreach ($dependency in $unit.Dependencies) {
         [void][Reflection.Assembly]::LoadFrom((Join-Path $RuntimeDirectory ($dependency+'.dll')))
     }
-    # Select the original parser-owned declarations. Reparse only their extents as an independent
-    # compilation unit so the other faculties' enums and source type names cannot shadow CLR identities.
+    # Dependency-free faculties can lower directly from their original, single named module scope.
+    # Cross-scope/dependency binding still needs migration; the dependent faculty path below is unchanged.
+    if(!$unit.Dependencies.Count){
+        $source=$RetainedSource
+        if($null -eq $source){$source=[PscSource]::new($PSCommandPath,$false)}
+        if($source.ParseErrors.Count){throw 'Faculty source is not parseable.'}
+        $scope=$null
+        foreach($name in $unit.Declarations){
+            $definition=$null
+            foreach($site in $source.Declarations($name)){
+                if($site.Target -isnot [System.Management.Automation.Language.TypeDefinitionAst]){continue}
+                if($null -ne $definition){throw "Ambiguous faculty declaration: $name"}
+                $definition=$site.Target
+            }
+            if($null -eq $definition){throw "Missing faculty declaration: $name"}
+            $owner=$definition.Parent.Parent
+            if($owner.Parent -isnot [System.Management.Automation.Language.FunctionDefinitionAst] -or ![object]::ReferenceEquals($owner,$owner.Parent.Body)){throw "Faculty declaration lacks a named module scope: $name"}
+            if($null -eq $scope){$scope=$owner}
+            elseif(![object]::ReferenceEquals($scope,$owner)){throw "Faculty '$Faculty' spans independent module scopes."}
+        }
+        return Export-LoweredAssembly -SourceAst $scope -DeclarationsOnly -ClassName $unit.Primary -ClassNames $unit.Declarations -OutputPath (Join-Path $RuntimeDirectory ($Faculty+'.dll')) -Deterministic
+    }
+    # Dependent faculties retain their existing isolation until declared cross-scope realization is supported.
     $holder = (Get-Command Get-PscFacultyDeclarations -CommandType Function).ScriptBlock.Ast
     if ($holder -is [System.Management.Automation.Language.FunctionDefinitionAst]) { $holder = $holder.Body }
     $declarations = @($holder.FindAll({ param($node) $node -is [System.Management.Automation.Language.TypeDefinitionAst] }, $true) | Where-Object { $_.Name -cin $unit.Declarations })
@@ -5134,7 +5155,13 @@ function Build-PscRuntime {
             $writer.Write([int]$ContractReferences.Length)
             foreach($path in $ContractReferences){$writer.Write([string]$path)}
         }finally{$writer.Dispose()}
+        $source=[PscSource]::new($PSCommandPath,$false)
+        if($source.ParseErrors.Count){throw 'Faculty source is not parseable.'}
         foreach($unit in Get-PscFacultyUnits){
+            if(!$unit.Dependencies.Count){
+                Build-PscFaculty -Faculty $unit.Name -RuntimeDirectory $RuntimeDirectory -RetainedSource $source
+                continue
+            }
             $arguments=@('-NoProfile','-File',$PSCommandPath,'-Mode','BuildFaculty','-Faculty',$unit.Name,'-RuntimeDirectory',$RuntimeDirectory)
             if($unit.Name -ceq 'ScriptType'){$arguments+=@('-ContractInputsPath',$transport)}
             & $exe @arguments
@@ -8068,7 +8095,7 @@ function Test-AstAdmitted {
     }
 
     # An expandable string joins a collection with $OFS; a source that uses $OFS decides that separator at run time.
-    $sourceRoot = $Ast; while ($null -ne $sourceRoot.Parent) { $sourceRoot = $sourceRoot.Parent }
+    $sourceRoot = Resolve-PscDeclarationRoot $Ast
     $usesSeparator = $null -ne $sourceRoot.Find({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.UserPath -eq 'OFS' }, $true)
     # Disallowed AST node types in compiled methods
     $disallowed = $Ast.FindAll({
@@ -8384,7 +8411,7 @@ function New-ClrDeclarationProjection {
         still being emitted cannot answer. The projection has the same fields,
         constructors and method signatures; its bodies only throw. The emitter
         maps each projected member to the output assembly's member.
-        Registers the projected types for Resolve-AstType.
+        Registers the projected types for Resolve-AstType. A distinct CLR namespace keeps compatibility types out of ordinary unqualified runtime type resolution; source names remain in the declaration scope.
     #>
     [OutputType([PscDeclarationScope])]
     param([Parameter(Mandatory)][AllowEmptyCollection()][object[]] $Model, [System.Management.Automation.Language.TypeDefinitionAst[]] $Enums = @(),[PscDeclarationScope]$Resolving)
@@ -8402,14 +8429,14 @@ function New-ClrDeclarationProjection {
 
     # Enums declared in the source are real enums here, before any class names them.
     foreach ($enumAst in $Enums) {
-        $enumBuilder = $module.DefineEnum($enumAst.Name, [Reflection.TypeAttributes]::Public, (Get-EnumUnderlyingType $enumAst))
+        $enumBuilder = $module.DefineEnum(('PSC.CompatibilityProjection.' + $enumAst.Name), [Reflection.TypeAttributes]::Public, (Get-EnumUnderlyingType $enumAst))
         foreach ($literal in (Get-EnumLiterals $enumAst)) { $null = $enumBuilder.DefineLiteral($literal.Name, $literal.Value) }
         $script:LoweringClassTypes[$enumAst.Name] = $enumBuilder.CreateType()
     }
 
     $builders = [ordered]@{}
     foreach ($c in $Model) {
-        $builders[$c.Name] = $module.DefineType($c.Name, [Reflection.TypeAttributes]'Public,Class')
+        $builders[$c.Name] = $module.DefineType(('PSC.CompatibilityProjection.' + $c.Name), [Reflection.TypeAttributes]'Public,Class')
         $script:LoweringClassTypes[$c.Name] = $builders[$c.Name]
     }
 
@@ -8488,6 +8515,21 @@ function Get-EnumLiterals([System.Management.Automation.Language.TypeDefinitionA
 
 $script:DeclarationScopeCache = [System.Runtime.CompilerServices.ConditionalWeakTable[System.Management.Automation.Language.ScriptBlockAst,PscDeclarationScope]]::new()
 
+# The admitted declaration scope is not necessarily the outermost authored script.
+# A named module body already selected by the lowerer retains its parser-owned identity.
+function Resolve-PscDeclarationRoot {
+    [OutputType([System.Management.Automation.Language.Ast])]
+    param([Parameter(Mandatory)][System.Management.Automation.Language.Ast]$Ast)
+    $root=$Ast
+    while($root.Parent){
+        if($root.Parent -is [System.Management.Automation.Language.FunctionDefinitionAst] -and [object]::ReferenceEquals($root,$root.Parent.Body)){
+            $scope=$null
+            if($script:DeclarationScopeCache.TryGetValue($root,[ref]$scope)){return $root}
+        }
+        $root=$root.Parent
+    }
+    return $root
+}
 function Use-DeclarationScope {
     <#
     .SYNOPSIS
@@ -8495,8 +8537,7 @@ function Use-DeclarationScope {
         their CLR declaration projection once per parsed source and registers it for Resolve-AstType.
     #>
     param([Parameter(Mandatory)][System.Management.Automation.Language.Ast] $Ast)
-    $root = $Ast
-    while ($root.Parent) { $root = $root.Parent }
+    $root = Resolve-PscDeclarationRoot $Ast
     # A source's function class resolves the source's own types; the source resolves its function class.
     $source = $null
     if ($script:ScriptFunctionSources.TryGetValue($root, [ref]$source)) {
@@ -8845,7 +8886,7 @@ function Get-PscFunctionOutputType {
         scope of the function's execution unit, not by AST identity alone.
     #>
     param([Parameter(Mandatory)][System.Management.Automation.Language.FunctionMemberAst] $Member)
-    $root = $Member; while ($root.Parent) { $root = $root.Parent }
+    $root = Resolve-PscDeclarationRoot $Member
     $source = $null
     if (!$script:ScriptFunctionSources.TryGetValue($root, [ref]$source)) { return $null }
     $sourceScope = Get-DeclarationScope -Root $source
@@ -9223,7 +9264,7 @@ function Get-ScriptField {
 
 # Whether a member is one of a source's functions, lowered with pipeline output.
 function Test-ScriptFunctionMember([System.Management.Automation.Language.Ast] $Member) {
-    $root = $Member; while ($root.Parent) { $root = $root.Parent }
+    $root = Resolve-PscDeclarationRoot $Member
     $script:ScriptFunctionSources.ContainsKey($root)
 }
 
@@ -9235,7 +9276,7 @@ function Find-ScriptFunction {
     param([Parameter(Mandatory)][System.Management.Automation.Language.CommandAst] $Command)
     $name = $Command.GetCommandName()
     if ([string]::IsNullOrEmpty($name)) { return $null }
-    $root = $Command; while ($root.Parent) { $root = $root.Parent }
+    $root = Resolve-PscDeclarationRoot $Command
     $source = $null
     if ($script:ScriptFunctionSources.TryGetValue($root, [ref]$source)) { $root = $source }
     $class = $null
@@ -9250,15 +9291,23 @@ function Find-ScriptFunction {
 # lower like any class's and every compile can include it. It has no constructor, so its copy is faithful (SMA's Copy()
 # of a constructor loses its implicit base call's node type).
 function Get-PscSemanticsClass {
+    [OutputType([System.Management.Automation.Language.TypeDefinitionAst])]
+    param()
     if ($null -eq $script:PscSemanticsAst) {
-        $tokens = $null; $errors = $null
-        $own = [System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$tokens, [ref]$errors)
-        $definition = $own.Find({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.Name -eq 'PowerShellSemantics' }, $true)
-        $block = [System.Management.Automation.Language.StatementBlockAst]::new($definition.Extent, [System.Management.Automation.Language.StatementAst[]]@($definition.Copy()), [System.Management.Automation.Language.TrapStatementAst[]]@())
-        $root = [System.Management.Automation.Language.ScriptBlockAst]::new($definition.Extent, $null, $block, $false)
-        $script:PscSemanticsAst = $root.Find({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] }, $true)
+        $source=[PscSource]::new($PSCommandPath,$false)
+        if($source.ParseErrors.Count){throw 'Semantics module source is not parseable.'}
+        $definition=$null
+        foreach($site in $source.Declarations('PowerShellSemantics')){
+            if($site.Target -isnot [System.Management.Automation.Language.TypeDefinitionAst]){continue}
+            if($null -ne $definition){throw 'Ambiguous semantics module declaration.'}
+            $definition=$site.Target
+        }
+        if($null -eq $definition){throw 'Missing semantics module declaration.'}
+        # The helper has an independent realization selection, not a reconstructed source root.
+        $null=Get-DeclarationScope -Root $source.Ast -SelectedClassAst @($definition) -SelectedEnumAst @()
+        $script:PscSemanticsAst=$definition
     }
-    $script:PscSemanticsAst
+    return $script:PscSemanticsAst
 }
 
 $script:ExpressionNewMethod = [Linq.Expressions.Expression].GetMethod(
@@ -10135,7 +10184,7 @@ function Resolve-PscSourceOperation {
     [OutputType([Reflection.MethodBase])]
     param([System.Management.Automation.Language.Ast]$SourceAst,[type]$TargetType,[string]$Name,[type[]]$ArgumentTypes,[bool]$Static,[bool]$Constructor)
     if($null -eq $SourceAst -or !$TargetType.Assembly.IsDynamic){return $null}
-    $root=$SourceAst;while($root.Parent){$root=$root.Parent}
+    $root=Resolve-PscDeclarationRoot $SourceAst
     $source=$null
     if(!$script:ScriptFunctionSources.TryGetValue($root,[ref]$source)){$source=$root}
     $scope=$null
@@ -15510,7 +15559,7 @@ Conform streams child stdout and stderr to the invoking host as they become avai
 
 - **Managed:** SMA AST and typed expression lowering, deterministic IL emission, static graph/data realization, reachability and fixed-parameter specialization.
 - **Native:** pinned Windows NativeAOT compiler plus PSC COFF linker; direct CIL-to-IR-to-x64 ELF leaf emission and decoded-byte ABI checks. The direct backend does not yet replace ILC for general programs.
-- **Faculties:** `Vom` (Virtual Object Model), `InquiryPrimitives`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
+- **Faculties:** `Vom` (Virtual Object Model), `InquiryPrimitives`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. The dependency-free Vom, InquiryPrimitives, NativeEncoding and ElfEncoding faculties lower their original declarations in the retained named module body, without extracting and reparsing extents. BuildRuntime acquires one source for the four dependency-free faculty builds and executes them in the coordinator. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. The three dependent faculties still use their existing isolated extraction and child-process path until cross-scope binding is migrated. This is build integration, not normal-startup activation. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
 - **Evidence:** differential tests, structural lint, Guard, non-loading binary queries and coverage. An observed call is not a universal binding proof; an ABI check is not a proof of arithmetic equivalence.
 
 ## Trust and security
@@ -15635,7 +15684,7 @@ $api | Get-Member
 & ./PSC.ps1 -Mode Capability
 ```
 
-The API retains the acquired source revision. LowerDeclarations(names) compiles an explicitly selected set of top-level classes and enums, including those in PSC's begin block; LowerDeclarations(ast,names) accepts a donor source AST. It compiles the selected original declarations directly, retaining their parser-owned AST identities without synthesizing or executing an enclosing script. Include required source types in the selection; program compilation is a separate operation. Eligible queries reuse its AST after byte-identity verification; declaration queries share the roadmap declaration inventory and use an ordinal-ignore-case name index. IndexedArtifacts counts indexed source artifacts; SitesExamined counts candidate declarations actually tested, and VisitorCallbacks counts visits in the query itself. Pull windows advance through retained declaration sites without replay; other source kinds still traverse the AST. Measurements are acquired only on the first Measures() call. ReadSource(path) still acquires all measurements. The API is derived from the running script, so mode names and parameter evidence do not depend on a previous session's notes. Use `Describe(mode)` for dispatcher extents and associated definitions. CLI inventory below is generated; source hash, local paths, runtime and measurement values are available from the live API rather than frozen into the README. Regenerate with `& ./PSC.ps1 -Mode Readme`.
+The API retains the acquired source revision. LowerDeclarations(names) compiles an explicitly selected set of top-level classes and enums, including those in PSC's begin block; LowerDeclarations(ast,names) accepts a donor source AST, including the original body of a named declaration scope when the selection is contained in that body. It compiles the selected original declarations directly, retaining their parser-owned AST identities without synthesizing or executing an enclosing script. Include required source types in the selection; program compilation is a separate operation. Eligible queries reuse its AST after byte-identity verification; declaration queries share the roadmap declaration inventory and use an ordinal-ignore-case name index. IndexedArtifacts counts indexed source artifacts; SitesExamined counts candidate declarations actually tested, and VisitorCallbacks counts visits in the query itself. Pull windows advance through retained declaration sites without replay; other source kinds still traverse the AST. Measurements are acquired only on the first Measures() call. ReadSource(path) still acquires all measurements. The API is derived from the running script, so mode names and parameter evidence do not depend on a previous session's notes. Use `Describe(mode)` for dispatcher extents and associated definitions. CLI inventory below is generated; source hash, local paths, runtime and measurement values are available from the live API rather than frozen into the README. Regenerate with `& ./PSC.ps1 -Mode Readme`.
 '@
         return $guideText.Replace('@@TYPESYSTEM@@',$this.TypeSystemContract).Replace('@@FORMATS@@',($formatRows -join "`n")).Replace('@@ROADMAP@@',$this.RoadmapMarkdown())
     }
