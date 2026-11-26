@@ -2688,10 +2688,10 @@ class HandleTable {
     static [uint64] Make([uint32] $generation, [uint32] $slot) { return (([uint64]$generation -shl 32) -bor [uint64]$slot) }
     static [uint32] Slot([uint64] $handle) { return [uint32]($handle -band [uint64]4294967295) }
     static [uint32] Generation([uint64] $handle) { return [uint32]($handle -shr 32) }
-    hidden [HandleTableCell] Find([uint64] $handle) {
+    hidden static [HandleTableCell] Find([HandleTable]$Table, [uint64] $handle) {
         [uint32]$slot = [HandleTable]::Slot($handle)
-        if ($slot -eq 0 -or $slot -ge $this.High) { return $null }
-        [HandleTableCell]$cell = $this.Cells[[int]$slot]
+        if ($slot -eq 0 -or $slot -ge $Table.High) { return $null }
+        [HandleTableCell]$cell = $Table.Cells[[int]$slot]
         if ($cell.Generation -ne [HandleTable]::Generation($handle) -or $cell.State -eq [HandleTableState]::Free -or $cell.State -eq [HandleTableState]::Exhausted) { return $null }
         return $cell
     }
@@ -2702,7 +2702,7 @@ class HandleTable {
             if ($this.Closed) { throw [InvalidOperationException]::new('Object space closed') }
             [HandleTableCell]$parent = $null
             if ($owner -ne [uint64]0) {
-                $parent = $this.Find($owner)
+                $parent = [HandleTable]::Find($this, $owner)
                 if ($null -eq $parent -or $parent.State -ne [HandleTableState]::Live) { throw [InvalidOperationException]::new('Owner revoked or stale') }
             }
             [int]$i = 0
@@ -2733,7 +2733,7 @@ class HandleTable {
     [uint64] Publish([uint64] $authority, [uint64] $owner, [object] $value, [type] $contract, [Action] $reclaim) {
         [System.Threading.Monitor]::Enter($this.Gate)
         try {
-            [HandleTableCell]$source = $this.Find($authority)
+            [HandleTableCell]$source = [HandleTable]::Find($this, $authority)
             if ($null -eq $source -or $source.State -ne [HandleTableState]::Live) { throw [InvalidOperationException]::new('Late publication') }
             return $this.Register($owner, $value, $contract, $reclaim)
         } finally { [System.Threading.Monitor]::Exit($this.Gate) }
@@ -2759,40 +2759,40 @@ class HandleTable {
     [HandleTableState] State([uint64] $handle) {
         [System.Threading.Monitor]::Enter($this.Gate)
         try {
-            [HandleTableCell]$cell = $this.Find($handle)
+            [HandleTableCell]$cell = [HandleTable]::Find($this, $handle)
             if ($null -eq $cell) { return [HandleTableState]::Stale }
             return $cell.State
         } finally { [System.Threading.Monitor]::Exit($this.Gate) }
     }
     # These helpers require Gate. No provider code runs while Gate is held.
-    hidden [HandleTableCell] CheckOpen([uint64]$handle,[type]$contract){
-        [HandleTableCell]$cell=$this.Find($handle)
+    hidden static [HandleTableCell] CheckOpen([HandleTable]$Table, [uint64]$handle,[type]$contract){
+        [HandleTableCell]$cell=[HandleTable]::Find($Table, $handle)
         if($null -eq $cell -or $cell.State -ne [HandleTableState]::Live){throw [InvalidOperationException]::new('Object revoked or stale')}
         if($null -eq $contract -or -not $contract.IsAssignableFrom($cell.Contract)){throw [InvalidCastException]::new('Wrong object type')}
         if($cell.Pins -eq [int]::MaxValue){throw [OverflowException]::new('Pin count exhausted')}
         return $cell
     }
-    hidden [HandleTableLease] Pin([uint64]$handle,[type]$contract){
-        [HandleTableCell]$cell=$this.CheckOpen($handle,$contract)
+    hidden static [HandleTableLease] Pin([HandleTable]$Table, [uint64]$handle,[type]$contract){
+        [HandleTableCell]$cell=[HandleTable]::CheckOpen($Table, $handle,$contract)
         [HandleTableLease]$lease=[HandleTableLease]::new($cell.Value)
-        $this.Leases.Add($lease,$handle)
+        $Table.Leases.Add($lease,$handle)
         $cell.Pins++
         return $lease
     }
     [HandleTableLease] Open([uint64]$handle,[type]$contract){
         [Threading.Monitor]::Enter($this.Gate)
-        try{return $this.Pin($handle,$contract)}finally{[Threading.Monitor]::Exit($this.Gate)}
+        try{return [HandleTable]::Pin($this, $handle,$contract)}finally{[Threading.Monitor]::Exit($this.Gate)}
     }
     [HandleTableLease] Open([uint64]$owner,[string]$name,[type]$contract){
         [Threading.Monitor]::Enter($this.Gate)
-        try{return $this.Pin($this.ResolveLocked($owner,$name),$contract)}finally{[Threading.Monitor]::Exit($this.Gate)}
+        try{return [HandleTable]::Pin($this, [HandleTable]::ResolveLocked($this, $owner,$name),$contract)}finally{[Threading.Monitor]::Exit($this.Gate)}
     }
     # All-or-nothing validation and pinning. Duplicate handles count twice.
     [HandleTablePairLease] OpenPair([uint64]$first,[type]$firstType,[uint64]$second,[type]$secondType){
         [Threading.Monitor]::Enter($this.Gate)
         try{
-            [HandleTableCell]$a=$this.CheckOpen($first,$firstType)
-            [HandleTableCell]$b=$this.CheckOpen($second,$secondType)
+            [HandleTableCell]$a=[HandleTable]::CheckOpen($this, $first,$firstType)
+            [HandleTableCell]$b=[HandleTable]::CheckOpen($this, $second,$secondType)
             if($first -eq $second -and $a.Pins -ge [int]::MaxValue-1){throw [OverflowException]::new('Pin count exhausted')}
             [HandleTablePairLease]$lease=[HandleTablePairLease]::new($a.Value,$b.Value)
             [uint64[]]$handles=[uint64[]]::new(2);$handles[0]=$first;$handles[1]=$second
@@ -2807,13 +2807,13 @@ class HandleTable {
     [HandleTableRetention] Retain([uint64]$source,[uint64]$target,[type]$contract){
         [Threading.Monitor]::Enter($this.Gate)
         try{
-            [HandleTableCell]$a=$this.Find($source);[HandleTableCell]$b=$this.Find($target)
+            [HandleTableCell]$a=[HandleTable]::Find($this, $source);[HandleTableCell]$b=[HandleTable]::Find($this, $target)
             if($this.Closed -or $null -eq $a -or $null -eq $b -or $a.State -ne [HandleTableState]::Live -or $b.State -ne [HandleTableState]::Live){throw [InvalidOperationException]::new('Retained endpoint revoked or stale')}
             if($null -eq $contract -or -not $contract.IsAssignableFrom($b.Contract)){throw [InvalidCastException]::new('Wrong retained object type')}
             [uint64]$ancestor=$b.Owner
             while($ancestor -ne [uint64]0){
                 if($ancestor -eq $source){throw [InvalidOperationException]::new('Retention conflicts with child-first ownership rundown')}
-                [HandleTableCell]$parent=$this.Find($ancestor)
+                [HandleTableCell]$parent=[HandleTable]::Find($this, $ancestor)
                 if($null -eq $parent){break}
                 $ancestor=$parent.Owner
             }
@@ -2826,18 +2826,18 @@ class HandleTable {
         }finally{[Threading.Monitor]::Exit($this.Gate)}
     }
     # Root release and pin/edge rundown share the same retirement predicate.
-    hidden [void] ConsiderRetirement([uint64]$handle,[HandleTableCell]$cell){
-        if($cell.State -eq [HandleTableState]::Live -and -not $cell.RootReference -and $cell.Pins -eq 0 -and $cell.Retainers -eq 0){$this.Mark($handle)}
-        else{$this.Enqueue([int][HandleTable]::Slot($handle))}
+    hidden static [void] ConsiderRetirement([HandleTable]$Table, [uint64]$handle,[HandleTableCell]$cell){
+        if($cell.State -eq [HandleTableState]::Live -and -not $cell.RootReference -and $cell.Pins -eq 0 -and $cell.Retainers -eq 0){[HandleTable]::Mark($Table, $handle)}
+        else{[HandleTable]::Enqueue($Table, [int][HandleTable]::Slot($handle))}
     }
     # Gate required. Successful source cleanup drops its outgoing edges only
     # after provider cleanup returns. Failed cleanup retains its dependencies.
-    hidden [void] DropRetention([HandleTableRetention]$edge){
-        [uint64[]]$ends=$this.Retentions[$edge]
-        [HandleTableCell]$a=$this.Find($ends[0]);[HandleTableCell]$b=$this.Find($ends[1])
+    hidden static [void] DropRetention([HandleTable]$Table, [HandleTableRetention]$edge){
+        [uint64[]]$ends=$Table.Retentions[$edge]
+        [HandleTableCell]$a=[HandleTable]::Find($Table, $ends[0]);[HandleTableCell]$b=[HandleTable]::Find($Table, $ends[1])
         if($null -eq $a -or $null -eq $b -or $b.Retainers -le 0 -or -not $a.Outgoing.Remove($edge)){throw [InvalidOperationException]::new('Invalid retained edge')}
-        $null=$this.Retentions.Remove($edge);$b.Retainers--
-        $this.ConsiderRetirement($ends[1],$b)
+        $null=$Table.Retentions.Remove($edge);$b.Retainers--
+        [HandleTable]::ConsiderRetirement($Table, $ends[1],$b)
     }
     # Explicit graph mutation is admitted only without active source execution.
     # This also permits a quiescent cycle to be broken after withdrawal, but
@@ -2846,17 +2846,17 @@ class HandleTable {
         [Threading.Monitor]::Enter($this.Gate)
         try{
             if($null -eq $edge -or -not $this.Retentions.ContainsKey($edge)){throw [InvalidOperationException]::new('Invalid or released retained edge')}
-            [uint64[]]$ends=$this.Retentions[$edge];[HandleTableCell]$source=$this.Find($ends[0])
+            [uint64[]]$ends=$this.Retentions[$edge];[HandleTableCell]$source=[HandleTable]::Find($this, $ends[0])
             if($null -eq $source -or $source.Pins -ne 0 -or ($source.State -ne [HandleTableState]::Live -and $source.State -ne [HandleTableState]::Revoking)){throw [InvalidOperationException]::new('Retaining source not quiescent')}
-            $this.DropRetention($edge)
+            [HandleTable]::DropRetention($this, $edge)
         }finally{[Threading.Monitor]::Exit($this.Gate)}
         $this.Collect()
     }
-    hidden [void] Unpin([uint64]$handle){
-        [HandleTableCell]$cell=$this.Find($handle)
+    hidden static [void] Unpin([HandleTable]$Table, [uint64]$handle){
+        [HandleTableCell]$cell=[HandleTable]::Find($Table, $handle)
         if($null -eq $cell -or $cell.Pins -le 0){throw [InvalidOperationException]::new('Invalid pin')}
         $cell.Pins--
-        $this.ConsiderRetirement($handle,$cell)
+        [HandleTable]::ConsiderRetirement($Table, $handle,$cell)
     }
     [void] Close([HandleTableLease]$lease){
         [Threading.Monitor]::Enter($this.Gate)
@@ -2864,7 +2864,7 @@ class HandleTable {
             if($null -eq $lease -or -not $this.Leases.ContainsKey($lease)){throw [InvalidOperationException]::new('Invalid or released lease')}
             [uint64]$handle=$this.Leases[$lease]
             $null=$this.Leases.Remove($lease);$lease.Value=$null
-            $this.Unpin($handle)
+            [HandleTable]::Unpin($this, $handle)
         }finally{[Threading.Monitor]::Exit($this.Gate)}
         $this.Collect()
     }
@@ -2874,61 +2874,61 @@ class HandleTable {
             if($null -eq $lease -or -not $this.PairLeases.ContainsKey($lease)){throw [InvalidOperationException]::new('Invalid or released pair lease')}
             [uint64[]]$handles=$this.PairLeases[$lease]
             $null=$this.PairLeases.Remove($lease);$lease.First=$null;$lease.Second=$null
-            $this.Unpin($handles[1]);$this.Unpin($handles[0])
+            [HandleTable]::Unpin($this, $handles[1]);[HandleTable]::Unpin($this, $handles[0])
         }finally{[Threading.Monitor]::Exit($this.Gate)}
         $this.Collect()
     }
     [void] Close([uint64] $handle) {
         [System.Threading.Monitor]::Enter($this.Gate)
         try {
-            [HandleTableCell]$cell = $this.Find($handle)
+            [HandleTableCell]$cell = [HandleTable]::Find($this, $handle)
             if ($null -eq $cell -or $cell.State -ne [HandleTableState]::Live -or -not $cell.RootReference) { throw [InvalidOperationException]::new('Invalid registration reference') }
             $cell.RootReference = $false
-            $this.ConsiderRetirement($handle,$cell)
+            [HandleTable]::ConsiderRetirement($this, $handle,$cell)
         } finally { [System.Threading.Monitor]::Exit($this.Gate) }
         $this.Collect()
     }
     # Names are an owner-local projection of live handles, not object identity.
-    hidden [System.Collections.Generic.Dictionary[string,uint64]] Names([uint64] $owner, [bool] $create) {
-        if ($owner -eq [uint64]0) { return $this.RootNames }
-        [HandleTableCell]$cell = $this.Find($owner)
+    hidden static [System.Collections.Generic.Dictionary[string,uint64]] Names([HandleTable]$Table, [uint64] $owner, [bool] $create) {
+        if ($owner -eq [uint64]0) { return $Table.RootNames }
+        [HandleTableCell]$cell = [HandleTable]::Find($Table, $owner)
         if ($null -eq $cell) { return $null }
         if ($null -eq $cell.Names -and $create) { $cell.Names = [System.Collections.Generic.Dictionary[string,uint64]]::new([StringComparer]::OrdinalIgnoreCase) }
         return $cell.Names
     }
-    hidden [void] Unname([HandleTableCell] $cell, [uint64] $handle) {
+    hidden static [void] Unname([HandleTable]$Table, [HandleTableCell] $cell, [uint64] $handle) {
         if ([string]::IsNullOrEmpty($cell.Name)) { return }
-        [System.Collections.Generic.Dictionary[string,uint64]]$names = $this.Names($cell.Owner,$false)
+        [System.Collections.Generic.Dictionary[string,uint64]]$names = [HandleTable]::Names($Table, $cell.Owner,$false)
         if ($null -ne $names -and $names.ContainsKey($cell.Name) -and $names[$cell.Name] -eq $handle) { $null = $names.Remove($cell.Name) }
     }
-    hidden [uint64] ResolveLocked([uint64]$owner,[string]$name){
-        if($this.Closed -or [string]::IsNullOrEmpty($name)){return [uint64]0}
+    hidden static [uint64] ResolveLocked([HandleTable]$Table, [uint64]$owner,[string]$name){
+        if($Table.Closed -or [string]::IsNullOrEmpty($name)){return [uint64]0}
         if($owner -ne [uint64]0){
-            [HandleTableCell]$parent=$this.Find($owner)
+            [HandleTableCell]$parent=[HandleTable]::Find($Table, $owner)
             if($null -eq $parent -or $parent.State -ne [HandleTableState]::Live){return [uint64]0}
         }
-        [System.Collections.Generic.Dictionary[string,uint64]]$names=$this.Names($owner,$false)
+        [System.Collections.Generic.Dictionary[string,uint64]]$names=[HandleTable]::Names($Table, $owner,$false)
         if($null -eq $names -or -not $names.ContainsKey($name)){return [uint64]0}
         return $names[$name]
     }
     [uint64] Resolve([uint64]$owner,[string]$name){
         [Threading.Monitor]::Enter($this.Gate)
-        try{return $this.ResolveLocked($owner,$name)}finally{[Threading.Monitor]::Exit($this.Gate)}
+        try{return [HandleTable]::ResolveLocked($this, $owner,$name)}finally{[Threading.Monitor]::Exit($this.Gate)}
     }
     # Compare-and-rebind: expected zero means vacant. Existing pins remain on the old
     # handle. A live occupant must have the same declared contract. No implicit detach.
     [void] Rebind([uint64] $owner, [string] $name, [uint64] $expected, [uint64] $replacement) {
         [System.Threading.Monitor]::Enter($this.Gate)
         try {
-            if ($this.Closed -or [string]::IsNullOrWhiteSpace($name) -or $this.ResolveLocked($owner,$name) -ne $expected) { throw [InvalidOperationException]::new('Role changed or invalid') }
-            [HandleTableCell]$next = $this.Find($replacement)
+            if ($this.Closed -or [string]::IsNullOrWhiteSpace($name) -or [HandleTable]::ResolveLocked($this, $owner,$name) -ne $expected) { throw [InvalidOperationException]::new('Role changed or invalid') }
+            [HandleTableCell]$next = [HandleTable]::Find($this, $replacement)
             if ($null -eq $next -or $next.State -ne [HandleTableState]::Live -or $next.Owner -ne $owner -or -not $next.RootReference -or -not [string]::IsNullOrEmpty($next.Name)) { throw [InvalidOperationException]::new('Invalid replacement') }
             if ($expected -ne [uint64]0) {
-                [HandleTableCell]$old = $this.Find($expected)
+                [HandleTableCell]$old = [HandleTable]::Find($this, $expected)
                 if ($old.Contract -ne $next.Contract) { throw [InvalidCastException]::new('Role contract mismatch') }
-                $this.Mark($expected)
+                [HandleTable]::Mark($this, $expected)
             }
-            [System.Collections.Generic.Dictionary[string,uint64]]$names = $this.Names($owner,$true)
+            [System.Collections.Generic.Dictionary[string,uint64]]$names = [HandleTable]::Names($this, $owner,$true)
             $next.Name = $name; $names[$name] = $replacement
         } finally { [System.Threading.Monitor]::Exit($this.Gate) }
     }
@@ -2938,8 +2938,8 @@ class HandleTable {
     [HandleTableState] Succeed([uint64] $retiring, [uint64] $successor) {
         [System.Threading.Monitor]::Enter($this.Gate)
         try {
-            [HandleTableCell]$old = $this.Find($retiring)
-            [HandleTableCell]$next = $this.Find($successor)
+            [HandleTableCell]$old = [HandleTable]::Find($this, $retiring)
+            [HandleTableCell]$next = [HandleTable]::Find($this, $successor)
             if ($this.Closed -or $null -eq $old -or $null -eq $next -or $old.State -ne [HandleTableState]::Live -or $next.State -ne [HandleTableState]::Live -or $next.Owner -ne $retiring -or -not $next.RootReference) { throw [InvalidOperationException]::new('Invalid succession') }
             if (-not [string]::IsNullOrEmpty($old.Name) -and $old.Contract -ne $next.Contract) { throw [InvalidCastException]::new('Succession role contract mismatch') }
             [int]$nextIndex = [int][HandleTable]::Slot($successor)
@@ -2952,22 +2952,22 @@ class HandleTable {
             if($null -ne $next.Outgoing){
                 foreach($edge in $next.Outgoing){
                     [uint64[]]$ends=$this.Retentions[$edge]
-                    [HandleTableCell]$target=$this.Find($ends[1])
+                    [HandleTableCell]$target=[HandleTable]::Find($this, $ends[1])
                     while($null -ne $target -and $target.Owner -ne [uint64]0){
                         if($target.Owner -eq $retiring){
                             if($ends[1] -ne $successor){throw [InvalidOperationException]::new('Succession conflicts with retained ownership dependencies')}
                             break
                         }
                         if($target.Owner -eq $successor){break}
-                        $target=$this.Find($target.Owner)
+                        $target=[HandleTable]::Find($this, $target.Owner)
                     }
                 }
             }
-            $this.Unname($next,$successor)
+            [HandleTable]::Unname($this, $next,$successor)
             $next.Name = $old.Name
-            $this.Unname($old,$retiring)
+            [HandleTable]::Unname($this, $old,$retiring)
             if (-not [string]::IsNullOrEmpty($next.Name)) {
-                [System.Collections.Generic.Dictionary[string,uint64]]$aboveNames = $this.Names($old.Owner,$true)
+                [System.Collections.Generic.Dictionary[string,uint64]]$aboveNames = [HandleTable]::Names($this, $old.Owner,$true)
                 $aboveNames[$next.Name] = $successor
             }
             # Detach successor from the retiring owner's child list.
@@ -2983,8 +2983,8 @@ class HandleTable {
                 if ($old.FirstChild -ne 0) { $this.Cells[$old.FirstChild].PreviousSibling = 0 }
                 if ($child.State -eq [HandleTableState]::Live -and -not [string]::IsNullOrEmpty($child.Name)) {
                     [uint64]$childHandle = [HandleTable]::Make($child.Generation,[uint32]$index)
-                    $this.Unname($child,$childHandle)
-                    [System.Collections.Generic.Dictionary[string,uint64]]$inherited = $this.Names($successor,$true)
+                    [HandleTable]::Unname($this, $child,$childHandle)
+                    [System.Collections.Generic.Dictionary[string,uint64]]$inherited = [HandleTable]::Names($this, $successor,$true)
                     $inherited[$child.Name] = $childHandle
                 }
                 $child.Owner = $successor; $child.PreviousSibling = 0; $child.NextSibling = $next.FirstChild
@@ -2993,13 +2993,13 @@ class HandleTable {
             }
             # Successor inherits the parent's place in the surrounding ownership tree.
             $next.Owner = $old.Owner
-            [HandleTableCell]$above = $this.Find($next.Owner)
+            [HandleTableCell]$above = [HandleTable]::Find($this, $next.Owner)
             if ($null -ne $above) {
                 $next.NextSibling = $above.FirstChild
                 if ($above.FirstChild -ne 0) { $this.Cells[$above.FirstChild].PreviousSibling = $nextIndex }
                 $above.FirstChild = $nextIndex
             }
-            $this.Mark($retiring)
+            [HandleTable]::Mark($this, $retiring)
         } finally { [System.Threading.Monitor]::Exit($this.Gate) }
         $this.Collect()
         return $this.State($retiring)
@@ -3010,52 +3010,52 @@ class HandleTable {
     [HandleTableState] Quarantine([uint64] $handle) {
         [System.Threading.Monitor]::Enter($this.Gate)
         try {
-            [HandleTableCell]$cell = $this.Find($handle)
+            [HandleTableCell]$cell = [HandleTable]::Find($this, $handle)
             if ($null -eq $cell) { return [HandleTableState]::Stale }
-            $this.Mark($handle)
-            [HandleTableCell]$parent = $this.Find($cell.Owner)
+            [HandleTable]::Mark($this, $handle)
+            [HandleTableCell]$parent = [HandleTable]::Find($this, $cell.Owner)
             if ($null -ne $parent) {
                 if ($cell.PreviousSibling -eq 0) { $parent.FirstChild = $cell.NextSibling }
                 else { $this.Cells[$cell.PreviousSibling].NextSibling = $cell.NextSibling }
                 if ($cell.NextSibling -ne 0) { $this.Cells[$cell.NextSibling].PreviousSibling = $cell.PreviousSibling }
-                $this.Enqueue([int][HandleTable]::Slot($cell.Owner))
+                [HandleTable]::Enqueue($this, [int][HandleTable]::Slot($cell.Owner))
                 $cell.Owner = [uint64]0; $cell.NextSibling = 0; $cell.PreviousSibling = 0
             }
             return $cell.State
         } finally { [System.Threading.Monitor]::Exit($this.Gate) }
     }
     # Gate protects transitions; claim finalization once by enqueuing only eligible cells.
-    hidden [void] Enqueue([int] $index) {
-        [HandleTableCell]$cell = $this.Cells[$index]
+    hidden static [void] Enqueue([HandleTable]$Table, [int] $index) {
+        [HandleTableCell]$cell = $Table.Cells[$index]
         if ($cell.State -eq [HandleTableState]::Revoking -and $cell.Pins -eq 0 -and $cell.Retainers -eq 0 -and $cell.FirstChild -eq 0) {
             $cell.State = [HandleTableState]::Finalizing
-            $this.Ready.Add($index)
+            $Table.Ready.Add($index)
         }
     }
     # Traverse actual ownership edges, not the entire object table. Iterative for deep trees.
-    hidden [void] Mark([uint64] $handle) {
-        [HandleTableCell]$root = $this.Find($handle)
+    hidden static [void] Mark([HandleTable]$Table, [uint64] $handle) {
+        [HandleTableCell]$root = [HandleTable]::Find($Table, $handle)
         if ($null -eq $root -or $root.State -ne [HandleTableState]::Live) { return }
         [System.Collections.Generic.List[int]]$pending = [System.Collections.Generic.List[int]]::new()
         $pending.Add([int][HandleTable]::Slot($handle))
         while ($pending.Count -gt 0) {
             [int]$index = $pending[$pending.Count-1]; $pending.RemoveAt($pending.Count-1)
-            [HandleTableCell]$cell = $this.Cells[$index]
+            [HandleTableCell]$cell = $Table.Cells[$index]
             if ($cell.State -ne [HandleTableState]::Live) { continue }
-            $this.Unname($cell,[HandleTable]::Make($cell.Generation,[uint32]$index))
+            [HandleTable]::Unname($Table, $cell,[HandleTable]::Make($cell.Generation,[uint32]$index))
             $cell.State = [HandleTableState]::Revoking; $cell.RootReference = $false
             [int]$child = $cell.FirstChild
             while ($child -ne 0) {
                 $pending.Add($child)
-                $child = $this.Cells[$child].NextSibling
+                $child = $Table.Cells[$child].NextSibling
             }
-            $this.Enqueue($index)
+            [HandleTable]::Enqueue($Table, $index)
         }
     }
     # Authority withdrawal never executes cleanup. Revoke adds immediate collection where safe.
     [HandleTableState] Withdraw([uint64] $handle) {
         [System.Threading.Monitor]::Enter($this.Gate)
-        try { $this.Mark($handle); return $this.State($handle) } finally { [System.Threading.Monitor]::Exit($this.Gate) }
+        try { [HandleTable]::Mark($this, $handle); return $this.State($handle) } finally { [System.Threading.Monitor]::Exit($this.Gate) }
     }
     [HandleTableState] Revoke([uint64] $handle) {
         $null = $this.Withdraw($handle)
@@ -3090,15 +3090,15 @@ class HandleTable {
                 if ($null -ne $failure) { $cell.Failure = $failure; $cell.State = [HandleTableState]::Failed }
                 else {
                     while($null -ne $cell.Outgoing -and $cell.Outgoing.Count -gt 0){
-                        $this.DropRetention($cell.Outgoing[$cell.Outgoing.Count-1])
+                        [HandleTable]::DropRetention($this, $cell.Outgoing[$cell.Outgoing.Count-1])
                     }
                     $cell.Outgoing=$null
-                    [HandleTableCell]$parent = $this.Find($cell.Owner)
+                    [HandleTableCell]$parent = [HandleTable]::Find($this, $cell.Owner)
                     if ($null -ne $parent) {
                         if ($cell.PreviousSibling -eq 0) { $parent.FirstChild = $cell.NextSibling }
                         else { $this.Cells[$cell.PreviousSibling].NextSibling = $cell.NextSibling }
                         if ($cell.NextSibling -ne 0) { $this.Cells[$cell.NextSibling].PreviousSibling = $cell.PreviousSibling }
-                        $this.Enqueue([int][HandleTable]::Slot($cell.Owner))
+                        [HandleTable]::Enqueue($this, [int][HandleTable]::Slot($cell.Owner))
                     }
                     $cell.NextSibling = 0; $cell.PreviousSibling = 0
                     $cell.Name = $null; $cell.Names = $null; $cell.Value = $null; $cell.Contract = $null; $cell.Reclaim = $null; $cell.Owner = [uint64]0
@@ -3114,7 +3114,7 @@ class HandleTable {
             $this.Closed = $true
             for ([int]$i = 1; $i -lt $this.High; $i++) {
                 [HandleTableCell]$cell = $this.Cells[$i]
-                if ($cell.State -eq [HandleTableState]::Live -and $cell.Owner -eq [uint64]0) { $this.Mark([HandleTable]::Make($cell.Generation, [uint32]$i)) }
+                if ($cell.State -eq [HandleTableState]::Live -and $cell.Owner -eq [uint64]0) { [HandleTable]::Mark($this, [HandleTable]::Make($cell.Generation, [uint32]$i)) }
             }
         } finally { [System.Threading.Monitor]::Exit($this.Gate) }
         $this.Collect()
@@ -3292,14 +3292,14 @@ class ScriptTypeBindingExtension {
     static [bool] MemoType([type]$t){
         return $null -eq $t -or $t -eq [object] -or $t -eq [string] -or $t.IsPrimitive -or $t -eq [decimal]
     }
-    [int] SelectBound([ScriptTypeCall[]]$Candidates,[object[]]$Arguments){
-        [Func[ScriptTypeCall[],object[],int]]$selector=$this.Select
-        if(!$this.TypeStable){return $selector.Invoke($Candidates,$Arguments)}
+    static [int] SelectBound([ScriptTypeBindingExtension]$Extension, [ScriptTypeCall[]]$Candidates,[object[]]$Arguments){
+        [Func[ScriptTypeCall[],object[],int]]$selector=$Extension.Select
+        if(!$Extension.TypeStable){return $selector.Invoke($Candidates,$Arguments)}
         [int]$arity=$Arguments.Length
         if($Candidates.Length -eq 0 -or $Candidates.Length -gt 32 -or $arity -gt 8){return $selector.Invoke($Candidates,$Arguments)}
-        [System.Threading.Monitor]::Enter($this.MemoGate)
+        [System.Threading.Monitor]::Enter($Extension.MemoGate)
         try{
-            [ScriptTypeSelectionMemo]$prior=$this.Memo
+            [ScriptTypeSelectionMemo]$prior=$Extension.Memo
             if($null -ne $prior -and [object]::ReferenceEquals($prior.Selector,$selector) -and $prior.Count -eq $Candidates.Length -and $prior.Sources.Length -eq $arity){
                 [bool]$same=$true
                 for([int]$i=0;$i -lt $arity;$i++){
@@ -3317,10 +3317,10 @@ class ScriptTypeBindingExtension {
                         if(!$same){break}
                     }
                 }
-                if($same){$this.CacheHits++;return $prior.Index}
+                if($same){$Extension.CacheHits++;return $prior.Index}
             }
-            $this.CacheMisses++
-        }finally{[System.Threading.Monitor]::Exit($this.MemoGate)}
+            $Extension.CacheMisses++
+        }finally{[System.Threading.Monitor]::Exit($Extension.MemoGate)}
         [int]$selected=$selector.Invoke($Candidates,$Arguments)
         if($selected -lt 0 -or $selected -ge $Candidates.Length){return $selected}
         [ScriptTypeSelectionMemo]$next=[ScriptTypeSelectionMemo]::new()
@@ -3338,9 +3338,9 @@ class ScriptTypeBindingExtension {
             }
         }
         $next.Count=$Candidates.Length;$next.Index=$selected;$next.Selector=$selector
-        [System.Threading.Monitor]::Enter($this.MemoGate)
-        try{if([object]::ReferenceEquals($selector,$this.Select) -and $this.TypeStable){$this.Memo=$next}}
-        finally{[System.Threading.Monitor]::Exit($this.MemoGate)}
+        [System.Threading.Monitor]::Enter($Extension.MemoGate)
+        try{if([object]::ReferenceEquals($selector,$Extension.Select) -and $Extension.TypeStable){$Extension.Memo=$next}}
+        finally{[System.Threading.Monitor]::Exit($Extension.MemoGate)}
         return $selected
     }
 }
@@ -3510,7 +3510,7 @@ class ScriptTypeReflection {
         return $exact
     }
     hidden static [object] InvokeConverted([ScriptTypeBindingExtension]$Extension,[ScriptTypeCall[]]$Calls,[object]$Receiver,[object[]]$Arguments){
-        [int]$index=$Extension.SelectBound($Calls,$Arguments)
+        [int]$index=[ScriptTypeBindingExtension]::SelectBound($Extension, $Calls,$Arguments)
         if($index -lt 0 -or $index -ge $Calls.Length){throw [InvalidOperationException]::new('Invalid selected operation')}
         return [ScriptTypeReflection]::InvokeSelected($Extension,$Calls[$index],$Receiver,$Arguments)
     }
@@ -3594,7 +3594,7 @@ class ScriptTypeReflection {
                                 $results[$i]=[ScriptTypeReflection]::InvokeConverted($extension,$calls,$dependencies.Second,$args)
                             }else{
                                 [Func[ScriptTypeCall[],object[],int]]$selector=$extension.Select
-                                [int]$index=$extension.SelectBound($calls,$args)
+                                [int]$index=[ScriptTypeBindingExtension]::SelectBound($extension, $calls,$args)
                                 if($index -lt 0 -or $index -ge $calls.Length){throw [InvalidOperationException]::new('Invalid selected operation')}
                                 [ScriptTypeCall]$selected=$calls[$index]
                                 # Rotate the two local slots on a miss. Reuse the
@@ -4081,7 +4081,7 @@ class ScriptTypeObjectDispatch {
         [HandleTableLease]$lease=$Context.Space.Open($Context.Owner,'ScriptType.Binding',[ScriptTypeBindingExtension])
         try{
             [ScriptTypeBindingExtension]$extension=$lease.Value
-            [int]$index=$extension.SelectBound($candidates,$Arguments)
+            [int]$index=[ScriptTypeBindingExtension]::SelectBound($extension, $candidates,$Arguments)
             if($index -lt 0 -or $index -ge $candidates.Length){throw [InvalidOperationException]::new('Invalid selected operation')}
             [object[]]$values=[object[]]::new($Arguments.Length)
             for([int]$i=0;$i -lt $values.Length;$i++){$values[$i]=[ScriptTypeObjectDispatch]::ConvertArgument($extension,$Arguments[$i],$candidates[$index].Parameters[$i])}
@@ -15576,6 +15576,8 @@ This is the architectural mission, not a claim of completed implementation. Reco
 ## Reflective managed runspace
 
 `ScriptTypeReflection.InvokeBound(role, binding, arguments)` consumes an exact locally declared `ScriptTypeBinding` with its original member reference, checks the role's realized contract, acquires the provider and dependency leases, and invokes the selected compiled target without a second name or overload search. It refuses unmaterialized signatures, nonexact argument representations, unrelated contract/member identities and unavailable realizations. The current profile does not yet admit inherited bindings, conversion plans or symbolic argument storage. `HandleTable` uses CoreLib collections for allocation, ownership traversal and deferred reclamation. Future collection development belongs to `HandleCollector`; the existing reclamation operation remains in HandleTable until that boundary is implemented. A bounded standalone CoreCLR control has exercised runtime definition construction, binding, replacement and withdrawal using only CoreLib and compiled PSC assemblies. ScriptType's generated-thunk naming still references `System.Security.Cryptography`; full module closure has not been established. The target is a lowered reflective runspace that parses `.ps1` without the SMA assembly, using acquired PowerShell language semantics rather than a second grammar. Independent parser realization is not implemented; current PSC authoring and compilation still acquire source using SMA.
+
+HandleTable's internal lookup, pinning, retention, name resolution and ownership traversal operations now take an explicit typed table participant. The public table instance operations still require migration. `ScriptTypeBindingExtension.SelectBound(extension, candidates, arguments)` is a static operation with an explicit extension participant; rebuild consumers of the previous instance signature. The existing selector memo and lease semantics are retained.
 
 ## Advisory redundancy analysis
 
