@@ -376,7 +376,7 @@ SOFTWARE.
 .PARAMETER AssemblyPath
     Assembly to inspect in Inspect mode, or trusted input for ImportCil (explicit public static methods only).
 .PARAMETER Faculty
-    BuildFaculty: one of HandleTable, InquiryPrimitives, ScriptType, PrimitiveConversion, ObjectDispatch, NativeEncoding, ElfEncoding.
+    BuildFaculty: one of HandleTable, DiscoveryMechanisms, ScriptType, PrimitiveConversion, ObjectDispatch, NativeEncoding, ElfEncoding.
 .PARAMETER RuntimeDirectory
     Directory for compiled PSC faculties (defaults to the script directory). NativeCil and VerifyNativeLeaf load from here.
 .PARAMETER ContractPaths
@@ -1073,7 +1073,7 @@ try {
     # All runtime dependencies are built from the same authoritative PSC.ps1.
     & $Compiler -Mode BuildRuntime -RuntimeDirectory $runtime -ContractPaths $contractSource | Out-Null
     Assert-Pass ([IO.Directory]::GetFiles($runtime, '*.dll').Length -eq 7) 'clean seven-faculty runtime with .srm1 contract input'
-    Assert-Pass (@([AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { $_.GetName().Name -in 'HandleTable', 'ScriptType', 'InquiryPrimitives' }).Count -eq 0) 'runtime build does not contaminate coordinator identities'
+    Assert-Pass (@([AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { $_.GetName().Name -in 'HandleTable', 'ScriptType', 'DiscoveryMechanisms' }).Count -eq 0) 'runtime build does not contaminate coordinator identities'
     $providerPath = Join-Path $work 'Provider.dll'
     $portablePath = Join-Path $work 'Portable.dll'
     $clientPath = Join-Path $work 'Client.dll'
@@ -1094,7 +1094,7 @@ try {
     try { $null = Invoke-Entry $compact @('-Value', '10', '-Presentation', 'Detailed') } catch { $rejected = $_.Exception.GetBaseException().Message.Contains('Presentation') }
     Assert-Pass $rejected 'fixed appliance parameter cannot be overridden at execution'
 
-    foreach ($name in 'HandleTable', 'InquiryPrimitives', 'ScriptType') { [void][Reflection.Assembly]::LoadFrom((Join-Path $runtime ($name + '.dll'))) }
+    foreach ($name in 'HandleTable', 'DiscoveryMechanisms', 'ScriptType') { [void][Reflection.Assembly]::LoadFrom((Join-Path $runtime ($name + '.dll'))) }
     & $Compiler -SourcePath $clientSource -DeclarationsOnly -ClassName SmCalibrationClient -OutputPath $clientPath | Out-Null
     $client = [Reflection.Assembly]::LoadFrom($clientPath).GetType('SmCalibrationClient', $true)
     $providerType = [Reflection.Assembly]::LoadFrom($providerPath).GetType('SmCalibrationProvider', $true)
@@ -1105,7 +1105,7 @@ try {
     Assert-Pass ($null -eq [ScriptTypeCatalog].Assembly.GetType('SmCalibrationContract') -and $null -eq [ScriptTypeCatalog].Assembly.GetType('SmCalibrationUse')) '.srm1 catalog retains semantic descriptors rather than executable contract classes'
     foreach ($facultyType in [type[]]@([HandleTable], [InquiryAxis], [ScriptTypeCatalog])) {
         foreach ($reference in $facultyType.Assembly.GetReferencedAssemblies()) {
-            Assert-Pass ($reference.Name -cin 'System.Private.CoreLib', 'HandleTable', 'InquiryPrimitives', 'ScriptType') "foundational faculty metadata closure: $($facultyType.Name) -> $($reference.Name)"
+            Assert-Pass ($reference.Name -cin 'System.Private.CoreLib', 'HandleTable', 'DiscoveryMechanisms', 'ScriptType') "foundational faculty metadata closure: $($facultyType.Name) -> $($reference.Name)"
         }
     }
     $thunkPath = Join-Path $work 'GeneratedThunks.dll'
@@ -3196,7 +3196,7 @@ class HandleTableFence {
     }
 }
 
-# Faculty: InquiryPrimitives.ps1
+# Faculty: DiscoveryMechanisms.ps1
 class InquirySourceCleanReference {
     [string] $OriginalTypeName
     [long] $ClrIdentityHash
@@ -5208,10 +5208,10 @@ class PscFacultyUnit {
 }
 function Get-PscFacultyUnits {
     [PscFacultyUnit]::new('HandleTable','HandleTable',@('HandleTableState','HandleTableRetention','HandleTableCell','HandleTableInfo','HandleTableLease','HandleTablePairLease','HandleTable','HandleCollector','HandleTableFence'),@())
-    [PscFacultyUnit]::new('InquiryPrimitives','InquiryCase',@('InquirySourceCleanReference','InquiryAxis','InquiryPredictiveScalar','InquiryOrigin','InquiryBlock','InquiryReading','InquiryCase','InquirySemanticAttachment','InquiryExecutionTier','InquiryReliance','InquiryWhenClause','InquiryJudgment'),@())
+    [PscFacultyUnit]::new('DiscoveryMechanisms','InquiryCase',@('InquirySourceCleanReference','InquiryAxis','InquiryPredictiveScalar','InquiryOrigin','InquiryBlock','InquiryReading','InquiryCase','InquirySemanticAttachment','InquiryExecutionTier','InquiryReliance','InquiryWhenClause','InquiryJudgment'),@())
     [PscFacultyUnit]::new('ScriptType','ScriptTypeReflection',@('ScriptTypeReferenceKind','ScriptTypeReference','ScriptTypeMember','ScriptTypeBinding','ScriptTypeContract','ScriptTypeCall','ScriptTypeSelectionMemo','ScriptTypeBindingExtension','ScriptTypeSmaSelector','ScriptTypeRealization','ScriptTypeRole','ScriptTypeReflection','ScriptTypeCatalog'),@('HandleTable'))
     [PscFacultyUnit]::new('PrimitiveConversion','ScriptTypePrimitiveConversion',@('ScriptTypePrimitiveConversion'),@('HandleTable','ScriptType'))
-    [PscFacultyUnit]::new('ObjectDispatch','ScriptTypeObjectDispatch',@('ScriptTypeObjectDispatch'),@('HandleTable','InquiryPrimitives','ScriptType'))
+    [PscFacultyUnit]::new('ObjectDispatch','ScriptTypeObjectDispatch',@('ScriptTypeObjectDispatch'),@('HandleTable','DiscoveryMechanisms','ScriptType'))
     [PscFacultyUnit]::new('NativeEncoding','PscNativeEncoding',@('PscNativeInstruction','PscNativeEncoding','HexagonForm','HexagonFields','HexagonDecoded','HexagonPatternEncoder'),@())
     [PscFacultyUnit]::new('ElfEncoding','PscElfEncoding',@('PscElfLayout','PscElfStringTable','PscElfEncoding','PscElfExport','PscElfCodeLibrary','PscElfProgramRecord','PscElfSectionRecord','PscElfSymbolRecord','PscElfImageRecord','PscElfImageReader'),@())
 }
@@ -5302,7 +5302,7 @@ function Build-PscRuntime {
     $ContractReferences = [string[]]@(foreach($path in $ContractReferences){[IO.Path]::GetFullPath($path)})
     $comparison = [StringComparison]::Ordinal
     if($IsWindows){$comparison=[StringComparison]::OrdinalIgnoreCase}
-    $earlier = [string[]]@((Join-Path $RuntimeDirectory 'HandleTable.dll'),(Join-Path $RuntimeDirectory 'InquiryPrimitives.dll'))
+    $earlier = [string[]]@((Join-Path $RuntimeDirectory 'HandleTable.dll'),(Join-Path $RuntimeDirectory 'DiscoveryMechanisms.dll'))
     foreach($path in $ContractPaths){if(![IO.File]::Exists($path)){throw "Contract source missing: $path"}}
     foreach($path in $ContractReferences){
         $deferred=$false
@@ -15587,7 +15587,7 @@ class PscApi {
         $objectives.Add([PscRoadmapObjective]::new('I3',[PscRoadmapState]::Research,@('F2'),'PDF intake: inventory existing reader; parse document structures, preserve page/extent/provenance, independently compare text and geometry; unsupported encodings explicit.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('I4',[PscRoadmapState]::Planned,@('I1'),'Checkpoint/weight readers from Kokoroku: bounded safe format decoding, shape/dtype/stride validation, truncated and adversarial inputs, typed graph/data output; no arbitrary pickle execution.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('I5',[PscRoadmapState]::Research,@('I1','L1'),'JS/TS and C# intake: reuse TS2PS grammar experiments and CS2PS semantic catalog; external languages are input, not implementation dependencies or a bypass of SMA target admission. Independent semantics tests; no arbitrary translation claim.',@(),@(),@()))
-        $objectives.Add([PscRoadmapObjective]::new('R1',[PscRoadmapState]::Existing,@('L1','L2'),'HandleTable, STS dynamic typing and classes, structural contracts, dispatch, canonical referents and lifetime: preserve identity/aliasing across independent realizations, test composition, revoke/restore, leases, compiled graph and shared references. Mitigate overload before exhaustion with explicit degradation evidence. Keep CLR interoperability explicit; do not recreate these in a separate host.',@('ConvertTo-PscStructuralSource'),@('HandleTable','ScriptType','ObjectDispatch','InquiryPrimitives'),@('SM/Test-Formats.ps1')))
+        $objectives.Add([PscRoadmapObjective]::new('R1',[PscRoadmapState]::Existing,@('L1','L2'),'HandleTable, STS dynamic typing and classes, structural contracts, dispatch, canonical referents and lifetime: preserve identity/aliasing across independent realizations, test composition, revoke/restore, leases, compiled graph and shared references. Mitigate overload before exhaustion with explicit degradation evidence. Keep CLR interoperability explicit; do not recreate these in a separate host.',@('ConvertTo-PscStructuralSource'),@('HandleTable','ScriptType','ObjectDispatch','DiscoveryMechanisms'),@('SM/Test-Formats.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('R2',[PscRoadmapState]::Planned,@('R1'),'Typed handle rights and explicit authority; least privilege, attenuation, negative authorization, stale handle and revocation tests. Discovery is not authorization.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('R3',[PscRoadmapState]::Planned,@('R2'),'Compartments and worker isolation with explicit enforcement boundary; test escaped handles, cancellation, resource bounds, failure and cleanup. In-process policies are not OS isolation.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('R4',[PscRoadmapState]::Planned,@('N1'),'Native link dependencies, C-runtime imports and library provenance; verify resolved symbols, relocations, ABI, initialization and imported closure; remove dependency only when evidence supports it.',@(),@(),@()))
@@ -15612,7 +15612,7 @@ class PscApi {
         $objectives.Add([PscRoadmapObjective]::new('X2',[PscRoadmapState]::Research,@('X1','L1'),'PSNL: typed meaning and executable binding via admitted SMA forms, explicit proposal and assessment; never treat parse acceptance or linguistic similarity as semantic equivalence.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('X3',[PscRoadmapState]::Research,@('X1','D5','H2'),'CPU 3D scene and observations: reuse QuickPS geometry/rendering, record reproducible controlled scene changes; no duplicate engine unless a measured gap requires it.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('X4',[PscRoadmapState]::Planned,@('X3'),'Anomaly identification over observations; establish reference distributions, controlled changes, false-positive/negative rates and conditions of applicability.',@(),@(),@()))
-        $objectives.Add([PscRoadmapObjective]::new('X5',[PscRoadmapState]::Planned,@('X1','R1','I1'),'Percept acquisition: typed observations, referent-relative composition, dependency invalidation and reversible proposals; test actual PSC AST/CIL referents, counterexamples, reassessment and retained capabilities on unseen cases.',@(),@('InquiryPrimitives','HandleTable'),@()))
+        $objectives.Add([PscRoadmapObjective]::new('X5',[PscRoadmapState]::Planned,@('X1','R1','I1'),'Percept acquisition: typed observations, referent-relative composition, dependency invalidation and reversible proposals; test actual PSC AST/CIL referents, counterexamples, reassessment and retained capabilities on unseen cases.',@(),@('DiscoveryMechanisms','HandleTable'),@()))
         $objectives.Add([PscRoadmapObjective]::new('X6',[PscRoadmapState]::Research,@('I3','D4','X2','X5'),'Manuals to experiments: derive explicit testable proposals with source extent, predictions, controls and independent comparison; test ISA facts before admitting encoding capabilities.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('X7',[PscRoadmapState]::Planned,@('X5','X2'),'Names and expression: bind terminology to observed relationships and typed capabilities; distinguish names from referents and test reuse across contexts.',@(),@(),@()))
         return $objectives.ToArray()
@@ -15742,7 +15742,7 @@ This is the architectural mission, not a claim of completed implementation. Reco
 
 ## Reflective managed runspace
 
-`ScriptTypeReflection.InvokeBound(role, binding, arguments)` consumes an exact locally declared `ScriptTypeBinding` with its original member reference, checks the role's realized contract, acquires the provider and dependency leases, and invokes the selected compiled target without a second name or overload search. It refuses unmaterialized signatures, nonexact argument representations, unrelated contract/member identities and unavailable realizations. The current profile does not yet admit inherited bindings, conversion plans or symbolic argument storage. `HandleTable` uses CoreLib collections for allocation, ownership traversal and deferred reclamation. `HandleCollector.Collect(table)` owns eligible cleanup execution, completion and free-slot recycling, using the existing table gate and storage. HandleTable owns eligibility, leases and dependency edges and calls the collector when lifetime operations release work. Both are realized in HandleTable.dll because the current synchronous lifetime contract is mutually dependent; no independent collector assembly or tracing GC is claimed. A bounded standalone CoreCLR control has exercised runtime definition construction, binding, replacement and withdrawal using only CoreLib and compiled PSC assemblies. Generated-thunk names encode the case-normalized member name and length-framed parameter identities as strict UTF-8 hexadecimal identifiers rather than cryptographic digests. HandleTable, InquiryPrimitives and ScriptType have no framework assembly reference beyond CoreLib; the standalone CoreCLR control also exercises generated-thunk binding, invocation and withdrawal. Rebuild previously generated thunk assemblies to match the new naming scheme. The names are longer than the former fixed-size digest names. The target is a lowered reflective runspace that parses `.ps1` without the SMA assembly, using acquired PowerShell language semantics rather than a second grammar. Independent parser realization is not implemented; current PSC authoring and compilation still acquire source using SMA.
+`ScriptTypeReflection.InvokeBound(role, binding, arguments)` consumes an exact locally declared `ScriptTypeBinding` with its original member reference, checks the role's realized contract, acquires the provider and dependency leases, and invokes the selected compiled target without a second name or overload search. It refuses unmaterialized signatures, nonexact argument representations, unrelated contract/member identities and unavailable realizations. The current profile does not yet admit inherited bindings, conversion plans or symbolic argument storage. `HandleTable` uses CoreLib collections for allocation, ownership traversal and deferred reclamation. `HandleCollector.Collect(table)` owns eligible cleanup execution, completion and free-slot recycling, using the existing table gate and storage. HandleTable owns eligibility, leases and dependency edges and calls the collector when lifetime operations release work. Both are realized in HandleTable.dll because the current synchronous lifetime contract is mutually dependent; no independent collector assembly or tracing GC is claimed. A bounded standalone CoreCLR control has exercised runtime definition construction, binding, replacement and withdrawal using only CoreLib and compiled PSC assemblies. Generated-thunk names encode the case-normalized member name and length-framed parameter identities as strict UTF-8 hexadecimal identifiers rather than cryptographic digests. HandleTable, DiscoveryMechanisms and ScriptType have no framework assembly reference beyond CoreLib; the standalone CoreCLR control also exercises generated-thunk binding, invocation and withdrawal. Rebuild previously generated thunk assemblies to match the new naming scheme. The names are longer than the former fixed-size digest names. The target is a lowered reflective runspace that parses `.ps1` without the SMA assembly, using acquired PowerShell language semantics rather than a second grammar. Independent parser realization is not implemented; current PSC authoring and compilation still acquire source using SMA.
 
 HandleTable's internal lookup, pinning, retention, name resolution and ownership traversal operations now take an explicit typed table participant. Fourteen additional public operations (including collection, withdrawal, succession, retention, pair leasing and rebinding) now require an explicit HandleTable participant. Register, Open, Close and Revoke also take an explicit table participant. The authoring-side query lease acquires exact CLR operation signatures once from the loaded faculty; compiled consumers use typed static calls. The existing IDisposable and cursor instance entry points remain compatibility boundaries. Lease and retention records use explicit typed Create operations; the fence Completed and Signal operations take an explicit fence participant. Rebuild callers of the changed operations. `ScriptTypeBindingExtension.SelectBound(extension, candidates, arguments)` is a static operation with an explicit extension participant; rebuild consumers of the previous instance signature. The existing selector memo and lease semantics are retained.
 
@@ -15752,7 +15752,7 @@ ScriptTypeRealization binding, candidate lookup and operation lookup take an exp
 
 ScriptTypeSmaSelector now takes an explicit adapter participant. A closed delegate binds that participant to the static selection method without changing the binding extension contract. The canonical ScriptType faculty contains no implicit receiver references.
 
-InquiryPrimitives uses explicit typed record creation for clean references, predictive scalars and when clauses. InquiryCase.Find(case, axis) retains reference-identity lookup and first matching reading selection. Rebuild callers of the previous constructors and Find instance signature.
+DiscoveryMechanisms uses explicit typed record creation for clean references, predictive scalars and when clauses. InquiryCase.Find(case, axis) retains reference-identity lookup and first matching reading selection. Rebuild callers of the previous constructors and Find instance signature.
 
 ## Advisory redundancy analysis
 
@@ -15824,7 +15824,7 @@ Conform streams child stdout and stderr to the invoking host as they become avai
 
 - **Managed:** SMA AST and typed expression lowering, deterministic IL emission, static graph/data realization, reachability and fixed-parameter specialization.
 - **Native:** pinned Windows NativeAOT compiler plus PSC COFF linker; direct CIL-to-IR-to-x64 ELF leaf emission and decoded-byte ABI checks. The direct backend does not yet replace ILC for general programs.
-- **Faculties:** `HandleTable`, `InquiryPrimitives`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. This is build integration, not normal-startup activation. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
+- **Faculties:** `HandleTable`, `DiscoveryMechanisms`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. This is build integration, not normal-startup activation. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
 - **Evidence:** differential tests, structural lint, Guard, non-loading binary queries and coverage. An observed call is not a universal binding proof; an ABI check is not a proof of arithmetic equivalence.
 
 ## Trust and security
@@ -19314,6 +19314,7 @@ class PscMeasurementMethod {
     }
 
     static [System.Collections.Generic.List[System.Management.Automation.Language.CommandAst]] Commands([PscSource] $source, [type] $cmdletType) {
+        if ($null -eq $cmdletType) { throw 'Measurement cmdlet realization is unavailable.' }
         $found = [System.Collections.Generic.List[System.Management.Automation.Language.CommandAst]]::new()
         foreach ($command in $source.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
             $name = $command.GetCommandName()
@@ -19339,7 +19340,7 @@ class PscMeasurementMethod {
 class AddTypeCommands : PscMeasurementMethod {
     [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]] Locate([PscSource] $source) {
         $found = [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]]::new()
-        foreach ($command in [PscMeasurementMethod]::Commands($source, [Microsoft.PowerShell.Commands.AddTypeCommand])) { $found.Add($command.Extent) }
+        foreach ($command in [PscMeasurementMethod]::Commands($source, [PscMeasurementMethod]::ResolveCmdlet('Microsoft.PowerShell.Utility\Add-Type'))) { $found.Add($command.Extent) }
         return $found
     }
 }
@@ -19348,7 +19349,7 @@ class AddTypeCommands : PscMeasurementMethod {
 class AddTypeSourceText : PscMeasurementMethod {
     [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]] Locate([PscSource] $source) {
         $found = [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]]::new()
-        foreach ($command in [PscMeasurementMethod]::Commands($source, [Microsoft.PowerShell.Commands.AddTypeCommand])) {
+        foreach ($command in [PscMeasurementMethod]::Commands($source, [PscMeasurementMethod]::ResolveCmdlet('Microsoft.PowerShell.Utility\Add-Type'))) {
             $bound = [System.Management.Automation.Language.StaticParameterBinder]::BindCommand($command, $true).BoundParameters
             if ($bound.ContainsKey('TypeDefinition') -or $bound.ContainsKey('MemberDefinition')) { $found.Add($command.Extent) }
         }
@@ -19359,7 +19360,7 @@ class AddTypeSourceText : PscMeasurementMethod {
 class InvokeExpressionCommands : PscMeasurementMethod {
     [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]] Locate([PscSource] $source) {
         $found = [System.Collections.Generic.List[System.Management.Automation.Language.IScriptExtent]]::new()
-        foreach ($command in [PscMeasurementMethod]::Commands($source, [Microsoft.PowerShell.Commands.InvokeExpressionCommand])) { $found.Add($command.Extent) }
+        foreach ($command in [PscMeasurementMethod]::Commands($source, [PscMeasurementMethod]::ResolveCmdlet('Microsoft.PowerShell.Utility\Invoke-Expression'))) { $found.Add($command.Extent) }
         return $found
     }
 }
