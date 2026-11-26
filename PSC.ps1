@@ -2477,7 +2477,7 @@ class PscDeclarationScope {
     [Collections.Generic.Dictionary[System.Management.Automation.Language.FunctionMemberAst,type]] $FunctionOutputTypes = [Collections.Generic.Dictionary[System.Management.Automation.Language.FunctionMemberAst,type]]::new()
 }
 function Get-PscFacultyDeclarations {
-    param([string[]]$ContractPaths,[System.Management.Automation.Language.TypeDefinitionAst[]]$CompilerClassAsts,[hashtable]$MaterializedTypes,[type[][]]$SelectionSignatures,[type[]]$SelectionSources,[PscDeclarationScope]$DeclarationScope,[System.Management.Automation.Language.TypeDefinitionAst]$BindingOwner,[string]$BindingName,[type[]]$BindingArguments,[bool]$BindingStatic,[bool]$BindingConstructor,[PscDeclarationScope[]]$BindingScopes,[ScriptTypeReference]$ComparisonLeft,[ScriptTypeReference]$ComparisonRight,[ScriptTypeContract]$ReferenceContract,[string]$ReferenceName,[ScriptTypeReference[]]$ReferenceParameters,[bool]$ReferenceStatic,[bool]$ReferenceConstructor,[switch]$DependencyContractsOnly,[PscDeclarationScope[]]$RetainedDependencyScopes,[type]$PersistedBindingTarget)
+    param([string[]]$ContractPaths,[System.Management.Automation.Language.TypeDefinitionAst[]]$CompilerClassAsts,[hashtable]$MaterializedTypes,[type[][]]$SelectionSignatures,[type[]]$SelectionSources,[PscDeclarationScope]$DeclarationScope,[System.Management.Automation.Language.TypeDefinitionAst]$BindingOwner,[string]$BindingName,[type[]]$BindingArguments,[bool]$BindingStatic,[bool]$BindingConstructor,[PscDeclarationScope[]]$BindingScopes,[ScriptTypeReference]$ComparisonLeft,[ScriptTypeReference]$ComparisonRight,[ScriptTypeContract]$ReferenceContract,[string]$ReferenceName,[ScriptTypeReference[]]$ReferenceParameters,[bool]$ReferenceStatic,[bool]$ReferenceConstructor,[switch]$DependencyContractsOnly,[PscDeclarationScope[]]$RetainedDependencyScopes,[type]$PersistedBindingTarget,[PscRuntimeSelection]$RuntimeSelection)
 
 # Only descriptor types are realized in the authoring scope. Other faculties must not shadow imported CLR identities.
 # The semantic description and the executable generation are ordinary HandleTable objects.
@@ -2645,7 +2645,7 @@ class PscMaterializedSignature {
 # Each published call references the original source member and a lowered thunk.
 
 function Get-PscOtherFacultyDeclarations {
-    param([type[][]]$SelectionSignatures,[type[]]$SelectionSources,[ScriptTypeContract]$BindingContract,[string]$BindingName,[ScriptTypeReference[]]$BindingReferences,[bool]$BindingStatic,[bool]$BindingConstructor)
+    param([type[][]]$SelectionSignatures,[type[]]$SelectionSources,[ScriptTypeContract]$BindingContract,[string]$BindingName,[ScriptTypeReference[]]$BindingReferences,[bool]$BindingStatic,[bool]$BindingConstructor,[PscRuntimeSelection]$RuntimeSelection)
 
 # Faculty: HandleTable.ps1
 # One typed object space. Handle generations describe operational identity, not learning.
@@ -3814,7 +3814,12 @@ class ScriptTypePrimitiveConversion {
         if($Static -and $Constructor){return $null}
         [ScriptTypeBinding]$exact=[ScriptTypeContract]::BindDeclared($Owner, $Name,$Arguments,$Static,$Constructor)
         if($null -ne $exact){return $exact}
-        if($Arguments.Length -eq 0){return $null}
+        return [ScriptTypePrimitiveConversion]::BindNumericDeclared($Owner,$Name,$Arguments,$Static,$Constructor,$null)
+    }
+    # The original member and argument referents stay in the authoring graph.
+    # The admitted selector consumes only the closed CTS numeric signatures.
+    static [ScriptTypeBinding] BindNumericDeclared([ScriptTypeContract]$Owner,[string]$Name,[ScriptTypeReference[]]$Arguments,[bool]$Static,[bool]$Constructor,[Func[type[][],type[],int]]$Selector){
+        if($Static -and $Constructor -or $Arguments.Length -eq 0){return $null}
         [type[]]$sources=[type[]]::new($Arguments.Length)
         for([int]$i=0;$i -lt $Arguments.Length;$i++){
             $sources[$i]=[ScriptTypePrimitiveConversion]::CompilerPrimitive($Arguments[$i])
@@ -3832,7 +3837,10 @@ class ScriptTypePrimitiveConversion {
             $members.Add($member);$signatures.Add($signature)
         }
         if($members.Count -eq 0){return $null}
-        [int]$index=[ScriptTypePrimitiveConversion]::SelectSignatures($signatures.ToArray(),$sources)
+        [int]$index=0
+        if($null -eq $Selector){$index=[ScriptTypePrimitiveConversion]::SelectSignatures($signatures.ToArray(),$sources)}
+        else{$index=$Selector.Invoke($signatures.ToArray(),$sources)}
+        if($index -lt 0 -or $index -ge $members.Count){throw [InvalidOperationException]::new('Numeric selection returned an invalid candidate index')}
         return [ScriptTypeBinding]::Create($Owner,$members[$index],$Arguments)
     }
     # Shared fixed-arity primitive compatibility selection; neither samples nor
@@ -4935,7 +4943,14 @@ class PscElfImageReader {
         return $r
     }
 }
-    if($null -ne $BindingContract){return [ScriptTypePrimitiveConversion]::BindDeclared($BindingContract,$BindingName,$BindingReferences,$BindingStatic,$BindingConstructor)}
+    if($null -ne $BindingContract){
+        if($null -eq $RuntimeSelection){return [ScriptTypePrimitiveConversion]::BindNumericDeclared($BindingContract,$BindingName,$BindingReferences,$BindingStatic,$BindingConstructor,$null)}
+        [Threading.Monitor]::Enter($RuntimeSelection)
+        try{
+            if($null -eq $RuntimeSelection.NumericSelector){throw 'Faculty selection session is closed.'}
+            return [ScriptTypePrimitiveConversion]::BindNumericDeclared($BindingContract,$BindingName,$BindingReferences,$BindingStatic,$BindingConstructor,$RuntimeSelection.NumericSelector)
+        }finally{[Threading.Monitor]::Exit($RuntimeSelection)}
+    }
     if($null -ne $SelectionSignatures){return [ScriptTypePrimitiveConversion]::SelectSignatures($SelectionSignatures,$SelectionSources)}
 }
 
@@ -5067,6 +5082,7 @@ function Get-ScriptTypeContract {
     if($PSBoundParameters.ContainsKey('ComparisonLeft')){return [ScriptTypeReference]::Same($ComparisonLeft,$ComparisonRight)}
     if($PSBoundParameters.ContainsKey('ReferenceContract')){return [ScriptTypeContract]::FindReference($ReferenceContract,$ReferenceName,$ReferenceParameters,$ReferenceStatic,$ReferenceConstructor)}
     if($null -ne $BindingOwner){
+        if($null -ne $RuntimeSelection){[PscRuntimeSelection]::AssertOpen($RuntimeSelection)}
         $contract=$DeclarationScope.Contracts[$BindingOwner]
         $references=[ScriptTypeReference[]]::new($BindingArguments.Length)
         for($i=0;$i -lt $references.Length;$i++){
@@ -5075,7 +5091,7 @@ function Get-ScriptTypeContract {
         }
         $exact=[ScriptTypeContract]::BindDeclared($contract, $BindingName,$references,$BindingStatic,$BindingConstructor)
         $binding=$exact
-        if($null -eq $binding){$binding=Get-PscOtherFacultyDeclarations -BindingContract $contract -BindingName $BindingName -BindingReferences $references -BindingStatic $BindingStatic -BindingConstructor $BindingConstructor}
+        if($null -eq $binding){$binding=Get-PscOtherFacultyDeclarations -BindingContract $contract -BindingName $BindingName -BindingReferences $references -BindingStatic $BindingStatic -BindingConstructor $BindingConstructor -RuntimeSelection $RuntimeSelection}
         if($null -eq $binding -or $null -eq $PersistedBindingTarget){return $binding}
         # The selected semantic member is authoritative. CLR supplies only an exact realization.
         $flags=[Reflection.BindingFlags]'Public,DeclaredOnly'
@@ -5418,6 +5434,12 @@ class PscRuntimeSelection {
             $session.NumericSelector=$method.CreateDelegate([Func[type[][],type[],int]])
             return $session
         }catch{$context.Unload();throw}
+    }
+    static [void] AssertOpen([PscRuntimeSelection]$Session){
+        if($null -eq $Session){throw 'Faculty selection session is required.'}
+        [Threading.Monitor]::Enter($Session)
+        try{if($null -eq $Session.NumericSelector){throw 'Faculty selection session is closed.'}}
+        finally{[Threading.Monitor]::Exit($Session)}
     }
     static [int] Select([PscRuntimeSelection]$Session,[type[][]]$Signatures,[type[]]$Sources){
         if($null -eq $Session){throw 'Faculty selection session is required.'}
@@ -10551,7 +10573,7 @@ function Add-GenericInference([Type] $Pattern, [Type] $Actual, [hashtable] $Bind
 # and the closed numeric compatibility fragment already used by structural calls.
 function Resolve-PscSourceOperation {
     [OutputType([Reflection.MethodBase])]
-    param([System.Management.Automation.Language.Ast]$SourceAst,[type]$TargetType,[string]$Name,[type[]]$ArgumentTypes,[bool]$Static,[bool]$Constructor)
+    param([System.Management.Automation.Language.Ast]$SourceAst,[type]$TargetType,[string]$Name,[type[]]$ArgumentTypes,[bool]$Static,[bool]$Constructor,[PscRuntimeSelection]$RuntimeSelection)
     if($null -eq $SourceAst){return $null}
     $root=Resolve-PscDeclarationRoot $SourceAst
     $source=$null
@@ -10566,7 +10588,7 @@ function Resolve-PscSourceOperation {
                     if($definition.Name -ine $TargetType.Name){continue}
                     $operationName=$Name
                     if($Constructor){$operationName=$definition.Name}
-                    return Get-PscFacultyDeclarations -DeclarationScope $dependencyScope -BindingOwner $definition -BindingName $operationName -BindingArguments $ArgumentTypes -BindingStatic $Static -BindingConstructor $Constructor -BindingScopes @($scope) -PersistedBindingTarget $TargetType
+                    return Get-PscFacultyDeclarations -DeclarationScope $dependencyScope -BindingOwner $definition -BindingName $operationName -BindingArguments $ArgumentTypes -BindingStatic $Static -BindingConstructor $Constructor -BindingScopes @($scope) -PersistedBindingTarget $TargetType -RuntimeSelection $RuntimeSelection
                 }
                 return $null
             }
@@ -10594,7 +10616,7 @@ function Resolve-PscSourceOperation {
             if($scope.DependentScopes.TryGetValue($functionRoot,[ref]$functionScope) -and [object]::ReferenceEquals($functionScope.Resolving,$scope)){$bindingScopes.Add($functionScope)}
         }
     }
-    $binding=Get-PscFacultyDeclarations -DeclarationScope $ownerScope -BindingOwner $ownerAst -BindingName $(if($Constructor){$ownerAst.Name}else{$Name}) -BindingArguments $ArgumentTypes -BindingStatic $Static -BindingConstructor $Constructor -BindingScopes $bindingScopes.ToArray()
+    $binding=Get-PscFacultyDeclarations -DeclarationScope $ownerScope -BindingOwner $ownerAst -BindingName $(if($Constructor){$ownerAst.Name}else{$Name}) -BindingArguments $ArgumentTypes -BindingStatic $Static -BindingConstructor $Constructor -BindingScopes $bindingScopes.ToArray() -RuntimeSelection $RuntimeSelection
     if($null -eq $binding){return $null}
     $member=$binding.Member
     $selected=$null
@@ -10635,11 +10657,11 @@ function Resolve-MatchingMethod {
         [Parameter(Mandatory)][AllowEmptyCollection()][Type[]] $ArgumentTypes,
         [switch] $IsStatic,
         [System.Management.Automation.Language.IScriptExtent] $SourceExtent,
-        [System.Management.Automation.Language.Ast] $SourceAst
+        [System.Management.Automation.Language.Ast] $SourceAst,[PscRuntimeSelection]$RuntimeSelection
     )
 
     if($null -ne $SourceAst){
-        $sourceOperation=Resolve-PscSourceOperation $SourceAst $TargetType $MethodName $ArgumentTypes $IsStatic.IsPresent $false
+        $sourceOperation=Resolve-PscSourceOperation $SourceAst $TargetType $MethodName $ArgumentTypes $IsStatic.IsPresent $false $RuntimeSelection
         if($null -ne $sourceOperation){return [Reflection.MethodInfo]$sourceOperation}
     }
 
@@ -10784,11 +10806,11 @@ function Resolve-MatchingConstructor {
     param(
         [Parameter(Mandatory)][Type] $TargetType,
         [Parameter(Mandatory)][AllowEmptyCollection()][Type[]] $ArgumentTypes,
-        [System.Management.Automation.Language.Ast] $SourceAst
+        [System.Management.Automation.Language.Ast] $SourceAst,[PscRuntimeSelection]$RuntimeSelection
     )
 
     if($null -ne $SourceAst){
-        $sourceOperation=Resolve-PscSourceOperation $SourceAst $TargetType 'new' $ArgumentTypes $false $true
+        $sourceOperation=Resolve-PscSourceOperation $SourceAst $TargetType 'new' $ArgumentTypes $false $true $RuntimeSelection
         if($null -ne $sourceOperation){return [Reflection.ConstructorInfo]$sourceOperation}
     }
 
@@ -12047,7 +12069,7 @@ function Convert-AstExpression {
 
             # Object constructor: [T]::new(...)
             if ($memberName -eq 'new') {
-                $ctor = Resolve-MatchingConstructor -TargetType $targetType -ArgumentTypes $argTypes -SourceAst $Node
+                $ctor = Resolve-MatchingConstructor -TargetType $targetType -ArgumentTypes $argTypes -SourceAst $Node -RuntimeSelection $Scope.RuntimeSelection
                 $params = $ctor.GetParameters()
                 for ($i = 0; $i -lt $params.Length; $i++) {
                     if (-not $params[$i].ParameterType.IsByRef -and $argExprs[$i].Type -ne $params[$i].ParameterType) {
@@ -12058,7 +12080,7 @@ function Convert-AstExpression {
             }
 
             # Static method call: [T]::Method(...)
-            $method = Resolve-MatchingMethod -TargetType $targetType -MethodName $memberName -ArgumentTypes $argTypes -IsStatic -SourceExtent $Node.Extent -SourceAst $Node
+            $method = Resolve-MatchingMethod -TargetType $targetType -MethodName $memberName -ArgumentTypes $argTypes -IsStatic -SourceExtent $Node.Extent -SourceAst $Node -RuntimeSelection $Scope.RuntimeSelection
             if ($method.IsDefined([Runtime.InteropServices.UnmanagedCallersOnlyAttribute],$false)) {
                 throw ('[{0}:{1}] UnmanagedCallersOnly method cannot be called from managed code.' -f $Node.Extent.StartLineNumber,$Node.Extent.StartColumnNumber)
             }
@@ -12088,7 +12110,7 @@ function Convert-AstExpression {
             if ($targetExpr.Type -eq [System.Management.Automation.PSObject] -and -not (Test-PSObjectView $Node.Expression)) {
                 $targetExpr = [Linq.Expressions.Expression]::Property($targetExpr, 'BaseObject')
             }
-            $method = Resolve-MatchingMethod -TargetType $targetExpr.Type -MethodName $memberName -ArgumentTypes $argTypes -SourceAst $Node
+            $method = Resolve-MatchingMethod -TargetType $targetExpr.Type -MethodName $memberName -ArgumentTypes $argTypes -SourceAst $Node -RuntimeSelection $Scope.RuntimeSelection
             if ($method.IsDefined([Runtime.InteropServices.UnmanagedCallersOnlyAttribute],$false)) {
                 throw ('[{0}:{1}] UnmanagedCallersOnly method cannot be called from managed code.' -f $Node.Extent.StartLineNumber,$Node.Extent.StartColumnNumber)
             }
@@ -12932,7 +12954,7 @@ function Convert-AstStatement {
             }
         }
         $parts = [System.Collections.Generic.List[Linq.Expressions.Expression]]::new()
-        $method = Resolve-MatchingMethod -TargetType $script:LoweringClassTypes[$definition.Class] -MethodName $definition.Name -ArgumentTypes ([Type[]]@($arguments | ForEach-Object Type)) -IsStatic -SourceAst $Statement
+        $method = Resolve-MatchingMethod -TargetType $script:LoweringClassTypes[$definition.Class] -MethodName $definition.Name -ArgumentTypes ([Type[]]@($arguments | ForEach-Object Type)) -IsStatic -SourceAst $Statement -RuntimeSelection $Scope.RuntimeSelection
         $parts.Add([Linq.Expressions.Expression]::Call($method, [Linq.Expressions.Expression[]]$arguments.ToArray()))
         if ($body -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) {
             foreach ($inner in $body.ScriptBlock.EndBlock.Statements) { $parts.Add((Convert-AstStatement -Statement $inner -Scope $Scope)) }
@@ -13009,7 +13031,7 @@ function Convert-MethodAstToLambda {
         [System.Management.Automation.Language.FunctionMemberAst] $MethodAst,
 
         [Parameter()]
-        [System.Management.Automation.Language.PropertyMemberAst[]] $Initializers = @()
+        [System.Management.Automation.Language.PropertyMemberAst[]] $Initializers = @(),[PscRuntimeSelection]$RuntimeSelection
     )
 
     Use-DeclarationScope -Ast $MethodAst
@@ -13047,7 +13069,7 @@ function Convert-MethodAstToLambda {
         -Initializers $Initializers -Statements @($(if ($MethodAst.Body -and $MethodAst.Body.EndBlock) { $MethodAst.Body.EndBlock.Statements })) `
         -IsStatic ([bool]$MethodAst.IsStatic) -IsConstructor ([bool]$MethodAst.IsConstructor) -Output:($isFunction -and -not $isProgram) `
         -ScriptClass $(if ($isFunction) { $classType } else { $null }) -Program:$isProgram `
-        -ProgramParameters $(if ($isProgram) { $script:PscProgramEntries[$MethodAst] } else { $null })
+        -ProgramParameters $(if ($isProgram) { $script:PscProgramEntries[$MethodAst] } else { $null }) -RuntimeSelection $RuntimeSelection
 }
 
 function Convert-InitializersToLambda {
@@ -13059,14 +13081,14 @@ function Convert-InitializersToLambda {
     param(
         [Parameter(Mandatory)][System.Management.Automation.Language.TypeDefinitionAst] $ClassAst,
         [Parameter()][System.Management.Automation.Language.PropertyMemberAst[]] $Initializers = @(),
-        [switch] $Static
+        [switch] $Static,[PscRuntimeSelection]$RuntimeSelection
     )
     Use-DeclarationScope -Ast $ClassAst
     $classType = $script:LoweringClassTypes[$ClassAst.Name]
     $thisParam = if ($Static) { $null } else { [Linq.Expressions.Expression]::Parameter($classType, 'this') }
     New-LoweredBody -Name $(if ($Static) { '.cctor' } else { '.ctor' }) -ReturnType ([void]) -This $thisParam `
         -Parameters ([System.Collections.Generic.List[Linq.Expressions.ParameterExpression]]::new()) -ParameterMap @{} `
-        -Initializers $Initializers -Statements @() -IsStatic ([bool]$Static) -IsConstructor $true
+        -Initializers $Initializers -Statements @() -IsStatic ([bool]$Static) -IsConstructor $true -RuntimeSelection $RuntimeSelection
 }
 
 function New-LoweredBody {
@@ -13082,7 +13104,7 @@ function New-LoweredBody {
         # A program's Main: the script's top level, whose unqualified assignments write the script's variables; it
         # first binds -ProgramParameters, the script's param block, from its [string[]] parameter.
         [switch] $Program,
-        [System.Management.Automation.Language.ParamBlockAst] $ProgramParameters
+        [System.Management.Automation.Language.ParamBlockAst] $ProgramParameters,[PscRuntimeSelection]$RuntimeSelection
     )
 
     $returnTarget = [Linq.Expressions.Expression]::Label($ReturnType, 'returnTarget')
@@ -13103,6 +13125,7 @@ function New-LoweredBody {
         Output         = $outputList
         ScriptClass    = $ScriptClass
         ScriptBody     = [bool]$Program
+        RuntimeSelection = $RuntimeSelection
     }
 
     $body = [System.Collections.Generic.List[Linq.Expressions.Expression]]::new()
@@ -15995,7 +16018,7 @@ Conform streams child stdout and stderr to the invoking host as they become avai
 
 - **Managed:** SMA AST and typed expression lowering, deterministic IL emission, static graph/data realization, reachability and fixed-parameter specialization.
 - **Native:** pinned Windows NativeAOT compiler plus PSC COFF linker; direct CIL-to-IR-to-x64 ELF leaf emission and decoded-byte ABI checks. The direct backend does not yet replace ILC for general programs.
-- **Faculties:** `HandleTable`, `DiscoveryMechanisms`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. BuildRuntime without contract inputs writes a local selection receipt for HandleTable, ScriptType and PrimitiveConversion after successful construction. Structural specialization with an explicit `-RuntimeDirectory` uses the compiled numeric selector on demand: verify source, CoreLib, SMA, the existing TypeConverter framework dependency and all three faculty assembly digests once, load the exact bytes in a private collectible context, and invoke a typed delegate. Missing or incompatible receipts refuse that path; no implicit interpreted fallback is permitted after selection is requested. Without an explicit directory the authoring selector is unchanged. The receipt identifies a trusted local build; it is not a signature or independent admission proof. This is limited compiler self-consumption, not full startup activation or migration of descriptor identities. `PscApi.AcquireSelection(api,directory)` acquires an explicit resident selection session from the API source revision. `PscRuntimeSelection.Select(session,signatures,sources)` reuses the admitted selector without reading artifacts again; `Close(session)` withdraws it and requests context unloading. Resident structural specialization accepts the same session as `-RuntimeSelection`, and does not close a caller-owned session. CLI specialization still acquires and closes its own session. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
+- **Faculties:** `HandleTable`, `DiscoveryMechanisms`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. BuildRuntime without contract inputs writes a local selection receipt for HandleTable, ScriptType and PrimitiveConversion after successful construction. Structural specialization with an explicit `-RuntimeDirectory` uses the compiled numeric selector on demand: verify source, CoreLib, SMA, the existing TypeConverter framework dependency and all three faculty assembly digests once, load the exact bytes in a private collectible context, and invoke a typed delegate. Missing or incompatible receipts refuse that path; no implicit interpreted fallback is permitted after selection is requested. Without an explicit directory the authoring selector is unchanged. The receipt identifies a trusted local build; it is not a signature or independent admission proof. This is limited compiler self-consumption, not full startup activation or migration of descriptor identities. `PscApi.AcquireSelection(api,directory)` acquires an explicit resident selection session from the API source revision. `PscRuntimeSelection.Select(session,signatures,sources)` reuses the admitted selector without reading artifacts again; `Close(session)` withdraws it and requests context unloading. Resident structural specialization accepts the same session as `-RuntimeSelection`, and does not close a caller-owned session. CLI specialization still acquires and closes its own session. The retained session may also be supplied to `Export-LoweredAssembly -RuntimeSelection`: ordinary source static/instance calls and explicit constructors preserve the original STS binding witnesses and use the admitted numeric selector for non-exact closed numeric signatures. Method closure and initializer lowering use the same session. Exact source-reference equality and candidate acquisition remain authoring operations; there is no secondary descriptor graph. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
 - **Evidence:** differential tests, structural lint, Guard, non-loading binary queries and coverage. An observed call is not a universal binding proof; an ABI check is not a proof of arithmetic equivalence.
 
 ## Trust and security
@@ -16594,7 +16617,7 @@ class PscMethodClosure : System.Linq.Expressions.ExpressionVisitor {
 
 function Get-RequiredClassMethods {
     param([Parameter(Mandatory)][object[]] $Model, [Parameter(Mandatory)][hashtable] $ProjectedTypes,
-        [Parameter(Mandatory)][string] $ClassName, [Parameter(Mandatory)][string[]] $MethodNames)
+        [Parameter(Mandatory)][string] $ClassName, [Parameter(Mandatory)][string[]] $MethodNames,[PscRuntimeSelection]$RuntimeSelection)
     $closure = [PscMethodClosure]::new()
     $roots = 0
     foreach ($class in $Model) {
@@ -16612,20 +16635,20 @@ function Get-RequiredClassMethods {
         $instanceInitializers = @($class.Properties | Where-Object { -not $_.IsStatic -and $_.InitialValue })
         $staticInitializers = @($class.Properties | Where-Object { $_.IsStatic -and $_.InitialValue })
         foreach ($constructor in $class.Constructors) {
-            $lowered = Convert-MethodAstToLambda -MethodAst $constructor -Initializers $instanceInitializers
+            $lowered = Convert-MethodAstToLambda -MethodAst $constructor -Initializers $instanceInitializers -RuntimeSelection $RuntimeSelection
             $null = $closure.Visit($lowered.Lambda.Body)
         }
         if (-not $class.Constructors.Count -and $instanceInitializers.Count) {
-            $lowered = Convert-InitializersToLambda -ClassAst $class.Ast -Initializers $instanceInitializers
+            $lowered = Convert-InitializersToLambda -ClassAst $class.Ast -Initializers $instanceInitializers -RuntimeSelection $RuntimeSelection
             $null = $closure.Visit($lowered.Lambda.Body)
         }
         if ($staticInitializers.Count) {
-            $lowered = Convert-InitializersToLambda -ClassAst $class.Ast -Initializers $staticInitializers -Static
+            $lowered = Convert-InitializersToLambda -ClassAst $class.Ast -Initializers $staticInitializers -Static -RuntimeSelection $RuntimeSelection
             $null = $closure.Visit($lowered.Lambda.Body)
         }
     }
     while ($closure.Pending.Count) {
-        $lowered = Convert-MethodAstToLambda -MethodAst $closure.Pending.Dequeue()
+        $lowered = Convert-MethodAstToLambda -MethodAst $closure.Pending.Dequeue() -RuntimeSelection $RuntimeSelection
         $null = $closure.Visit($lowered.Lambda.Body)
     }
     return ,$closure.Required
@@ -16704,7 +16727,7 @@ function Export-LoweredAssembly {
         [Parameter()][string] $ClassName,
         [Parameter()][string[]] $ClassNames,
         [System.Management.Automation.Language.TypeDefinitionAst[]] $ScopeDeclarations,
-        [PscDeclarationScope] $DependencyScope,
+        [PscDeclarationScope] $DependencyScope,[PscRuntimeSelection]$RuntimeSelection,
         [ref] $RealizedScope,
         [switch] $DeclarationsOnly,
         # Select these methods of -ClassName and retain their bound method dependencies.
@@ -16723,6 +16746,7 @@ function Export-LoweredAssembly {
         [switch] $Program
     )
 
+    if($null -ne $RuntimeSelection){[PscRuntimeSelection]::AssertOpen($RuntimeSelection)}
     if($null -ne $RealizedScope){$RealizedScope.Value=$null}
     $script:PscCompilingProgram = [bool]$Program
     if (($ScopeDeclarations -or $DependencyScope) -and !$DeclarationsOnly){throw 'Explicit scope is available only for declaration realization.'}
@@ -16857,7 +16881,7 @@ function Export-LoweredAssembly {
     if($MethodNames){
         foreach($c in $model){if($c.Ast.BaseTypes.Count){throw 'MethodNames selection is not yet admitted for inherited types; full virtual dispatch closure is required.'}}
     }
-    $requiredMethods = if ($MethodNames) { Get-RequiredClassMethods -Model $model -ProjectedTypes $projection -ClassName $targetClass.Name -MethodNames $MethodNames } else { $null }
+    $requiredMethods = if ($MethodNames) { Get-RequiredClassMethods -Model $model -ProjectedTypes $projection -ClassName $targetClass.Name -MethodNames $MethodNames -RuntimeSelection $RuntimeSelection } else { $null }
     $dataFields = @{}
     if ($null -eq $StaticData) { $StaticData = @{} }
     # One graph of instances per class with static data (PscStaticGraph).
@@ -16958,7 +16982,7 @@ function Export-LoweredAssembly {
             $instanceInits = @($c.Properties | Where-Object { -not $_.IsStatic -and $_.InitialValue })
             $fieldInputs = @($dataFields.Values | Where-Object { $_.Field.DeclaringType -eq $projection[$c.Name] })
             if ($staticInits.Count -or $fieldInputs.Count) {
-                $lowered = Convert-InitializersToLambda -ClassAst $c.Ast -Initializers $staticInits -Static
+                $lowered = Convert-InitializersToLambda -ClassAst $c.Ast -Initializers $staticInits -Static -RuntimeSelection $RuntimeSelection
                 $initializer = $lowered.Lambda
                 if ($fieldInputs.Count) {
                 $body = [Collections.Generic.List[Linq.Expressions.Expression]]::new()
@@ -16976,15 +17000,15 @@ function Export-LoweredAssembly {
                 Write-IlMethodBody -Lambda $initializer -MethodBuilder $session.Types[$c.Name].DefineTypeInitializer() -IsStatic
             }
             foreach ($ctor in $plan.Constructors) {
-                $lowered = if ($ctor.Ast) { Convert-MethodAstToLambda -MethodAst $ctor.Ast -Initializers $instanceInits }
-                           else { Convert-InitializersToLambda -ClassAst $c.Ast -Initializers $instanceInits }
+                $lowered = if ($ctor.Ast) { Convert-MethodAstToLambda -MethodAst $ctor.Ast -Initializers $instanceInits -RuntimeSelection $RuntimeSelection }
+                           else { Convert-InitializersToLambda -ClassAst $c.Ast -Initializers $instanceInits -RuntimeSelection $RuntimeSelection }
                 $base=$projection[$c.Name].BaseType
                 $baseCtor=$base.GetConstructor([Reflection.BindingFlags]'Public,NonPublic,Instance', $null, [type[]]@(), $null)
                 if($null -eq $baseCtor -or $baseCtor.IsPrivate){throw "Base of '$($c.Name)' has no accessible parameterless constructor."}
                 Write-IlMethodBody -Lambda $lowered.Lambda -MethodBuilder $ctor.Builder -HasThis -BaseConstructor -BaseConstructorMember $baseCtor
             }
             foreach ($method in $plan.Methods) {
-                $lowered = Convert-MethodAstToLambda -MethodAst $method.Ast
+                $lowered = Convert-MethodAstToLambda -MethodAst $method.Ast -RuntimeSelection $RuntimeSelection
                 Write-IlMethodBody -Lambda $lowered.Lambda -MethodBuilder $method.Builder -IsStatic:$lowered.IsStatic -HasThis:$lowered.HasThis
                 if ($c.Name -eq $targetClass.Name) {
                     $emittedMethods.Add($lowered.Name)
@@ -17009,7 +17033,7 @@ function Export-LoweredAssembly {
         $helpers = [string[]]@()
         if ($null -ne $script:IlMap.Semantics.Methods) {
             foreach ($helper in $script:IlMap.Semantics.Methods) {
-                $lowered = Convert-MethodAstToLambda -MethodAst $helper.Ast
+                $lowered = Convert-MethodAstToLambda -MethodAst $helper.Ast -RuntimeSelection $RuntimeSelection
                 Write-IlMethodBody -Lambda $lowered.Lambda -MethodBuilder $helper.Builder -IsStatic:$lowered.IsStatic -HasThis:$lowered.HasThis
             }
             $helpers = [string[]]@($script:IlMap.Semantics.Needed)
