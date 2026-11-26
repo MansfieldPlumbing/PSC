@@ -2626,7 +2626,7 @@ enum HandleTableState { Stale = 0; Live = 1; Revoking = 2; Finalizing = 3; Faile
 class HandleTableRetention {
     [uint64] $Source
     [uint64] $Target
-    HandleTableRetention([uint64]$source,[uint64]$target){$this.Source=$source;$this.Target=$target}
+    static [HandleTableRetention] Create([uint64]$source,[uint64]$target){[HandleTableRetention]$edge=[HandleTableRetention]::new();$edge.Source=$source;$edge.Target=$target;return $edge}
 }
 class HandleTableCell {
     [uint32] $Generation = 1
@@ -2662,14 +2662,14 @@ class HandleTableInfo {
 }
 class HandleTableLease {
     [object] $Value
-    HandleTableLease([object] $value) { $this.Value = $value }
+    static [HandleTableLease] Create([object]$value){[HandleTableLease]$lease=[HandleTableLease]::new();$lease.Value=$value;return $lease}
 }
 # One compound lease protects two dependency handles. The space, not the
 # public value fields, owns the pin identities.
 class HandleTablePairLease {
     [object] $First
     [object] $Second
-    HandleTablePairLease([object]$first,[object]$second){$this.First=$first;$this.Second=$second}
+    static [HandleTablePairLease] Create([object]$first,[object]$second){[HandleTablePairLease]$lease=[HandleTablePairLease]::new();$lease.First=$first;$lease.Second=$second;return $lease}
 }
 class HandleTable {
     hidden [object] $Gate = [object]::new()
@@ -2774,7 +2774,7 @@ class HandleTable {
     }
     hidden static [HandleTableLease] Pin([HandleTable]$Table, [uint64]$handle,[type]$contract){
         [HandleTableCell]$cell=[HandleTable]::CheckOpen($Table, $handle,$contract)
-        [HandleTableLease]$lease=[HandleTableLease]::new($cell.Value)
+        [HandleTableLease]$lease=[HandleTableLease]::Create($cell.Value)
         $Table.Leases.Add($lease,$handle)
         $cell.Pins++
         return $lease
@@ -2794,7 +2794,7 @@ class HandleTable {
             [HandleTableCell]$a=[HandleTable]::CheckOpen($Table, $first,$firstType)
             [HandleTableCell]$b=[HandleTable]::CheckOpen($Table, $second,$secondType)
             if($first -eq $second -and $a.Pins -ge [int]::MaxValue-1){throw [OverflowException]::new('Pin count exhausted')}
-            [HandleTablePairLease]$lease=[HandleTablePairLease]::new($a.Value,$b.Value)
+            [HandleTablePairLease]$lease=[HandleTablePairLease]::Create($a.Value,$b.Value)
             [uint64[]]$handles=[uint64[]]::new(2);$handles[0]=$first;$handles[1]=$second
             $Table.PairLeases.Add($lease,$handles)
             $a.Pins++;$b.Pins++
@@ -2819,7 +2819,7 @@ class HandleTable {
             }
             if($b.Retainers -eq [int]::MaxValue){throw [OverflowException]::new('Retainer count exhausted')}
             if($null -eq $a.Outgoing){$a.Outgoing=[System.Collections.Generic.List[HandleTableRetention]]::new()}
-            [HandleTableRetention]$edge=[HandleTableRetention]::new($source,$target)
+            [HandleTableRetention]$edge=[HandleTableRetention]::Create($source,$target)
             [uint64[]]$endpoints=[uint64[]]::new(2);$endpoints[0]=$source;$endpoints[1]=$target
             $a.Outgoing.Add($edge);$Table.Retentions.Add($edge,$endpoints);$b.Retainers++
             return $edge
@@ -2850,7 +2850,7 @@ class HandleTable {
             if($null -eq $source -or $source.Pins -ne 0 -or ($source.State -ne [HandleTableState]::Live -and $source.State -ne [HandleTableState]::Revoking)){throw [InvalidOperationException]::new('Retaining source not quiescent')}
             [HandleTable]::DropRetention($Table, $edge)
         }finally{[Threading.Monitor]::Exit($Table.Gate)}
-        [HandleTable]::Collect($Table)
+        [HandleCollector]::Collect($Table)
     }
     hidden static [void] Unpin([HandleTable]$Table, [uint64]$handle){
         [HandleTableCell]$cell=[HandleTable]::Find($Table, $handle)
@@ -2866,7 +2866,7 @@ class HandleTable {
             $null=$Table.Leases.Remove($lease);$lease.Value=$null
             [HandleTable]::Unpin($Table, $handle)
         }finally{[Threading.Monitor]::Exit($Table.Gate)}
-        [HandleTable]::Collect($Table)
+        [HandleCollector]::Collect($Table)
     }
     static [void] ClosePair([HandleTable]$Table, [HandleTablePairLease]$lease){
         [Threading.Monitor]::Enter($Table.Gate)
@@ -2876,7 +2876,7 @@ class HandleTable {
             $null=$Table.PairLeases.Remove($lease);$lease.First=$null;$lease.Second=$null
             [HandleTable]::Unpin($Table, $handles[1]);[HandleTable]::Unpin($Table, $handles[0])
         }finally{[Threading.Monitor]::Exit($Table.Gate)}
-        [HandleTable]::Collect($Table)
+        [HandleCollector]::Collect($Table)
     }
     static [void] Close([HandleTable]$Table, [uint64] $handle) {
         [System.Threading.Monitor]::Enter($Table.Gate)
@@ -2886,7 +2886,7 @@ class HandleTable {
             $cell.RootReference = $false
             [HandleTable]::ConsiderRetirement($Table, $handle,$cell)
         } finally { [System.Threading.Monitor]::Exit($Table.Gate) }
-        [HandleTable]::Collect($Table)
+        [HandleCollector]::Collect($Table)
     }
     # Names are an owner-local projection of live handles, not object identity.
     hidden static [System.Collections.Generic.Dictionary[string,uint64]] Names([HandleTable]$Table, [uint64] $owner, [bool] $create) {
@@ -3001,7 +3001,7 @@ class HandleTable {
             }
             [HandleTable]::Mark($Table, $retiring)
         } finally { [System.Threading.Monitor]::Exit($Table.Gate) }
-        [HandleTable]::Collect($Table)
+        [HandleCollector]::Collect($Table)
         return [HandleTable]::State($Table, $retiring)
     }
     # Detach a revoked ownership subtree as a residual root. Existing leases
@@ -3059,9 +3059,25 @@ class HandleTable {
     }
     static [HandleTableState] Revoke([HandleTable]$Table, [uint64] $handle) {
         $null = [HandleTable]::Withdraw($Table, $handle)
-        [HandleTable]::Collect($Table)
+        [HandleCollector]::Collect($Table)
         return [HandleTable]::State($Table, $handle)
     }
+    static [void] Shutdown([HandleTable]$Table) {
+        [System.Threading.Monitor]::Enter($Table.Gate)
+        try {
+            $Table.Closed = $true
+            for ([int]$i = 1; $i -lt $Table.High; $i++) {
+                [HandleTableCell]$cell = $Table.Cells[$i]
+                if ($cell.State -eq [HandleTableState]::Live -and $cell.Owner -eq [uint64]0) { [HandleTable]::Mark($Table, [HandleTable]::Make($cell.Generation, [uint32]$i)) }
+            }
+        } finally { [System.Threading.Monitor]::Exit($Table.Gate) }
+        [HandleCollector]::Collect($Table)
+    }
+}
+
+# Collection executes eligible cleanup outside the table gate and completes under it.
+# The table owns eligibility, storage, generations, and dependency edges.
+class HandleCollector {
     # The caller holds the table's Gate. The queue operation takes its participant explicitly.
     hidden static [int] TakeReady([HandleTable]$Table) {
         if($Table.ReadyHead -ge $Table.Ready.Count){return 0}
@@ -3079,7 +3095,7 @@ class HandleTable {
             [HandleTableCell]$cell = $null
             [System.Threading.Monitor]::Enter($Table.Gate)
             try {
-                $index=[HandleTable]::TakeReady($Table)
+                $index=[HandleCollector]::TakeReady($Table)
                 if($index -ne 0){$cell=$Table.Cells[$index]}
             } finally { [System.Threading.Monitor]::Exit($Table.Gate) }
             if ($index -eq 0) { return }
@@ -3108,17 +3124,6 @@ class HandleTable {
             } finally { [System.Threading.Monitor]::Exit($Table.Gate) }
         }
     }
-    static [void] Shutdown([HandleTable]$Table) {
-        [System.Threading.Monitor]::Enter($Table.Gate)
-        try {
-            $Table.Closed = $true
-            for ([int]$i = 1; $i -lt $Table.High; $i++) {
-                [HandleTableCell]$cell = $Table.Cells[$i]
-                if ($cell.State -eq [HandleTableState]::Live -and $cell.Owner -eq [uint64]0) { [HandleTable]::Mark($Table, [HandleTable]::Make($cell.Generation, [uint32]$i)) }
-            }
-        } finally { [System.Threading.Monitor]::Exit($Table.Gate) }
-        [HandleTable]::Collect($Table)
-    }
 }
 
 # Optional monotone timeline object. All CPU fences share a
@@ -3126,14 +3131,14 @@ class HandleTable {
 class HandleTableFence {
     hidden static [object] $Gate = [object]::new()
     hidden [uint64] $Phase
-    [uint64] Completed() {
+    static [uint64] Completed([HandleTableFence]$Fence) {
         [System.Threading.Monitor]::Enter([HandleTableFence]::Gate)
-        try { return $this.Phase } finally { [System.Threading.Monitor]::Exit([HandleTableFence]::Gate) }
+        try { return $Fence.Phase } finally { [System.Threading.Monitor]::Exit([HandleTableFence]::Gate) }
     }
-    [void] Signal([uint64] $phase) {
+    static [void] Signal([HandleTableFence]$Fence, [uint64] $phase) {
         [System.Threading.Monitor]::Enter([HandleTableFence]::Gate)
         try {
-            if ($phase -gt $this.Phase) { $this.Phase = $phase; [System.Threading.Monitor]::PulseAll([HandleTableFence]::Gate) }
+            if ($phase -gt $Fence.Phase) { $Fence.Phase = $phase; [System.Threading.Monitor]::PulseAll([HandleTableFence]::Gate) }
         } finally { [System.Threading.Monitor]::Exit([HandleTableFence]::Gate) }
     }
     static [int] WaitN([HandleTableFence[]] $fences, [uint64[]] $targets, [int] $n, [int] $timeoutMs) {
@@ -3154,7 +3159,7 @@ class HandleTableFence {
     }
     static [int] WaitAny([HandleTableFence[]] $fences, [uint64[]] $targets, [int] $timeoutMs) {
         if ([HandleTableFence]::WaitN($fences,$targets,1,$timeoutMs) -lt 0) { return -1 }
-        for ([int]$i = 0; $i -lt $fences.Length; $i++) { if ($fences[$i].Completed() -ge $targets[$i]) { return $i } }
+        for ([int]$i = 0; $i -lt $fences.Length; $i++) { if ([HandleTableFence]::Completed($fences[$i]) -ge $targets[$i]) { return $i } }
         return -1
     }
     static [bool] WaitAll([HandleTableFence[]] $fences, [uint64[]] $targets, [int] $timeoutMs) {
@@ -5128,7 +5133,7 @@ class PscFacultyUnit {
     }
 }
 function Get-PscFacultyUnits {
-    [PscFacultyUnit]::new('HandleTable','HandleTable',@('HandleTableState','HandleTableRetention','HandleTableCell','HandleTableInfo','HandleTableLease','HandleTablePairLease','HandleTable','HandleTableFence'),@())
+    [PscFacultyUnit]::new('HandleTable','HandleTable',@('HandleTableState','HandleTableRetention','HandleTableCell','HandleTableInfo','HandleTableLease','HandleTablePairLease','HandleTable','HandleCollector','HandleTableFence'),@())
     [PscFacultyUnit]::new('InquiryPrimitives','InquiryCase',@('InquirySourceCleanReference','InquiryAxis','InquiryPredictiveScalar','InquiryOrigin','InquiryBlock','InquiryReading','InquiryCase','InquirySemanticAttachment','InquiryExecutionTier','InquiryReliance','InquiryWhenClause','InquiryJudgment'),@())
     [PscFacultyUnit]::new('ScriptType','ScriptTypeReflection',@('ScriptTypeReferenceKind','ScriptTypeReference','ScriptTypeMember','ScriptTypeBinding','ScriptTypeContract','ScriptTypeCall','ScriptTypeSelectionMemo','ScriptTypeBindingExtension','ScriptTypeSmaSelector','ScriptTypeRealization','ScriptTypeRole','ScriptTypeReflection','ScriptTypeCatalog'),@('HandleTable'))
     [PscFacultyUnit]::new('PrimitiveConversion','ScriptTypePrimitiveConversion',@('ScriptTypePrimitiveConversion'),@('HandleTable','ScriptType'))
@@ -15575,9 +15580,9 @@ This is the architectural mission, not a claim of completed implementation. Reco
 
 ## Reflective managed runspace
 
-`ScriptTypeReflection.InvokeBound(role, binding, arguments)` consumes an exact locally declared `ScriptTypeBinding` with its original member reference, checks the role's realized contract, acquires the provider and dependency leases, and invokes the selected compiled target without a second name or overload search. It refuses unmaterialized signatures, nonexact argument representations, unrelated contract/member identities and unavailable realizations. The current profile does not yet admit inherited bindings, conversion plans or symbolic argument storage. `HandleTable` uses CoreLib collections for allocation, ownership traversal and deferred reclamation. Future collection development belongs to `HandleCollector`; the existing reclamation operation remains in HandleTable until that boundary is implemented. A bounded standalone CoreCLR control has exercised runtime definition construction, binding, replacement and withdrawal using only CoreLib and compiled PSC assemblies. ScriptType's generated-thunk naming still references `System.Security.Cryptography`; full module closure has not been established. The target is a lowered reflective runspace that parses `.ps1` without the SMA assembly, using acquired PowerShell language semantics rather than a second grammar. Independent parser realization is not implemented; current PSC authoring and compilation still acquire source using SMA.
+`ScriptTypeReflection.InvokeBound(role, binding, arguments)` consumes an exact locally declared `ScriptTypeBinding` with its original member reference, checks the role's realized contract, acquires the provider and dependency leases, and invokes the selected compiled target without a second name or overload search. It refuses unmaterialized signatures, nonexact argument representations, unrelated contract/member identities and unavailable realizations. The current profile does not yet admit inherited bindings, conversion plans or symbolic argument storage. `HandleTable` uses CoreLib collections for allocation, ownership traversal and deferred reclamation. `HandleCollector.Collect(table)` owns eligible cleanup execution, completion and free-slot recycling, using the existing table gate and storage. HandleTable owns eligibility, leases and dependency edges and calls the collector when lifetime operations release work. Both are realized in HandleTable.dll because the current synchronous lifetime contract is mutually dependent; no independent collector assembly or tracing GC is claimed. A bounded standalone CoreCLR control has exercised runtime definition construction, binding, replacement and withdrawal using only CoreLib and compiled PSC assemblies. ScriptType's generated-thunk naming still references `System.Security.Cryptography`; full module closure has not been established. The target is a lowered reflective runspace that parses `.ps1` without the SMA assembly, using acquired PowerShell language semantics rather than a second grammar. Independent parser realization is not implemented; current PSC authoring and compilation still acquire source using SMA.
 
-HandleTable's internal lookup, pinning, retention, name resolution and ownership traversal operations now take an explicit typed table participant. Fourteen additional public operations (including collection, withdrawal, succession, retention, pair leasing and rebinding) now require an explicit HandleTable participant. Register, Open, Close and Revoke also take an explicit table participant. The authoring-side query lease acquires exact CLR operation signatures once from the loaded faculty; compiled consumers use typed static calls. The existing IDisposable and cursor instance entry points remain compatibility boundaries. Rebuild callers of the changed operations. `ScriptTypeBindingExtension.SelectBound(extension, candidates, arguments)` is a static operation with an explicit extension participant; rebuild consumers of the previous instance signature. The existing selector memo and lease semantics are retained.
+HandleTable's internal lookup, pinning, retention, name resolution and ownership traversal operations now take an explicit typed table participant. Fourteen additional public operations (including collection, withdrawal, succession, retention, pair leasing and rebinding) now require an explicit HandleTable participant. Register, Open, Close and Revoke also take an explicit table participant. The authoring-side query lease acquires exact CLR operation signatures once from the loaded faculty; compiled consumers use typed static calls. The existing IDisposable and cursor instance entry points remain compatibility boundaries. Lease and retention records use explicit typed Create operations; the fence Completed and Signal operations take an explicit fence participant. Rebuild callers of the changed operations. `ScriptTypeBindingExtension.SelectBound(extension, candidates, arguments)` is a static operation with an explicit extension participant; rebuild consumers of the previous instance signature. The existing selector memo and lease semantics are retained.
 
 ## Advisory redundancy analysis
 
