@@ -27,6 +27,8 @@ HandleTable's internal lookup, pinning, retention, name resolution and ownership
 
 ScriptTypeContract reflection and binding operations now take an explicit contract participant. Rebuild callers of the previous instance signatures; the binding still retains the original owner, member and argument references.
 
+ScriptTypeRealization binding, candidate lookup and operation lookup take an explicit realization participant. ScriptTypeBinding, ScriptTypeCall and ScriptTypeRole use typed Create operations rather than implicit receiver constructors. Rebuild callers of the changed signatures.
+
 ## Advisory redundancy analysis
 
 Use the existing graph to compare authored function and method bodies, including their source identities and locations:

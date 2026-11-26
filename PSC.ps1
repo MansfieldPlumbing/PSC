@@ -1110,10 +1110,10 @@ try {
         $realization.ContractHandle = [HandleTable]::Register($space, $owner, $descriptor, [ScriptTypeContract], $null)
         $realization.ReceiverHandle = [HandleTable]::Register($space, $owner, $provider, [object], $null)
         $thunk = $providerType.GetMethod('ApplyThunk').CreateDelegate([Func[object,object[],object]])
-        $realization.Calls = [ScriptTypeCall[]]@([ScriptTypeCall]::new($member, [type[]]@([double]), $thunk))
+        $realization.Calls = [ScriptTypeCall[]]@([ScriptTypeCall]::Create($member, [type[]]@([double]), $thunk))
         $handle = [HandleTable]::Register($space, $owner, $realization, [ScriptTypeRealization], $null)
         [HandleTable]::Rebind($space, $owner, 'calibration', 0, $handle)
-        $role = [ScriptTypeRole]::new($space, $owner, 'calibration')
+        $role = [ScriptTypeRole]::Create($space, $owner, 'calibration')
         $measure = $client.GetMethod('Measure')
         foreach ($value in [double[]]@(-10, 0, 2.5, 10, 127.125)) {
             $reference = $providerType.GetMethod('Apply').Invoke($provider, [object[]]@($value))
@@ -2356,7 +2356,7 @@ if($RuntimeDirectory){
     $s=[type[][]]::new(3);$s[0]=[type[]]@([long],[byte]);$s[1]=[type[]]@([decimal],[object]);$s[2]=[type[]]@([string],[long])
     $values=[object[]]@([int]2,[byte]2)
     $calls=[ScriptTypeCall[]]::new(3)
-    for($i=0;$i -lt $s.Length;$i++){$calls[$i]=[ScriptTypeCall]::new($null,$s[$i],$null)}
+    for($i=0;$i -lt $s.Length;$i++){$calls[$i]=[ScriptTypeCall]::Create($null,$s[$i],$null)}
     $actual=[ScriptTypePrimitiveConversion]::SelectSignatures($s,[type[]]@([int],[byte]))
     if($actual -ne 0 -or [ScriptTypePrimitiveConversion]::Select($calls,$values) -ne $actual){throw 'Compiled selection mismatch'}
     $refused=$false;try{$null=[ScriptTypePrimitiveConversion]::SelectSignatures([type[][]]@($s[0],$s[0]),[type[]]@([int],[byte]))}catch [Reflection.AmbiguousMatchException]{$refused=$true}
@@ -2502,9 +2502,7 @@ class ScriptTypeBinding {
     [ScriptTypeContract] $Owner
     [ScriptTypeMember] $Member
     [ScriptTypeReference[]] $Arguments
-    ScriptTypeBinding([ScriptTypeContract]$Owner,[ScriptTypeMember]$Member,[ScriptTypeReference[]]$Arguments){
-        $this.Owner=$Owner;$this.Member=$Member;$this.Arguments=$Arguments
-    }
+    static [ScriptTypeBinding] Create([ScriptTypeContract]$Owner, [ScriptTypeMember]$Member, [ScriptTypeReference[]]$Arguments){ [ScriptTypeBinding]$recordValue=[ScriptTypeBinding]::new(); $recordValue.Owner=$Owner;$recordValue.Member=$Member;$recordValue.Arguments=$Arguments; return $recordValue }
 }
 class ScriptTypeContract {
     [string] $Name
@@ -2542,7 +2540,7 @@ class ScriptTypeContract {
     static [ScriptTypeBinding] BindDeclared([ScriptTypeContract]$Contract, [string]$Name,[ScriptTypeReference[]]$Parameters,[bool]$Static,[bool]$Constructor){
         [ScriptTypeMember]$result=[ScriptTypeContract]::FindDeclaredReference($Contract, $Name,$Parameters,$Static,$Constructor)
         if($null -eq $result){return $null}
-        return [ScriptTypeBinding]::new($Contract,$result,$Parameters)
+        return [ScriptTypeBinding]::Create($Contract,$result,$Parameters)
     }
     # Constructors are local declarations; static and instance methods may have source bases.
     static [ScriptTypeMember] FindReference([ScriptTypeContract]$Contract, [string]$Name,[ScriptTypeReference[]]$Parameters,[bool]$Static,[bool]$Constructor){
@@ -3272,9 +3270,7 @@ class ScriptTypeCall {
     [ScriptTypeMember] $Member
     [type[]] $Parameters
     [Func[object,object[],object]] $Target
-    ScriptTypeCall([ScriptTypeMember]$Member,[type[]]$Parameters,[Func[object,object[],object]]$Target){
-        $this.Member=$Member; $this.Parameters=$Parameters; $this.Target=$Target
-    }
+    static [ScriptTypeCall] Create([ScriptTypeMember]$Member, [type[]]$Parameters, [Func[object,object[],object]]$Target){ [ScriptTypeCall]$recordValue=[ScriptTypeCall]::new(); $recordValue.Member=$Member; $recordValue.Parameters=$Parameters; $recordValue.Target=$Target; return $recordValue }
 }
 # Selection and conversion share a lease and therefore a generation.
 # A bounded selection memo, owned by the leased extension, never a receiver or thunk.
@@ -3386,7 +3382,7 @@ class ScriptTypeRealization {
     [Collections.Generic.Dictionary[string,Delegate]] $Operations = [Collections.Generic.Dictionary[string,Delegate]]::new([StringComparer]::OrdinalIgnoreCase)
     [ScriptTypeCall[]] $Calls = [ScriptTypeCall[]]::new(0)
     # Resolve generated thunks at realization binding, never at invocation.
-    [void] BindGenerated([ScriptTypeContract]$Contract,[type]$Thunks){
+    static [void] BindGenerated([ScriptTypeRealization]$Realization, [ScriptTypeContract]$Contract,[type]$Thunks){
         [Collections.Generic.List[ScriptTypeCall]]$items=[Collections.Generic.List[ScriptTypeCall]]::new()
         [ScriptTypeContract]$current=$Contract
         while($null -ne $current){
@@ -3401,20 +3397,20 @@ class ScriptTypeRealization {
                 [Reflection.MethodInfo]$method=$Thunks.GetMethod([ScriptTypeMember]::ThunkName($member),[Reflection.BindingFlags]'Public,Static')
                 if($null -eq $method){throw [MissingMethodException]::new($member.Name)}
                 [Func[object,object[],object]]$target=$method.CreateDelegate([Func[object,object[],object]])
-                $items.Add([ScriptTypeCall]::new($member,$signature,$target))
+                $items.Add([ScriptTypeCall]::Create($member,$signature,$target))
             }
             if($null -eq $current.BaseContracts -or $current.BaseContracts.Length -eq 0){break}
             if($current.BaseContracts.Length -ne 1){throw [NotSupportedException]::new('Multiple source bases not admitted')}
             $current=$current.BaseContracts[0]
         }
-        $this.Calls=$items.ToArray()
+        $Realization.Calls=$items.ToArray()
     }
-    [ScriptTypeCall[]] Candidates([ScriptTypeContract]$Contract,[string]$Name,[int]$Arity){
+    static [ScriptTypeCall[]] Candidates([ScriptTypeRealization]$Realization, [ScriptTypeContract]$Contract,[string]$Name,[int]$Arity){
         [ScriptTypeMember[]]$members=[ScriptTypeContract]::Candidates($Contract, $Name,$Arity)
         if($members.Length -eq 0){throw [MissingMethodException]::new($Name)}
         [ScriptTypeCall[]]$result=[ScriptTypeCall[]]::new($members.Length)
         for([int]$i=0;$i -lt $members.Length;$i++){
-            foreach($call in $this.Calls){
+            foreach($call in $Realization.Calls){
                 if(![object]::ReferenceEquals($call.Member,$members[$i])){continue}
                 if($null -ne $result[$i] -or $null -eq $call.Target -or $call.Parameters.Length -ne $Arity){throw [InvalidOperationException]::new('Invalid call realization')}
                 for([int]$j=0;$j -lt $Arity;$j++){
@@ -3426,8 +3422,8 @@ class ScriptTypeRealization {
         }
         return $result
     }
-    [Delegate] Find([string]$Name){
-        if($this.Operations.ContainsKey($Name)){return $this.Operations[$Name]}
+    static [Delegate] Find([ScriptTypeRealization]$Realization, [string]$Name){
+        if($Realization.Operations.ContainsKey($Name)){return $Realization.Operations[$Name]}
         return $null
     }
 }
@@ -3436,7 +3432,7 @@ class ScriptTypeRole {
     [HandleTable] $Space
     [uint64] $Owner
     [string] $Name
-    ScriptTypeRole([HandleTable]$Space,[uint64]$Owner,[string]$Name){$this.Space=$Space;$this.Owner=$Owner;$this.Name=$Name}
+    static [ScriptTypeRole] Create([HandleTable]$Space, [uint64]$Owner, [string]$Name){ [ScriptTypeRole]$recordValue=[ScriptTypeRole]::new(); $recordValue.Space=$Space;$recordValue.Owner=$Owner;$recordValue.Name=$Name; return $recordValue }
 }
 class ScriptTypeReflection {
     # Invoke a reflected semantic member without rediscovery by name or runtime overload selection.
@@ -3492,7 +3488,7 @@ class ScriptTypeReflection {
             try{
                 [ScriptTypeContract]$contract=$dependencies.First
                 if($null -ne $Expected -and ![object]::ReferenceEquals($Expected,$contract)){throw [InvalidOperationException]::new('Role does not realize the declared source contract')}
-                [ScriptTypeCall[]]$calls=$realization.Candidates($contract,$Member,$Arguments.Length)
+                [ScriptTypeCall[]]$calls=[ScriptTypeRealization]::Candidates($realization, $contract,$Member,$Arguments.Length)
                 [ScriptTypeCall]$exact=[ScriptTypeReflection]::Exact($calls,$Arguments)
                 if($null -ne $exact){return $exact.Target.Invoke($dependencies.Second,$Arguments)}
                 [HandleTableLease]$semantics=[HandleTable]::Open($Space, $Owner,'ScriptType.Binding',[ScriptTypeBindingExtension])
@@ -3558,7 +3554,7 @@ class ScriptTypeReflection {
             try{
                 [ScriptTypeContract]$contract=$dependencies.First
                 if(![object]::ReferenceEquals($expected,$contract)){throw [InvalidOperationException]::new('Role does not realize the declared source contract')}
-                [ScriptTypeCall[]]$calls=$realization.Candidates($contract,$Member,$arity)
+                [ScriptTypeCall[]]$calls=[ScriptTypeRealization]::Candidates($realization, $contract,$Member,$arity)
                 [object[]]$results=[object[]]::new($Rows.Length)
                 [HandleTableLease]$semantics=$null
                 [ScriptTypeBindingExtension]$extension=$null
@@ -3810,7 +3806,7 @@ class ScriptTypePrimitiveConversion {
         }
         if($members.Count -eq 0){return $null}
         [int]$index=[ScriptTypePrimitiveConversion]::SelectSignatures($signatures.ToArray(),$sources)
-        return [ScriptTypeBinding]::new($Owner,$members[$index],$Arguments)
+        return [ScriptTypeBinding]::Create($Owner,$members[$index],$Arguments)
     }
     # Shared fixed-arity primitive compatibility selection; neither samples nor
     # invocation delegates are needed to select from a statically known signature.
@@ -4079,7 +4075,7 @@ class ScriptTypeObjectDispatch {
                 if($signature[$i].IsByRef -or $signature[$i].IsByRefLike -or $signature[$i].IsPointer){throw [NotSupportedException]::new('Non-boxable parameter signature')}
             }
             $methods.Add($method)
-            $calls.Add([ScriptTypeCall]::new($null,$signature,$null))
+            $calls.Add([ScriptTypeCall]::Create($null,$signature,$null))
         }
         if($calls.Count -eq 0){throw [MissingMethodException]::new($Name)}
         [ScriptTypeCall[]]$candidates=$calls.ToArray()
@@ -15586,6 +15582,8 @@ This is the architectural mission, not a claim of completed implementation. Reco
 HandleTable's internal lookup, pinning, retention, name resolution and ownership traversal operations now take an explicit typed table participant. Fourteen additional public operations (including collection, withdrawal, succession, retention, pair leasing and rebinding) now require an explicit HandleTable participant. Register, Open, Close and Revoke also take an explicit table participant. The authoring-side query lease acquires exact CLR operation signatures once from the loaded faculty; compiled consumers use typed static calls. The existing IDisposable and cursor instance entry points remain compatibility boundaries. Lease and retention records use explicit typed Create operations; the fence Completed and Signal operations take an explicit fence participant. Rebuild callers of the changed operations. `ScriptTypeBindingExtension.SelectBound(extension, candidates, arguments)` is a static operation with an explicit extension participant; rebuild consumers of the previous instance signature. The existing selector memo and lease semantics are retained.
 
 ScriptTypeContract reflection and binding operations now take an explicit contract participant. Rebuild callers of the previous instance signatures; the binding still retains the original owner, member and argument references.
+
+ScriptTypeRealization binding, candidate lookup and operation lookup take an explicit realization participant. ScriptTypeBinding, ScriptTypeCall and ScriptTypeRole use typed Create operations rather than implicit receiver constructors. Rebuild callers of the changed signatures.
 
 ## Advisory redundancy analysis
 
