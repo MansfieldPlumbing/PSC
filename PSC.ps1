@@ -9684,15 +9684,43 @@ class PscDifferential {
     # assembly's bytes. The assembly is written under build/api beside PSC, named by the SHA-512 of the source text and
     # the classes lowered.
     static [System.Reflection.Assembly] Lower([string] $psc, [System.Management.Automation.Language.ScriptBlockAst] $source, [string[]] $classNames) {
+        return [PscDifferential]::Lower($psc,$source,$classNames,'')
+    }
+    hidden static [System.Reflection.Assembly] Lower([string] $psc, [System.Management.Automation.Language.ScriptBlockAst] $source, [string[]] $classNames,[string]$selection) {
         $names = [System.Collections.Generic.List[string]]::new()
         foreach ($name in $classNames) { if (-not [string]::IsNullOrEmpty($name)) { $names.Add($name) } }
-        $identity = [System.Security.Cryptography.SHA512]::HashData([System.Text.Encoding]::UTF8.GetBytes($source.Extent.Text + [char]0 + [string]::Join([char]0, $names)))
+        $identityText=$source.Extent.Text+[char]0+[string]::Join([char]0,$names)
+        if($selection){$identityText+=[char]0+$selection}
+        $identity = [System.Security.Cryptography.SHA512]::HashData([System.Text.Encoding]::UTF8.GetBytes($identityText))
         $directory = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($psc), 'build', 'api', [Convert]::ToHexString($identity, 0, 8))
         $null = [System.IO.Directory]::CreateDirectory($directory)
         $output = [System.IO.Path]::Combine($directory, 'Lowered.dll')
         if ($names.Count) { $null = & $psc -Mode Compile -SourceAst $source -ClassName $names[0] -ClassNames $names.ToArray() -OutputPath $output -Deterministic }
         else { $null = & $psc -Mode Compile -SourceAst $source -OutputPath $output -Deterministic }
         return [System.Reflection.Assembly]::Load([System.IO.File]::ReadAllBytes($output))
+    }
+
+    static [System.Reflection.Assembly] LowerDeclarations([string]$psc,[System.Management.Automation.Language.ScriptBlockAst]$source,[string[]]$names){
+        if($null -eq $source -or !$names.Count){throw 'LowerDeclarations requires an explicit declaration set.'}
+        $pending=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach($name in $names){if([string]::IsNullOrWhiteSpace($name) -or !$pending.Add($name)){throw 'Empty or duplicate declaration selection.'}}
+        $selected=[Collections.Generic.List[System.Management.Automation.Language.StatementAst]]::new()
+        $classes=[Collections.Generic.List[string]]::new();$copy=[PscAstRebuild]::new()
+        foreach($block in @($source.BeginBlock,$source.ProcessBlock,$source.EndBlock,$source.CleanBlock,$source.DynamicParamBlock)){
+            if($null -eq $block){continue}
+            foreach($statement in $block.Statements){
+                if($statement -isnot [System.Management.Automation.Language.TypeDefinitionAst] -or $statement.Name -notin $names){continue}
+                if(!$pending.Remove($statement.Name)){throw 'Ambiguous top-level type declaration.'}
+                $selected.Add([System.Management.Automation.Language.StatementAst]$copy.Rebuild($statement))
+                if($statement.IsClass){$classes.Add($statement.Name)}
+            }
+        }
+        if($pending.Count -or !$classes.Count){throw 'LowerDeclarations requires existing top-level types and at least one class.'}
+        $usings=[System.Collections.Generic.List[System.Management.Automation.Language.UsingStatementAst]]::new()
+        foreach($using in $source.UsingStatements){$usings.Add([System.Management.Automation.Language.UsingStatementAst]$copy.Rebuild($using))}
+        $block=[System.Management.Automation.Language.StatementBlockAst]::new($source.Extent,$selected.ToArray(),$null)
+        $unit=[System.Management.Automation.Language.ScriptBlockAst]::new($source.Extent,$usings.ToArray(),$null,$block,$false,$false)
+        return [PscDifferential]::Lower($psc,$unit,$classes.ToArray(),'SelectedDeclarations'+[char]0+[string]::Join([char]0,$names))
     }
 
     # PSC's PowerShellSemantics definition, alone in a script block of its own, read from PSC's source.
@@ -15281,11 +15309,9 @@ class PscApi {
         $bytes=[IO.File]::ReadAllBytes($this.Script)
         if([Convert]::ToHexString([Security.Cryptography.SHA512]::HashData($bytes)) -cne $this.SourceSha512){throw 'Roadmap API source has changed.'}
         $sourceHash=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
-        # Reuse the structural query visitor over the API's already parsed source. Preserve its actual referents.
-        $visitor=[PscSourceQueryVisitor]::new();$visitor.Spec=[PscQuerySpec]::new([PscQueryKind]::Declaration,'','',[int]::MaxValue)
-        $visitor.Limit=[int]::MaxValue;$visitor.Path=$this.Script;$visitor.Digest=$sourceHash
-        $this.Ast.Visit($visitor)
-        foreach($hit in $visitor.Hits){
+        # Share the acquired declaration inventory with the resident API. Return independent result records.
+        foreach($site in $this.Source.Declarations('')){
+            $hit=$site.Copy()
             if($hit.Target -isnot [System.Management.Automation.Language.TypeDefinitionAst] -and $hit.Target -isnot [System.Management.Automation.Language.FunctionDefinitionAst]){continue}
             if(!$declarations.TryAdd($hit.Name,$hit)){[void]$ambiguous.Add($hit.Name)}
         }
@@ -15582,7 +15608,7 @@ $api | Get-Member
 & ./PSC.ps1 -Mode Capability
 ```
 
-The API retains the acquired source revision. Eligible queries reuse its AST after byte-identity verification; measurements are acquired only on the first Measures() call. ReadSource(path) still acquires all measurements. The API is derived from the running script, so mode names and parameter evidence do not depend on a previous session's notes. Use `Describe(mode)` for dispatcher extents and associated definitions. CLI inventory below is generated; source hash, local paths, runtime and measurement values are available from the live API rather than frozen into the README. Regenerate with `& ./PSC.ps1 -Mode Readme`.
+The API retains the acquired source revision. LowerDeclarations(names) compiles an explicitly selected set of top-level classes and enums, including those in PSC's begin block; LowerDeclarations(ast,names) accepts a donor source AST. It uses structural AST reconstruction and compiles only that selected unit, without executing the enclosing script. Include required source types in the selection; program compilation is a separate operation. Eligible queries reuse its AST after byte-identity verification; declaration queries share the roadmap declaration inventory and use an ordinal-ignore-case name index. IndexedArtifacts counts indexed source artifacts; SitesExamined counts candidate declarations actually tested, and VisitorCallbacks counts visits in the query itself. Pull windows advance through retained declaration sites without replay; other source kinds still traverse the AST. Measurements are acquired only on the first Measures() call. ReadSource(path) still acquires all measurements. The API is derived from the running script, so mode names and parameter evidence do not depend on a previous session's notes. Use `Describe(mode)` for dispatcher extents and associated definitions. CLI inventory below is generated; source hash, local paths, runtime and measurement values are available from the live API rather than frozen into the README. Regenerate with `& ./PSC.ps1 -Mode Readme`.
 '@
         return $guideText.Replace('@@TYPESYSTEM@@',$this.TypeSystemContract).Replace('@@FORMATS@@',($formatRows -join "`n")).Replace('@@ROADMAP@@',$this.RoadmapMarkdown())
     }
@@ -15655,6 +15681,15 @@ The API retains the acquired source revision. Eligible queries reuse its AST aft
     # The classes of a source (all of them when $classNames is empty), lowered by PSC and loaded from the assembly's bytes.
     [System.Reflection.Assembly] Lower([System.Management.Automation.Language.ScriptBlockAst] $source, [string[]] $classNames) {
         return [PscDifferential]::Lower($this.Script, $source, $classNames)
+    }
+
+    # Realize a deliberate declaration set, independent of the enclosing script's execution blocks.
+    [System.Reflection.Assembly] LowerDeclarations([string[]]$names){
+        return $this.LowerDeclarations($this.Source.Ast,$names)
+    }
+    [System.Reflection.Assembly] LowerDeclarations([System.Management.Automation.Language.ScriptBlockAst]$source,[string[]]$names){
+        if([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($this.Script))) -cne $this.Source.Sha256){throw 'LowerDeclarations API source has changed.'}
+        return [PscDifferential]::LowerDeclarations($this.Script,$source,$names)
     }
 
     # PSC's PowerShellSemantics, lowered as every program that needs a helper receives it.
@@ -16606,6 +16641,11 @@ class PscMatch {
     [bool] $ParseIncomplete
     [int] $SourceRevision = -1
     [Guid] $DocumentIdentity
+    [PscMatch] Copy(){
+        $copy=[PscMatch]::new();$copy.Domain=$this.Domain;$copy.ArtifactPath=$this.ArtifactPath;$copy.ArtifactSha256=$this.ArtifactSha256;$copy.Owner=$this.Owner;$copy.Kind=$this.Kind;$copy.Name=$this.Name
+        $copy.StartOffset=$this.StartOffset;$copy.EndOffset=$this.EndOffset;$copy.Line=$this.Line;$copy.Column=$this.Column;$copy.MethodToken=$this.MethodToken;$copy.Target=$this.Target;$copy.ParseIncomplete=$this.ParseIncomplete;$copy.SourceRevision=$this.SourceRevision;$copy.DocumentIdentity=$this.DocumentIdentity
+        return $copy
+    }
 }
 class PscQueryCoverage {
     [int] $ArtifactsOpened
@@ -16620,6 +16660,7 @@ class PscQueryCoverage {
     [int] $BodiesOpened
     [int] $InstructionsExamined
     [int] $SitesExamined
+    [int] $IndexedArtifacts
     [long] $VisitorCallbacks
     [int] $Matches
     [bool] $Exhausted
@@ -17002,6 +17043,8 @@ class PscQueryCursor : IDisposable {
     hidden [string] $Digest
     hidden [System.Management.Automation.Language.ScriptBlockAst] $Ast
     hidden [int] $Resume
+    hidden [bool] $Indexed
+    hidden [PscMatch[]] $DeclarationSites
     hidden [bool] $ParseIncomplete
     hidden [Reflection.PortableExecutable.PEReader] $Pe
     hidden [Reflection.Metadata.MetadataReader] $Metadata
@@ -17020,7 +17063,7 @@ class PscQueryCursor : IDisposable {
         $this.Paths=[string[]]::new($paths.Length);for($n=0;$n -lt $paths.Length;$n++){$this.Paths[$n]=[PscTreeText]::FullPath($paths[$n])};$this.Spec=$spec;$this.RetainedSource=$source
     }
     hidden [void] CloseArtifact(){
-        $this.Ast=$null;$this.Resume=0;$this.ParseIncomplete=$false;$this.Body=$null;$this.Methods=$null;$this.Metadata=$null
+        $this.Ast=$null;$this.Resume=0;$this.Indexed=$false;$this.DeclarationSites=$null;$this.ParseIncomplete=$false;$this.Body=$null;$this.Methods=$null;$this.Metadata=$null
         if($null -ne $this.Pe){$this.Pe.Dispose();$this.Pe=$null}
         $this.Path=$null;$this.Digest=$null
     }
@@ -17056,6 +17099,9 @@ class PscQueryCursor : IDisposable {
                     $this.Methods=[Collections.IEnumerator]$this.Metadata.MethodDefinitions.GetEnumerator()
                 }elseif($null -ne $this.RetainedSource -and $this.RetainedSource.Path -ceq $next -and $this.RetainedSource.Sha256 -ceq $this.Digest -and !$this.RetainedSource.ParseErrors.Count -and !$this.RetainedSource.Ast.UsingStatements.Count -and $null -eq $this.RetainedSource.Ast.ScriptRequirements){
                     $this.Ast=$this.RetainedSource.Ast
+                    if($this.Spec.Kind -eq [PscQueryKind]::Declaration){
+                        $this.DeclarationSites=$this.RetainedSource.Declarations($this.Spec.Name);$this.Indexed=$true;$this.Counts.IndexedArtifacts++
+                    }
                 }else{
                     $reader=[IO.StreamReader]::new([IO.MemoryStream]::new($bytes,$false),[Text.Encoding]::UTF8,$true)
                     $source="";try{$source=$reader.ReadToEnd()}finally{$reader.Dispose()}
@@ -17101,7 +17147,13 @@ class PscQueryCursor : IDisposable {
         $hits=[Collections.Generic.List[PscMatch]]::new();$limit=[Math]::Min($limit,$this.Spec.Take-$this.Counts.Matches)
         while($hits.Count -lt $limit -and !$this.Counts.Exhausted){
             if(!$this.Path -and !$this.NextArtifact()){break}
-            if($null -ne $this.Ast){
+            if($this.Indexed){
+                while($this.Resume -lt $this.DeclarationSites.Length -and $hits.Count -lt $limit){
+                    $site=$this.DeclarationSites[$this.Resume];$this.Resume++;$this.Counts.SitesExamined++
+                    if($this.Spec.Matches($site.Name,$site.Owner,$false) -and (!$this.Spec.Literal -or $site.Target.Extent.Text.Contains($this.Spec.Literal,[StringComparison]::Ordinal))){$hits.Add($site.Copy())}
+                }
+                if($this.Resume -eq $this.DeclarationSites.Length){$this.Counts.ArtifactsCompleted++;$this.CloseArtifact()}
+            }elseif($null -ne $this.Ast){
                 $visitor=[PscSourceQueryVisitor]::new();$visitor.Spec=$this.Spec;$visitor.Path=$this.Path;$visitor.Digest=$this.Digest;$visitor.Resume=$this.Resume;$visitor.ParseIncomplete=$this.ParseIncomplete;$visitor.Limit=$limit-$hits.Count
                 $this.Ast.Visit($visitor);$this.Counts.VisitorCallbacks+=$visitor.Seen;$this.Counts.SitesExamined+=$visitor.Seen-$this.Resume;$this.Counts.UnexaminedDynamic+=$visitor.Unknown;$this.Resume=$visitor.Seen;$hits.AddRange($visitor.Hits)
                 if(!$visitor.Stopped){$this.Counts.ArtifactsCompleted++;$this.CloseArtifact()}
@@ -17115,7 +17167,7 @@ class PscQueryCursor : IDisposable {
         return $hits.ToArray()
     }
     [PscQueryCoverage] Coverage(){
-        $c=[PscQueryCoverage]::new();$c.ArtifactsOpened=$this.Counts.ArtifactsOpened;$c.ArtifactsCompleted=$this.Counts.ArtifactsCompleted;$c.Parsed=$this.Counts.Parsed;$c.SkippedByDomain=$this.Counts.SkippedByDomain;$c.ParseFailures=$this.Counts.ParseFailures;$c.ReadFailures=$this.Counts.ReadFailures;$c.UnexaminedDynamic=$this.Counts.UnexaminedDynamic;$c.MethodsExamined=$this.Counts.MethodsExamined;$c.MethodsSkipped=$this.Counts.MethodsSkipped;$c.BodiesOpened=$this.Counts.BodiesOpened;$c.InstructionsExamined=$this.Counts.InstructionsExamined;$c.SitesExamined=$this.Counts.SitesExamined;$c.VisitorCallbacks=$this.Counts.VisitorCallbacks;$c.Matches=$this.Counts.Matches;$c.Exhausted=$this.Counts.Exhausted;$c.StoppedByLimit=$this.Counts.StoppedByLimit;$c.Diagnostics=$this.Errors.ToArray()
+        $c=[PscQueryCoverage]::new();$c.ArtifactsOpened=$this.Counts.ArtifactsOpened;$c.ArtifactsCompleted=$this.Counts.ArtifactsCompleted;$c.Parsed=$this.Counts.Parsed;$c.SkippedByDomain=$this.Counts.SkippedByDomain;$c.ParseFailures=$this.Counts.ParseFailures;$c.ReadFailures=$this.Counts.ReadFailures;$c.UnexaminedDynamic=$this.Counts.UnexaminedDynamic;$c.MethodsExamined=$this.Counts.MethodsExamined;$c.MethodsSkipped=$this.Counts.MethodsSkipped;$c.BodiesOpened=$this.Counts.BodiesOpened;$c.InstructionsExamined=$this.Counts.InstructionsExamined;$c.SitesExamined=$this.Counts.SitesExamined;$c.IndexedArtifacts=$this.Counts.IndexedArtifacts;$c.VisitorCallbacks=$this.Counts.VisitorCallbacks;$c.Matches=$this.Counts.Matches;$c.Exhausted=$this.Counts.Exhausted;$c.StoppedByLimit=$this.Counts.StoppedByLimit;$c.Diagnostics=$this.Errors.ToArray()
         if($c.Matches){$c.Status='Found'}elseif(!$c.Exhausted -or $c.ParseFailures -or $c.ReadFailures -or $c.UnexaminedDynamic){$c.Status='Unknown'}else{$c.Status='NotFoundWithinScope'}
         return $c
     }
@@ -18739,6 +18791,24 @@ class PscSource {
     [System.Management.Automation.Language.Token[]] $Tokens
     [System.Management.Automation.Language.ParseError[]] $ParseErrors
     [PscMeasure[]] $Measures
+    hidden [PscMatch[]] $DeclarationSites
+    hidden [Collections.Generic.Dictionary[string,Collections.Generic.List[PscMatch]]] $DeclarationNames
+    hidden [PscMatch[]] Declarations([string]$name){
+        if($null -eq $this.DeclarationNames){
+            $visitor=[PscSourceQueryVisitor]::new();$visitor.Spec=[PscQuerySpec]::new([PscQueryKind]::Declaration,'','',[int]::MaxValue)
+            $visitor.Limit=[int]::MaxValue;$visitor.Path=$this.Path;$visitor.Digest=$this.Sha256;$visitor.ParseIncomplete=$this.ParseErrors.Count -gt 0
+            $this.Ast.Visit($visitor)
+            $names=[Collections.Generic.Dictionary[string,Collections.Generic.List[PscMatch]]]::new([StringComparer]::OrdinalIgnoreCase)
+            foreach($hit in $visitor.Hits){
+                if(!$names.ContainsKey($hit.Name)){$names.Add($hit.Name,[Collections.Generic.List[PscMatch]]::new())}
+                $names[$hit.Name].Add($hit)
+            }
+            $this.DeclarationSites=$visitor.Hits.ToArray();$this.DeclarationNames=$names
+        }
+        if([string]::IsNullOrEmpty($name)){return $this.DeclarationSites}
+        if($this.DeclarationNames.ContainsKey($name)){return $this.DeclarationNames[$name].ToArray()}
+        return [PscMatch[]]::new(0)
+    }
 
     PscSource([string] $path) { $this.Initialize($path); $null=$this.Measure() }
     PscSource([string] $path,[bool] $measure) { $this.Initialize($path); if($measure){$null=$this.Measure()} }
