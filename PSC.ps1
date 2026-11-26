@@ -1104,14 +1104,14 @@ try {
     Assert-Pass ($null -ne $member -and $member.Required -and $member.ResultTypeIdentity -ceq [double].AssemblyQualifiedName) '.srm1 produces a typed required contract operation'
     Assert-Pass ($null -eq [ScriptTypeCatalog].Assembly.GetType('SmCalibrationContract') -and $null -eq [ScriptTypeCatalog].Assembly.GetType('SmCalibrationUse')) '.srm1 catalog retains semantic descriptors rather than executable contract classes'
     $space = [HandleTable]::new()
-    $owner = $space.Register(0, [object]::new(), [object], $null)
+    $owner = [HandleTable]::Register($space, 0, [object]::new(), [object], $null)
     try {
         $realization = [ScriptTypeRealization]::new()
-        $realization.ContractHandle = $space.Register($owner, $descriptor, [ScriptTypeContract], $null)
-        $realization.ReceiverHandle = $space.Register($owner, $provider, [object], $null)
+        $realization.ContractHandle = [HandleTable]::Register($space, $owner, $descriptor, [ScriptTypeContract], $null)
+        $realization.ReceiverHandle = [HandleTable]::Register($space, $owner, $provider, [object], $null)
         $thunk = $providerType.GetMethod('ApplyThunk').CreateDelegate([Func[object,object[],object]])
         $realization.Calls = [ScriptTypeCall[]]@([ScriptTypeCall]::new($member, [type[]]@([double]), $thunk))
-        $handle = $space.Register($owner, $realization, [ScriptTypeRealization], $null)
+        $handle = [HandleTable]::Register($space, $owner, $realization, [ScriptTypeRealization], $null)
         [HandleTable]::Rebind($space, $owner, 'calibration', 0, $handle)
         $role = [ScriptTypeRole]::new($space, $owner, 'calibration')
         $measure = $client.GetMethod('Measure')
@@ -1119,11 +1119,11 @@ try {
             $reference = $providerType.GetMethod('Apply').Invoke($provider, [object[]]@($value))
             Assert-Pass ($measure.Invoke($null, [object[]]@($role, $value)) -eq $reference) "bootstrapped .sm1 resolves .srm1 contract and invokes provider ($value)"
         }
-        [void]$space.Revoke($handle)
+        [void][HandleTable]::Revoke($space, $handle)
         $denied = $false
         try { [void]$measure.Invoke($null, [object[]]@($role, [double]10)) } catch { $denied = $true }
         Assert-Pass $denied 'withdrawn role denies the same compiled SM client'
-    } finally { [void]$space.Revoke($owner) }
+    } finally { [void][HandleTable]::Revoke($space, $owner) }
     Assert-Pass ('System.Management.Automation' -notin $client.Assembly.GetReferencedAssemblies().Name -and 'System.Management.Automation' -notin [ScriptTypeCatalog].Assembly.GetReferencedAssemblies().Name) 'PSC-dependent SM client and catalog have no SMA reference'
 
     if ($IsLinux -and [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq [Runtime.InteropServices.Architecture]::X64) {
@@ -2695,39 +2695,39 @@ class HandleTable {
         if ($cell.Generation -ne [HandleTable]::Generation($handle) -or $cell.State -eq [HandleTableState]::Free -or $cell.State -eq [HandleTableState]::Exhausted) { return $null }
         return $cell
     }
-    [uint64] Register([uint64] $owner, [object] $value, [type] $contract, [Action] $reclaim) {
+    static [uint64] Register([HandleTable]$Table, [uint64] $owner, [object] $value, [type] $contract, [Action] $reclaim) {
         if ($null -eq $value -or $null -eq $contract -or -not $contract.IsInstanceOfType($value)) { throw [ArgumentException]::new('Invalid typed object') }
-        [System.Threading.Monitor]::Enter($this.Gate)
+        [System.Threading.Monitor]::Enter($Table.Gate)
         try {
-            if ($this.Closed) { throw [InvalidOperationException]::new('Object space closed') }
+            if ($Table.Closed) { throw [InvalidOperationException]::new('Object space closed') }
             [HandleTableCell]$parent = $null
             if ($owner -ne [uint64]0) {
-                $parent = [HandleTable]::Find($this, $owner)
+                $parent = [HandleTable]::Find($Table, $owner)
                 if ($null -eq $parent -or $parent.State -ne [HandleTableState]::Live) { throw [InvalidOperationException]::new('Owner revoked or stale') }
             }
             [int]$i = 0
-            [Collections.Generic.List[int]]$availableSlots=$this.Free
+            [Collections.Generic.List[int]]$availableSlots=$Table.Free
             if ($availableSlots.Count -gt 0) { $i = $availableSlots[$availableSlots.Count-1]; $availableSlots.RemoveAt($availableSlots.Count-1) }
             else {
-                $i = $this.High
-                if ($i -eq $this.Cells.Length) {
+                $i = $Table.High
+                if ($i -eq $Table.Cells.Length) {
                     [HandleTableCell[]]$larger = [HandleTableCell[]]::new($i * 2)
-                    [Array]::Copy($this.Cells, $larger, $i)
-                    $this.Cells = $larger
+                    [Array]::Copy($Table.Cells, $larger, $i)
+                    $Table.Cells = $larger
                 }
-                $this.Cells[$i] = [HandleTableCell]::new()
-                $this.High++
+                $Table.Cells[$i] = [HandleTableCell]::new()
+                $Table.High++
             }
-            [HandleTableCell]$cell = $this.Cells[$i]
+            [HandleTableCell]$cell = $Table.Cells[$i]
             $cell.Owner = $owner; $cell.Value = $value; $cell.Contract = $contract; $cell.Reclaim = $reclaim
             $cell.RootReference = $true; $cell.State = [HandleTableState]::Live
             if ($null -ne $parent) {
                 $cell.NextSibling = $parent.FirstChild
-                if ($parent.FirstChild -ne 0) { $this.Cells[$parent.FirstChild].PreviousSibling = $i }
+                if ($parent.FirstChild -ne 0) { $Table.Cells[$parent.FirstChild].PreviousSibling = $i }
                 $parent.FirstChild = $i
             }
             return [HandleTable]::Make($cell.Generation, [uint32]$i)
-        } finally { [System.Threading.Monitor]::Exit($this.Gate) }
+        } finally { [System.Threading.Monitor]::Exit($Table.Gate) }
     }
     # Register a new object into another surviving owner, conditional on live source authority.
     static [uint64] Publish([HandleTable]$Table, [uint64] $authority, [uint64] $owner, [object] $value, [type] $contract, [Action] $reclaim) {
@@ -2735,7 +2735,7 @@ class HandleTable {
         try {
             [HandleTableCell]$source = [HandleTable]::Find($Table, $authority)
             if ($null -eq $source -or $source.State -ne [HandleTableState]::Live) { throw [InvalidOperationException]::new('Late publication') }
-            return $Table.Register($owner, $value, $contract, $reclaim)
+            return [HandleTable]::Register($Table, $owner, $value, $contract, $reclaim)
         } finally { [System.Threading.Monitor]::Exit($Table.Gate) }
     }
     static [HandleTableInfo[]] Snapshot([HandleTable]$Table) {
@@ -2779,13 +2779,13 @@ class HandleTable {
         $cell.Pins++
         return $lease
     }
-    [HandleTableLease] Open([uint64]$handle,[type]$contract){
-        [Threading.Monitor]::Enter($this.Gate)
-        try{return [HandleTable]::Pin($this, $handle,$contract)}finally{[Threading.Monitor]::Exit($this.Gate)}
+    static [HandleTableLease] Open([HandleTable]$Table, [uint64]$handle,[type]$contract){
+        [Threading.Monitor]::Enter($Table.Gate)
+        try{return [HandleTable]::Pin($Table, $handle,$contract)}finally{[Threading.Monitor]::Exit($Table.Gate)}
     }
-    [HandleTableLease] Open([uint64]$owner,[string]$name,[type]$contract){
-        [Threading.Monitor]::Enter($this.Gate)
-        try{return [HandleTable]::Pin($this, [HandleTable]::ResolveLocked($this, $owner,$name),$contract)}finally{[Threading.Monitor]::Exit($this.Gate)}
+    static [HandleTableLease] Open([HandleTable]$Table, [uint64]$owner,[string]$name,[type]$contract){
+        [Threading.Monitor]::Enter($Table.Gate)
+        try{return [HandleTable]::Pin($Table, [HandleTable]::ResolveLocked($Table, $owner,$name),$contract)}finally{[Threading.Monitor]::Exit($Table.Gate)}
     }
     # All-or-nothing validation and pinning. Duplicate handles count twice.
     static [HandleTablePairLease] OpenPair([HandleTable]$Table, [uint64]$first,[type]$firstType,[uint64]$second,[type]$secondType){
@@ -2858,15 +2858,15 @@ class HandleTable {
         $cell.Pins--
         [HandleTable]::ConsiderRetirement($Table, $handle,$cell)
     }
-    [void] Close([HandleTableLease]$lease){
-        [Threading.Monitor]::Enter($this.Gate)
+    static [void] Close([HandleTable]$Table, [HandleTableLease]$lease){
+        [Threading.Monitor]::Enter($Table.Gate)
         try{
-            if($null -eq $lease -or -not $this.Leases.ContainsKey($lease)){throw [InvalidOperationException]::new('Invalid or released lease')}
-            [uint64]$handle=$this.Leases[$lease]
-            $null=$this.Leases.Remove($lease);$lease.Value=$null
-            [HandleTable]::Unpin($this, $handle)
-        }finally{[Threading.Monitor]::Exit($this.Gate)}
-        [HandleTable]::Collect($this)
+            if($null -eq $lease -or -not $Table.Leases.ContainsKey($lease)){throw [InvalidOperationException]::new('Invalid or released lease')}
+            [uint64]$handle=$Table.Leases[$lease]
+            $null=$Table.Leases.Remove($lease);$lease.Value=$null
+            [HandleTable]::Unpin($Table, $handle)
+        }finally{[Threading.Monitor]::Exit($Table.Gate)}
+        [HandleTable]::Collect($Table)
     }
     static [void] ClosePair([HandleTable]$Table, [HandleTablePairLease]$lease){
         [Threading.Monitor]::Enter($Table.Gate)
@@ -2878,15 +2878,15 @@ class HandleTable {
         }finally{[Threading.Monitor]::Exit($Table.Gate)}
         [HandleTable]::Collect($Table)
     }
-    [void] Close([uint64] $handle) {
-        [System.Threading.Monitor]::Enter($this.Gate)
+    static [void] Close([HandleTable]$Table, [uint64] $handle) {
+        [System.Threading.Monitor]::Enter($Table.Gate)
         try {
-            [HandleTableCell]$cell = [HandleTable]::Find($this, $handle)
+            [HandleTableCell]$cell = [HandleTable]::Find($Table, $handle)
             if ($null -eq $cell -or $cell.State -ne [HandleTableState]::Live -or -not $cell.RootReference) { throw [InvalidOperationException]::new('Invalid registration reference') }
             $cell.RootReference = $false
-            [HandleTable]::ConsiderRetirement($this, $handle,$cell)
-        } finally { [System.Threading.Monitor]::Exit($this.Gate) }
-        [HandleTable]::Collect($this)
+            [HandleTable]::ConsiderRetirement($Table, $handle,$cell)
+        } finally { [System.Threading.Monitor]::Exit($Table.Gate) }
+        [HandleTable]::Collect($Table)
     }
     # Names are an owner-local projection of live handles, not object identity.
     hidden static [System.Collections.Generic.Dictionary[string,uint64]] Names([HandleTable]$Table, [uint64] $owner, [bool] $create) {
@@ -3057,10 +3057,10 @@ class HandleTable {
         [System.Threading.Monitor]::Enter($Table.Gate)
         try { [HandleTable]::Mark($Table, $handle); return [HandleTable]::State($Table, $handle) } finally { [System.Threading.Monitor]::Exit($Table.Gate) }
     }
-    [HandleTableState] Revoke([uint64] $handle) {
-        $null = [HandleTable]::Withdraw($this, $handle)
-        [HandleTable]::Collect($this)
-        return [HandleTable]::State($this, $handle)
+    static [HandleTableState] Revoke([HandleTable]$Table, [uint64] $handle) {
+        $null = [HandleTable]::Withdraw($Table, $handle)
+        [HandleTable]::Collect($Table)
+        return [HandleTable]::State($Table, $handle)
     }
     # The caller holds the table's Gate. The queue operation takes its participant explicitly.
     hidden static [int] TakeReady([HandleTable]$Table) {
@@ -3447,7 +3447,7 @@ class ScriptTypeReflection {
             if($null -eq $member.ParameterReferences[$i] -or ![ScriptTypeReference]::Same($member.ParameterReferences[$i],$Binding.Arguments[$i])){throw [InvalidOperationException]::new('Bound argument reference changed')}
         }
         [HandleTable]$space=$Role.Space
-        [HandleTableLease]$lease=$space.Open($Role.Owner,$Role.Name,[ScriptTypeRealization])
+        [HandleTableLease]$lease=[HandleTable]::Open($space, $Role.Owner,$Role.Name,[ScriptTypeRealization])
         try{
             [ScriptTypeRealization]$realization=$lease.Value
             [HandleTablePairLease]$dependencies=[HandleTable]::OpenPair($space, $realization.ContractHandle,[ScriptTypeContract],$realization.ReceiverHandle,[object])
@@ -3469,7 +3469,7 @@ class ScriptTypeReflection {
                 if(!$exact){throw [NotSupportedException]::new('Bound invocation requires exact admitted argument representations')}
                 return $selected.Target.Invoke($dependencies.Second,$Arguments)
             }finally{[HandleTable]::ClosePair($space, $dependencies)}
-        }finally{$space.Close($lease)}
+        }finally{[HandleTable]::Close($space, $lease)}
     }
     static [object] InvokeRole([ScriptTypeRole]$Role,[string]$SourceContract,[string]$Member,[object[]]$Arguments){
         [ScriptTypeContract]$expected=[ScriptTypeCatalog]::Find($SourceContract)
@@ -3480,7 +3480,7 @@ class ScriptTypeReflection {
         return [ScriptTypeReflection]::InvokeDeclared($Space,$Owner,$Name,$Member,$Arguments,$null)
     }
     static [object] InvokeDeclared([HandleTable]$Space,[uint64]$Owner,[string]$Name,[string]$Member,[object[]]$Arguments,[ScriptTypeContract]$Expected){
-        [HandleTableLease]$lease=$Space.Open($Owner,$Name,[ScriptTypeRealization])
+        [HandleTableLease]$lease=[HandleTable]::Open($Space, $Owner,$Name,[ScriptTypeRealization])
         try{
             [ScriptTypeRealization]$realization=$lease.Value
             [HandleTablePairLease]$dependencies=[HandleTable]::OpenPair($Space, $realization.ContractHandle,[ScriptTypeContract],$realization.ReceiverHandle,[object])
@@ -3490,13 +3490,13 @@ class ScriptTypeReflection {
                 [ScriptTypeCall[]]$calls=$realization.Candidates($contract,$Member,$Arguments.Length)
                 [ScriptTypeCall]$exact=[ScriptTypeReflection]::Exact($calls,$Arguments)
                 if($null -ne $exact){return $exact.Target.Invoke($dependencies.Second,$Arguments)}
-                [HandleTableLease]$semantics=$Space.Open($Owner,'ScriptType.Binding',[ScriptTypeBindingExtension])
+                [HandleTableLease]$semantics=[HandleTable]::Open($Space, $Owner,'ScriptType.Binding',[ScriptTypeBindingExtension])
                 try{
                     [ScriptTypeBindingExtension]$extension=$semantics.Value
                     return [ScriptTypeReflection]::InvokeConverted($extension,$calls,$dependencies.Second,$Arguments)
-                }finally{$Space.Close($semantics)}
+                }finally{[HandleTable]::Close($Space, $semantics)}
             }finally{[HandleTable]::ClosePair($Space, $dependencies)}
-        }finally{$Space.Close($lease)}
+        }finally{[HandleTable]::Close($Space, $lease)}
     }
     hidden static [ScriptTypeCall] Exact([ScriptTypeCall[]]$Calls,[object[]]$Arguments){
         [ScriptTypeCall]$exact=$null
@@ -3546,7 +3546,7 @@ class ScriptTypeReflection {
         if($null -eq $expected){throw [InvalidOperationException]::new('Source contract not loaded')}
         [HandleTable]$space=$Role.Space
         [uint64]$owner=$Role.Owner
-        [HandleTableLease]$lease=$space.Open($owner,$Role.Name,[ScriptTypeRealization])
+        [HandleTableLease]$lease=[HandleTable]::Open($space, $owner,$Role.Name,[ScriptTypeRealization])
         try{
             [ScriptTypeRealization]$realization=$lease.Value
             [HandleTablePairLease]$dependencies=[HandleTable]::OpenPair($space, $realization.ContractHandle,[ScriptTypeContract],$realization.ReceiverHandle,[object])
@@ -3589,7 +3589,7 @@ class ScriptTypeReflection {
                             if($Specialize){$priorExact=$exact}
                             $results[$i]=$exact.Target.Invoke($dependencies.Second,$args)
                         }else{
-                            if($null -eq $semantics){$semantics=$space.Open($owner,'ScriptType.Binding',[ScriptTypeBindingExtension]);$extension=$semantics.Value}
+                            if($null -eq $semantics){$semantics=[HandleTable]::Open($space, $owner,'ScriptType.Binding',[ScriptTypeBindingExtension]);$extension=$semantics.Value}
                             if(!$Specialize -or !$extension.TypeStable){
                                 $results[$i]=[ScriptTypeReflection]::InvokeConverted($extension,$calls,$dependencies.Second,$args)
                             }else{
@@ -3614,17 +3614,17 @@ class ScriptTypeReflection {
                         }
                     }
                     return $results
-                }finally{if($null -ne $semantics){$space.Close($semantics)}}
+                }finally{if($null -ne $semantics){[HandleTable]::Close($space, $semantics)}}
             }finally{[HandleTable]::ClosePair($space, $dependencies)}
-        }finally{$space.Close($lease)}
+        }finally{[HandleTable]::Close($space, $lease)}
     }
     # The caller holds the realization lease for this whole operation.
     # The returned lease owns the descriptor; it must be closed by the caller.
     static [HandleTableLease] OpenContract([HandleTable]$Space,[ScriptTypeRealization]$Realization,[type]$ContractType){
-        return $Space.Open($Realization.ContractHandle,$ContractType)
+        return [HandleTable]::Open($Space, $Realization.ContractHandle,$ContractType)
     }
     static [HandleTableLease] OpenReceiver([HandleTable]$Space,[ScriptTypeRealization]$Realization,[type]$ObjectType){
-        return $Space.Open($Realization.ReceiverHandle,$ObjectType)
+        return [HandleTable]::Open($Space, $Realization.ReceiverHandle,$ObjectType)
     }
 }
 # PSC emits the source contract graph into this field at build time.
@@ -4078,7 +4078,7 @@ class ScriptTypeObjectDispatch {
         }
         if($calls.Count -eq 0){throw [MissingMethodException]::new($Name)}
         [ScriptTypeCall[]]$candidates=$calls.ToArray()
-        [HandleTableLease]$lease=$Context.Space.Open($Context.Owner,'ScriptType.Binding',[ScriptTypeBindingExtension])
+        [HandleTableLease]$lease=[HandleTable]::Open($Context.Space, $Context.Owner,'ScriptType.Binding',[ScriptTypeBindingExtension])
         try{
             [ScriptTypeBindingExtension]$extension=$lease.Value
             [int]$index=[ScriptTypeBindingExtension]::SelectBound($extension, $candidates,$Arguments)
@@ -4086,7 +4086,7 @@ class ScriptTypeObjectDispatch {
             [object[]]$values=[object[]]::new($Arguments.Length)
             for([int]$i=0;$i -lt $values.Length;$i++){$values[$i]=[ScriptTypeObjectDispatch]::ConvertArgument($extension,$Arguments[$i],$candidates[$index].Parameters[$i])}
             return $methods[$index].Invoke($Receiver,$values)
-        }finally{$Context.Space.Close($lease)}
+        }finally{[HandleTable]::Close($Context.Space, $lease)}
     }
     static [object] Read([ScriptTypeRole]$Context,[object]$Receiver,[string]$Name,[bool]$Strict){
         if($Receiver -is [ScriptTypeRole]){throw [NotSupportedException]::new('Structural property access requires a declared property realization')}
@@ -4116,12 +4116,12 @@ class ScriptTypeObjectDispatch {
         if($null -ne $property -and $property.GetIndexParameters().Length -eq 0 -and $null -ne $property.GetSetMethod()){$target=$property.PropertyType}
         elseif($null -ne $field -and !$field.IsInitOnly -and !$field.IsLiteral){$target=$field.FieldType}
         if($null -eq $target){throw [MissingMemberException]::new($Name)}
-        [HandleTableLease]$lease=$Context.Space.Open($Context.Owner,'ScriptType.Binding',[ScriptTypeBindingExtension])
+        [HandleTableLease]$lease=[HandleTable]::Open($Context.Space, $Context.Owner,'ScriptType.Binding',[ScriptTypeBindingExtension])
         try{
             [ScriptTypeBindingExtension]$extension=$lease.Value
             [object]$converted=[ScriptTypeObjectDispatch]::ConvertArgument($extension,$Value,$target)
             if($null -ne $property){$property.SetValue($Receiver,$converted)}else{$field.SetValue($Receiver,$converted)}
-        }finally{$Context.Space.Close($lease)}
+        }finally{[HandleTable]::Close($Context.Space, $lease)}
     }
     static [int] Position([ScriptTypeBindingExtension]$Extension,[object]$Index,[int]$Count){
         if($Index -is [array] -or $Index -is [Collections.IList]){throw [NotSupportedException]::new('Vector index selection is not admitted')}
@@ -4138,14 +4138,14 @@ class ScriptTypeObjectDispatch {
         if($Receiver -is [string]){$count=([string]$Receiver).Length}
         elseif($Receiver -is [Collections.IList]){$count=([Collections.IList]$Receiver).Count}
         else{throw [NotSupportedException]::new('Receiver indexer is not admitted')}
-        [HandleTableLease]$lease=$Context.Space.Open($Context.Owner,'ScriptType.Binding',[ScriptTypeBindingExtension])
+        [HandleTableLease]$lease=[HandleTable]::Open($Context.Space, $Context.Owner,'ScriptType.Binding',[ScriptTypeBindingExtension])
         try{
             [ScriptTypeBindingExtension]$extension=$lease.Value
             [int]$position=[ScriptTypeObjectDispatch]::Position($extension,$Index,$count)
             if($position -lt 0 -or $position -ge $count){return $null}
             if($Receiver -is [string]){return ([string]$Receiver)[$position]}
             return ([Collections.IList]$Receiver)[$position]
-        }finally{$Context.Space.Close($lease)}
+        }finally{[HandleTable]::Close($Context.Space, $lease)}
     }
     static [void] SetIndex([ScriptTypeRole]$Context,[object]$Receiver,[object]$Index,[object]$Value){
         if($Index -is [array] -or $Index -is [Collections.IList]){throw [NotSupportedException]::new('Vector index selection is not admitted')}
@@ -4153,14 +4153,14 @@ class ScriptTypeObjectDispatch {
         if($null -eq $Receiver){throw [InvalidOperationException]::new('Cannot index a null receiver')}
         if(!$Receiver.GetType().IsSZArray -and $Receiver -isnot [Collections.ArrayList]){throw [NotSupportedException]::new('Only vector arrays and ArrayList mutations are admitted')}
         [Collections.IList]$list=$Receiver
-        [HandleTableLease]$lease=$Context.Space.Open($Context.Owner,'ScriptType.Binding',[ScriptTypeBindingExtension])
+        [HandleTableLease]$lease=[HandleTable]::Open($Context.Space, $Context.Owner,'ScriptType.Binding',[ScriptTypeBindingExtension])
         try{
             [ScriptTypeBindingExtension]$extension=$lease.Value
             [int]$position=[ScriptTypeObjectDispatch]::Position($extension,$Index,$list.Count)
             if($position -lt 0 -or $position -ge $list.Count){throw [IndexOutOfRangeException]::new()}
             if($Receiver.GetType().IsSZArray){$list[$position]=[ScriptTypeObjectDispatch]::ConvertArgument($extension,$Value,$Receiver.GetType().GetElementType())}
             else{$list[$position]=$Value}
-        }finally{$Context.Space.Close($lease)}
+        }finally{[HandleTable]::Close($Context.Space, $lease)}
     }
 }
 
@@ -15577,7 +15577,7 @@ This is the architectural mission, not a claim of completed implementation. Reco
 
 `ScriptTypeReflection.InvokeBound(role, binding, arguments)` consumes an exact locally declared `ScriptTypeBinding` with its original member reference, checks the role's realized contract, acquires the provider and dependency leases, and invokes the selected compiled target without a second name or overload search. It refuses unmaterialized signatures, nonexact argument representations, unrelated contract/member identities and unavailable realizations. The current profile does not yet admit inherited bindings, conversion plans or symbolic argument storage. `HandleTable` uses CoreLib collections for allocation, ownership traversal and deferred reclamation. Future collection development belongs to `HandleCollector`; the existing reclamation operation remains in HandleTable until that boundary is implemented. A bounded standalone CoreCLR control has exercised runtime definition construction, binding, replacement and withdrawal using only CoreLib and compiled PSC assemblies. ScriptType's generated-thunk naming still references `System.Security.Cryptography`; full module closure has not been established. The target is a lowered reflective runspace that parses `.ps1` without the SMA assembly, using acquired PowerShell language semantics rather than a second grammar. Independent parser realization is not implemented; current PSC authoring and compilation still acquire source using SMA.
 
-HandleTable's internal lookup, pinning, retention, name resolution and ownership traversal operations now take an explicit typed table participant. Fourteen additional public operations (including collection, withdrawal, succession, retention, pair leasing and rebinding) now require an explicit HandleTable participant. Register, Open, Close and Revoke retain their instance signatures pending migration of the authoring-side query lease. Rebuild callers of the changed operations. `ScriptTypeBindingExtension.SelectBound(extension, candidates, arguments)` is a static operation with an explicit extension participant; rebuild consumers of the previous instance signature. The existing selector memo and lease semantics are retained.
+HandleTable's internal lookup, pinning, retention, name resolution and ownership traversal operations now take an explicit typed table participant. Fourteen additional public operations (including collection, withdrawal, succession, retention, pair leasing and rebinding) now require an explicit HandleTable participant. Register, Open, Close and Revoke also take an explicit table participant. The authoring-side query lease acquires exact CLR operation signatures once from the loaded faculty; compiled consumers use typed static calls. The existing IDisposable and cursor instance entry points remain compatibility boundaries. Rebuild callers of the changed operations. `ScriptTypeBindingExtension.SelectBound(extension, candidates, arguments)` is a static operation with an explicit extension participant; rebuild consumers of the previous instance signature. The existing selector memo and lease semantics are retained.
 
 ## Advisory redundancy analysis
 
@@ -17399,28 +17399,54 @@ class PscQueryCursor : IDisposable {
 # The authoring-side cursor is single-consumer/runspace-affine. HandleTable owns its
 # lifetime; each pull opens one lease, and revocation denies later windows.
 class PscQueryLease : IDisposable {
+    # CTS admission boundary: the authoring host parses before the faculty is loaded.
+    # Retain the admitted signatures, not a name-based invocation on every query window.
     hidden [object] $Space
+    hidden [Reflection.MethodInfo] $OpenOperation
+    hidden [Reflection.MethodInfo] $CloseOperation
+    hidden [Reflection.MethodInfo] $RevokeOperation
+    hidden [Reflection.FieldInfo] $LeaseValue
     hidden [uint64] $Handle
     hidden [bool] $Disposed
     hidden [PscQueryCoverage] $LastCoverage
     PscQueryLease([object]$space,[uint64]$owner,[PscQueryCursor]$cursor){
-        $this.Space=$space;$this.LastCoverage=$cursor.Coverage()
-        try{$this.Handle=$space.Register($owner,$cursor,[PscQueryCursor],[Action]$cursor.Dispose)}catch{$cursor.Dispose();throw}
+        [PscQueryLease]::Initialize($this,$space,$owner,$cursor)
+    }
+    hidden static [void] Initialize([PscQueryLease]$Query,[object]$Space,[uint64]$Owner,[PscQueryCursor]$Cursor){
+        try{
+            if($null -eq $Space){throw [ArgumentNullException]::new('Space')}
+            [type]$tableType=$Space.GetType()
+            if($tableType.FullName -cne 'HandleTable' -or $tableType.Assembly.GetName().Name -cne 'HandleTable'){throw [ArgumentException]::new('Query requires an admitted HandleTable realization')}
+            [type]$leaseType=$tableType.Assembly.GetType('HandleTableLease',$true)
+            [type]$stateType=$tableType.Assembly.GetType('HandleTableState',$true)
+            [Reflection.BindingFlags]$flags=[Reflection.BindingFlags]::Public -bor [Reflection.BindingFlags]::Static -bor [Reflection.BindingFlags]::DeclaredOnly
+            [Reflection.MethodInfo]$register=$tableType.GetMethod('Register',$flags,$null,[type[]]@($tableType,[uint64],[object],[type],[Action]),$null)
+            $Query.OpenOperation=$tableType.GetMethod('Open',$flags,$null,[type[]]@($tableType,[uint64],[type]),$null)
+            $Query.CloseOperation=$tableType.GetMethod('Close',$flags,$null,[type[]]@($tableType,$leaseType),$null)
+            $Query.RevokeOperation=$tableType.GetMethod('Revoke',$flags,$null,[type[]]@($tableType,[uint64]),$null)
+            $Query.LeaseValue=$leaseType.GetField('Value',[Reflection.BindingFlags]::Public -bor [Reflection.BindingFlags]::Instance -bor [Reflection.BindingFlags]::DeclaredOnly)
+            if($null -eq $register -or $register.ReturnType -ne [uint64] -or $null -eq $Query.OpenOperation -or $Query.OpenOperation.ReturnType -ne $leaseType -or $null -eq $Query.CloseOperation -or $Query.CloseOperation.ReturnType -ne [void] -or $null -eq $Query.RevokeOperation -or $Query.RevokeOperation.ReturnType -ne $stateType -or $null -eq $Query.LeaseValue -or $Query.LeaseValue.FieldType -ne [object]){throw [InvalidOperationException]::new('Incomplete HandleTable query contract')}
+            $Query.Space=$Space;$Query.LastCoverage=$Cursor.Coverage()
+            $Query.Handle=[uint64]$register.Invoke($null,[object[]]@($Space,$Owner,$Cursor,[PscQueryCursor],[Action]$Cursor.Dispose))
+        }catch{$Cursor.Dispose();throw}
     }
     [uint64] Identity(){return $this.Handle}
-    [PscMatch[]] Pull([int]$limit){
-        if($this.Disposed){throw [ObjectDisposedException]::new('PscQueryLease')}
-        $lease=$this.Space.Open($this.Handle,[PscQueryCursor])
-        try{return ([PscQueryCursor]$lease.Value).Pull($limit)}finally{
-            try{$this.LastCoverage=([PscQueryCursor]$lease.Value).Coverage()}finally{$this.Space.Close($lease)}
+    hidden static [PscMatch[]] PullWindow([PscQueryLease]$Query,[int]$Limit){
+        if($Query.Disposed){throw [ObjectDisposedException]::new('PscQueryLease')}
+        $lease=$Query.OpenOperation.Invoke($null,[object[]]@($Query.Space,$Query.Handle,[PscQueryCursor]))
+        try{return ([PscQueryCursor]$Query.LeaseValue.GetValue($lease)).Pull($Limit)}finally{
+            try{$Query.LastCoverage=([PscQueryCursor]$Query.LeaseValue.GetValue($lease)).Coverage()}finally{$Query.CloseOperation.Invoke($null,[object[]]@($Query.Space,$lease))}
         }
     }
-    [PscQueryCoverage] Coverage(){
-        if($this.Disposed){return $this.LastCoverage}
-        $lease=$this.Space.Open($this.Handle,[PscQueryCursor])
-        try{return ([PscQueryCursor]$lease.Value).Coverage()}finally{$this.Space.Close($lease)}
+    [PscMatch[]] Pull([int]$limit){return [PscQueryLease]::PullWindow($this,$limit)}
+    hidden static [PscQueryCoverage] ReadCoverage([PscQueryLease]$Query){
+        if($Query.Disposed){return $Query.LastCoverage}
+        $lease=$Query.OpenOperation.Invoke($null,[object[]]@($Query.Space,$Query.Handle,[PscQueryCursor]))
+        try{return ([PscQueryCursor]$Query.LeaseValue.GetValue($lease)).Coverage()}finally{$Query.CloseOperation.Invoke($null,[object[]]@($Query.Space,$lease))}
     }
-    [void] Dispose(){if(!$this.Disposed){$this.Disposed=$true;$null=$this.Space.Revoke($this.Handle)}}
+    [PscQueryCoverage] Coverage(){return [PscQueryLease]::ReadCoverage($this)}
+    hidden static [void] Release([PscQueryLease]$Query){if(!$Query.Disposed){$Query.Disposed=$true;$null=$Query.RevokeOperation.Invoke($null,[object[]]@($Query.Space,$Query.Handle))}}
+    [void] Dispose(){[PscQueryLease]::Release($this)}
 }
 class PscCilMethod {
     [Reflection.MethodInfo] $Method
