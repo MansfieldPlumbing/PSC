@@ -2209,8 +2209,12 @@ function Copy-Peer { [OutputType([RetainedPeer])] param([RetainedPeer]`$value); 
     $otherPeer=@($otherScope.Contracts.Values|Where-Object Name -ceq 'RetainedPeer')[0]
     if([object]::ReferenceEquals($peerContract,$otherPeer) -or $declarationScope.Types['RetainedPeer'] -eq $otherScope.Types['RetainedPeer']){throw 'Distinct parsed scopes merged'}
     $rebuilt=Get-DeclarationScope -Root $scope -SelectedClassAst $sourceClasses
+    if(![object]::ReferenceEquals($declarationScope,(Get-DeclarationScope -Root $scope))){throw 'Selected scope displaced complete source scope'}
+    $partial=Get-DeclarationScope -Root $scope -SelectedClassAst @($peerAst) -SelectedEnumAst @()
+    if($partial.Contracts.Count -ne 1 -or ![object]::ReferenceEquals($declarationScope,(Get-DeclarationScope -Root $scope))){throw 'Partial scope displaced complete source scope'}
     Use-DeclarationScope -Ast $scope
     $nextDependent=Get-DeclarationScope -Root $functionRoot -Resolving $rebuilt
+    if(![object]::ReferenceEquals($dependent,(Get-DeclarationScope -Root $functionRoot -Resolving $declarationScope))){throw 'Dependent scope displaced by another resolving context'}
     $nextFunction=$nextDependent.Signatures[$functionClass.Members[0]]
     if([object]::ReferenceEquals($declarationScope,$rebuilt) -or [object]::ReferenceEquals($dependent,$nextDependent) -or ![object]::ReferenceEquals($nextFunction.Member.ParameterReferences[0].Definition,$rebuilt.Contracts[$peerAst]) -or $nextFunction.Parameters[0] -ne $rebuilt.Types['RetainedPeer'] -or ![object]::ReferenceEquals($functionSignature.Member.ParameterReferences[0].Definition,$peerContract)){throw 'Dependent scope revision or retained historical witness failed'}
     $empty=[System.Management.Automation.Language.Parser]::ParseInput('enum ProjectionOnly { One }',[ref]$tokens,[ref]$errors)
@@ -2246,9 +2250,11 @@ function Recur-Value { Recur-Value }
     $selected=[System.Management.Automation.Language.TypeDefinitionAst[]]@($inferenceRoot.EndBlock.Statements[0])
     $revised=Get-DeclarationScope -Root $inferenceRoot -SelectedClassAst $selected
     $revisedExecution=Get-DeclarationScope -Root $executionRoot -Resolving $revised
+    $PscSelectedRoot=$inferenceRoot;$PscSelectedScope=$revised
     $activeTypes=$script:LoweringClassTypes
     $next=Get-PscFunctionOutputType -Member $forward
     if($null -eq $next -or $next -eq $prior -or $next.GetGenericArguments()[1] -ne $revised.Types['InferencePeer'] -or $prior.GetGenericArguments()[1] -ne $inferenceScope.Types['InferencePeer'] -or $executionScope.FunctionOutputTypes[$forward] -ne $prior -or $revisedExecution.FunctionOutputTypes[$forward] -ne $next -or ![object]::ReferenceEquals($activeTypes,$script:LoweringClassTypes)){throw 'Inferred generic result retained stale realization or altered caller state'}
+    $PscSelectedRoot=$null;$PscSelectedScope=$null
     $secondRoot=[System.Management.Automation.Language.Parser]::ParseInput($inferenceSource,[ref]$tokens,[ref]$errors)
     $secondClass=Get-ScriptFunctionClass -Root $secondRoot
     $secondScope=Get-DeclarationScope -Root $secondRoot
@@ -2453,6 +2459,7 @@ class PscDeclarationScope {
     [System.Collections.IDictionary] $Signatures
     [Collections.Generic.Dictionary[System.Management.Automation.Language.TypeDefinitionAst,type]] $Bases = [Collections.Generic.Dictionary[System.Management.Automation.Language.TypeDefinitionAst,type]]::new()
     [PscDeclarationScope] $Resolving
+    [System.Runtime.CompilerServices.ConditionalWeakTable[System.Management.Automation.Language.Ast,PscDeclarationScope]] $DependentScopes = [System.Runtime.CompilerServices.ConditionalWeakTable[System.Management.Automation.Language.Ast,PscDeclarationScope]]::new()
     # A null result is also retained (including the recursion sentinel). Inference
     # depends on this exact source revision and its realized CLR types.
     [Collections.Generic.Dictionary[System.Management.Automation.Language.FunctionMemberAst,type]] $FunctionOutputTypes = [Collections.Generic.Dictionary[System.Management.Automation.Language.FunctionMemberAst,type]]::new()
@@ -5232,9 +5239,10 @@ function Build-PscFaculty {
         else{$imports.Contracts=Get-PscFacultyDeclarations -CompilerClassAsts $importedClasses.ToArray() -DependencyContractsOnly}
     }
     else{$imports=$null}
-    Export-LoweredAssembly -SourceAst $holder -DeclarationsOnly -ClassName $unit.Primary -ClassNames $unit.Declarations -ScopeDeclarations $definitions.ToArray() -DependencyScope $imports -StaticData $data -OutputPath (Join-Path $RuntimeDirectory ($Faculty+'.dll')) -Deterministic
+    $scope=$null
+    Export-LoweredAssembly -RealizedScope ([ref]$scope) -SourceAst $holder -DeclarationsOnly -ClassName $unit.Primary -ClassNames $unit.Declarations -ScopeDeclarations $definitions.ToArray() -DependencyScope $imports -StaticData $data -OutputPath (Join-Path $RuntimeDirectory ($Faculty+'.dll')) -Deterministic
     if($null -ne $RetainedScopes){
-        $scope=Get-DeclarationScope -Root $holder
+        if($null -eq $scope){throw 'Faculty realization returned no declaration scope.'}
         $RetainedScopes.Add($Faculty,$scope)
     }
 }
@@ -8666,11 +8674,17 @@ $script:DeclarationScopeCache = [System.Runtime.CompilerServices.ConditionalWeak
 
 # The admitted declaration scope is not necessarily the outermost authored script.
 # A named module body already selected by the lowerer retains its parser-owned identity.
+$script:PscSelectedRoot=$null
+$script:PscSelectedScope=$null
+$script:PscSemanticsRoot=$null
+$script:PscSemanticsScope=$null
+
 function Resolve-PscDeclarationRoot {
     [OutputType([System.Management.Automation.Language.Ast])]
     param([Parameter(Mandatory)][System.Management.Automation.Language.Ast]$Ast)
     $root=$Ast
     while($root.Parent){
+        if([object]::ReferenceEquals($root,$PscSelectedRoot)){return $root}
         if($root.Parent -is [System.Management.Automation.Language.FunctionDefinitionAst] -and [object]::ReferenceEquals($root,$root.Parent.Body)){
             $scope=$null
             if($script:DeclarationScopeCache.TryGetValue($root,[ref]$scope)){return $root}
@@ -8679,6 +8693,19 @@ function Resolve-PscDeclarationRoot {
     }
     return $root
 }
+function Get-PscOperationalScope {
+    [OutputType([PscDeclarationScope])]
+    param([System.Management.Automation.Language.Ast]$Root,[switch]$ExistingOnly)
+    if([object]::ReferenceEquals($Root,$PscSelectedRoot)){return $PscSelectedScope}
+    if([object]::ReferenceEquals($Root,$script:PscSemanticsRoot)){return $script:PscSemanticsScope}
+    if($ExistingOnly){
+        $scope=$null
+        if($script:DeclarationScopeCache.TryGetValue($Root,[ref]$scope)){return $scope}
+        return $null
+    }
+    Get-DeclarationScope -Root $Root
+}
+
 function Use-DeclarationScope {
     <#
     .SYNOPSIS
@@ -8690,12 +8717,12 @@ function Use-DeclarationScope {
     # A source's function class resolves the source's own types; the source resolves its function class.
     $source = $null
     if ($script:ScriptFunctionSources.TryGetValue($root, [ref]$source)) {
-        $sourceScope = Get-DeclarationScope -Root $source
+        $sourceScope = Get-PscOperationalScope -Root $source
         $functionScope = Get-DeclarationScope -Root $root -Resolving $sourceScope
         $script:LoweringClassTypes = @{} + $sourceScope.Types + $functionScope.Types
         return
     }
-    $sourceScope = Get-DeclarationScope -Root $root
+    $sourceScope = Get-PscOperationalScope -Root $root
     $types = $sourceScope.Types
     if($null -ne $sourceScope.Resolving){$types=$sourceScope.Resolving.Types+$types}
     $functionClass = $null
@@ -8714,10 +8741,11 @@ function Get-DeclarationScope {
     [OutputType([PscDeclarationScope])]
     param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Root,[PscDeclarationScope]$Resolving,
         [System.Management.Automation.Language.TypeDefinitionAst[]] $SelectedClassAst,[System.Management.Automation.Language.TypeDefinitionAst[]] $SelectedEnumAst)
+    $selected=$PSBoundParameters.ContainsKey('SelectedClassAst') -or $PSBoundParameters.ContainsKey('SelectedEnumAst')
+    $cache=$script:DeclarationScopeCache
+    if($null -ne $Resolving){$cache=$Resolving.DependentScopes}
     $declarationScope=$null
-    if($script:DeclarationScopeCache.TryGetValue($Root,[ref]$declarationScope)){
-        if(!$PSBoundParameters.ContainsKey('SelectedClassAst') -and !$PSBoundParameters.ContainsKey('SelectedEnumAst') -and (!$PSBoundParameters.ContainsKey('Resolving') -or [object]::ReferenceEquals($declarationScope.Resolving,$Resolving))){return $declarationScope}
-    }
+    if(!$selected -and $cache.TryGetValue($Root,[ref]$declarationScope)){return $declarationScope}
     $inProgress = $script:LoweringClassTypes
     try {
         $classes = @(if ($PSBoundParameters.ContainsKey('SelectedClassAst')) { $SelectedClassAst }
@@ -8726,8 +8754,7 @@ function Get-DeclarationScope {
         $script:LoweringClassTypes = @{}
         if($null -ne $Resolving){$script:LoweringClassTypes += $Resolving.Types}
         $next=New-ClrDeclarationProjection -Model @(if ($classes.Count) { Get-ClassModel -ClassAsts $classes }) -Enums $enums -Resolving $Resolving
-        $null=$script:DeclarationScopeCache.Remove($Root)
-        $script:DeclarationScopeCache.Add($Root,$next)
+        if(!$selected){$cache.Add($Root,$next)}
         return $next
     }
     finally { $script:LoweringClassTypes = $inProgress }
@@ -8749,7 +8776,7 @@ function Get-PscSemanticsMethod {
     param([Parameter(Mandatory)][string] $Name, [Parameter(Mandatory)][Type[]] $ParameterTypes)
     $root = Get-PscSemanticsClass
     while ($root.Parent) { $root = $root.Parent }
-    (Get-ClrTypeProjection -Root $root)['PowerShellSemantics'].GetMethod($Name, $ParameterTypes)
+    (Get-PscOperationalScope -Root $root).Types['PowerShellSemantics'].GetMethod($Name, $ParameterTypes)
 }
 
 # Defines PowerShellSemantics in the assembly being compiled, the first time an emitted call needs one of its methods;
@@ -8759,7 +8786,7 @@ function Add-PscSemanticsToSession {
     if ($null -ne $state.Methods) { return }
     $class = Get-PscSemanticsClass
     $root = $class; while ($root.Parent) { $root = $root.Parent }
-    $projectedType = (Get-ClrTypeProjection -Root $root)['PowerShellSemantics']
+    $projectedType = (Get-PscOperationalScope -Root $root).Types['PowerShellSemantics']
     $declared = [Reflection.BindingFlags]'Public,Static,Instance,DeclaredOnly'
     $tb = $state.Session.Module.DefineType('PowerShellSemantics', [Reflection.TypeAttributes]'Public,Class')
     $state.Session.Types['PowerShellSemantics'] = $tb
@@ -9039,7 +9066,7 @@ function Get-PscFunctionOutputType {
     $root = Resolve-PscDeclarationRoot $Member
     $source = $null
     if (!$script:ScriptFunctionSources.TryGetValue($root, [ref]$source)) { return $null }
-    $sourceScope = Get-DeclarationScope -Root $source
+    $sourceScope = Get-PscOperationalScope -Root $source
     $functionScope = Get-DeclarationScope -Root $root -Resolving $sourceScope
     $outputs = $functionScope.FunctionOutputTypes
     $known = $null
@@ -9454,7 +9481,8 @@ function Get-PscSemanticsClass {
         }
         if($null -eq $definition){throw 'Missing semantics module declaration.'}
         # The helper has an independent realization selection, not a reconstructed source root.
-        $null=Get-DeclarationScope -Root $source.Ast -SelectedClassAst @($definition) -SelectedEnumAst @()
+        $script:PscSemanticsRoot=$source.Ast
+        $script:PscSemanticsScope=Get-DeclarationScope -Root $source.Ast -SelectedClassAst @($definition) -SelectedEnumAst @()
         $script:PscSemanticsAst=$definition
     }
     return $script:PscSemanticsAst
@@ -10337,14 +10365,14 @@ function Resolve-PscSourceOperation {
     $root=Resolve-PscDeclarationRoot $SourceAst
     $source=$null
     if(!$script:ScriptFunctionSources.TryGetValue($root,[ref]$source)){$source=$root}
-    $scope=$null
-    if(!$script:DeclarationScopeCache.TryGetValue($source,[ref]$scope)){return $null}
+    $scope=Get-PscOperationalScope -Root $source -ExistingOnly
+    if($null -eq $scope){return $null}
     $ownerScope=$scope
     if($scope.Types[$TargetType.Name] -ne $TargetType){
         $functionClass=$null
         if(!$script:ScriptFunctionClasses.TryGetValue($source,[ref]$functionClass) -or $null -eq $functionClass){return $null}
         $functionRoot=$functionClass;while($functionRoot.Parent){$functionRoot=$functionRoot.Parent}
-        if(!$script:DeclarationScopeCache.TryGetValue($functionRoot,[ref]$ownerScope) -or ![object]::ReferenceEquals($ownerScope.Resolving,$scope) -or $ownerScope.Types[$TargetType.Name] -ne $TargetType){return $null}
+        if(!$scope.DependentScopes.TryGetValue($functionRoot,[ref]$ownerScope) -or ![object]::ReferenceEquals($ownerScope.Resolving,$scope) -or $ownerScope.Types[$TargetType.Name] -ne $TargetType){return $null}
     }
     $ownerAst=$null
     foreach($definition in $ownerScope.Contracts.Keys){if($definition.Name -ieq $TargetType.Name){$ownerAst=$definition;break}}
@@ -10356,7 +10384,7 @@ function Resolve-PscSourceOperation {
         if($script:ScriptFunctionClasses.TryGetValue($source,[ref]$functionClass) -and $null -ne $functionClass){
             $functionRoot=$functionClass;while($functionRoot.Parent){$functionRoot=$functionRoot.Parent}
             $functionScope=$null
-            if($script:DeclarationScopeCache.TryGetValue($functionRoot,[ref]$functionScope) -and [object]::ReferenceEquals($functionScope.Resolving,$scope)){$bindingScopes.Add($functionScope)}
+            if($scope.DependentScopes.TryGetValue($functionRoot,[ref]$functionScope) -and [object]::ReferenceEquals($functionScope.Resolving,$scope)){$bindingScopes.Add($functionScope)}
         }
     }
     $binding=Get-PscFacultyDeclarations -DeclarationScope $ownerScope -BindingOwner $ownerAst -BindingName $(if($Constructor){$ownerAst.Name}else{$Name}) -BindingArguments $ArgumentTypes -BindingStatic $Static -BindingConstructor $Constructor -BindingScopes $bindingScopes.ToArray()
@@ -15737,7 +15765,7 @@ Conform streams child stdout and stderr to the invoking host as they become avai
 
 - **Managed:** SMA AST and typed expression lowering, deterministic IL emission, static graph/data realization, reachability and fixed-parameter specialization.
 - **Native:** pinned Windows NativeAOT compiler plus PSC COFF linker; direct CIL-to-IR-to-x64 ELF leaf emission and decoded-byte ABI checks. The direct backend does not yet replace ILC for general programs.
-- **Faculties:** `HandleTable`, `InquiryPrimitives`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding; imported executable member calls still use the CLR compatibility boundary. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. This is build integration, not normal-startup activation. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
+- **Faculties:** `HandleTable`, `InquiryPrimitives`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding; imported executable member calls still use the CLR compatibility boundary. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. This is build integration, not normal-startup activation. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
 - **Evidence:** differential tests, structural lint, Guard, non-loading binary queries and coverage. An observed call is not a universal binding proof; an ABI check is not a proof of arithmetic equivalence.
 
 ## Trust and security
@@ -16447,6 +16475,7 @@ function Export-LoweredAssembly {
         [Parameter()][string[]] $ClassNames,
         [System.Management.Automation.Language.TypeDefinitionAst[]] $ScopeDeclarations,
         [PscDeclarationScope] $DependencyScope,
+        [ref] $RealizedScope,
         [switch] $DeclarationsOnly,
         # Select these methods of -ClassName and retain their bound method dependencies.
         [Parameter()][string[]] $MethodNames,
@@ -16464,6 +16493,7 @@ function Export-LoweredAssembly {
         [switch] $Program
     )
 
+    if($null -ne $RealizedScope){$RealizedScope.Value=$null}
     $script:PscCompilingProgram = [bool]$Program
     if (($ScopeDeclarations -or $DependencyScope) -and !$DeclarationsOnly){throw 'Explicit scope is available only for declaration realization.'}
     if ($Program -and $DeclarationsOnly) { throw 'DeclarationsOnly cannot compile a program.' }
@@ -16589,7 +16619,9 @@ function Export-LoweredAssembly {
     Assert-PscInlineOverrides -Classes $classAsts
     $model = @(Get-ClassModel -ClassAsts $classAsts)
     $sourceClasses = [System.Management.Automation.Language.TypeDefinitionAst[]]@($classAsts | Where-Object { -not [object]::ReferenceEquals($_, $functionClass) })
-    $null = Get-ClrTypeProjection -Root $parsed.Ast -SelectedClassAst $sourceClasses -SelectedEnumAst $enumAsts -Resolving $DependencyScope
+    $PscSelectedRoot=$parsed.Ast
+    $PscSelectedScope=Get-DeclarationScope -Root $parsed.Ast -SelectedClassAst $sourceClasses -SelectedEnumAst $enumAsts -Resolving $DependencyScope
+
     Use-DeclarationScope -Ast $parsed.Ast
     $projection = @{} + $script:LoweringClassTypes
     if($MethodNames){
@@ -16782,6 +16814,7 @@ function Export-LoweredAssembly {
     if ($null -ne $saveResult.EntryPoint) { $compiled.EntryPoint = $saveResult.EntryPoint }
     if ($null -ne $saveResult.RuntimeConfig) { $compiled.RuntimeConfig = $saveResult.RuntimeConfig }
     $compiled.ApplicationIcon = $programIcon
+    if($null -ne $RealizedScope){$RealizedScope.Value=$PscSelectedScope}
     $compiled
 }
 
