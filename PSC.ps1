@@ -2674,8 +2674,11 @@ class VomPairLease {
 class Vom {
     hidden [object] $Gate = [object]::new()
     hidden [VomCell[]] $Cells = [VomCell[]]::new(64)
-    hidden [System.Collections.Generic.Stack[int]] $Free = [System.Collections.Generic.Stack[int]]::new()
-    hidden [System.Collections.Generic.Queue[int]] $Ready = [System.Collections.Generic.Queue[int]]::new()
+    # CoreLib supplies List<T>. Free slots are LIFO; finalization entries are FIFO.
+    # ReadyHead is advanced under Gate and consumed prefixes are periodically released.
+    hidden [System.Collections.Generic.List[int]] $Free = [System.Collections.Generic.List[int]]::new()
+    hidden [System.Collections.Generic.List[int]] $Ready = [System.Collections.Generic.List[int]]::new()
+    hidden [int] $ReadyHead
     hidden [System.Collections.Generic.Dictionary[VomLease,uint64]] $Leases = [System.Collections.Generic.Dictionary[VomLease,uint64]]::new()
     hidden [System.Collections.Generic.Dictionary[VomPairLease,uint64[]]] $PairLeases = [System.Collections.Generic.Dictionary[VomPairLease,uint64[]]]::new()
     hidden [System.Collections.Generic.Dictionary[VomRetention,uint64[]]] $Retentions = [System.Collections.Generic.Dictionary[VomRetention,uint64[]]]::new()
@@ -2703,7 +2706,8 @@ class Vom {
                 if ($null -eq $parent -or $parent.State -ne [VomState]::Live) { throw [InvalidOperationException]::new('Owner revoked or stale') }
             }
             [int]$i = 0
-            if ($this.Free.Count -gt 0) { $i = $this.Free.Pop() }
+            [Collections.Generic.List[int]]$availableSlots=$this.Free
+            if ($availableSlots.Count -gt 0) { $i = $availableSlots[$availableSlots.Count-1]; $availableSlots.RemoveAt($availableSlots.Count-1) }
             else {
                 $i = $this.High
                 if ($i -eq $this.Cells.Length) {
@@ -3025,24 +3029,24 @@ class Vom {
         [VomCell]$cell = $this.Cells[$index]
         if ($cell.State -eq [VomState]::Revoking -and $cell.Pins -eq 0 -and $cell.Retainers -eq 0 -and $cell.FirstChild -eq 0) {
             $cell.State = [VomState]::Finalizing
-            $this.Ready.Enqueue($index)
+            $this.Ready.Add($index)
         }
     }
     # Traverse actual ownership edges, not the entire object table. Iterative for deep trees.
     hidden [void] Mark([uint64] $handle) {
         [VomCell]$root = $this.Find($handle)
         if ($null -eq $root -or $root.State -ne [VomState]::Live) { return }
-        [System.Collections.Generic.Stack[int]]$pending = [System.Collections.Generic.Stack[int]]::new()
-        $pending.Push([int][Vom]::Slot($handle))
+        [System.Collections.Generic.List[int]]$pending = [System.Collections.Generic.List[int]]::new()
+        $pending.Add([int][Vom]::Slot($handle))
         while ($pending.Count -gt 0) {
-            [int]$index = $pending.Pop()
+            [int]$index = $pending[$pending.Count-1]; $pending.RemoveAt($pending.Count-1)
             [VomCell]$cell = $this.Cells[$index]
             if ($cell.State -ne [VomState]::Live) { continue }
             $this.Unname($cell,[Vom]::Make($cell.Generation,[uint32]$index))
             $cell.State = [VomState]::Revoking; $cell.RootReference = $false
             [int]$child = $cell.FirstChild
             while ($child -ne 0) {
-                $pending.Push($child)
+                $pending.Add($child)
                 $child = $this.Cells[$child].NextSibling
             }
             $this.Enqueue($index)
@@ -3058,6 +3062,16 @@ class Vom {
         $this.Collect()
         return $this.State($handle)
     }
+    # The caller holds the table's Gate. The queue operation takes its participant explicitly.
+    hidden static [int] TakeReady([Vom]$Table) {
+        if($Table.ReadyHead -ge $Table.Ready.Count){return 0}
+        [int]$index=$Table.Ready[$Table.ReadyHead];$Table.ReadyHead++
+        if($Table.ReadyHead -eq $Table.Ready.Count){$Table.Ready.Clear();$Table.ReadyHead=0}
+        elseif($Table.ReadyHead -ge 64 -and $Table.ReadyHead -ge ($Table.Ready.Count-$Table.ReadyHead)){
+            $Table.Ready.RemoveRange(0,$Table.ReadyHead);$Table.ReadyHead=0
+        }
+        return $index
+    }
     # Claim finalization under Gate, run user cleanup outside it; no reuse before success.
     [void] Collect() {
         while ($true) {
@@ -3065,9 +3079,8 @@ class Vom {
             [VomCell]$cell = $null
             [System.Threading.Monitor]::Enter($this.Gate)
             try {
-                if ($this.Ready.Count -gt 0) {
-                    $index = $this.Ready.Dequeue(); $cell = $this.Cells[$index]
-                }
+                $index=[Vom]::TakeReady($this)
+                if($index -ne 0){$cell=$this.Cells[$index]}
             } finally { [System.Threading.Monitor]::Exit($this.Gate) }
             if ($index -eq 0) { return }
             [Exception]$failure = $null
@@ -3090,7 +3103,7 @@ class Vom {
                     $cell.NextSibling = 0; $cell.PreviousSibling = 0
                     $cell.Name = $null; $cell.Names = $null; $cell.Value = $null; $cell.Contract = $null; $cell.Reclaim = $null; $cell.Owner = [uint64]0
                     if ($cell.Generation -eq [uint32]::MaxValue) { $cell.State = [VomState]::Exhausted }
-                    else { $cell.Generation++; $cell.State = [VomState]::Free; $this.Free.Push($index) }
+                    else { $cell.Generation++; $cell.State = [VomState]::Free; $this.Free.Add($index) }
                 }
             } finally { [System.Threading.Monitor]::Exit($this.Gate) }
         }
@@ -3421,6 +3434,43 @@ class ScriptTypeRole {
     ScriptTypeRole([Vom]$Space,[uint64]$Owner,[string]$Name){$this.Space=$Space;$this.Owner=$Owner;$this.Name=$Name}
 }
 class ScriptTypeReflection {
+    # Invoke a reflected semantic member without rediscovery by name or runtime overload selection.
+    static [object] InvokeBound([ScriptTypeRole]$Role,[ScriptTypeBinding]$Binding,[object[]]$Arguments){
+        if($null -eq $Role -or $null -eq $Binding -or $null -eq $Binding.Owner -or $null -eq $Binding.Member -or $null -eq $Arguments){throw [ArgumentNullException]::new('Role, binding or arguments')}
+        [ScriptTypeMember]$member=$Binding.Member
+        if(!$member.Operation -or $member.Static -or $member.Constructor -or $null -eq $Binding.Arguments -or $null -eq $member.ParameterReferences -or $Binding.Arguments.Length -ne $Arguments.Length -or $member.ParameterReferences.Length -ne $Arguments.Length){throw [ArgumentException]::new('Invalid bound instance operation')}
+        [int]$declared=0
+        foreach($candidate in $Binding.Owner.Members){if([object]::ReferenceEquals($candidate,$member)){$declared++}}
+        if($declared -ne 1){throw [InvalidOperationException]::new('Member is not uniquely declared by the bound contract')}
+        if($null -eq $member.ParameterTypeIdentities -or $member.ParameterTypeIdentities.Length -ne $Arguments.Length){throw [NotSupportedException]::new('Unmaterialized parameter signature')}
+        for([int]$i=0;$i -lt $Arguments.Length;$i++){
+            if($null -eq $member.ParameterReferences[$i] -or !$member.ParameterReferences[$i].Same($Binding.Arguments[$i])){throw [InvalidOperationException]::new('Bound argument reference changed')}
+        }
+        [Vom]$space=$Role.Space
+        [VomLease]$lease=$space.Open($Role.Owner,$Role.Name,[ScriptTypeRealization])
+        try{
+            [ScriptTypeRealization]$realization=$lease.Value
+            [VomPairLease]$dependencies=$space.OpenPair($realization.ContractHandle,[ScriptTypeContract],$realization.ReceiverHandle,[object])
+            try{
+                if(![object]::ReferenceEquals($Binding.Owner,$dependencies.First)){throw [InvalidOperationException]::new('Role does not realize the bound source contract')}
+                [ScriptTypeCall]$selected=$null
+                foreach($call in $realization.Calls){
+                    if(![object]::ReferenceEquals($call.Member,$member)){continue}
+                    if($null -ne $selected -or $null -eq $call.Target -or $null -eq $call.Parameters -or $call.Parameters.Length -ne $Arguments.Length){throw [InvalidOperationException]::new('Invalid or ambiguous bound realization')}
+                    $selected=$call
+                }
+                if($null -eq $selected){throw [InvalidOperationException]::new('Bound member has no realization')}
+                # CLR compatibility validation does not select the semantic member.
+                [bool]$exact=$true
+                for([int]$i=0;$i -lt $Arguments.Length;$i++){
+                    if($null -eq $selected.Parameters[$i] -or ![string]::Equals($selected.Parameters[$i].AssemblyQualifiedName,$member.ParameterTypeIdentities[$i],[StringComparison]::Ordinal)){throw [InvalidOperationException]::new('Incompatible bound realization signature')}
+                    if($null -eq $Arguments[$i] -or $Arguments[$i].GetType() -ne $selected.Parameters[$i]){$exact=$false}
+                }
+                if(!$exact){throw [NotSupportedException]::new('Bound invocation requires exact admitted argument representations')}
+                return $selected.Target.Invoke($dependencies.Second,$Arguments)
+            }finally{$space.ClosePair($dependencies)}
+        }finally{$space.Close($lease)}
+    }
     static [object] InvokeRole([ScriptTypeRole]$Role,[string]$SourceContract,[string]$Member,[object[]]$Arguments){
         [ScriptTypeContract]$expected=[ScriptTypeCatalog]::Find($SourceContract)
         if($null -eq $expected){throw [InvalidOperationException]::new('Source contract not loaded')}
@@ -15521,6 +15571,10 @@ $dev = $api.OpenDevelopment('./psc-tree') # Project the canonical source
 @@TYPESYSTEM@@
 
 This is the architectural mission, not a claim of completed implementation. Reconcile ScriptType, compiler binding and native IR before adding competing representations. Keep the existing NativeAOT path for Notepad and PSNES. Distinguish source evidence from semantic definitions; keep runtime reflection and synthetic execution representations out of semantic authority.
+
+## Reflective managed runspace
+
+`ScriptTypeReflection.InvokeBound(role, binding, arguments)` consumes an exact locally declared `ScriptTypeBinding` with its original member reference, checks the role's realized contract, acquires the provider and dependency leases, and invokes the selected compiled target without a second name or overload search. It refuses unmaterialized signatures, nonexact argument representations, unrelated contract/member identities and unavailable realizations. The current profile does not yet admit inherited bindings, conversion plans or symbolic argument storage. `Vom` uses CoreLib collections for allocation, ownership traversal and deferred reclamation. A bounded standalone CoreCLR control has exercised runtime definition construction, binding, replacement and withdrawal using only CoreLib and compiled PSC assemblies. ScriptType's generated-thunk naming still references `System.Security.Cryptography`; full module closure has not been established. The target is a lowered reflective runspace that parses `.ps1` without the SMA assembly, using acquired PowerShell language semantics rather than a second grammar. Independent parser realization is not implemented; current PSC authoring and compilation still acquire source using SMA.
 
 ## Advisory redundancy analysis
 

@@ -19,6 +19,10 @@ PSC owns first-class typed representations of the ScriptType System (STS) and th
 
 This is the architectural mission, not a claim of completed implementation. Reconcile ScriptType, compiler binding and native IR before adding competing representations. Keep the existing NativeAOT path for Notepad and PSNES. Distinguish source evidence from semantic definitions; keep runtime reflection and synthetic execution representations out of semantic authority.
 
+## Reflective managed runspace
+
+`ScriptTypeReflection.InvokeBound(role, binding, arguments)` consumes an exact locally declared `ScriptTypeBinding` with its original member reference, checks the role's realized contract, acquires the provider and dependency leases, and invokes the selected compiled target without a second name or overload search. It refuses unmaterialized signatures, nonexact argument representations, unrelated contract/member identities and unavailable realizations. The current profile does not yet admit inherited bindings, conversion plans or symbolic argument storage. `Vom` uses CoreLib collections for allocation, ownership traversal and deferred reclamation. A bounded standalone CoreCLR control has exercised runtime definition construction, binding, replacement and withdrawal using only CoreLib and compiled PSC assemblies. ScriptType's generated-thunk naming still references `System.Security.Cryptography`; full module closure has not been established. The target is a lowered reflective runspace that parses `.ps1` without the SMA assembly, using acquired PowerShell language semantics rather than a second grammar. Independent parser realization is not implemented; current PSC authoring and compilation still acquire source using SMA.
+
 ## Advisory redundancy analysis
 
 Use the existing graph to compare authored function and method bodies, including their source identities and locations:
