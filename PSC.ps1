@@ -1103,6 +1103,18 @@ try {
     $member = [ScriptTypeContract]::FindResolved($descriptor, 'Apply', [type[]]@([double]))
     Assert-Pass ($null -ne $member -and $member.Required -and $member.ResultTypeIdentity -ceq [double].AssemblyQualifiedName) '.srm1 produces a typed required contract operation'
     Assert-Pass ($null -eq [ScriptTypeCatalog].Assembly.GetType('SmCalibrationContract') -and $null -eq [ScriptTypeCatalog].Assembly.GetType('SmCalibrationUse')) '.srm1 catalog retains semantic descriptors rather than executable contract classes'
+    foreach ($facultyType in [type[]]@([HandleTable], [InquiryAxis], [ScriptTypeCatalog])) {
+        foreach ($reference in $facultyType.Assembly.GetReferencedAssemblies()) {
+            Assert-Pass ($reference.Name -cin 'System.Private.CoreLib', 'HandleTable', 'InquiryPrimitives', 'ScriptType') "foundational faculty metadata closure: $($facultyType.Name) -> $($reference.Name)"
+        }
+    }
+    $thunkPath = Join-Path $work 'GeneratedThunks.dll'
+    & $Compiler -SourcePath $contractSource -ClassName GeneratedThunks -StructuralThunks @{ SmCalibrationContract = $providerType } -OutputPath $thunkPath -Deterministic | Out-Null
+    $generatedType = [Reflection.Assembly]::LoadFrom($thunkPath).GetType('GeneratedThunks', $true)
+    $generated = [ScriptTypeRealization]::new()
+    [ScriptTypeRealization]::BindGenerated($generated, $descriptor, $generatedType)
+    Assert-Pass ($generated.Calls.Length -eq 1 -and [object]::ReferenceEquals($generated.Calls[0].Member, $member)) 'generated thunk retains original semantic member'
+    Assert-Pass ($generated.Calls[0].Target.Invoke($provider, [object[]]@([double]10)) -eq [double]41.25) 'generated thunk executes compiled provider'
     $space = [HandleTable]::new()
     $owner = [HandleTable]::Register($space, 0, [object]::new(), [object], $null)
     try {
@@ -2507,9 +2519,12 @@ class ScriptTypeMember {
     [bool] $Hidden
     [bool] $Constructor
     static [string] ThunkName([ScriptTypeMember]$Member){
-        [string]$key=$Member.Name.ToUpperInvariant()
-        foreach($identity in $Member.ParameterTypeIdentities){$key=$key+'|'+([string]$identity.Length)+':'+$identity}
-        return 'Call_'+[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($key)))
+        [string]$normalizedName=$Member.Name.ToUpperInvariant()
+        [string]$key=$normalizedName.Length.ToString([Globalization.CultureInfo]::InvariantCulture)+':'+$normalizedName
+        foreach($identity in $Member.ParameterTypeIdentities){$key=$key+'|'+$identity.Length.ToString([Globalization.CultureInfo]::InvariantCulture)+':'+$identity}
+        # Reversible, identifier-safe encoding; no digest collision or framework crypto dependency.
+        [Text.UTF8Encoding]$encoding=[Text.UTF8Encoding]::new($false,$true)
+        return 'Call_'+[Convert]::ToHexString($encoding.GetBytes($key))
     }
 }
 # A selected operation is semantic evidence, not an executable member. Ordered
@@ -15727,7 +15742,7 @@ This is the architectural mission, not a claim of completed implementation. Reco
 
 ## Reflective managed runspace
 
-`ScriptTypeReflection.InvokeBound(role, binding, arguments)` consumes an exact locally declared `ScriptTypeBinding` with its original member reference, checks the role's realized contract, acquires the provider and dependency leases, and invokes the selected compiled target without a second name or overload search. It refuses unmaterialized signatures, nonexact argument representations, unrelated contract/member identities and unavailable realizations. The current profile does not yet admit inherited bindings, conversion plans or symbolic argument storage. `HandleTable` uses CoreLib collections for allocation, ownership traversal and deferred reclamation. `HandleCollector.Collect(table)` owns eligible cleanup execution, completion and free-slot recycling, using the existing table gate and storage. HandleTable owns eligibility, leases and dependency edges and calls the collector when lifetime operations release work. Both are realized in HandleTable.dll because the current synchronous lifetime contract is mutually dependent; no independent collector assembly or tracing GC is claimed. A bounded standalone CoreCLR control has exercised runtime definition construction, binding, replacement and withdrawal using only CoreLib and compiled PSC assemblies. ScriptType's generated-thunk naming still references `System.Security.Cryptography`; full module closure has not been established. The target is a lowered reflective runspace that parses `.ps1` without the SMA assembly, using acquired PowerShell language semantics rather than a second grammar. Independent parser realization is not implemented; current PSC authoring and compilation still acquire source using SMA.
+`ScriptTypeReflection.InvokeBound(role, binding, arguments)` consumes an exact locally declared `ScriptTypeBinding` with its original member reference, checks the role's realized contract, acquires the provider and dependency leases, and invokes the selected compiled target without a second name or overload search. It refuses unmaterialized signatures, nonexact argument representations, unrelated contract/member identities and unavailable realizations. The current profile does not yet admit inherited bindings, conversion plans or symbolic argument storage. `HandleTable` uses CoreLib collections for allocation, ownership traversal and deferred reclamation. `HandleCollector.Collect(table)` owns eligible cleanup execution, completion and free-slot recycling, using the existing table gate and storage. HandleTable owns eligibility, leases and dependency edges and calls the collector when lifetime operations release work. Both are realized in HandleTable.dll because the current synchronous lifetime contract is mutually dependent; no independent collector assembly or tracing GC is claimed. A bounded standalone CoreCLR control has exercised runtime definition construction, binding, replacement and withdrawal using only CoreLib and compiled PSC assemblies. Generated-thunk names encode the case-normalized member name and length-framed parameter identities as strict UTF-8 hexadecimal identifiers rather than cryptographic digests. HandleTable, InquiryPrimitives and ScriptType have no framework assembly reference beyond CoreLib; the standalone CoreCLR control also exercises generated-thunk binding, invocation and withdrawal. Rebuild previously generated thunk assemblies to match the new naming scheme. The names are longer than the former fixed-size digest names. The target is a lowered reflective runspace that parses `.ps1` without the SMA assembly, using acquired PowerShell language semantics rather than a second grammar. Independent parser realization is not implemented; current PSC authoring and compilation still acquire source using SMA.
 
 HandleTable's internal lookup, pinning, retention, name resolution and ownership traversal operations now take an explicit typed table participant. Fourteen additional public operations (including collection, withdrawal, succession, retention, pair leasing and rebinding) now require an explicit HandleTable participant. Register, Open, Close and Revoke also take an explicit table participant. The authoring-side query lease acquires exact CLR operation signatures once from the loaded faculty; compiled consumers use typed static calls. The existing IDisposable and cursor instance entry points remain compatibility boundaries. Lease and retention records use explicit typed Create operations; the fence Completed and Signal operations take an explicit fence participant. Rebuild callers of the changed operations. `ScriptTypeBindingExtension.SelectBound(extension, candidates, arguments)` is a static operation with an explicit extension participant; rebuild consumers of the previous instance signature. The existing selector memo and lease semantics are retained.
 
