@@ -4955,34 +4955,106 @@ class PscElfImageReader {
 }
 
 # Authoring-time metadata extraction; compiled runtime receives the resulting typed graph.
-function Get-ScriptTypeReference {
-    [OutputType([ScriptTypeReference])]
-    param([System.Management.Automation.Language.ITypeName]$Name,[Collections.Generic.Dictionary[string,ScriptTypeContract]]$Catalog,[type]$DefaultType)
-    $reference=[ScriptTypeReference]::new();$reference.Arguments=[ScriptTypeReference[]]::new(0)
-    if($null -eq $Name){$reference.Kind=[ScriptTypeReferenceKind]::Clr;$reference.Spelling=$DefaultType.FullName;$reference.ClrIdentity=$DefaultType.AssemblyQualifiedName;return $reference}
-    $reference.Spelling=$Name.FullName
-    # Source identity takes precedence over imported runtime types.
-    if(!$Name.AssemblyName -and $Catalog.ContainsKey($Name.FullName)){$reference.Kind=[ScriptTypeReferenceKind]::Source;$reference.Definition=$Catalog[$Name.FullName];return $reference}
-    if($Name -is [System.Management.Automation.Language.ArrayTypeName]){
-        $reference.Kind=[ScriptTypeReferenceKind]::Array;$reference.Rank=$Name.Rank
-        $reference.Element=Get-ScriptTypeReference $Name.ElementType $Catalog ([object])
-        if(!$reference.Element.ClrIdentity){return $reference}
-    }elseif($Name -is [System.Management.Automation.Language.GenericTypeName]){
-        $reference.Kind=[ScriptTypeReferenceKind]::Generic
-        $reference.Element=Get-ScriptTypeReference $Name.TypeName $Catalog ([object])
-        $reference.Arguments=@(foreach($argument in $Name.GenericArguments){Get-ScriptTypeReference $argument $Catalog ([object])})
-        if($reference.Element.Kind -eq [ScriptTypeReferenceKind]::Source){return $reference}
-        foreach($argument in $reference.Arguments){if(!$argument.ClrIdentity){return $reference}}
-    }
-    $resolved=$Name.GetReflectionType()
-    if($null -ne $resolved){
-        $reference.ClrIdentity=$resolved.AssemblyQualifiedName
-        if($reference.Kind -eq [ScriptTypeReferenceKind]::Generic -and $resolved.IsGenericType){
-            $reference.Element.Kind=[ScriptTypeReferenceKind]::Clr;$reference.Element.ClrIdentity=$resolved.GetGenericTypeDefinition().AssemblyQualifiedName
+# SMA supplies declaration evidence. This operation constructs STS descriptors
+# directly in its executing domain; ScriptType.dll itself has no SMA dependency.
+class PscScriptTypeAcquisition {
+    static [ScriptTypeReference] Reference([System.Management.Automation.Language.ITypeName]$Name,[Collections.Generic.Dictionary[string,ScriptTypeContract]]$Catalog,[type]$DefaultType){
+        [ScriptTypeReference]$reference=[ScriptTypeReference]::new()
+        $reference.Arguments=[ScriptTypeReference[]]::new(0)
+        if($null -eq $Name){$reference.Kind=[ScriptTypeReferenceKind]::Clr;$reference.Spelling=$DefaultType.FullName;$reference.ClrIdentity=$DefaultType.AssemblyQualifiedName;return $reference}
+        $reference.Spelling=$Name.FullName
+        if([string]::IsNullOrEmpty($Name.AssemblyName) -and $Catalog.ContainsKey($Name.FullName)){$reference.Kind=[ScriptTypeReferenceKind]::Source;$reference.Definition=$Catalog[$Name.FullName];return $reference}
+        if($Name -is [System.Management.Automation.Language.ArrayTypeName]){
+            [System.Management.Automation.Language.ArrayTypeName]$arrayName=$Name
+            $reference.Kind=[ScriptTypeReferenceKind]::Array;$reference.Rank=$arrayName.Rank
+            $reference.Element=[PscScriptTypeAcquisition]::Reference($arrayName.ElementType,$Catalog,[object])
+            if([string]::IsNullOrEmpty($reference.Element.ClrIdentity)){return $reference}
+        }elseif($Name -is [System.Management.Automation.Language.GenericTypeName]){
+            [System.Management.Automation.Language.GenericTypeName]$genericName=$Name
+            $reference.Kind=[ScriptTypeReferenceKind]::Generic
+            $reference.Element=[PscScriptTypeAcquisition]::Reference($genericName.TypeName,$Catalog,[object])
+            $reference.Arguments=[ScriptTypeReference[]]::new($genericName.GenericArguments.Count)
+            for([int]$index=0;$index -lt $reference.Arguments.Length;$index++){$reference.Arguments[$index]=[PscScriptTypeAcquisition]::Reference($genericName.GenericArguments[$index],$Catalog,[object])}
+            if($reference.Element.Kind -eq [ScriptTypeReferenceKind]::Source){return $reference}
+            foreach($argument in $reference.Arguments){if([string]::IsNullOrEmpty($argument.ClrIdentity)){return $reference}}
         }
-        if($reference.Kind -eq [ScriptTypeReferenceKind]::Unresolved){$reference.Kind=[ScriptTypeReferenceKind]::Clr}
+        [type]$resolved=$Name.GetReflectionType()
+        if($null -ne $resolved){
+            $reference.ClrIdentity=$resolved.AssemblyQualifiedName
+            if($reference.Kind -eq [ScriptTypeReferenceKind]::Generic -and $resolved.IsGenericType){
+                $reference.Element.Kind=[ScriptTypeReferenceKind]::Clr;$reference.Element.ClrIdentity=$resolved.GetGenericTypeDefinition().AssemblyQualifiedName
+            }
+            if($reference.Kind -eq [ScriptTypeReferenceKind]::Unresolved){$reference.Kind=[ScriptTypeReferenceKind]::Clr}
+        }
+        return $reference
     }
-    return $reference
+    static [System.Management.Automation.Language.ITypeName] ParameterType([System.Management.Automation.Language.ParameterAst]$Parameter){
+        foreach($attribute in $Parameter.Attributes){
+            if($attribute -is [System.Management.Automation.Language.TypeConstraintAst]){return ([System.Management.Automation.Language.TypeConstraintAst]$attribute).TypeName}
+        }
+        return $null
+    }
+    static [ScriptTypeContract[]] Acquire([System.Management.Automation.Language.TypeDefinitionAst[]]$Definitions,[ScriptTypeContract[]]$Imported){
+        [Collections.Generic.Dictionary[string,ScriptTypeContract]]$catalog=[Collections.Generic.Dictionary[string,ScriptTypeContract]]::new([StringComparer]::OrdinalIgnoreCase)
+        [ScriptTypeContract[]]$contracts=[ScriptTypeContract[]]::new($Definitions.Length)
+        # Acquire every local definition before resolving any reference. Imports
+        # retain their identity and do not displace a local declaration.
+        for([int]$index=0;$index -lt $Definitions.Length;$index++){
+            [System.Management.Automation.Language.TypeDefinitionAst]$shape=$Definitions[$index]
+            if($catalog.ContainsKey($shape.Name)){throw [InvalidOperationException]::new('Duplicate declaration: '+$shape.Name)}
+            [ScriptTypeContract]$description=[ScriptTypeContract]::new();$description.Name=$shape.Name;$description.Source=$shape.Extent.Text
+            $catalog.Add($shape.Name,$description);$contracts[$index]=$description
+        }
+        if($null -ne $Imported){foreach($importedContract in $Imported){$null=$catalog.TryAdd($importedContract.Name,$importedContract)}}
+        for([int]$index=0;$index -lt $Definitions.Length;$index++){
+            [System.Management.Automation.Language.TypeDefinitionAst]$shape=$Definitions[$index]
+            [ScriptTypeContract]$description=$contracts[$index]
+            $description.BaseTypes=[string[]]::new($shape.BaseTypes.Count)
+            $description.BaseReferences=[ScriptTypeReference[]]::new($shape.BaseTypes.Count)
+            [Collections.Generic.List[ScriptTypeContract]]$bases=[Collections.Generic.List[ScriptTypeContract]]::new()
+            for([int]$baseIndex=0;$baseIndex -lt $shape.BaseTypes.Count;$baseIndex++){
+                [System.Management.Automation.Language.ITypeName]$baseName=$shape.BaseTypes[$baseIndex].TypeName
+                $description.BaseTypes[$baseIndex]=$baseName.FullName
+                $description.BaseReferences[$baseIndex]=[PscScriptTypeAcquisition]::Reference($baseName,$catalog,[object])
+                if($catalog.ContainsKey($baseName.FullName)){$bases.Add($catalog[$baseName.FullName])}
+            }
+            $description.BaseContracts=$bases.ToArray()
+            $description.Members=[ScriptTypeMember[]]::new($shape.Members.Count)
+            for([int]$memberIndex=0;$memberIndex -lt $shape.Members.Count;$memberIndex++){
+                [System.Management.Automation.Language.MemberAst]$member=$shape.Members[$memberIndex]
+                [ScriptTypeMember]$item=[ScriptTypeMember]::new();$item.Name=$member.Name;$item.Declaration=$member.Extent.Text
+                [System.Management.Automation.Language.ITypeName]$resultName=$null
+                [type]$defaultResult=[object]
+                if($member -is [System.Management.Automation.Language.FunctionMemberAst]){
+                    [System.Management.Automation.Language.FunctionMemberAst]$method=$member
+                    $item.Static=$method.IsStatic;$item.Hidden=$method.IsHidden;$item.Operation=$true;$item.Constructor=$method.IsConstructor;$defaultResult=[void];$item.ResultType='void'
+                    if($null -ne $method.ReturnType){$resultName=$method.ReturnType.TypeName}
+                    [int]$arity=$method.Parameters.Count
+                    $item.ParameterTypes=[string[]]::new($arity);$item.ParameterNames=[string[]]::new($arity);$item.ParameterTypeIdentities=[string[]]::new($arity);$item.ParameterReferences=[ScriptTypeReference[]]::new($arity)
+                    for([int]$parameterIndex=0;$parameterIndex -lt $arity;$parameterIndex++){
+                        [System.Management.Automation.Language.ParameterAst]$parameter=$method.Parameters[$parameterIndex]
+                        [System.Management.Automation.Language.ITypeName]$parameterName=[PscScriptTypeAcquisition]::ParameterType($parameter)
+                        $item.ParameterNames[$parameterIndex]=$parameter.Name.VariablePath.UserPath
+                        $item.ParameterTypes[$parameterIndex]='object'
+                        if($null -ne $parameterName){$item.ParameterTypes[$parameterIndex]=$parameterName.FullName}
+                        $item.ParameterReferences[$parameterIndex]=[PscScriptTypeAcquisition]::Reference($parameterName,$catalog,[object])
+                        $item.ParameterTypeIdentities[$parameterIndex]=$item.ParameterReferences[$parameterIndex].ClrIdentity
+                    }
+                }else{
+                    [System.Management.Automation.Language.PropertyMemberAst]$property=$member
+                    $item.Static=$property.IsStatic;$item.Hidden=$property.IsHidden
+                    $item.ResultType='object'
+                    if($null -ne $property.PropertyType){$resultName=$property.PropertyType.TypeName}
+                    $item.ParameterTypes=[string[]]::new(0);$item.ParameterNames=[string[]]::new(0);$item.ParameterTypeIdentities=[string[]]::new(0);$item.ParameterReferences=[ScriptTypeReference[]]::new(0)
+                }
+                if($null -ne $resultName){$item.ResultType=$resultName.FullName}
+                $item.ResultReference=[PscScriptTypeAcquisition]::Reference($resultName,$catalog,$defaultResult)
+                $item.ResultTypeIdentity=$item.ResultReference.ClrIdentity
+                $description.Members[$memberIndex]=$item
+            }
+        }
+        return $contracts
+    }
 }
 function Get-ScriptTypeContract {
     param([string[]]$Paths,[System.Management.Automation.Language.TypeDefinitionAst[]]$DefinitionAsts,[switch]$SignaturesOnly,[ScriptTypeContract[]]$ImportedContracts)
@@ -4994,18 +5066,11 @@ function Get-ScriptTypeContract {
         if($errors.Count){throw "Invalid source: $path"}
         foreach($definition in $root.EndBlock.Statements){if($definition -is [System.Management.Automation.Language.TypeDefinitionAst] -and $definition.IsClass){$definitions.Add($definition)}}
     }
-    $catalog=[Collections.Generic.Dictionary[string,ScriptTypeContract]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach($shape in $definitions){
-        if($catalog.ContainsKey($shape.Name)){throw "Duplicate declaration: $($shape.Name)"}
-        $description=[ScriptTypeContract]::new();$description.Name=$shape.Name;$description.Source=$shape.Extent.Text
-        $catalog.Add($shape.Name,$description)
-    }
-    # Imported definitions are the original retained objects, not copies. Local
-    # declarations take precedence in the same way as the scope's CLR projection.
-    foreach($imported in $ImportedContracts){$null=$catalog.TryAdd($imported.Name,$imported)}
-    foreach($shape in $definitions){
+    $contracts=[PscScriptTypeAcquisition]::Acquire($definitions.ToArray(),$ImportedContracts)
+    if(!$SignaturesOnly){for($index=0;$index -lt $definitions.Count;$index++){
+        $shape=$definitions[$index]
         $required=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-        if(!$SignaturesOnly){foreach($owner in $definitions){foreach($method in $owner.Members){
+        foreach($owner in $definitions){foreach($method in $owner.Members){
             if($method -isnot [System.Management.Automation.Language.FunctionMemberAst]){continue}
             foreach($parameter in $method.Parameters){
                 $constraint=$parameter.Attributes|Where-Object {$_ -is [System.Management.Automation.Language.TypeConstraintAst]}|Select-Object -First 1
@@ -5014,28 +5079,10 @@ function Get-ScriptTypeContract {
                     if($member.Expression -is [System.Management.Automation.Language.VariableExpressionAst] -and $member.Expression.VariablePath.UserPath -ieq $parameter.Name.VariablePath.UserPath -and $member.Member -is [System.Management.Automation.Language.StringConstantExpressionAst]){$null=$required.Add($member.Member.Value)}
                 }
             }
-        }}}
-        $description=$catalog[$shape.Name];$description.BaseTypes=@($shape.BaseTypes|ForEach-Object {$_.TypeName.FullName})
-        $description.BaseReferences=@(foreach($baseType in $shape.BaseTypes){Get-ScriptTypeReference $baseType.TypeName $catalog ([object])})
-        $description.Members=@(foreach($member in $shape.Members){
-            $item=[ScriptTypeMember]::new();$item.Name=$member.Name;$item.Required=$required.Contains($item.Name);$item.Declaration=$member.Extent.Text;$item.Static=$member.IsStatic;$item.Hidden=$member.IsHidden
-            if($member -is [System.Management.Automation.Language.FunctionMemberAst]){
-                $item.Operation=$true;$item.Constructor=$member.IsConstructor;$item.ResultType=if($member.ReturnType){$member.ReturnType.TypeName.FullName}else{'void'}
-                $item.ParameterTypes=@(foreach($parameter in $member.Parameters){$tc=$parameter.Attributes|Where-Object {$_ -is [System.Management.Automation.Language.TypeConstraintAst]}|Select-Object -First 1;if($tc){$tc.TypeName.FullName}else{'object'}})
-                $item.ParameterNames=@($member.Parameters|ForEach-Object {$_.Name.VariablePath.UserPath})
-                $item.ResultReference=Get-ScriptTypeReference $(if($member.ReturnType){$member.ReturnType.TypeName}) $catalog ([void])
-                $item.ParameterReferences=@(foreach($parameter in $member.Parameters){$tc=$parameter.Attributes|Where-Object {$_ -is [System.Management.Automation.Language.TypeConstraintAst]}|Select-Object -First 1;Get-ScriptTypeReference $(if($tc){$tc.TypeName}) $catalog ([object])})
-                $item.ResultTypeIdentity=$item.ResultReference.ClrIdentity
-                $item.ParameterTypeIdentities=@(foreach($reference in $item.ParameterReferences){$reference.ClrIdentity})
-            }else{$item.ResultType=if($member.PropertyType){$member.PropertyType.TypeName.FullName}else{'object'};$item.ParameterTypes=@();$item.ParameterNames=@();$item.ParameterTypeIdentities=@();$item.ResultReference=Get-ScriptTypeReference $(if($member.PropertyType){$member.PropertyType.TypeName}) $catalog ([object]);$item.ResultTypeIdentity=$item.ResultReference.ClrIdentity;$item.ParameterReferences=[ScriptTypeReference[]]::new(0)}
-            $item
-        })
-    }
-    foreach($shape in $definitions){
-        $description=$catalog[$shape.Name]
-        $description.BaseContracts=@(foreach($baseName in $description.BaseTypes){if($catalog.ContainsKey($baseName)){$catalog[$baseName]}})
-    }
-    foreach($shape in $definitions){$catalog[$shape.Name]}
+        }}
+        foreach($member in $contracts[$index].Members){$member.Required=$required.Contains($member.Name)}
+    }}
+    foreach($contract in $contracts){$contract}
 }
 
     # Translate the caller's CLR expression type at the compatibility boundary.
@@ -9685,18 +9732,21 @@ function Get-PscSemanticsClass {
     [OutputType([System.Management.Automation.Language.TypeDefinitionAst])]
     param()
     if ($null -eq $script:PscSemanticsAst) {
-        $source=[PscSource]::new($PSCommandPath,$false)
-        if($source.ParseErrors.Count){throw 'Semantics module source is not parseable.'}
+        $tokens=$null;$errors=$null
+        $root=[System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath,[ref]$tokens,[ref]$errors)
+        if($errors.Count){throw 'Semantics module source is not parseable.'}
         $definition=$null
-        foreach($site in $source.Declarations('PowerShellSemantics')){
-            if($site.Target -isnot [System.Management.Automation.Language.TypeDefinitionAst]){continue}
+        # This is acquisition of a particular top-level module, not a source-wide query.
+        # Retain the parser's original declaration rather than an authoring query witness.
+        foreach($statement in $root.BeginBlock.Statements){
+            if($statement -isnot [System.Management.Automation.Language.TypeDefinitionAst] -or !$statement.IsClass -or $statement.Name -ine 'PowerShellSemantics'){continue}
             if($null -ne $definition){throw 'Ambiguous semantics module declaration.'}
-            $definition=$site.Target
+            $definition=$statement
         }
         if($null -eq $definition){throw 'Missing semantics module declaration.'}
         # The helper has an independent realization selection, not a reconstructed source root.
-        $script:PscSemanticsRoot=$source.Ast
-        $script:PscSemanticsScope=Get-DeclarationScope -Root $source.Ast -SelectedClassAst @($definition) -SelectedEnumAst @()
+        $script:PscSemanticsScope=Get-DeclarationScope -Root $root -SelectedClassAst @($definition) -SelectedEnumAst @()
+        $script:PscSemanticsRoot=$root
         $script:PscSemanticsAst=$definition
     }
     return $script:PscSemanticsAst
@@ -15774,7 +15824,7 @@ class PscApi {
         $objectives.Add([PscRoadmapObjective]::new('F4',[PscRoadmapState]::Existing,@('F0','F3'),'Structural editing: replacement exists; add insertion, deletion, rename, move and dependency-aware validation, atomic grouped undo/redo and stale-reference refusal. No textual parser or competing authority.',@('PscDocument','PscDocumentEdit'),@(),@('Tests/Test-Document.ps1','Tests/Test-Worktree.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('F5',[PscRoadmapState]::Planned,@('F1','F4'),'Canonical script, ordered tree and artifacts: deterministic realization and independently tested exact source, semantic identity and target realization recovery when requested. Explicit retention policy; development information must not impose execution dependencies. Keep compiled faculties optional.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('F6',[PscRoadmapState]::Planned,@('F0','F2','F4','R1','H1'),'Persistent PscHost, retained API and compiled self-consumption, accepted/candidate workspaces, typed operations and PSRP; concurrent sessions, revision leases, restart recovery and constrained write admission. Agents use this same API; no second compiler or string-based control plane.',@(),@(),@()))
-        $objectives.Add([PscRoadmapObjective]::new('L1',[PscRoadmapState]::Existing,@('F1'),'First-class PSC-owned STS and CTS definitions, references, signatures, constraints and compatibility relations; reconcile ScriptType with compiler declarations before extending value/generic types, interfaces, properties, events, visibility and namespaces. Use SMA-visible forms; prove supported definitions independent of runtime materialization.',@('PscAstRebuild','Export-LoweredAssembly','Get-ScriptTypeContract','Get-ScriptTypeReference','ScriptTypeReference','PscMaterializedSignature','ConvertTo-PscMaterializedSignatureType','PscDeclarationScope','Get-DeclarationScope'),@('ScriptType'),@('SM/Test-Formats.ps1','Tests/Test-ScriptTypeReference.ps1','Tests/Test-ScriptTypeCompiler.ps1')))
+        $objectives.Add([PscRoadmapObjective]::new('L1',[PscRoadmapState]::Existing,@('F1'),'First-class PSC-owned STS and CTS definitions, references, signatures, constraints and compatibility relations; reconcile ScriptType with compiler declarations before extending value/generic types, interfaces, properties, events, visibility and namespaces. Use SMA-visible forms; prove supported definitions independent of runtime materialization.',@('PscAstRebuild','Export-LoweredAssembly','Get-ScriptTypeContract','PscScriptTypeAcquisition','ScriptTypeReference','PscMaterializedSignature','ConvertTo-PscMaterializedSignatureType','PscDeclarationScope','Get-DeclarationScope'),@('ScriptType'),@('SM/Test-Formats.ps1','Tests/Test-ScriptTypeReference.ps1','Tests/Test-ScriptTypeCompiler.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('L2',[PscRoadmapState]::Planned,@('L1'),'Explicit program semantics profiles; independent typed binding, structural compatibility, inference and conversion; consolidate duplicate binders. Test declared differences from SMA and CTS, null/overflow/conversion/exception semantics, ambiguity and target parity without requiring runtime materialization.',@('ScriptTypePrimitiveConversion','Select-PscStructuralNumericOverload'),@('PrimitiveConversion'),@('Tests/Test-ScriptTypeSelection.ps1')))
         $objectives.Add([PscRoadmapObjective]::new('L3',[PscRoadmapState]::Planned,@('F2','L1','L2'),'Managed CLI realization from bound definitions; progressively self-compile PSC.dll, and close compiler refusals using complete pinned application sources, non-loading metadata and executable repros; no stubs counted as completion. Deterministic PE, entry points, callbacks, static graphs, reachability, dependencies, independent execution and CTS interoperability.',@(),@(),@()))
         $objectives.Add([PscRoadmapObjective]::new('I1',[PscRoadmapState]::Planned,@('F2','F3'),'Inventory donor declarations and contracts, hashes, dependencies, licenses, historical revisions and evidence; reconcile duplicate mechanisms and admit typed source into PSC only.',@(),@(),@()))
@@ -16019,7 +16069,7 @@ Conform streams child stdout and stderr to the invoking host as they become avai
 
 - **Managed:** SMA AST and typed expression lowering, deterministic IL emission, static graph/data realization, reachability and fixed-parameter specialization.
 - **Native:** pinned Windows NativeAOT compiler plus PSC COFF linker; direct CIL-to-IR-to-x64 ELF leaf emission and decoded-byte ABI checks. The direct backend does not yet replace ILC for general programs.
-- **Faculties:** `HandleTable`, `DiscoveryMechanisms`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. BuildRuntime without contract inputs writes a local selection receipt for HandleTable, ScriptType and PrimitiveConversion after successful construction. The compiled numeric selection path verifies source, CoreLib, SMA, the existing TypeConverter framework dependency and all three faculty assembly digests once, loads the exact bytes in a private collectible context, and invokes a typed delegate. Missing or incompatible receipts refuse that path; no implicit interpreted fallback is permitted after selection is requested. Without an explicit directory the authoring selector is unchanged. The receipt identifies a trusted local build; it is not a signature or independent admission proof. This is limited compiler self-consumption, not full startup activation or migration of descriptor identities. `PscApi.AcquireSelection(api,directory)` acquires an explicit resident selection session from the API source revision. `PscRuntimeSelection.Select(session,signatures,sources)` reuses the admitted selector without reading artifacts again; `Close(session)` withdraws it and requests context unloading. Resident structural specialization accepts the same session as `-RuntimeSelection`, and does not close a caller-owned session. CLI Compile with an explicit `-RuntimeDirectory` uses `Invoke-PscCompile` to acquire one session before lowering, supply it to both structural specialization and ordinary managed lowering (including the managed precursor of Native), and close it in a finally boundary before returning the managed result. The session remains inside the authoring operation, not the process dispatcher. Even an exact-only compilation refuses a missing or incompatible receipt when explicitly requested. Without an explicit directory CLI Compile retains interpreted selection. The retained session may also be supplied to `Export-LoweredAssembly -RuntimeSelection`: ordinary source static/instance calls and explicit constructors preserve the original STS binding witnesses and use the admitted numeric selector for non-exact closed numeric signatures. Method closure, initializer lowering and recursive function-output inference use the same session; a selected compilation owns fresh declaration scopes, including their existing inference caches. Exact source-reference equality and candidate acquisition remain authoring operations; there is no secondary descriptor graph. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
+- **Faculties:** `HandleTable`, `DiscoveryMechanisms`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. BuildRuntime without contract inputs writes a local selection receipt for HandleTable, ScriptType and PrimitiveConversion after successful construction. The compiled numeric selection path verifies source, CoreLib, SMA, the existing TypeConverter framework dependency and all three faculty assembly digests once, loads the exact bytes in a private collectible context, and invokes a typed delegate. Missing or incompatible receipts refuse that path; no implicit interpreted fallback is permitted after selection is requested. Without an explicit directory the authoring selector is unchanged. The receipt identifies a trusted local build; it is not a signature or independent admission proof. This is limited compiler self-consumption, not full startup activation or migration of descriptor identities. `PscApi.AcquireSelection(api,directory)` acquires an explicit resident selection session from the API source revision. `PscRuntimeSelection.Select(session,signatures,sources)` reuses the admitted selector without reading artifacts again; `Close(session)` withdraws it and requests context unloading. Resident structural specialization accepts the same session as `-RuntimeSelection`, and does not close a caller-owned session. CLI Compile with an explicit `-RuntimeDirectory` uses `Invoke-PscCompile` to acquire one session before lowering, supply it to both structural specialization and ordinary managed lowering (including the managed precursor of Native), and close it in a finally boundary before returning the managed result. The session remains inside the authoring operation, not the process dispatcher. Even an exact-only compilation refuses a missing or incompatible receipt when explicitly requested. Without an explicit directory CLI Compile retains interpreted selection. The retained session may also be supplied to `Export-LoweredAssembly -RuntimeSelection`: ordinary source static/instance calls and explicit constructors preserve the original STS binding witnesses and use the admitted numeric selector for non-exact closed numeric signatures. Method closure, initializer lowering and recursive function-output inference use the same session; a selected compilation owns fresh declaration scopes, including their existing inference caches. Exact source-reference equality and candidate acquisition remain authoring operations in ordinary lowering; there is no secondary descriptor graph. `PscScriptTypeAcquisition` constructs signature descriptors from original SMA AST declarations with typed static operations shared by authoring and compiled realization. The descriptor acquisition operation is independently lowerable against compiled ScriptType; its compiled consumer can retain exact source referents without exposing them to SMA, and withdraw the collectible domain. This compiler-side adapter is not yet admitted by the runtime selection receipt or used for ordinary compiled-scope binding. ScriptType.dll remains independent of SMA. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
 - **Evidence:** differential tests, structural lint, Guard, non-loading binary queries and coverage. An observed call is not a universal binding proof; an ABI check is not a proof of arithmetic equivalence.
 
 ## Trust and security
