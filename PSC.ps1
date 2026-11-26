@@ -5328,6 +5328,8 @@ function Build-PscRuntime {
         }
         $source=[PscSource]::new($PSCommandPath,$false)
         if($source.ParseErrors.Count){throw 'Faculty source is not parseable.'}
+        $selectionRecord=Join-Path $RuntimeDirectory 'PSC.runtime-selection.bin'
+        if([IO.File]::Exists($selectionRecord)){[IO.File]::Delete($selectionRecord)}
         $retainedScopes=[Collections.Generic.Dictionary[string,PscDeclarationScope]]::new([StringComparer]::Ordinal)
         foreach($unit in $ordered){
             if($unit.Name -ceq 'ScriptType'){
@@ -5336,6 +5338,7 @@ function Build-PscRuntime {
                 Build-PscFaculty -Faculty $unit.Name -RuntimeDirectory $RuntimeDirectory -RetainedSource $source -RetainedScopes $retainedScopes
             }
         }
+        if(!$ContractPaths.Count -and !$ContractReferences.Count){Write-PscRuntimeSelectionRecord -Directory $RuntimeDirectory -Source $source}
         return
     }
     $exe=Join-Path $PSHOME 'pwsh'
@@ -5354,6 +5357,87 @@ function Build-PscRuntime {
         & $exe -NoProfile -File $PSCommandPath -Mode BuildRuntime -RuntimeDirectory $RuntimeDirectory -ContractInputsPath $transport
         if($LASTEXITCODE -ne 0){throw 'PSC runtime coordinator failed.'}
     }finally{[IO.Directory]::Delete($transportDirectory,$true)}
+}
+
+# A local build receipt is an integrity relationship, not publisher authentication.
+# Only an explicitly selected runtime directory may supply executable faculties.
+function Get-PscSelectionFacultyNames {
+    [OutputType([string])]
+    param()
+    'HandleTable'; 'ScriptType'; 'PrimitiveConversion'
+}
+function Write-PscRuntimeSelectionRecord {
+    [OutputType([void])]
+    param([string]$Directory,[PscSource]$Source)
+    if([PscRuntimeInventory]::FileDigest($Source.Path) -cne $Source.Sha256){throw 'Faculty source changed during realization.'}
+    $path=Join-Path $Directory 'PSC.runtime-selection.bin'
+    $temporary=$path+'.'+[Guid]::NewGuid().ToString('N')
+    try{
+        $writer=[IO.BinaryWriter]::new([IO.File]::Open($temporary,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None))
+        try{
+            $writer.Write('PSC.Runtime.Selection/1')
+            $writer.Write($Source.Sha256)
+            $writer.Write([PscRuntimeInventory]::FileDigest([object].Assembly.Location))
+            $writer.Write([PscRuntimeInventory]::FileDigest([System.Management.Automation.PSObject].Assembly.Location))
+            $writer.Write([PscRuntimeInventory]::FileDigest([ComponentModel.TypeConverter].Assembly.Location))
+            foreach($name in Get-PscSelectionFacultyNames){
+                $writer.Write($name)
+                $writer.Write([PscRuntimeInventory]::FileDigest((Join-Path $Directory ($name+'.dll'))))
+            }
+        }finally{$writer.Dispose()}
+        [IO.File]::Move($temporary,$path,$true)
+    }finally{if([IO.File]::Exists($temporary)){[IO.File]::Delete($temporary)}}
+}
+function Open-PscRuntimeSelection {
+    [OutputType([Func[type[][],type[],int]])]
+    param([string]$Directory)
+    $path=Join-Path ([IO.Path]::GetFullPath($Directory)) 'PSC.runtime-selection.bin'
+    $record=[IO.File]::ReadAllBytes($path)
+    if($record.Length -gt 2048){throw 'Invalid faculty selection receipt size.'}
+    $reader=[IO.BinaryReader]::new([IO.MemoryStream]::new($record,$false))
+    $names=[string[]]@(Get-PscSelectionFacultyNames)
+    $images=[byte[][]]::new($names.Length)
+    try{
+        if($reader.ReadString() -cne 'PSC.Runtime.Selection/1'){throw 'Invalid faculty selection receipt.'}
+        if($reader.ReadString() -cne [PscRuntimeInventory]::FileDigest($PSCommandPath)){throw 'Faculty selection source identity mismatch.'}
+        if($reader.ReadString() -cne [PscRuntimeInventory]::FileDigest([object].Assembly.Location) -or $reader.ReadString() -cne [PscRuntimeInventory]::FileDigest([System.Management.Automation.PSObject].Assembly.Location)){throw 'Faculty selection host identity mismatch.'}
+        if($reader.ReadString() -cne [PscRuntimeInventory]::FileDigest([ComponentModel.TypeConverter].Assembly.Location)){throw 'Faculty selection conversion dependency identity mismatch.'}
+        for($index=0;$index -lt $names.Length;$index++){
+            $name=$names[$index]
+            if($reader.ReadString() -cne $name){throw 'Faculty selection dependency identity mismatch.'}
+            $image=[IO.File]::ReadAllBytes((Join-Path $Directory ($name+'.dll')))
+            if($reader.ReadString() -cne [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($image))){throw "Faculty selection artifact identity mismatch: $name"}
+            $images[$index]=$image
+        }
+        if($reader.BaseStream.Position -ne $reader.BaseStream.Length){throw 'Trailing faculty selection receipt data.'}
+    }finally{$reader.Dispose()}
+    # Load the exact verified bytes together; authoring descriptors never cross this context.
+    $context=[System.Runtime.Loader.AssemblyLoadContext]::new('PSC.Runtime.Selection',$true)
+    try{
+        $admitted=[Collections.Generic.Dictionary[string,Reflection.AssemblyName]]::new([StringComparer]::Ordinal)
+        $core=[object].Assembly.GetName()
+        $admitted.Add($core.Name,$core)
+        $loaded=[Reflection.Assembly[]]::new($names.Length)
+        for($index=0;$index -lt $names.Length;$index++){
+            $stream=[IO.MemoryStream]::new($images[$index],$false)
+            try{$assembly=$context.LoadFromStream($stream)}finally{$stream.Dispose()}
+            if($assembly.GetName().Name -cne $names[$index]){throw 'Faculty selection assembly identity mismatch.'}
+            if($names[$index] -ceq 'PrimitiveConversion'){
+                # The existing textual conversion operations share this assembly with the selector.
+                $converter=[ComponentModel.TypeConverter].Assembly.GetName()
+                $admitted.Add($converter.Name,$converter)
+            }
+            foreach($reference in $assembly.GetReferencedAssemblies()){
+                if(!$admitted.ContainsKey($reference.Name) -or $admitted[$reference.Name].FullName -cne $reference.FullName){throw "Unexpected faculty selection dependency: $($reference.FullName)"}
+            }
+            $admitted.Add($names[$index],$assembly.GetName())
+            $loaded[$index]=$assembly
+        }
+        $target=$loaded[$loaded.Length-1].GetType('ScriptTypePrimitiveConversion',$true,$false)
+        $method=$target.GetMethod('SelectSignatures',[Reflection.BindingFlags]'Public,Static,DeclaredOnly',$null,[type[]]@([type[][]],[type[]]),$null)
+        if($null -eq $method -or $method.ReturnType -ne [int]){throw 'Faculty selection realization signature mismatch.'}
+        return $method.CreateDelegate([Func[type[][],type[],int]])
+    }catch{$context.Unload();throw}
 }
 function Read-PscContractInputs([string]$Path){
     $reader=[IO.BinaryReader]::new([IO.File]::OpenRead($Path))
@@ -15201,15 +15285,15 @@ function Get-PscStructuralMembers {
 # ranking as runtime ScriptType dispatch. CLR types describe only this
 # admitted compatibility fragment; no provider methods participate.
 function Select-PscStructuralNumericOverload {
-    param([System.Management.Automation.Language.FunctionMemberAst[]]$Candidates,[type[]]$ArgumentTypes)
+    param([System.Management.Automation.Language.FunctionMemberAst[]]$Candidates,[type[]]$ArgumentTypes,[Func[type[][],type[],int]]$Selection)
     $signatures=[type[][]]::new($Candidates.Length)
     for($candidateIndex=0;$candidateIndex -lt $Candidates.Length;$candidateIndex++){$signatures[$candidateIndex]=Get-ParameterTypes $Candidates[$candidateIndex]}
-    $index=Get-PscFacultyDeclarations -SelectionSignatures $signatures -SelectionSources $ArgumentTypes
+    $index=if($null -ne $Selection){$Selection.Invoke($signatures,$ArgumentTypes)}else{Get-PscFacultyDeclarations -SelectionSignatures $signatures -SelectionSources $ArgumentTypes}
     return $Candidates[$index]
 }
 
 function ConvertTo-PscStructuralSource {
-    param([System.Management.Automation.Language.ScriptBlockAst]$Root,[string]$ClassName,[string[]]$MethodNames,[Collections.IDictionary]$Bindings)
+    param([System.Management.Automation.Language.ScriptBlockAst]$Root,[string]$ClassName,[string[]]$MethodNames,[Collections.IDictionary]$Bindings,[string]$SelectionDirectory)
     # The declared shape and actual realization are deliberately independent.
     # This first admitted fragment handles direct, statically named instance
     # member access; escaping, rebinding and ambiguous overloads fail closed.
@@ -15220,6 +15304,8 @@ function ConvertTo-PscStructuralSource {
     $erased=[System.Collections.Generic.HashSet[System.Management.Automation.Language.Ast]]::new()
     $argumentCasts=[System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast,type]]::new()
     $used=[System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    [Func[type[][],type[],int]]$selection=$null
+    try{
     foreach($method in $owner[0].Members){
         if($method -isnot [System.Management.Automation.Language.FunctionMemberAst] -or $method.Name -notin $MethodNames){continue}
         if(!$method.IsStatic -or $method.IsConstructor){throw 'Structural lowering currently admits static operations only.'}
@@ -15268,7 +15354,8 @@ function ConvertTo-PscStructuralSource {
                         }
                     }
                     if($closedNumeric -and $required.Count){
-                        $required=@(Select-PscStructuralNumericOverload -Candidates $required -ArgumentTypes $argumentTypes.ToArray())
+                        if($SelectionDirectory -and $null -eq $selection){$selection=Open-PscRuntimeSelection -Directory $SelectionDirectory}
+                        $required=@(Select-PscStructuralNumericOverload -Candidates $required -ArgumentTypes $argumentTypes.ToArray() -Selection $selection)
                     }elseif($required.Count -gt 1){
                         $required=@(foreach($candidate in $required){
                             $signature=Get-ParameterTypes $candidate;$ok=$true
@@ -15310,6 +15397,7 @@ function ConvertTo-PscStructuralSource {
     foreach($key in $Bindings.Keys){if(!$used.Contains([string]$key)){throw "Unused structural binding '$key'."}}
     if(!$erased.Count){throw 'No structural parameter was admitted.'}
     return [PscStructuralRewrite]::new($receivers,$erased,$argumentCasts).Rebuild($Root)
+    }finally{if($null -ne $selection){[System.Runtime.Loader.AssemblyLoadContext]::GetLoadContext($selection.Method.DeclaringType.Assembly).Unload()}}
 }
 
 # Exact typed thunks generated from the compiled source contract. No source
@@ -15875,7 +15963,7 @@ Conform streams child stdout and stderr to the invoking host as they become avai
 
 - **Managed:** SMA AST and typed expression lowering, deterministic IL emission, static graph/data realization, reachability and fixed-parameter specialization.
 - **Native:** pinned Windows NativeAOT compiler plus PSC COFF linker; direct CIL-to-IR-to-x64 ELF leaf emission and decoded-byte ABI checks. The direct backend does not yet replace ILC for general programs.
-- **Faculties:** `HandleTable`, `DiscoveryMechanisms`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. This is build integration, not normal-startup activation. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
+- **Faculties:** `HandleTable`, `DiscoveryMechanisms`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. BuildRuntime without contract inputs writes a local selection receipt for HandleTable, ScriptType and PrimitiveConversion after successful construction. Structural specialization with an explicit `-RuntimeDirectory` uses the compiled numeric selector on demand: verify source, CoreLib, SMA, the existing TypeConverter framework dependency and all three faculty assembly digests once, load the exact bytes in a private collectible context, and invoke a typed delegate. Missing or incompatible receipts refuse that path; no implicit interpreted fallback is permitted after selection is requested. Without an explicit directory the authoring selector is unchanged. The receipt identifies a trusted local build; it is not a signature or independent admission proof. This is limited compiler self-consumption, not full startup activation or migration of descriptor identities. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
 - **Evidence:** differential tests, structural lint, Guard, non-loading binary queries and coverage. An observed call is not a universal binding proof; an ABI check is not a proof of arithmetic equivalence.
 
 ## Trust and security
@@ -20638,7 +20726,7 @@ Full command help and live mode inventory follow.
                     $full=[PscTreeText]::FullPath($SourcePath)
                     $structuralRoot=Read-PowerShellSource -Source ([IO.File]::ReadAllText($full)) -SourceFile $full
                 }
-                $compileParameters['SourceAst']=ConvertTo-PscStructuralSource -Root $structuralRoot -ClassName $ClassName -MethodNames $MethodNames -Bindings $StructuralBindings
+                $compileParameters['SourceAst']=ConvertTo-PscStructuralSource -Root $structuralRoot -ClassName $ClassName -MethodNames $MethodNames -Bindings $StructuralBindings -SelectionDirectory $(if($PSBoundParameters.ContainsKey('RuntimeDirectory')){$RuntimeDirectory}else{''})
                 $null=$compileParameters.Remove('SourcePath')
                 if (!$ClassNames) { $compileParameters['ClassNames']=[string[]]@($ClassName) }
                 foreach($shapeName in $StructuralBindings.Keys){if($shapeName -in $compileParameters['ClassNames']){throw "Structural contract '$shapeName' must be erased, not emitted."}}
