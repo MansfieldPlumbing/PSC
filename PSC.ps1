@@ -2465,7 +2465,7 @@ class PscDeclarationScope {
     [Collections.Generic.Dictionary[System.Management.Automation.Language.FunctionMemberAst,type]] $FunctionOutputTypes = [Collections.Generic.Dictionary[System.Management.Automation.Language.FunctionMemberAst,type]]::new()
 }
 function Get-PscFacultyDeclarations {
-    param([string[]]$ContractPaths,[System.Management.Automation.Language.TypeDefinitionAst[]]$CompilerClassAsts,[hashtable]$MaterializedTypes,[type[][]]$SelectionSignatures,[type[]]$SelectionSources,[PscDeclarationScope]$DeclarationScope,[System.Management.Automation.Language.TypeDefinitionAst]$BindingOwner,[string]$BindingName,[type[]]$BindingArguments,[bool]$BindingStatic,[bool]$BindingConstructor,[PscDeclarationScope[]]$BindingScopes,[ScriptTypeReference]$ComparisonLeft,[ScriptTypeReference]$ComparisonRight,[ScriptTypeContract]$ReferenceContract,[string]$ReferenceName,[ScriptTypeReference[]]$ReferenceParameters,[bool]$ReferenceStatic,[bool]$ReferenceConstructor,[switch]$DependencyContractsOnly,[PscDeclarationScope[]]$RetainedDependencyScopes)
+    param([string[]]$ContractPaths,[System.Management.Automation.Language.TypeDefinitionAst[]]$CompilerClassAsts,[hashtable]$MaterializedTypes,[type[][]]$SelectionSignatures,[type[]]$SelectionSources,[PscDeclarationScope]$DeclarationScope,[System.Management.Automation.Language.TypeDefinitionAst]$BindingOwner,[string]$BindingName,[type[]]$BindingArguments,[bool]$BindingStatic,[bool]$BindingConstructor,[PscDeclarationScope[]]$BindingScopes,[ScriptTypeReference]$ComparisonLeft,[ScriptTypeReference]$ComparisonRight,[ScriptTypeContract]$ReferenceContract,[string]$ReferenceName,[ScriptTypeReference[]]$ReferenceParameters,[bool]$ReferenceStatic,[bool]$ReferenceConstructor,[switch]$DependencyContractsOnly,[PscDeclarationScope[]]$RetainedDependencyScopes,[type]$PersistedBindingTarget)
 
 # Only descriptor types are realized in the authoring scope. Other faculties must not shadow imported CLR identities.
 # The semantic description and the executable generation are ordinary HandleTable objects.
@@ -5059,8 +5059,36 @@ function Get-ScriptTypeContract {
             if($null -eq $references[$i]){return $null}
         }
         $exact=[ScriptTypeContract]::BindDeclared($contract, $BindingName,$references,$BindingStatic,$BindingConstructor)
-        if($null -ne $exact){return $exact}
-        return Get-PscOtherFacultyDeclarations -BindingContract $contract -BindingName $BindingName -BindingReferences $references -BindingStatic $BindingStatic -BindingConstructor $BindingConstructor
+        $binding=$exact
+        if($null -eq $binding){$binding=Get-PscOtherFacultyDeclarations -BindingContract $contract -BindingName $BindingName -BindingReferences $references -BindingStatic $BindingStatic -BindingConstructor $BindingConstructor}
+        if($null -eq $binding -or $null -eq $PersistedBindingTarget){return $binding}
+        # The selected semantic member is authoritative. CLR supplies only an exact realization.
+        $flags=[Reflection.BindingFlags]'Public,DeclaredOnly'
+        if($BindingConstructor){$operations=$PersistedBindingTarget.GetConstructors($flags -bor [Reflection.BindingFlags]::Instance)}
+        else{
+            if($BindingStatic){$flags=$flags -bor [Reflection.BindingFlags]::Static}else{$flags=$flags -bor [Reflection.BindingFlags]::Instance}
+            $operations=$PersistedBindingTarget.GetMethods($flags)
+        }
+        $selectedOperation=$null
+        foreach($operation in $operations){
+            if(!$BindingConstructor -and ($operation.Name -ine $binding.Member.Name -or $operation.ContainsGenericParameters)){continue}
+            $parameters=$operation.GetParameters()
+            if($parameters.Length -ne $binding.Member.ParameterReferences.Length){continue}
+            $matches=$true
+            for($index=0;$index -lt $parameters.Length;$index++){
+                $reference=ConvertTo-PscBindingReference $parameters[$index].ParameterType $BindingScopes
+                if(![ScriptTypeReference]::Same($binding.Member.ParameterReferences[$index],$reference)){$matches=$false;break}
+            }
+            if(!$matches){continue}
+            if($null -ne $selectedOperation){throw [Reflection.AmbiguousMatchException]::new('Multiple CLR realizations of selected STS operation')}
+            $selectedOperation=$operation
+        }
+        if($null -eq $selectedOperation){throw [MissingMethodException]::new('Selected STS operation has no persisted realization')}
+        if(!$BindingConstructor){
+            $resultReference=ConvertTo-PscBindingReference $selectedOperation.ReturnType $BindingScopes
+            if(![ScriptTypeReference]::Same($binding.Member.ResultReference,$resultReference)){throw [InvalidOperationException]::new('Selected STS operation persisted result differs')}
+        }
+        return $selectedOperation
     }
     # This is a CLR realization adapter, not a semantic binding operation. Only
     # source-owned leaves use the selected definition map; existing imported and
@@ -10361,12 +10389,28 @@ function Add-GenericInference([Type] $Pattern, [Type] $Actual, [hashtable] $Bind
 function Resolve-PscSourceOperation {
     [OutputType([Reflection.MethodBase])]
     param([System.Management.Automation.Language.Ast]$SourceAst,[type]$TargetType,[string]$Name,[type[]]$ArgumentTypes,[bool]$Static,[bool]$Constructor)
-    if($null -eq $SourceAst -or !$TargetType.Assembly.IsDynamic){return $null}
+    if($null -eq $SourceAst){return $null}
     $root=Resolve-PscDeclarationRoot $SourceAst
     $source=$null
     if(!$script:ScriptFunctionSources.TryGetValue($root,[ref]$source)){$source=$root}
     $scope=Get-PscOperationalScope -Root $source -ExistingOnly
     if($null -eq $scope){return $null}
+    if(!$TargetType.Assembly.IsDynamic){
+        $dependencyScope=$scope.Resolving
+        while($null -ne $dependencyScope){
+            if($dependencyScope.Types[$TargetType.Name] -eq $TargetType){
+                foreach($definition in $dependencyScope.Contracts.Keys){
+                    if($definition.Name -ine $TargetType.Name){continue}
+                    $operationName=$Name
+                    if($Constructor){$operationName=$definition.Name}
+                    return Get-PscFacultyDeclarations -DeclarationScope $dependencyScope -BindingOwner $definition -BindingName $operationName -BindingArguments $ArgumentTypes -BindingStatic $Static -BindingConstructor $Constructor -BindingScopes @($scope) -PersistedBindingTarget $TargetType
+                }
+                return $null
+            }
+            $dependencyScope=$dependencyScope.Resolving
+        }
+        return $null
+    }
     $ownerScope=$scope
     if($scope.Types[$TargetType.Name] -ne $TargetType){
         $functionClass=$null
@@ -10431,7 +10475,7 @@ function Resolve-MatchingMethod {
         [System.Management.Automation.Language.Ast] $SourceAst
     )
 
-    if($null -ne $SourceAst -and $TargetType.Assembly.IsDynamic){
+    if($null -ne $SourceAst){
         $sourceOperation=Resolve-PscSourceOperation $SourceAst $TargetType $MethodName $ArgumentTypes $IsStatic.IsPresent $false
         if($null -ne $sourceOperation){return [Reflection.MethodInfo]$sourceOperation}
     }
@@ -10580,7 +10624,7 @@ function Resolve-MatchingConstructor {
         [System.Management.Automation.Language.Ast] $SourceAst
     )
 
-    if($null -ne $SourceAst -and $TargetType.Assembly.IsDynamic){
+    if($null -ne $SourceAst){
         $sourceOperation=Resolve-PscSourceOperation $SourceAst $TargetType 'new' $ArgumentTypes $false $true
         if($null -ne $sourceOperation){return [Reflection.ConstructorInfo]$sourceOperation}
     }
@@ -15765,7 +15809,7 @@ Conform streams child stdout and stderr to the invoking host as they become avai
 
 - **Managed:** SMA AST and typed expression lowering, deterministic IL emission, static graph/data realization, reachability and fixed-parameter specialization.
 - **Native:** pinned Windows NativeAOT compiler plus PSC COFF linker; direct CIL-to-IR-to-x64 ELF leaf emission and decoded-byte ABI checks. The direct backend does not yet replace ILC for general programs.
-- **Faculties:** `HandleTable`, `InquiryPrimitives`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding; imported executable member calls still use the CLR compatibility boundary. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. This is build integration, not normal-startup activation. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
+- **Faculties:** `HandleTable`, `InquiryPrimitives`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. This is build integration, not normal-startup activation. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
 - **Evidence:** differential tests, structural lint, Guard, non-loading binary queries and coverage. An observed call is not a universal binding proof; an ABI check is not a proof of arithmetic equivalence.
 
 ## Trust and security
