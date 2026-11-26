@@ -1006,7 +1006,7 @@ $doc.Save()
 
 All paired replacements in a group are checked for overlapping extents and parsed together before updating the journal. Re-query after any change, undo or redo. Save refuses a changed on-disk file and uses a sibling temporary file; it is not a cross-process locking protocol. Document query requires a fully parsed source unit; incomplete fragments may instead be edited in an external editor and checked by Collate. The piece-table model is adapted from Notepad.ps1 at 17b76e2, not its cached find/replace UI logic. Dirty state compares content hashes, including after a new branch of edits.
 
-To reproduce development fixtures, first UnCollate and run `Tests/Test-Document.ps1`, `Tests/Test-Worktree.ps1` and `Tests/Test-Guard.ps1` in the projected tree, passing `-Compiler ./PSC.ps1`. `PscApi.Lint(paths)` or `-Mode Lint -LintObjects` returns typed findings with AST extents, diagnostic text, named authoring scope and a baseline identity. Guard compares occurrences of identities, not aggregate counts. Embedded source resources are discovered from literal AST declarations and assessed independently by resource path; an existing finding cannot excuse a finding in another resource. Non-source resources are not linted. Casing uses known local declarations and visible enclosing names; arbitrary dynamic scope and invoked scriptblocks remain unresolved, not proven bindings.
+To reproduce development fixtures, first UnCollate and run `Tests/Test-Document.ps1`, `Tests/Test-Worktree.ps1` and `Tests/Test-Guard.ps1` in the projected tree, passing `-Compiler ./PSC.ps1`. `PscApi.Lint(paths)` or `-Mode Lint -LintObjects` returns typed findings with AST extents, diagnostic text, named authoring scope and a baseline identity. Guard requires zero current findings, including committed findings and findings in the checker itself. Embedded source modules are acquired from literal AST declarations and assessed independently by resource path. Historical test modules remain evidence, not a waiver of the current policy. Non-source resources are not linted. Casing uses known local declarations and visible enclosing names; arbitrary dynamic scope and invoked scriptblocks remain unresolved, not proven bindings.
 
 ## Development criteria
 
@@ -5461,7 +5461,28 @@ function Get-SmaLint {
         if (!$identity) { $identity = $scope + '|' + $detail }
         [SmaLintFinding]@{ File = $file; Line = $node.Extent.StartLineNumber; Rule = $rule; Detail = $detail; Identity = $identity; Scope = $scope; Extent = $node.Extent; Edits = $edits }
     }
-    $variables = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.VariableExpressionAst] }, $true))
+    # The parser's root and named declaration bodies are evidence, not authored scriptblock expressions.
+    # This policy applies to PSC authoring, not to the language compatibility of Compile inputs.
+    $variables = [Collections.Generic.List[System.Management.Automation.Language.VariableExpressionAst]]::new()
+    foreach ($node in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.VariableExpressionAst] -or $args[0] -is [System.Management.Automation.Language.ScriptBlockExpressionAst] -or $args[0] -is [System.Management.Automation.Language.TypeExpressionAst] -or $args[0] -is [System.Management.Automation.Language.TypeConstraintAst] -or $args[0] -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true)) {
+        if ($node -is [System.Management.Automation.Language.VariableExpressionAst]) {
+            $variables.Add($node)
+            if ($node.Extent.StartLineNumber -gt 0 -and $node.Extent.EndOffset -gt $node.Extent.StartOffset -and !$node.VariablePath.IsDriveQualified -and $node.VariablePath.UserPath.Split(':')[-1] -ieq 'this') { & $finding 'ImplicitReceiver' $node 'Implicit receiver is prohibited in PSC source; declare typed referents.' }
+        } elseif ($node -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) {
+            & $finding 'ScriptBlockExpression' $node 'Authored scriptblock expressions are prohibited; use named module operations.'
+        } elseif ($node -is [System.Management.Automation.Language.TypeExpressionAst] -or $node -is [System.Management.Automation.Language.TypeConstraintAst]) {
+            $typeNames = [Collections.Generic.Stack[System.Management.Automation.Language.ITypeName]]::new()
+            $typeNames.Push($node.TypeName)
+            while ($typeNames.Count) {
+                $typeReference = $typeNames.Pop()
+                if ($typeReference -is [System.Management.Automation.Language.ArrayTypeName]) { $typeNames.Push($typeReference.ElementType); continue }
+                if ($typeReference -is [System.Management.Automation.Language.GenericTypeName]) { $typeNames.Push($typeReference.TypeName); foreach ($argumentType in $typeReference.GenericArguments) { $typeNames.Push($argumentType) }; continue }
+                if ($typeReference.FullName.Split('.')[-1] -in 'ScriptBlockAst','ScriptBlock') { & $finding 'ScriptBlockType' $node ('Prohibited authored scriptblock type reference: ' + $typeReference.FullName) }
+            }
+        } elseif ($node.Member -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $node.Member.Value -ieq 'GetScriptBlock') {
+            & $finding 'ExecutableAstMaterialization' $node 'Executable AST materialization is prohibited; lower named declarations.'
+        }
+    }
     $locals = [Collections.Generic.Dictionary[System.Management.Automation.Language.Ast,Collections.Generic.HashSet[string]]]::new()
     $scopeOfVariable = [Collections.Generic.Dictionary[System.Management.Automation.Language.Ast,System.Management.Automation.Language.Ast]]::new()
     foreach ($variable in $variables) {
@@ -5511,7 +5532,7 @@ function Get-SmaLint {
             foreach ($variable in $method.Body.FindAll({ $args[0] -is [System.Management.Automation.Language.VariableExpressionAst] -and -not $args[0].VariablePath.IsDriveQualified }, $true)) {
                 $variableName = $variable.VariablePath.UserPath
                 if ($variableName -eq 'this' -or -not $properties.Contains($variableName) -or $parameterNames.Contains($variableName) -or !$reported.Add($variableName)) { continue }
-                $how = if ($assigned.Contains($variableName)) { 'assigned as a local' } else { 'read but never assigned or passed in; $this.' + $variableName + ' was probably meant' }
+                $how = if ($assigned.Contains($variableName)) { 'assigned as a local' } else { 'read but never assigned or passed in; an explicit referent is required for ' + $variableName }
                 & $finding 'LocalShadowsProperty' $variable ("`$$variableName in $($type.Name).$($method.Name) shares property $($type.Name).$variableName's name and is $how")
             }
         }
@@ -5546,6 +5567,7 @@ function Get-SmaLint {
                 }
             }
             if ($null -eq $typeArgument -and $elements.Count -gt 1 -and $elements[1] -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $typeArgument = $elements[1] }
+            if ($typeArgument -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $typeArgument.Value.Split('.')[-1] -in 'ScriptBlockAst','ScriptBlock') { & $finding 'ScriptBlockType' $typeArgument ('Prohibited authored scriptblock construction: ' + $typeArgument.Value) }
             if ($typeArgument -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $typeArgument.Value -in $unsafeFormatters) { & $finding 'UnsafeDeserialization' $typeArgument ('Insecure formatter construction: ' + $typeArgument.Value) }
         }
     }
@@ -5899,21 +5921,13 @@ function Get-SmaChecker {
         @($node.Body.ParamBlock.Attributes | Where-Object { $_.TypeName.Name -eq [PscVerify].Name }).Count }, $true)
 }
 
-function Compare-SmaGuardFindings {
+function Add-SmaGuardFindings {
     [PscVerify()]
-    param([SmaLintFinding[]]$before,[SmaLintFinding[]]$after,[Collections.Generic.List[string]]$reasons,[string]$resourcePath)
+    param([SmaLintFinding[]]$findings,[Collections.Generic.List[string]]$reasons,[string]$resourcePath)
     $prefix=if($resourcePath){$resourcePath+': '}else{''}
-    foreach ($rule in $after | Group-Object Rule) {
-        $was = @($before | Where-Object Rule -EQ $rule.Name)
-        $known = [Collections.Generic.Dictionary[string,int]]::new([StringComparer]::Ordinal)
-        foreach ($observation in $was) {
-            if (!$known.ContainsKey($observation.Identity)) { $known.Add($observation.Identity,0) }
-            $known[$observation.Identity]++
-        }
-        foreach ($observation in $rule.Group) {
-            if ($known.ContainsKey($observation.Identity) -and $known[$observation.Identity] -gt 0) { $known[$observation.Identity]--; continue }
-            $reasons.Add(($prefix+'{0}: new finding at line {1}: {2}' -f $rule.Name, $observation.Line, $observation.Detail))
-        }
+    # Every current finding fails admission. Committed occurrences are not exemptions.
+    foreach ($observation in $findings) {
+        $reasons.Add(($prefix+'{0}: finding at line {1} ({2}): {3}' -f $observation.Rule, $observation.Line, $observation.Scope, $observation.Detail))
     }
 }
 function Get-SmaGuardResources {
@@ -5929,6 +5943,7 @@ function Get-SmaGuardResources {
 function Test-SmaGuard {
     [PscVerify()]
     param([string] $file, [string] $expectedHash, [AllowNull()][PscCommittedSource] $committedSource)
+    # Strict policy supersedes the historical occurrence comparison: any current finding fails.
     $tokens = $errors = $committedErrors = $null
     $candidateBytes = [IO.File]::ReadAllBytes($file)
     $candidateDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($candidateBytes))
@@ -5939,22 +5954,21 @@ function Test-SmaGuard {
     $reasons = [Collections.Generic.List[string]]::new()
     foreach ($problem in $errors) { $reasons.Add(('parse error at line {0}: {1}' -f $problem.Extent.StartLineNumber, $problem.Message)) }
     $committedText = if ($committed) { [PscCommittedSource]::DecodeGuardText($committedSource.Bytes) }
-    $before = @(if ($committed) { Get-SmaLint $comparisonPath $committedText })
     $after = @(Get-SmaLint $comparisonPath $text)
-    Compare-SmaGuardFindings $before $after $reasons ''
+    Add-SmaGuardFindings $after $reasons ''
     $committedAst=if($committed){[System.Management.Automation.Language.Parser]::ParseInput($committedText,[ref]$tokens,[ref]$committedErrors)}
     try {
         $beforeResources=@(if($committed){Get-SmaGuardResources $committedAst})
         $afterResources=@(Get-SmaGuardResources $ast)
         if($beforeResources.Count -and !$afterResources.Count){$reasons.Add('Embedded resource holder removed or emptied.')}
-        $priorResources=[Collections.Generic.Dictionary[string,PscTreeUnit]]::new([StringComparer]::Ordinal)
-        foreach($resource in $beforeResources){$priorResources.Add($resource.Path,$resource)}
+        # Historical resources remain evidence, not a source of lint exemptions.
+
         foreach($resource in $afterResources){
             if(![PscSourceFormat]::IsSource($resource.Path)){continue}
             try{$null=Read-PscTreeAst $resource.Text $resource.Path -Resource}catch{$reasons.Add($_.Exception.Message);continue}
-            $priorFindings=@(if($priorResources.ContainsKey($resource.Path)){Get-SmaLint $resource.Path $priorResources[$resource.Path].Text})
+
             $currentFindings=@(Get-SmaLint $resource.Path $resource.Text)
-            Compare-SmaGuardFindings $priorFindings $currentFindings $reasons $resource.Path
+            Add-SmaGuardFindings $currentFindings $reasons $resource.Path
         }
     } catch { $reasons.Add('Embedded resource coverage failed: '+$_.Exception.Message) }
     $prior = @(if ($committed) { Get-SmaChecker $committedAst })
@@ -15499,6 +15513,8 @@ $result.Stages | Select-Object Name,State,ExitCode
 ```
 
 External edits to projected files are also supported. Start with a clean Git baseline and a new or matching projection. Collate needs a fresh candidate destination and rejects missing/untracked units and changed declaration boundaries. Additions, deletions and renames still require explicit canonical edits. Affected reports declared faculty dependencies, not exhaustive semantic or test coverage. No tests are omitted based on Affected.
+
+**Strict authoring admission (migration in progress):** PSC and its embedded source modules, including the checker, are held to zero current lint findings. Guard no longer grants exemptions for findings in committed source. Lint reports implicit receivers, authored scriptblock expressions, explicit scriptblock type references (including nested array/generic references) and executable AST materialization. Parser-owned declaration roots are source evidence, not authored expressions. Compile remains a separate SMA compatibility boundary. The current source intentionally fails Guard during migration; no claim of acceptance or full conformance is made. Existing historical test modules are retained as evidence, including former grandfathering expectations that conflict with the new rule. Continue independent tests without treating them as admission. New source edits use PSC's revision-bound document API. The module activation and native semantic control requirements are in AGENTS.md; they are not yet implemented.
 
 Conform streams child stdout and stderr to the invoking host as they become available, with stage names, paths and completion status; the typed receipt retains each decoded stream separately. Cross-stream display order is not a guaranteed chronological ordering. Conform runs Guard against committed source, the candidate API and projection, then literal regression resources obtained from the same committed baseline without candidate execution. If the embedded resource inventory changes, supplementary candidate regression stages also run. Standalone and candidate Guard consume byte-verified committed source directly, without staging a temporary Git repository. Both record the candidate digest and, when present, the committed path, commit, blob identity and digest. Conform reuses that same committed object. A standalone file without a committed baseline is held to zero findings and an empty verification inventory; failed reads of existing objects are not treated as absence. Guard parses decoded source without line joining; only protected extent comparison normalizes line endings. Unborn Git repositories require Git support for show-ref --exists. The report identifies the runner and resource digests. Required stages are declared before execution, with exact names, provenance, source identity and permitted states; VerifyStages checks the observations against those requirements; VerifyScope independently requires the ordered mandatory compiler and fixture stages, resource inventory identities and permitted Verify outcome. VerifyConformance re-extracts both resource inventories from the retained committed bytes and the identified candidate, comparing independent baseline and runner digest pins. Conform also pins the observed absolute PowerShell executable path and file digest before launch and after every executed stage. Executed stages carry that identity; skipped stages do not. Supply -ExpectedHostSha256 to Conform or VerifyConformance to check an independently retained executable digest. Legacy scope reports may lack host evidence and cannot satisfy an independent host pin. Conform additionally inventories ten fixed files in the colocated PowerShell distribution (entry assembly, deps/runtimeconfig, ConsoleHost, SMA, CoreLib, CoreCLR, JIT, hostfxr and hostpolicy), checks their bytes before and after each executed stage and at completion, and records the ordered inventory digest in executed stages. VerifyConformance checks the recorded inventory structure and stage identities; -ExpectedRuntimeSha256 independently pins that digest. Legacy reports cannot satisfy this independent pin without runtime evidence. This is a bounded file inventory, not an observation of child module loads, complete runtime dependency closure or process authentication; non-colocated hosts are not admitted. Roadmap checks retained inputs when present; legacy reports without retained bytes remain scope-only observations. Primary fixture stages use baseline resources, and Candidate/ stages identify supplementary tests. Candidate resource extraction is checked against the Guard digest; the candidate and complete runner identities are checked before and after each stage. This detects persistent interstage changes, not changes made and restored within one child process. Guard and Conform resolve one absolute Git executable through application-only discovery, pin its SHA-256 before and after every committed-source read, and retain its path and digest. Supply -ExpectedGitSha256 to Guard, Conform or VerifyConformance to compare an independently retained executable digest; legacy reports without Git evidence cannot satisfy that pin. This does not authenticate Git, pin its libraries or helpers, or constrain Git invocations inside candidate fixtures. Standalone replacement-reference checks use the same native read boundary as committed-object acquisition. The byte-level blob identity calculation follows Pwsh prior art. Report consistency does not authenticate the runner or its evidence. This is not full assessment-authority closure: the caller must choose a trusted runner, and historical Verify still executes candidate code. `true` selects development scope and skips historical Windows verification (`Complete = False`); `false` requests the full suite and requires its native toolchain. Review the result before explicitly promoting the candidate. Use `git diff -- PSC.ps1`, commit the reviewed change, verify HEAD, then open a fresh projection. Never silently change protected checkers. See [AGENTS.md](AGENTS.md) for engineering requirements.
 
