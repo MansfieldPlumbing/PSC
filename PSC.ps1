@@ -2449,7 +2449,7 @@ class PscDeclarationScope {
     [Collections.Generic.Dictionary[System.Management.Automation.Language.FunctionMemberAst,type]] $FunctionOutputTypes = [Collections.Generic.Dictionary[System.Management.Automation.Language.FunctionMemberAst,type]]::new()
 }
 function Get-PscFacultyDeclarations {
-    param([string[]]$ContractPaths,[System.Management.Automation.Language.TypeDefinitionAst[]]$CompilerClassAsts,[hashtable]$MaterializedTypes,[type[][]]$SelectionSignatures,[type[]]$SelectionSources,[PscDeclarationScope]$DeclarationScope,[System.Management.Automation.Language.TypeDefinitionAst]$BindingOwner,[string]$BindingName,[type[]]$BindingArguments,[bool]$BindingStatic,[bool]$BindingConstructor,[PscDeclarationScope[]]$BindingScopes,[ScriptTypeReference]$ComparisonLeft,[ScriptTypeReference]$ComparisonRight,[ScriptTypeContract]$ReferenceContract,[string]$ReferenceName,[ScriptTypeReference[]]$ReferenceParameters,[bool]$ReferenceStatic,[bool]$ReferenceConstructor)
+    param([string[]]$ContractPaths,[System.Management.Automation.Language.TypeDefinitionAst[]]$CompilerClassAsts,[hashtable]$MaterializedTypes,[type[][]]$SelectionSignatures,[type[]]$SelectionSources,[PscDeclarationScope]$DeclarationScope,[System.Management.Automation.Language.TypeDefinitionAst]$BindingOwner,[string]$BindingName,[type[]]$BindingArguments,[bool]$BindingStatic,[bool]$BindingConstructor,[PscDeclarationScope[]]$BindingScopes,[ScriptTypeReference]$ComparisonLeft,[ScriptTypeReference]$ComparisonRight,[ScriptTypeContract]$ReferenceContract,[string]$ReferenceName,[ScriptTypeReference[]]$ReferenceParameters,[bool]$ReferenceStatic,[bool]$ReferenceConstructor,[switch]$DependencyContractsOnly)
 
 # Only descriptor types are realized in the authoring scope. Other faculties must not shadow imported CLR identities.
 # The semantic description and the executable generation are ordinary HandleTable objects.
@@ -5018,15 +5018,18 @@ function Get-ScriptTypeContract {
             }
             return $reference
         }
-        if($Type.Assembly.IsDynamic){
-            foreach($scope in $Scopes){
-                if($null -eq $scope -or $scope.Types[$Type.Name] -ne $Type){continue}
-                foreach($definition in $scope.Contracts.Keys){
-                    if($definition.Name -ieq $Type.Name){$reference.Kind=[ScriptTypeReferenceKind]::Source;$reference.Definition=$scope.Contracts[$definition];return $reference}
+        foreach($scope in $Scopes){
+            $visible=$scope
+            while($null -ne $visible){
+                if($visible.Types[$Type.Name] -eq $Type){
+                    foreach($definition in $visible.Contracts.Keys){
+                        if($definition.Name -ieq $Type.Name){$reference.Kind=[ScriptTypeReferenceKind]::Source;$reference.Definition=$visible.Contracts[$definition];return $reference}
+                    }
                 }
+                $visible=$visible.Resolving
             }
-            return $null
         }
+        if($Type.Assembly.IsDynamic){return $null}
         $reference.Kind=[ScriptTypeReferenceKind]::Clr;$reference.ClrIdentity=$Type.AssemblyQualifiedName
         if(!$reference.ClrIdentity){return $null};return $reference
     }
@@ -5069,6 +5072,12 @@ function Get-ScriptTypeContract {
         return Resolve-AstType $Witness
     }
     if($null -ne $SelectionSignatures){return Get-PscOtherFacultyDeclarations -SelectionSignatures $SelectionSignatures -SelectionSources $SelectionSources}
+    if($DependencyContractsOnly){
+        $contracts=@(Get-ScriptTypeContract -DefinitionAsts $CompilerClassAsts -SignaturesOnly)
+        $retained=[Collections.Generic.Dictionary[System.Management.Automation.Language.TypeDefinitionAst,ScriptTypeContract]]::new()
+        for($index=0;$index -lt $CompilerClassAsts.Length;$index++){$retained.Add($CompilerClassAsts[$index],$contracts[$index])}
+        return $retained
+    }
     if($null -ne $DeclarationScope -or ($null -ne $CompilerClassAsts -and $CompilerClassAsts.Length)){
         if($null -ne $ContractPaths -and $ContractPaths.Length -or $null -eq $MaterializedTypes){throw 'Compiler signature realization requires one selected source scope'}
         $retainedContracts=[Collections.Generic.Dictionary[System.Management.Automation.Language.TypeDefinitionAst,ScriptTypeContract]]::new()
@@ -5136,55 +5145,71 @@ function Get-PscFacultyUnits {
 }
 function Build-PscFaculty {
     param([string]$Faculty,[string]$RuntimeDirectory,[string[]]$ContractPaths,[string[]]$ContractReferences,[PscSource]$RetainedSource)
-    $unit = @(Get-PscFacultyUnits | Where-Object Name -ceq $Faculty)
+    $units=@(Get-PscFacultyUnits)
+    $unit = @($units | Where-Object Name -ceq $Faculty)
     if ($unit.Count -ne 1) { throw "Unknown PSC faculty: $Faculty" }
     $unit = $unit[0]
     [void][IO.Directory]::CreateDirectory($RuntimeDirectory)
     [void][Reflection.Assembly]::LoadFrom((Join-Path $PSHOME 'Microsoft.PowerShell.Commands.Utility.dll'))
-    foreach ($dependency in $unit.Dependencies) {
-        [void][Reflection.Assembly]::LoadFrom((Join-Path $RuntimeDirectory ($dependency+'.dll')))
+    $source=$RetainedSource
+    if($null -eq $source){$source=[PscSource]::new($PSCommandPath,$false)}
+    if($source.ParseErrors.Count){throw 'Faculty source is not parseable.'}
+    $holder=$null
+    foreach($site in $source.Declarations('Get-PscFacultyDeclarations')){
+        if($site.Target -isnot [System.Management.Automation.Language.FunctionDefinitionAst]){continue}
+        if($null -ne $holder){throw 'Ambiguous faculty declaration holder.'}
+        $holder=$site.Target.Body
     }
-    # Dependency-free faculties can lower directly from their original, single named module scope.
-    # Cross-scope/dependency binding still needs migration; the dependent faculty path below is unchanged.
-    if(!$unit.Dependencies.Count){
-        $source=$RetainedSource
-        if($null -eq $source){$source=[PscSource]::new($PSCommandPath,$false)}
-        if($source.ParseErrors.Count){throw 'Faculty source is not parseable.'}
-        $scope=$null
-        foreach($name in $unit.Declarations){
-            $definition=$null
-            foreach($site in $source.Declarations($name)){
-                if($site.Target -isnot [System.Management.Automation.Language.TypeDefinitionAst]){continue}
-                if($null -ne $definition){throw "Ambiguous faculty declaration: $name"}
-                $definition=$site.Target
-            }
-            if($null -eq $definition){throw "Missing faculty declaration: $name"}
-            $owner=$definition.Parent.Parent
-            if($owner.Parent -isnot [System.Management.Automation.Language.FunctionDefinitionAst] -or ![object]::ReferenceEquals($owner,$owner.Parent.Body)){throw "Faculty declaration lacks a named module scope: $name"}
-            if($null -eq $scope){$scope=$owner}
-            elseif(![object]::ReferenceEquals($scope,$owner)){throw "Faculty '$Faculty' spans independent module scopes."}
+    if($null -eq $holder){throw 'Missing faculty declaration holder.'}
+    # Acquire the visible declaration inventory once from the original named holder,
+    # including its nested declaration scopes. No serialization or executable AST is needed.
+    $definitions=[Collections.Generic.List[System.Management.Automation.Language.TypeDefinitionAst]]::new()
+    $byName=[Collections.Generic.Dictionary[string,System.Management.Automation.Language.TypeDefinitionAst]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach($site in $source.Declarations('')){
+        $definition=$site.Target
+        if($definition -isnot [System.Management.Automation.Language.TypeDefinitionAst]){continue}
+        $ancestor=$definition.Parent
+        while($null -ne $ancestor -and ![object]::ReferenceEquals($ancestor,$holder)){$ancestor=$ancestor.Parent}
+        if($null -eq $ancestor){continue}
+        if(!$byName.TryAdd($definition.Name,$definition)){throw "Ambiguous faculty declaration: $($definition.Name)"}
+        $definitions.Add($definition)
+    }
+    $imports=[PscDeclarationScope]::new()
+    $importedClasses=[Collections.Generic.List[System.Management.Automation.Language.TypeDefinitionAst]]::new()
+    foreach($dependency in $unit.Dependencies){
+        $dependencyUnit=@($units | Where-Object Name -ceq $dependency)
+        if($dependencyUnit.Count -ne 1){throw "Unknown dependency '$dependency'."}
+        $path=[IO.Path]::GetFullPath((Join-Path $RuntimeDirectory ($dependency+'.dll')))
+        $assembly=[Reflection.Assembly]::LoadFrom($path)
+        if($assembly.GetName().Name -cne $dependency -or $assembly.Location -cne $path){throw "Unexpected faculty realization for '$dependency'."}
+        foreach($name in $dependencyUnit[0].Declarations){
+            if(!$byName.ContainsKey($name)){throw "Missing dependency declaration: $name"}
+            $definition=$byName[$name]
+            $type=$assembly.GetType($name,$true,$false)
+            if(![object]::ReferenceEquals($type.Assembly,$assembly)){throw "Forwarded dependency declaration: $name"}
+            $imports.Types.Add($name,$type)
+            if($definition.IsClass){$importedClasses.Add($definition)}
         }
-        return Export-LoweredAssembly -SourceAst $scope -DeclarationsOnly -ClassName $unit.Primary -ClassNames $unit.Declarations -OutputPath (Join-Path $RuntimeDirectory ($Faculty+'.dll')) -Deterministic
     }
-    # Dependent faculties retain their existing isolation until declared cross-scope realization is supported.
-    $holder = (Get-Command Get-PscFacultyDeclarations -CommandType Function).ScriptBlock.Ast
-    if ($holder -is [System.Management.Automation.Language.FunctionDefinitionAst]) { $holder = $holder.Body }
-    $declarations = @($holder.FindAll({ param($node) $node -is [System.Management.Automation.Language.TypeDefinitionAst] }, $true) | Where-Object { $_.Name -cin $unit.Declarations })
-    if ($declarations.Count -ne $unit.Declarations.Length) { throw "Incomplete declaration set for $Faculty" }
-    $source = [string]::Join("`n",[string[]]@($declarations | ForEach-Object { $_.Extent.Text }))
-    $parsed = Read-PowerShellClass -Source $source -ClassName $unit.Primary -SourceFile ($Faculty+'.ps1')
     $data=@{}
-    if ($Faculty -ceq 'ScriptType') {
+    if($Faculty -ceq 'ScriptType'){
         foreach($reference in $ContractReferences){[void][Reflection.Assembly]::LoadFrom([IO.Path]::GetFullPath($reference))}
         if($ContractPaths.Count){$data['ScriptTypeCatalog.Contracts']=@(Get-PscFacultyDeclarations -ContractPaths $ContractPaths)}
         else{$data['ScriptTypeCatalog.Contracts']=[object[]]@()}
     }
-    Export-LoweredAssembly -SourceAst $parsed.Ast -DeclarationsOnly -ClassName $unit.Primary -StaticData $data -OutputPath (Join-Path $RuntimeDirectory ($Faculty+'.dll')) -Deterministic
+    if($importedClasses.Count){$imports.Contracts=Get-PscFacultyDeclarations -CompilerClassAsts $importedClasses.ToArray() -DependencyContractsOnly}
+    else{$imports=$null}
+    Export-LoweredAssembly -SourceAst $holder -DeclarationsOnly -ClassName $unit.Primary -ClassNames $unit.Declarations -ScopeDeclarations $definitions.ToArray() -DependencyScope $imports -StaticData $data -OutputPath (Join-Path $RuntimeDirectory ($Faculty+'.dll')) -Deterministic
 }
 function Build-PscRuntime {
-    param([string]$RuntimeDirectory,[string[]]$ContractPaths,[string[]]$ContractReferences)
-    # External inputs must exist before publishing; earlier faculty outputs are
-    # validated by the catalog child after their builds, never loaded here.
+    param([string]$RuntimeDirectory,[string[]]$ContractPaths,[string[]]$ContractReferences,[string]$ContractInputsPath)
+    # Only the isolated runtime coordinator loads dependencies. The caller
+    # retains its own assembly identities and the transport contains paths only.
+    if($ContractInputsPath){
+        if($ContractPaths.Count -or $ContractReferences.Count){throw 'ContractInputsPath is exclusive to the runtime coordinator.'}
+        $inputs=Read-PscContractInputs $ContractInputsPath
+        $ContractPaths=$inputs.Sources;$ContractReferences=$inputs.References
+    }
     $ContractPaths = [string[]]@(foreach($path in $ContractPaths){[IO.Path]::GetFullPath($path)})
     $ContractReferences = [string[]]@(foreach($path in $ContractReferences){[IO.Path]::GetFullPath($path)})
     $comparison = [StringComparison]::Ordinal
@@ -5195,6 +5220,34 @@ function Build-PscRuntime {
         $deferred=$false
         foreach($output in $earlier){if([string]::Equals($path,$output,$comparison)){$deferred=$true;break}}
         if(!$deferred -and ![IO.File]::Exists($path)){throw "Contract reference missing: $path"}
+    }
+    if($ContractInputsPath){
+        # Resolve the declared dependency graph before realizing any unit.
+        $pending=[Collections.Generic.List[PscFacultyUnit]]::new()
+        $pending.AddRange([PscFacultyUnit[]]@(Get-PscFacultyUnits))
+        $ordered=[Collections.Generic.List[PscFacultyUnit]]::new()
+        $ready=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        while($pending.Count){
+            $progress=$false
+            for($index=0;$index -lt $pending.Count;){
+                $unit=$pending[$index];$blocked=$false
+                foreach($dependency in $unit.Dependencies){if(!$ready.Contains($dependency)){$blocked=$true;break}}
+                if($blocked){$index++;continue}
+                if(!$ready.Add($unit.Name)){throw "Duplicate faculty '$($unit.Name)'."}
+                $ordered.Add($unit);$pending.RemoveAt($index);$progress=$true
+            }
+            if(!$progress){throw 'Unresolved or cyclic faculty dependency.'}
+        }
+        $source=[PscSource]::new($PSCommandPath,$false)
+        if($source.ParseErrors.Count){throw 'Faculty source is not parseable.'}
+        foreach($unit in $ordered){
+            if($unit.Name -ceq 'ScriptType'){
+                Build-PscFaculty -Faculty $unit.Name -RuntimeDirectory $RuntimeDirectory -RetainedSource $source -ContractPaths $ContractPaths -ContractReferences $ContractReferences
+            }else{
+                Build-PscFaculty -Faculty $unit.Name -RuntimeDirectory $RuntimeDirectory -RetainedSource $source
+            }
+        }
+        return
     }
     $exe=Join-Path $PSHOME 'pwsh'
     if($IsWindows){$exe+='.exe'}
@@ -5209,18 +5262,8 @@ function Build-PscRuntime {
             $writer.Write([int]$ContractReferences.Length)
             foreach($path in $ContractReferences){$writer.Write([string]$path)}
         }finally{$writer.Dispose()}
-        $source=[PscSource]::new($PSCommandPath,$false)
-        if($source.ParseErrors.Count){throw 'Faculty source is not parseable.'}
-        foreach($unit in Get-PscFacultyUnits){
-            if(!$unit.Dependencies.Count){
-                Build-PscFaculty -Faculty $unit.Name -RuntimeDirectory $RuntimeDirectory -RetainedSource $source
-                continue
-            }
-            $arguments=@('-NoProfile','-File',$PSCommandPath,'-Mode','BuildFaculty','-Faculty',$unit.Name,'-RuntimeDirectory',$RuntimeDirectory)
-            if($unit.Name -ceq 'ScriptType'){$arguments+=@('-ContractInputsPath',$transport)}
-            & $exe @arguments
-            if($LASTEXITCODE -ne 0){throw "PSC faculty build failed: $($unit.Name)"}
-        }
+        & $exe -NoProfile -File $PSCommandPath -Mode BuildRuntime -RuntimeDirectory $RuntimeDirectory -ContractInputsPath $transport
+        if($LASTEXITCODE -ne 0){throw 'PSC runtime coordinator failed.'}
     }finally{[IO.Directory]::Delete($transportDirectory,$true)}
 }
 function Read-PscContractInputs([string]$Path){
@@ -8616,6 +8659,7 @@ function Use-DeclarationScope {
     }
     $sourceScope = Get-DeclarationScope -Root $root
     $types = $sourceScope.Types
+    if($null -ne $sourceScope.Resolving){$types=$sourceScope.Resolving.Types+$types}
     $functionClass = $null
     if ($script:ScriptFunctionClasses.TryGetValue($root, [ref]$functionClass) -and $null -ne $functionClass) {
         $functionRoot = $functionClass; while ($functionRoot.Parent) { $functionRoot = $functionRoot.Parent }
@@ -8634,7 +8678,7 @@ function Get-DeclarationScope {
         [System.Management.Automation.Language.TypeDefinitionAst[]] $SelectedClassAst,[System.Management.Automation.Language.TypeDefinitionAst[]] $SelectedEnumAst)
     $declarationScope=$null
     if($script:DeclarationScopeCache.TryGetValue($Root,[ref]$declarationScope)){
-        if(!$PSBoundParameters.ContainsKey('SelectedClassAst') -and !$PSBoundParameters.ContainsKey('SelectedEnumAst') -and [object]::ReferenceEquals($declarationScope.Resolving,$Resolving)){return $declarationScope}
+        if(!$PSBoundParameters.ContainsKey('SelectedClassAst') -and !$PSBoundParameters.ContainsKey('SelectedEnumAst') -and (!$PSBoundParameters.ContainsKey('Resolving') -or [object]::ReferenceEquals($declarationScope.Resolving,$Resolving))){return $declarationScope}
     }
     $inProgress = $script:LoweringClassTypes
     try {
@@ -15655,7 +15699,7 @@ Conform streams child stdout and stderr to the invoking host as they become avai
 
 - **Managed:** SMA AST and typed expression lowering, deterministic IL emission, static graph/data realization, reachability and fixed-parameter specialization.
 - **Native:** pinned Windows NativeAOT compiler plus PSC COFF linker; direct CIL-to-IR-to-x64 ELF leaf emission and decoded-byte ABI checks. The direct backend does not yet replace ILC for general programs.
-- **Faculties:** `HandleTable`, `InquiryPrimitives`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. The dependency-free HandleTable, InquiryPrimitives, NativeEncoding and ElfEncoding faculties lower their original declarations in the retained named module body, without extracting and reparsing extents. BuildRuntime acquires one source for the four dependency-free faculty builds and executes them in the coordinator. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. The three dependent faculties still use their existing isolated extraction and child-process path until cross-scope binding is migrated. This is build integration, not normal-startup activation. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
+- **Faculties:** `HandleTable`, `InquiryPrimitives`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding; imported executable member calls still use the CLR compatibility boundary. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. This is build integration, not normal-startup activation. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
 - **Evidence:** differential tests, structural lint, Guard, non-loading binary queries and coverage. An observed call is not a universal binding proof; an ABI check is not a proof of arithmetic equivalence.
 
 ## Trust and security
@@ -16363,6 +16407,8 @@ function Export-LoweredAssembly {
         [Parameter()][Collections.IDictionary] $StaticData,
         [Parameter()][string] $ClassName,
         [Parameter()][string[]] $ClassNames,
+        [System.Management.Automation.Language.TypeDefinitionAst[]] $ScopeDeclarations,
+        [PscDeclarationScope] $DependencyScope,
         [switch] $DeclarationsOnly,
         # Select these methods of -ClassName and retain their bound method dependencies.
         [Parameter()][string[]] $MethodNames,
@@ -16381,6 +16427,7 @@ function Export-LoweredAssembly {
     )
 
     $script:PscCompilingProgram = [bool]$Program
+    if (($ScopeDeclarations -or $DependencyScope) -and !$DeclarationsOnly){throw 'Explicit scope is available only for declaration realization.'}
     if ($Program -and $DeclarationsOnly) { throw 'DeclarationsOnly cannot compile a program.' }
     if ($DeclarationsOnly) {
         if ($null -ne $SourceAst -and $SourcePath) { throw 'Supply SourcePath or SourceAst, not both.' }
@@ -16392,9 +16439,17 @@ function Export-LoweredAssembly {
         $pending=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         $omitted=[Collections.Generic.Dictionary[string,System.Management.Automation.Language.TypeDefinitionAst]]::new([StringComparer]::OrdinalIgnoreCase)
         foreach($name in $ClassNames){if([string]::IsNullOrWhiteSpace($name) -or !$pending.Add($name)){throw 'Empty or duplicate declaration selection.'}}
-        foreach ($block in @($SourceAst.BeginBlock,$SourceAst.ProcessBlock,$SourceAst.EndBlock,$SourceAst.CleanBlock,$SourceAst.DynamicParamBlock)) {
-            if ($null -eq $block) { continue }
-            foreach ($declaration in $block.Statements) {
+        $visibleDeclarations=if($ScopeDeclarations){$ScopeDeclarations}else{
+            foreach($block in @($SourceAst.BeginBlock,$SourceAst.ProcessBlock,$SourceAst.EndBlock,$SourceAst.CleanBlock,$SourceAst.DynamicParamBlock)){
+                if($null -ne $block){$block.Statements}
+            }
+        }
+        foreach($declaration in $visibleDeclarations){
+            if($ScopeDeclarations){
+                $ancestor=$declaration.Parent
+                while($null -ne $ancestor -and ![object]::ReferenceEquals($ancestor,$SourceAst)){$ancestor=$ancestor.Parent}
+                if($null -eq $ancestor){throw 'Explicit declaration is outside the retained source scope.'}
+            }
                 if ($declaration -isnot [System.Management.Automation.Language.TypeDefinitionAst]) { continue }
                 if (!$declaration.IsClass -and !$declaration.IsEnum) { continue }
                 if (($ClassNames -and $declaration.Name -notin $ClassNames) -or ($declaration.IsClass -and (Test-AttributeClass $declaration))) {
@@ -16403,7 +16458,6 @@ function Export-LoweredAssembly {
                 }
                 if ($ClassNames -and !$pending.Remove($declaration.Name)) { throw 'Ambiguous top-level type declaration.' }
                 $selected.Add($declaration)
-            }
         }
         if ($pending.Count) { throw 'DeclarationsOnly requires existing top-level types.' }
         $classAsts=@($selected | Where-Object IsClass)
@@ -16420,7 +16474,7 @@ function Export-LoweredAssembly {
                     foreach($argument in $Name.GenericArguments){Assert-PscSelectedTypeReference $argument}
                     return
                 }
-                if (!$Name.AssemblyName -and $omitted.ContainsKey($Name.FullName)) { throw "Missing selected source type '$($omitted[$Name.FullName].Name)' at $($Name.Extent.StartLineNumber):$($Name.Extent.StartColumnNumber)." }
+                if (!$Name.AssemblyName -and $omitted.ContainsKey($Name.FullName) -and ($null -eq $DependencyScope -or !$DependencyScope.Types.ContainsKey($Name.FullName))) { throw "Missing selected source type '$($omitted[$Name.FullName].Name)' at $($Name.Extent.StartLineNumber):$($Name.Extent.StartColumnNumber)." }
             }
             foreach($definition in $selected){
                 foreach($witness in $definition.FindAll({param($node) $node -is [System.Management.Automation.Language.TypeConstraintAst] -or $node -is [System.Management.Automation.Language.TypeExpressionAst]},$true)){
@@ -16497,7 +16551,7 @@ function Export-LoweredAssembly {
     Assert-PscInlineOverrides -Classes $classAsts
     $model = @(Get-ClassModel -ClassAsts $classAsts)
     $sourceClasses = [System.Management.Automation.Language.TypeDefinitionAst[]]@($classAsts | Where-Object { -not [object]::ReferenceEquals($_, $functionClass) })
-    $null = Get-ClrTypeProjection -Root $parsed.Ast -SelectedClassAst $sourceClasses -SelectedEnumAst $enumAsts
+    $null = Get-ClrTypeProjection -Root $parsed.Ast -SelectedClassAst $sourceClasses -SelectedEnumAst $enumAsts -Resolving $DependencyScope
     Use-DeclarationScope -Ast $parsed.Ast
     $projection = @{} + $script:LoweringClassTypes
     if($MethodNames){
@@ -20365,7 +20419,7 @@ Full command help and live mode inventory follow.
             }
             Build-PscFaculty -Faculty $Faculty -RuntimeDirectory ([IO.Path]::GetFullPath($RuntimeDirectory)) -ContractPaths $ContractPaths -ContractReferences $ContractReferences
         }
-        'BuildRuntime' { Build-PscRuntime -RuntimeDirectory ([IO.Path]::GetFullPath($RuntimeDirectory)) -ContractPaths $ContractPaths -ContractReferences $ContractReferences }
+        'BuildRuntime' { Build-PscRuntime -RuntimeDirectory ([IO.Path]::GetFullPath($RuntimeDirectory)) -ContractPaths $ContractPaths -ContractReferences $ContractReferences -ContractInputsPath $ContractInputsPath }
         'Query' { if(!$QueryPath){throw 'Query requires -QueryPath.'}; if($QueryLiteral -and $QueryKind -in 'CilMethod','CilOp'){throw 'QueryLiteral requires a source query.'}; $spec=[PscQuerySpec]::new([PscQueryKind]$QueryKind,$QueryName,$QueryOwner,$QueryTake); $spec.Literal=$QueryLiteral; $cursor=[PscQueryCursor]::new($QueryPath,$spec); if($null -ne $QuerySpace){return [PscQueryLease]::new($QuerySpace,$QueryOwnerHandle,$cursor)};return $cursor }
         'PowerShell' { Get-PinnedPowerShell -ArchivePath $ArchivePath }
         'Compile' {
