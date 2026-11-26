@@ -9275,7 +9275,8 @@ function Get-PscFunctionOutputType {
         one type that is written whole, and not void. Retained by the declaration
         scope of the function's execution unit, not by AST identity alone.
     #>
-    param([Parameter(Mandatory)][System.Management.Automation.Language.FunctionMemberAst] $Member)
+    param([Parameter(Mandatory)][System.Management.Automation.Language.FunctionMemberAst] $Member,[PscRuntimeSelection]$RuntimeSelection)
+    if($null -ne $RuntimeSelection){[PscRuntimeSelection]::AssertOpen($RuntimeSelection)}
     $root = Resolve-PscDeclarationRoot $Member
     $source = $null
     if (!$script:ScriptFunctionSources.TryGetValue($root, [ref]$source)) { return $null }
@@ -9298,7 +9299,7 @@ function Get-PscFunctionOutputType {
         foreach ($terminal in $terminals) {
             $element = if ($terminal -is [System.Management.Automation.Language.PipelineAst]) { $terminal.PipelineElements[0] } else { $null }
             if ($element -is [System.Management.Automation.Language.CommandAst]) {
-                $callee = Get-PscFunctionOutputType -Member (Find-ScriptFunction $element)
+                $callee = Get-PscFunctionOutputType -Member (Find-ScriptFunction $element) -RuntimeSelection $RuntimeSelection
                 if ($null -eq $callee) { return $null }
                 $types.Add($callee)
             }
@@ -9309,7 +9310,7 @@ function Get-PscFunctionOutputType {
             $watchTypes = $script:LoweringClassTypes
             $script:PscOutputWatch = [System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast, Type]]::new()
             try {
-                try { $null = Convert-MethodAstToLambda -MethodAst $Member } catch { return $null }
+                try { $null = Convert-MethodAstToLambda -MethodAst $Member -RuntimeSelection $RuntimeSelection } catch { return $null }
                 foreach ($terminal in $watched) {
                     $type = $null
                     if (-not $script:PscOutputWatch.TryGetValue($terminal, [ref]$type)) { return $null }
@@ -11448,7 +11449,7 @@ function Convert-AstExpression {
                 $collapse = Get-PscSemanticsMethod -Name Collapse -ParameterTypes ([object[]])
                 $collapsed = [Linq.Expressions.Expression]::Call($collapse, $call)
                 # A function that writes exactly one value of one type: that value, as that type.
-                $single = Get-PscFunctionOutputType -Member (Find-ScriptFunction $Node.PipelineElements[0])
+                $single = Get-PscFunctionOutputType -Member (Find-ScriptFunction $Node.PipelineElements[0]) -RuntimeSelection $Scope.RuntimeSelection
                 if ($null -ne $single) { return [Linq.Expressions.Expression]::Convert($collapsed, $single) }
                 return $collapsed
             }
@@ -16018,7 +16019,7 @@ Conform streams child stdout and stderr to the invoking host as they become avai
 
 - **Managed:** SMA AST and typed expression lowering, deterministic IL emission, static graph/data realization, reachability and fixed-parameter specialization.
 - **Native:** pinned Windows NativeAOT compiler plus PSC COFF linker; direct CIL-to-IR-to-x64 ELF leaf emission and decoded-byte ABI checks. The direct backend does not yet replace ILC for general programs.
-- **Faculties:** `HandleTable`, `DiscoveryMechanisms`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. BuildRuntime without contract inputs writes a local selection receipt for HandleTable, ScriptType and PrimitiveConversion after successful construction. Structural specialization with an explicit `-RuntimeDirectory` uses the compiled numeric selector on demand: verify source, CoreLib, SMA, the existing TypeConverter framework dependency and all three faculty assembly digests once, load the exact bytes in a private collectible context, and invoke a typed delegate. Missing or incompatible receipts refuse that path; no implicit interpreted fallback is permitted after selection is requested. Without an explicit directory the authoring selector is unchanged. The receipt identifies a trusted local build; it is not a signature or independent admission proof. This is limited compiler self-consumption, not full startup activation or migration of descriptor identities. `PscApi.AcquireSelection(api,directory)` acquires an explicit resident selection session from the API source revision. `PscRuntimeSelection.Select(session,signatures,sources)` reuses the admitted selector without reading artifacts again; `Close(session)` withdraws it and requests context unloading. Resident structural specialization accepts the same session as `-RuntimeSelection`, and does not close a caller-owned session. CLI specialization still acquires and closes its own session. The retained session may also be supplied to `Export-LoweredAssembly -RuntimeSelection`: ordinary source static/instance calls and explicit constructors preserve the original STS binding witnesses and use the admitted numeric selector for non-exact closed numeric signatures. Method closure and initializer lowering use the same session. Exact source-reference equality and candidate acquisition remain authoring operations; there is no secondary descriptor graph. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
+- **Faculties:** `HandleTable`, `DiscoveryMechanisms`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. BuildRuntime without contract inputs writes a local selection receipt for HandleTable, ScriptType and PrimitiveConversion after successful construction. The compiled numeric selection path verifies source, CoreLib, SMA, the existing TypeConverter framework dependency and all three faculty assembly digests once, loads the exact bytes in a private collectible context, and invokes a typed delegate. Missing or incompatible receipts refuse that path; no implicit interpreted fallback is permitted after selection is requested. Without an explicit directory the authoring selector is unchanged. The receipt identifies a trusted local build; it is not a signature or independent admission proof. This is limited compiler self-consumption, not full startup activation or migration of descriptor identities. `PscApi.AcquireSelection(api,directory)` acquires an explicit resident selection session from the API source revision. `PscRuntimeSelection.Select(session,signatures,sources)` reuses the admitted selector without reading artifacts again; `Close(session)` withdraws it and requests context unloading. Resident structural specialization accepts the same session as `-RuntimeSelection`, and does not close a caller-owned session. CLI Compile with an explicit `-RuntimeDirectory` uses `Invoke-PscCompile` to acquire one session before lowering, supply it to both structural specialization and ordinary managed lowering (including the managed precursor of Native), and close it in a finally boundary before returning the managed result. The session remains inside the authoring operation, not the process dispatcher. Even an exact-only compilation refuses a missing or incompatible receipt when explicitly requested. Without an explicit directory CLI Compile retains interpreted selection. The retained session may also be supplied to `Export-LoweredAssembly -RuntimeSelection`: ordinary source static/instance calls and explicit constructors preserve the original STS binding witnesses and use the admitted numeric selector for non-exact closed numeric signatures. Method closure, initializer lowering and recursive function-output inference use the same session; a selected compilation owns fresh declaration scopes, including their existing inference caches. Exact source-reference equality and candidate acquisition remain authoring operations; there is no secondary descriptor graph. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
 - **Evidence:** differential tests, structural lint, Guard, non-loading binary queries and coverage. An observed call is not a universal binding proof; an ABI check is not a proof of arithmetic equivalence.
 
 ## Trust and security
@@ -17070,6 +17071,35 @@ function Export-LoweredAssembly {
     $compiled.ApplicationIcon = $programIcon
     if($null -ne $RealizedScope){$RealizedScope.Value=$PscSelectedScope}
     $compiled
+}
+
+# One authoring operation owns CLI selection, structural transformation and
+# managed emission. No authoring-context session object crosses the dispatcher.
+function Invoke-PscCompile {
+    [CmdletBinding()]
+    param([string]$SourcePath,[System.Management.Automation.Language.Ast]$SourceAst,[Collections.IDictionary]$StaticData,
+        [string]$ClassName,[string[]]$ClassNames,[switch]$DeclarationsOnly,[string[]]$MethodNames,[string]$OutputPath,[string]$EntryPoint,
+        [switch]$Deterministic=$true,[switch]$Program,[Collections.IDictionary]$StructuralBindings,[string]$SelectionDirectory)
+    $CompileParameters=@{}+$PSBoundParameters
+    $null=$CompileParameters.Remove('StructuralBindings');$null=$CompileParameters.Remove('SelectionDirectory')
+    $selection=$null
+    if($SelectionDirectory){$selection=Open-PscRuntimeSelection -Directory $SelectionDirectory}
+    try{
+        if($null -ne $selection){$CompileParameters['RuntimeSelection']=$selection}
+        if($StructuralBindings){
+            $structuralRoot=$CompileParameters['SourceAst']
+            if($null -eq $structuralRoot){
+                $full=[PscTreeText]::FullPath($CompileParameters['SourcePath'])
+                $structuralRoot=Read-PowerShellSource -Source ([IO.File]::ReadAllText($full)) -SourceFile $full
+            }
+
+            $CompileParameters['SourceAst']=ConvertTo-PscStructuralSource -Root $structuralRoot -ClassName $ClassName -MethodNames $CompileParameters['MethodNames'] -Bindings $StructuralBindings -RuntimeSelection $selection
+            $null=$CompileParameters.Remove('SourcePath')
+            if(!$CompileParameters['ClassNames']){$CompileParameters['ClassNames']=[string[]]@($ClassName)}
+            foreach($shapeName in $StructuralBindings.Keys){if($shapeName -in $CompileParameters['ClassNames']){throw "Structural contract '$shapeName' must be erased, not emitted."}}
+        }
+        return Export-LoweredAssembly @CompileParameters
+    }finally{[PscRuntimeSelection]::Close($selection)}
 }
 
 # Native AOT: the lowered assembly compiled to machine code by ILC (Microsoft's IL compiler, PSC's backend) and
@@ -20777,15 +20807,6 @@ Full command help and live mode inventory follow.
             }
             if ($StructuralBindings) {
                 if ($Program -or $Native -or !$ClassName -or !$MethodNames) { throw 'Structural specialization currently requires managed class/method compilation.' }
-                $structuralRoot=$SourceAst
-                if ($null -eq $structuralRoot) {
-                    $full=[PscTreeText]::FullPath($SourcePath)
-                    $structuralRoot=Read-PowerShellSource -Source ([IO.File]::ReadAllText($full)) -SourceFile $full
-                }
-                $compileParameters['SourceAst']=ConvertTo-PscStructuralSource -Root $structuralRoot -ClassName $ClassName -MethodNames $MethodNames -Bindings $StructuralBindings -SelectionDirectory $(if($PSBoundParameters.ContainsKey('RuntimeDirectory')){$RuntimeDirectory}else{''})
-                $null=$compileParameters.Remove('SourcePath')
-                if (!$ClassNames) { $compileParameters['ClassNames']=[string[]]@($ClassName) }
-                foreach($shapeName in $StructuralBindings.Keys){if($shapeName -in $compileParameters['ClassNames']){throw "Structural contract '$shapeName' must be erased, not emitted."}}
             }
             if ($Program) {
                 # The script parsed (with the keywords it declares taught to SMA's parser), its fixed parameters applied,
@@ -20801,11 +20822,13 @@ Full command help and live mode inventory follow.
                 $compileParameters['Program'] = $true
                 if (-not $EntryPoint) { $compileParameters['EntryPoint'] = 'Main'; $EntryPoint = 'Main' }
             }
-            if (-not $Native) { return Export-LoweredAssembly @compileParameters }
-            if (-not $EntryPoint) { throw 'A native executable needs -EntryPoint.' }
-            # The lowered assembly sits beside the executable, named for it; ILC and the linker take it from there.
-            $compileParameters['OutputPath'] = [IO.Path]::ChangeExtension([PscTreeText]::FullPath($OutputPath), '.dll')
-            $lowered = Export-LoweredAssembly @compileParameters
+            if ($Native) {
+                if (-not $EntryPoint) { throw 'A native executable needs -EntryPoint.' }
+                # The lowered assembly sits beside the executable, named for it; ILC and the linker take it from there.
+                $compileParameters['OutputPath'] = [IO.Path]::ChangeExtension([PscTreeText]::FullPath($OutputPath), '.dll')
+            }
+            $lowered = Invoke-PscCompile @compileParameters -StructuralBindings $StructuralBindings -SelectionDirectory $(if($PSBoundParameters.ContainsKey('RuntimeDirectory')){$RuntimeDirectory}else{''})
+            if (-not $Native) { return $lowered }
             $image = Export-NativeImage -AssemblyPath $lowered.OutputPath -OutputPath $OutputPath -Subsystem $Subsystem -ApplicationIcon $lowered.ApplicationIcon
             [pscustomobject]@{ Assembly = $lowered; Native = $image }
         }
