@@ -7808,9 +7808,19 @@ function Get-PscPeResource {
 
 function Test-PscProgramMetadata {
     param([string] $Directory)
-    # The executable PSC built from a program with neither marker before program markers existed: [CmdletBinding()]
-    # and an empty param block, as Unmarked.exe. A program with neither marker still builds to exactly these bytes.
-    $unmarkedImageSha256 = '323AC739D8C1C54C61CD90376DAA3A3EADF637D4EFCDC105139FCF61A6626AB4'
+    # Historical unmarked PE: 323AC739D8C1C54C61CD90376DAA3A3EADF637D4EFCDC105139FCF61A6626AB4
+    # Recorded at c1c577593c1c20a88532cb8638340763e83b734d; historical toolchain manifests unavailable.
+    # On 2026-11-26, independent Windows builds of c1c5775, cbb1d8d and dab3f88 produced the same
+    # managed DLL, COFF object and PE under the five manifests below. Unknown pins fail qualification.
+    $unmarkedManagedSha256 = '2109C5B9993FA3D1FFD726C3042FF6D991E7FDEE5622B4AA934774BADDBB0997'
+    $unmarkedObjectSha256 = '9182CBC3636BC9B5FA083707A3D3838F992AA5C40695E9578CD46A8AF75D0BCC'
+    $unmarkedImageSha256 = '38C38B1D7347833E9209CDFF5801BDCDC5F3E6553DB7762BAD2DB1EFE630C195'
+    $expectedPins = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+    $expectedPins.Add('ilc-11.0.0','457716E0DA7D6CC3876A23E7AD3C1625A459C5423997E5C27FB248CABD2AA334')
+    $expectedPins.Add('ilc-build-11.0.0','37E9AD4C0471BFA102D07CA59FEE1730914964A90530F010699A8AE9260A4A8C')
+    $expectedPins.Add('msvc-14.51.36231','FC49348E263C62BDC432B343B0A450528A5573F6E8D1BB04ECE7A44F03023B46')
+    $expectedPins.Add('nativeaot-win-x64-11.0.0','A9738CDC0B85E0A34214C16D2FF704184B07EF9EC027E5755C45DDD2546BD0DB')
+    $expectedPins.Add('windows-sdk-lib-10.0.26100.0','83C48CED8DAE1C0F54BC04E4FC90169E766D148C252F9AEB9F98B8D828DFB5F1')
     # The fixture icon: three 32-bit images of 1, 2 and 3 pixels square, each a DIB with its AND mask, every byte
     # written here, so what the executable carries is compared against the test's own bytes, not PscIcon's reading.
     $iconPath = [IO.Path]::Join($Directory, 'EntryFixture.ico')
@@ -7855,10 +7865,30 @@ function Test-PscProgramMetadata {
     $plain = Export-LoweredAssembly -SourceAst $plainAst -Program -EntryPoint Main -OutputPath $plainPath
     $plainAgain = Export-LoweredAssembly -SourceAst $plainAst -Program -EntryPoint Main -OutputPath $plainPath
     $checks.ProgramUnmarkedDeterministic = $plain.SHA256 -ceq $plainAgain.SHA256
-    $plainImage = Export-NativeImage -AssemblyPath $plainPath -OutputPath ([IO.Path]::Join($plainDirectory, 'Unmarked.exe'))
+    $checks.ProgramUnmarkedManagedUnchanged = $plain.SHA256 -ceq $unmarkedManagedSha256
+    $toolset = Get-NativeToolset
+    $qualified = $true
+    $observedPins = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($folder in $toolset.Compiler, $toolset.Build, $toolset.Runtime, $toolset.Msvc, $toolset.Sdk) {
+        $pinName = [IO.Path]::GetFileName($folder)
+        $pinHash = (Get-FileHash -LiteralPath (Join-Path $folder 'pin.sha256.csv') -Algorithm SHA256).Hash
+        if (!$observedPins.Add($pinName) -or !$expectedPins.ContainsKey($pinName) -or $expectedPins[$pinName] -cne $pinHash) { $qualified = $false }
+    }
+    $checks.ProgramUnmarkedToolchainQualified = $qualified -and $observedPins.Count -eq $expectedPins.Count
+    $plainExe = [IO.Path]::Join($plainDirectory, 'Unmarked.exe')
+    $plainImage = Export-NativeImage -AssemblyPath $plainPath -OutputPath $plainExe
     $plainImageHash = (Get-FileHash -LiteralPath $plainImage.OutputPath -Algorithm SHA256).Hash
-    $checks.ProgramUnmarkedImageUnchanged = $plainImageHash -ceq $unmarkedImageSha256
+    $plainObjectHash = (Get-FileHash -LiteralPath $plainImage.Object -Algorithm SHA256).Hash
+    $checks.ProgramUnmarkedImageUnchanged = $checks.ProgramUnmarkedToolchainQualified -and $plainImageHash -ceq $unmarkedImageSha256
+    $checks.ProgramUnmarkedObjectUnchanged = $checks.ProgramUnmarkedToolchainQualified -and $plainObjectHash -ceq $unmarkedObjectSha256
     $checks.ProgramUnmarkedResourcesUnchanged = (Get-PscPeResourceBytes -Path $plainImage.OutputPath).Length -eq 0
+    # Remove the first build outputs before repeating the same request; no stale object or PE can satisfy the check.
+    [IO.File]::Delete($plainImage.Object)
+    [IO.File]::Delete($plainImage.OutputPath)
+    [IO.File]::Delete([IO.Path]::ChangeExtension($plainExe, '.ilc.rsp'))
+    $plainNativeAgain = Export-NativeImage -AssemblyPath $plainPath -OutputPath $plainExe
+    $checks.ProgramUnmarkedNativeDeterministic = $plainImageHash -ceq (Get-FileHash -LiteralPath $plainNativeAgain.OutputPath -Algorithm SHA256).Hash -and
+        $plainObjectHash -ceq (Get-FileHash -LiteralPath $plainNativeAgain.Object -Algorithm SHA256).Hash
     $markedAst = New-PscEntryFixtureAst -Directory $Directory -Apartment -IconFileName ([IO.Path]::GetFileName($iconPath))
     $marked = Export-LoweredAssembly -SourceAst $markedAst -Program -EntryPoint Main -OutputPath ([IO.Path]::Join($Directory, 'EntryMarked.dll'))
     $markedImage = Export-NativeImage -AssemblyPath $marked.OutputPath -OutputPath ([IO.Path]::Join($Directory, 'EntryMarked.exe')) -ApplicationIcon $marked.ApplicationIcon
@@ -7906,6 +7936,8 @@ function Test-PscProgramMetadata {
         $verdict.Test = $name
         $verdict.Passed = $checks[$name]
         $verdict.UnmarkedImageHash = $plainImageHash
+        $verdict.UnmarkedObjectHash = $plainObjectHash
+        $verdict.UnmarkedManagedHash = $plain.SHA256
         $verdict.Apartment = if ($report.Count -gt 0) { $report[0] } else { [IO.File]::ReadAllText($stderr) }
         $verdict.ComStatus = if ($report.Count -gt 1) { $report[1] } else { $process.ExitCode }
         $verdict.IconImages = $icons.Count
@@ -7918,6 +7950,8 @@ class PscProgramMetadataVerdict {
     [string] $Test
     [bool] $Passed
     [string] $UnmarkedImageHash
+    [string] $UnmarkedObjectHash
+    [string] $UnmarkedManagedHash
     [string] $Apartment
     [string] $ComStatus
     [int] $IconImages
@@ -16911,7 +16945,7 @@ function Get-NativeToolset {
         Msvc = & $find 'msvc-'
         Sdk = & $find 'windows-sdk-lib-'
     }
-    foreach ($folder in $toolset.Compiler, $toolset.Build, $toolset.Runtime, $toolset.Sdk) {
+    foreach ($folder in $toolset.Compiler, $toolset.Build, $toolset.Runtime, $toolset.Msvc, $toolset.Sdk) {
         if ($script:VerifiedPins.Contains($folder)) { continue }
         $manifest = Join-Path $folder 'pin.sha256.csv'
         if (-not [IO.File]::Exists($manifest)) { throw "Pinned tool $folder has no hash manifest." }
