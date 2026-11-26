@@ -2468,6 +2468,10 @@ try{
 class PscDeclarationScope {
     [hashtable] $Types = @{}
     [System.Collections.IDictionary] $Contracts
+    # Resident scopes carry operational coordinates, not compiled descriptor objects.
+    [Guid] $ResidentSession
+    [int] $ResidentSlot = -1
+    [System.Management.Automation.Language.TypeDefinitionAst[]] $ResidentDefinitions
     [System.Collections.IDictionary] $Signatures
     [Collections.Generic.Dictionary[System.Management.Automation.Language.TypeDefinitionAst,type]] $Bases = [Collections.Generic.Dictionary[System.Management.Automation.Language.TypeDefinitionAst,type]]::new()
     [PscDeclarationScope] $Resolving
@@ -4943,6 +4947,204 @@ class PscElfImageReader {
         return $r
     }
 }
+# Compiler-side resident declaration acquisition and binding.
+# Scope identity is distinct from AST identity: the same AST may be realized
+# in several independent declaration scopes.
+class PscResidentDeclarationGraph {
+    hidden static [Collections.Generic.List[ScriptTypeContract[]]] $Scopes
+    hidden static [Collections.Generic.List[System.Management.Automation.Language.TypeDefinitionAst[]]] $Definitions
+    static [Tuple[int,int,string]] Acquire([System.Management.Automation.Language.TypeDefinitionAst[]]$Definitions,[int[]]$Imports){
+        try {
+            if($null -eq [PscResidentDeclarationGraph]::Scopes){[PscResidentDeclarationGraph]::Scopes=[Collections.Generic.List[ScriptTypeContract[]]]::new();[PscResidentDeclarationGraph]::Definitions=[Collections.Generic.List[System.Management.Automation.Language.TypeDefinitionAst[]]]::new()}
+            [Collections.Generic.List[ScriptTypeContract]]$imported=[Collections.Generic.List[ScriptTypeContract]]::new()
+            foreach($slot in $Imports){
+                if($slot -lt 0 -or $slot -ge [PscResidentDeclarationGraph]::Scopes.Count){return [Tuple[int,int,string]]::new(4,-1,'Invalid imported scope')}
+                $imported.AddRange([PscResidentDeclarationGraph]::Scopes[$slot])
+            }
+            [ScriptTypeContract[]]$contracts=[PscScriptTypeAcquisition]::Acquire($Definitions,$imported.ToArray())
+            [int]$scope=[PscResidentDeclarationGraph]::Scopes.Count
+            [PscResidentDeclarationGraph]::Scopes.Add($contracts)
+            [PscResidentDeclarationGraph]::Definitions.Add($Definitions)
+            return [Tuple[int,int,string]]::new(1,$scope,'')
+        }catch [Exception]{return [Tuple[int,int,string]]::new(4,-1,$_.Exception.Message)}
+        return [Tuple[int,int,string]]::new(4,-1,'Acquisition did not complete')
+    }
+    hidden static [ScriptTypeReference] Reference([type]$Type,[Collections.Generic.Dictionary[type,Tuple[int,int]]]$Owners){
+        if($null -eq $Type -or $Type.IsPointer -or $Type.IsByRef -or $Type.ContainsGenericParameters){return $null}
+        [ScriptTypeReference]$reference=[ScriptTypeReference]::new();$reference.Spelling=$Type.FullName;$reference.Arguments=[ScriptTypeReference[]]::new(0)
+        if($Type.IsArray){
+            if($Type.GetArrayRank() -eq 1 -and !$Type.IsSZArray){return $null}
+            $reference.Kind=[ScriptTypeReferenceKind]::Array;$reference.Rank=$Type.GetArrayRank()
+            $reference.Element=[PscResidentDeclarationGraph]::Reference($Type.GetElementType(),$Owners)
+            if($null -eq $reference.Element){return $null};return $reference
+        }
+        if($Type.IsConstructedGenericType){
+            $reference.Kind=[ScriptTypeReferenceKind]::Generic
+            [type]$generic=$Type.GetGenericTypeDefinition()
+            if($generic.Assembly.IsDynamic){return $null}
+            $reference.Element=[ScriptTypeReference]::new();$reference.Element.Kind=[ScriptTypeReferenceKind]::Clr;$reference.Element.Spelling=$generic.FullName;$reference.Element.ClrIdentity=$generic.AssemblyQualifiedName
+            [type[]]$arguments=$Type.GetGenericArguments();$reference.Arguments=[ScriptTypeReference[]]::new($arguments.Length)
+            for([int]$i=0;$i -lt $arguments.Length;$i++){
+                $reference.Arguments[$i]=[PscResidentDeclarationGraph]::Reference($arguments[$i],$Owners)
+                if($null -eq $reference.Arguments[$i]){return $null}
+            }
+            return $reference
+        }
+        if($Owners.ContainsKey($Type)){
+            [Tuple[int,int]]$slot=$Owners[$Type]
+            if($slot.Item1 -lt 0 -or $slot.Item1 -ge [PscResidentDeclarationGraph]::Scopes.Count){throw [InvalidOperationException]::new('Invalid owner scope')}
+            [ScriptTypeContract[]]$contracts=[PscResidentDeclarationGraph]::Scopes[$slot.Item1]
+            if($slot.Item2 -lt 0 -or $slot.Item2 -ge $contracts.Length){throw [InvalidOperationException]::new('Invalid owner declaration')}
+            $reference.Kind=[ScriptTypeReferenceKind]::Source;$reference.Definition=$contracts[$slot.Item2];return $reference
+        }
+        if($Type.Assembly.IsDynamic){return $null}
+        $reference.Kind=[ScriptTypeReferenceKind]::Clr;$reference.ClrIdentity=$Type.AssemblyQualifiedName
+        if([string]::IsNullOrEmpty($reference.ClrIdentity)){return $null};return $reference
+    }
+    # 0 absent, 1 found, 3 ambiguous, 4 invalid. The member slot refers to
+    # the original source member ordering, not a CLR reflection enumeration.
+    static [Tuple[int,int,bool[],string[],string]] Bind([int]$Scope,[int]$Owner,[string]$Name,[type[]]$Arguments,[bool]$Static,[bool]$Constructor,[Collections.Generic.Dictionary[type,Tuple[int,int]]]$Owners){
+        [Tuple[int,int,bool[],string[],string]]$result=$null
+        try{$result=[PscResidentDeclarationGraph]::BindCore($Scope,$Owner,$Name,$Arguments,$Static,$Constructor,$Owners)}
+        catch [Reflection.AmbiguousMatchException]{$result=[Tuple[int,int,bool[],string[],string]]::new(3,-1,[bool[]]::new(0),[string[]]::new(0),$_.Exception.Message)}
+        catch [Exception]{$result=[Tuple[int,int,bool[],string[],string]]::new(4,-1,[bool[]]::new(0),[string[]]::new(0),$_.Exception.Message)}
+        return $result
+    }
+    hidden static [Tuple[int,int,bool[],string[],string]] BindCore([int]$Scope,[int]$Owner,[string]$Name,[type[]]$Arguments,[bool]$Static,[bool]$Constructor,[Collections.Generic.Dictionary[type,Tuple[int,int]]]$Owners){
+            if($null -eq [PscResidentDeclarationGraph]::Scopes -or $Scope -lt 0 -or $Scope -ge [PscResidentDeclarationGraph]::Scopes.Count){return [Tuple[int,int,bool[],string[],string]]::new(4,-1,[bool[]]::new(0),[string[]]::new(0),'Invalid binding scope')}
+            [ScriptTypeContract[]]$contracts=[PscResidentDeclarationGraph]::Scopes[$Scope]
+            if($Owner -lt 0 -or $Owner -ge $contracts.Length){return [Tuple[int,int,bool[],string[],string]]::new(4,-1,[bool[]]::new(0),[string[]]::new(0),'Invalid binding owner')}
+            [ScriptTypeContract]$contract=$contracts[$Owner]
+            [ScriptTypeReference[]]$references=[ScriptTypeReference[]]::new($Arguments.Length)
+            for([int]$i=0;$i -lt $references.Length;$i++){
+                $references[$i]=[PscResidentDeclarationGraph]::Reference($Arguments[$i],$Owners)
+                if($null -eq $references[$i]){return [Tuple[int,int,bool[],string[],string]]::new(0,-1,[bool[]]::new(0),[string[]]::new(0),'')}
+            }
+            [ScriptTypeBinding]$binding=[ScriptTypePrimitiveConversion]::BindDeclared($contract,$Name,$references,$Static,$Constructor)
+            if($null -eq $binding){return [Tuple[int,int,bool[],string[],string]]::new(0,-1,[bool[]]::new(0),[string[]]::new(0),'')}
+            if(![object]::ReferenceEquals($binding.Owner,$contract)){return [Tuple[int,int,bool[],string[],string]]::new(4,-1,[bool[]]::new(0),[string[]]::new(0),'Binding owner differs')}
+            for([int]$memberIndex=0;$memberIndex -lt $contract.Members.Length;$memberIndex++){
+                if(![object]::ReferenceEquals($contract.Members[$memberIndex],$binding.Member)){continue}
+                [bool[]]$exact=[bool[]]::new($references.Length)
+                [string[]]$identities=[string[]]::new($references.Length)
+                for([int]$i=0;$i -lt $references.Length;$i++){
+                    if(![object]::ReferenceEquals($binding.Arguments[$i],$references[$i])){return [Tuple[int,int,bool[],string[],string]]::new(4,-1,[bool[]]::new(0),[string[]]::new(0),'Binding argument differs')}
+                    $exact[$i]=[ScriptTypeReference]::Same($binding.Member.ParameterReferences[$i],$references[$i])
+                    $identities[$i]=$binding.Member.ParameterReferences[$i].ClrIdentity
+                }
+                return [Tuple[int,int,bool[],string[],string]]::new(1,$memberIndex,$exact,$identities,'')
+            }
+            return [Tuple[int,int,bool[],string[],string]]::new(4,-1,[bool[]]::new(0),[string[]]::new(0),'Selected member is not retained')
+    }
+    # CTS acquisition is distinct from source ownership. Known source leaves
+    # are mapped through the retained referent, never through reflection names.
+    hidden static [bool] PrivateAssembly([Reflection.Assembly]$Assembly){
+        [System.Runtime.Loader.AssemblyLoadContext]$context=[System.Runtime.Loader.AssemblyLoadContext]::GetLoadContext($Assembly)
+        return $null -ne $context -and $context.IsCollectible -and $context.Name -ceq 'PSC.Runtime.Selection'
+    }
+    hidden static [type] ExternalType([type]$Type){
+        if($null -eq $Type){return $null}
+        if([PscResidentDeclarationGraph]::PrivateAssembly($Type.Assembly)){throw [InvalidOperationException]::new('Private compiler realization cannot be projected')}
+        if($Type.HasElementType){[void][PscResidentDeclarationGraph]::ExternalType($Type.GetElementType())}
+        if($Type.IsConstructedGenericType){foreach($argument in $Type.GetGenericArguments()){[void][PscResidentDeclarationGraph]::ExternalType($argument)}}
+        return $Type
+    }
+    hidden static [type] ResolveName([string]$Name,[Collections.Generic.Dictionary[string,type]]$NamedTypes){
+        if($NamedTypes.ContainsKey($Name)){return [PscResidentDeclarationGraph]::ExternalType($NamedTypes[$Name])}
+        [type]$resolved=[type]::GetType($Name,$false,$true)
+        if($null -ne $resolved){return [PscResidentDeclarationGraph]::ExternalType($resolved)}
+        foreach($assembly in [AppDomain]::CurrentDomain.GetAssemblies()){
+            if([PscResidentDeclarationGraph]::PrivateAssembly($assembly)){continue}
+            $resolved=$assembly.GetType($Name,$false,$true)
+            if($null -ne $resolved){return [PscResidentDeclarationGraph]::ExternalType($resolved)}
+        }
+        if(!$Name.StartsWith('System.',[StringComparison]::OrdinalIgnoreCase)){
+            foreach($assembly in [AppDomain]::CurrentDomain.GetAssemblies()){
+            if([PscResidentDeclarationGraph]::PrivateAssembly($assembly)){continue}
+                $resolved=$assembly.GetType('System.'+$Name,$false,$true)
+                if($null -ne $resolved){return [PscResidentDeclarationGraph]::ExternalType($resolved)}
+            }
+        }
+        throw [TypeLoadException]::new('Missing CLR realization: '+$Name)
+    }
+    hidden static [type] Realize([ScriptTypeReference]$Reference,[System.Management.Automation.Language.ITypeName]$Witness,[Collections.Generic.Dictionary[ScriptTypeContract,type]]$Types,[Collections.Generic.Dictionary[string,type]]$NamedTypes,[type]$DefaultType){
+        if($Reference.Kind -eq [ScriptTypeReferenceKind]::Source){
+            if(!$Types.ContainsKey($Reference.Definition)){throw [InvalidOperationException]::new('Missing source referent realization')}
+            return [PscResidentDeclarationGraph]::ExternalType($Types[$Reference.Definition])
+        }
+        if($Reference.Kind -eq [ScriptTypeReferenceKind]::Array){
+            [System.Management.Automation.Language.ArrayTypeName]$arrayName=$Witness
+            [type]$element=[PscResidentDeclarationGraph]::Realize($Reference.Element,$arrayName.ElementType,$Types,$NamedTypes,[object])
+            if($Reference.Rank -eq 1){return $element.MakeArrayType()}
+            return $element.MakeArrayType($Reference.Rank)
+        }
+        if($Reference.Kind -eq [ScriptTypeReferenceKind]::Generic){
+            [System.Management.Automation.Language.GenericTypeName]$genericName=$Witness
+            [type[]]$arguments=[type[]]::new($Reference.Arguments.Length)
+            for([int]$i=0;$i -lt $arguments.Length;$i++){$arguments[$i]=[PscResidentDeclarationGraph]::Realize($Reference.Arguments[$i],$genericName.GenericArguments[$i],$Types,$NamedTypes,[object])}
+            [type]$generic=[PscResidentDeclarationGraph]::ResolveName($genericName.TypeName.FullName+'`'+$arguments.Length.ToString([Globalization.CultureInfo]::InvariantCulture),$NamedTypes)
+            return $generic.MakeGenericType($arguments)
+        }
+        if($null -eq $Witness){return $DefaultType}
+        if($Witness -is [System.Management.Automation.Language.TypeName] -and $NamedTypes.ContainsKey($Witness.FullName)){return [PscResidentDeclarationGraph]::ExternalType($NamedTypes[$Witness.FullName])}
+        [type]$resolved=$Witness.GetReflectionType()
+        if($null -ne $resolved){return [PscResidentDeclarationGraph]::ExternalType($resolved)}
+        return [PscResidentDeclarationGraph]::ResolveName($Witness.FullName,$NamedTypes)
+    }
+    static [Tuple[int,type,Tuple[type,type[]][],string]] Project([int]$Scope,[int]$Owner,[Collections.Generic.Dictionary[type,Tuple[int,int]]]$Owners,[Collections.Generic.Dictionary[string,type]]$NamedTypes){
+        [Tuple[int,type,Tuple[type,type[]][],string]]$result=$null
+        [type]$noType=$null
+        try{$result=[PscResidentDeclarationGraph]::ProjectCore($Scope,$Owner,$Owners,$NamedTypes)}
+        catch [Exception]{$result=[Tuple[int,type,Tuple[type,type[]][],string]]::new(4,$noType,[Tuple[type,type[]][]]::new(0),$_.Exception.Message)}
+        return $result
+    }
+    hidden static [Tuple[int,type,Tuple[type,type[]][],string]] ProjectCore([int]$Scope,[int]$Owner,[Collections.Generic.Dictionary[type,Tuple[int,int]]]$Owners,[Collections.Generic.Dictionary[string,type]]$NamedTypes){
+        if($Scope -lt 0 -or $Scope -ge [PscResidentDeclarationGraph]::Scopes.Count){throw [InvalidOperationException]::new('Invalid projection scope')}
+        [ScriptTypeContract[]]$contracts=[PscResidentDeclarationGraph]::Scopes[$Scope]
+        if($Owner -lt 0 -or $Owner -ge $contracts.Length){throw [InvalidOperationException]::new('Invalid projection owner')}
+        [Collections.Generic.Dictionary[ScriptTypeContract,type]]$types=[Collections.Generic.Dictionary[ScriptTypeContract,type]]::new()
+        [type[]]$keys=[type[]]::new($Owners.Count)
+        $Owners.Keys.CopyTo($keys,0)
+        foreach($key in $keys){
+            [Tuple[int,int]]$slot=$Owners[$key]
+            if($slot.Item1 -lt 0 -or $slot.Item1 -ge [PscResidentDeclarationGraph]::Scopes.Count){throw [InvalidOperationException]::new('Invalid realization scope')}
+            [ScriptTypeContract[]]$visible=[PscResidentDeclarationGraph]::Scopes[$slot.Item1]
+            if($slot.Item2 -lt 0 -or $slot.Item2 -ge $visible.Length){throw [InvalidOperationException]::new('Invalid realization owner')}
+            $types.Add($visible[$slot.Item2],$key)
+        }
+        [ScriptTypeContract]$contract=$contracts[$Owner]
+        [System.Management.Automation.Language.TypeDefinitionAst]$definition=[PscResidentDeclarationGraph]::Definitions[$Scope][$Owner]
+        [type]$base=$null
+        if($contract.BaseReferences.Length -ne 0){
+            if($contract.BaseReferences.Length -ne 1 -or $contract.BaseReferences[0].Kind -ne [ScriptTypeReferenceKind]::Source){throw [InvalidOperationException]::new('Base is not an admitted source-owned class: '+$definition.Name)}
+            $base=[PscResidentDeclarationGraph]::Realize($contract.BaseReferences[0],$definition.BaseTypes[0].TypeName,$types,$NamedTypes,[object])
+        }
+        [Tuple[type,type[]][]]$signatures=[Tuple[type,type[]][]]::new($contract.Members.Length)
+        for([int]$index=0;$index -lt $signatures.Length;$index++){
+            [ScriptTypeMember]$descriptor=$contract.Members[$index]
+            [System.Management.Automation.Language.MemberAst]$member=$definition.Members[$index]
+            [System.Management.Automation.Language.ITypeName]$witness=$null
+            [type]$defaultType=[object]
+            [type[]]$parameters=[type[]]::new(0)
+            if($member -is [System.Management.Automation.Language.FunctionMemberAst]){
+                [System.Management.Automation.Language.FunctionMemberAst]$method=$member
+                $defaultType=[void]
+                if($null -ne $method.ReturnType){$witness=$method.ReturnType.TypeName}
+                $parameters=[type[]]::new($descriptor.ParameterReferences.Length)
+                for([int]$j=0;$j -lt $parameters.Length;$j++){
+                    $parameters[$j]=[PscResidentDeclarationGraph]::Realize($descriptor.ParameterReferences[$j],[PscScriptTypeAcquisition]::ParameterType($method.Parameters[$j]),$types,$NamedTypes,[object])
+                }
+            }else{
+                [System.Management.Automation.Language.PropertyMemberAst]$property=$member
+                if($null -ne $property.PropertyType){$witness=$property.PropertyType.TypeName}
+            }
+            [type]$returnType=[PscResidentDeclarationGraph]::Realize($descriptor.ResultReference,$witness,$types,$NamedTypes,$defaultType)
+            $signatures[$index]=[Tuple[type,type[]]]::new($returnType,$parameters)
+        }
+        return [Tuple[int,type,Tuple[type,type[]][],string]]::new(1,$base,$signatures,'')
+    }
+
+}
     if($null -ne $BindingContract){
         if($null -eq $RuntimeSelection){return [ScriptTypePrimitiveConversion]::BindNumericDeclared($BindingContract,$BindingName,$BindingReferences,$BindingStatic,$BindingConstructor,$null)}
         [Threading.Monitor]::Enter($RuntimeSelection)
@@ -5129,6 +5331,7 @@ function Get-ScriptTypeContract {
     if($PSBoundParameters.ContainsKey('ComparisonLeft')){return [ScriptTypeReference]::Same($ComparisonLeft,$ComparisonRight)}
     if($PSBoundParameters.ContainsKey('ReferenceContract')){return [ScriptTypeContract]::FindReference($ReferenceContract,$ReferenceName,$ReferenceParameters,$ReferenceStatic,$ReferenceConstructor)}
     if($null -ne $BindingOwner){
+        if($DeclarationScope.ResidentSlot -ge 0){throw 'Resident member binding requires the session-owned operational boundary.'}
         if($null -ne $RuntimeSelection){[PscRuntimeSelection]::AssertOpen($RuntimeSelection)}
         $contract=$DeclarationScope.Contracts[$BindingOwner]
         $references=[ScriptTypeReference[]]::new($BindingArguments.Length)
@@ -5215,6 +5418,38 @@ function Get-ScriptTypeContract {
     }
     if($null -ne $DeclarationScope -or ($null -ne $CompilerClassAsts -and $CompilerClassAsts.Length)){
         if($null -ne $ContractPaths -and $ContractPaths.Length -or $null -eq $MaterializedTypes){throw 'Compiler signature realization requires one selected source scope'}
+        if($null -ne $RuntimeSelection){
+            if($null -eq $DeclarationScope){throw 'Resident acquisition requires an owning declaration scope'}
+            $DeclarationScope.ResidentSession=$RuntimeSelection.Identity
+            $DeclarationScope.ResidentDefinitions=$CompilerClassAsts
+            if($null -eq $DeclarationScope.ResidentDefinitions){$DeclarationScope.ResidentDefinitions=[System.Management.Automation.Language.TypeDefinitionAst[]]::new(0)}
+            $imports=[int[]]::new(0)
+            if($null -ne $DeclarationScope.Resolving){
+                if($DeclarationScope.Resolving.ResidentSession -ne $RuntimeSelection.Identity -or $DeclarationScope.Resolving.ResidentSlot -lt 0){throw 'Resident declaration scope cannot import an authoring descriptor graph'}
+                $imports=[int[]]@($DeclarationScope.Resolving.ResidentSlot)
+            }
+            $DeclarationScope.ResidentSlot=[PscRuntimeSelection]::AcquireGraph($RuntimeSelection,$DeclarationScope.ResidentDefinitions,$imports)
+            $owners=Get-PscResidentOwnerMap -RuntimeSelection $RuntimeSelection -Scopes @($DeclarationScope) -BuildingScope $DeclarationScope -MaterializedTypes $MaterializedTypes
+            $named=[Collections.Generic.Dictionary[string,type]]::new([StringComparer]::OrdinalIgnoreCase)
+            foreach($key in $MaterializedTypes.Keys){$named.Add($key,$MaterializedTypes[$key])}
+            $signatures=[Collections.Generic.Dictionary[System.Management.Automation.Language.MemberAst,PscMaterializedSignature]]::new()
+            for($ownerIndex=0;$ownerIndex -lt $DeclarationScope.ResidentDefinitions.Length;$ownerIndex++){
+                $owner=$DeclarationScope.ResidentDefinitions[$ownerIndex]
+                $projection=[PscRuntimeSelection]::ProjectGraph($RuntimeSelection,$DeclarationScope.ResidentSlot,$ownerIndex,$owners,$named)
+                if($null -ne $projection.Item2){$DeclarationScope.Bases.Add($owner,$projection.Item2)}
+                if($projection.Item3.Length -ne $owner.Members.Count){throw 'Resident member inventory differs from source'}
+                for($memberIndex=0;$memberIndex -lt $owner.Members.Count;$memberIndex++){
+                    $member=$owner.Members[$memberIndex];$projected=$projection.Item3[$memberIndex]
+                    $signature=[PscMaterializedSignature]::new();$signature.Declaration=$member;$signature.Result=$projected.Item1;$signature.Parameters=$projected.Item2
+                    if($member -is [System.Management.Automation.Language.FunctionMemberAst] -and (Test-ScriptFunctionMember $member)){
+                        for($i=0;$i -lt $signature.Parameters.Length;$i++){if($signature.Parameters[$i] -eq [System.Management.Automation.SwitchParameter]){$signature.Parameters[$i]=[bool]}}
+                    }
+                    $signatures.Add($member,$signature);$signature
+                }
+            }
+            $DeclarationScope.Signatures=$signatures
+            return
+        }
         $retainedContracts=[Collections.Generic.Dictionary[System.Management.Automation.Language.TypeDefinitionAst,ScriptTypeContract]]::new()
         $retainedSignatures=[Collections.Generic.Dictionary[System.Management.Automation.Language.MemberAst,PscMaterializedSignature]]::new()
         $imported=[ScriptTypeContract[]]@()
@@ -5270,6 +5505,7 @@ class PscFacultyUnit {
     }
 }
 function Get-PscFacultyUnits {
+    param([switch]$IncludeCompiler)
     [PscFacultyUnit]::new('HandleTable','HandleTable',@('HandleTableState','HandleTableRetention','HandleTableCell','HandleTableInfo','HandleTableLease','HandleTablePairLease','HandleTable','HandleCollector','HandleTableFence'),@())
     [PscFacultyUnit]::new('DiscoveryMechanisms','InquiryCase',@('InquirySourceCleanReference','InquiryAxis','InquiryPredictiveScalar','InquiryOrigin','InquiryBlock','InquiryReading','InquiryCase','InquirySemanticAttachment','InquiryExecutionTier','InquiryReliance','InquiryWhenClause','InquiryJudgment'),@())
     [PscFacultyUnit]::new('ScriptType','ScriptTypeReflection',@('ScriptTypeReferenceKind','ScriptTypeReference','ScriptTypeMember','ScriptTypeBinding','ScriptTypeContract','ScriptTypeCall','ScriptTypeSelectionMemo','ScriptTypeBindingExtension','ScriptTypeSmaSelector','ScriptTypeRealization','ScriptTypeRole','ScriptTypeReflection','ScriptTypeCatalog'),@('HandleTable'))
@@ -5277,12 +5513,13 @@ function Get-PscFacultyUnits {
     [PscFacultyUnit]::new('ObjectDispatch','ScriptTypeObjectDispatch',@('ScriptTypeObjectDispatch'),@('HandleTable','DiscoveryMechanisms','ScriptType'))
     [PscFacultyUnit]::new('NativeEncoding','PscNativeEncoding',@('PscNativeInstruction','PscNativeEncoding','HexagonForm','HexagonFields','HexagonDecoded','HexagonPatternEncoder'),@())
     [PscFacultyUnit]::new('ElfEncoding','PscElfEncoding',@('PscElfLayout','PscElfStringTable','PscElfEncoding','PscElfExport','PscElfCodeLibrary','PscElfProgramRecord','PscElfSectionRecord','PscElfSymbolRecord','PscElfImageRecord','PscElfImageReader'),@())
+    if($IncludeCompiler){[PscFacultyUnit]::new('CompilerDeclarations','PscResidentDeclarationGraph',@('PscScriptTypeAcquisition','PscResidentDeclarationGraph'),@('HandleTable','ScriptType','PrimitiveConversion'))}
 }
 function Build-PscFaculty {
     param([string]$Faculty,[string]$RuntimeDirectory,[string[]]$ContractPaths,[string[]]$ContractReferences,[PscSource]$RetainedSource,[Collections.Generic.Dictionary[string,PscDeclarationScope]]$RetainedScopes)
     if($null -ne $RetainedScopes -and $null -eq $RetainedSource){throw 'Retained faculty scopes require the original source.'}
     if($null -ne $RetainedScopes -and $RetainedScopes.ContainsKey($Faculty)){throw "Faculty '$Faculty' already realized in this coordinator."}
-    $units=@(Get-PscFacultyUnits)
+    $units=@(Get-PscFacultyUnits -IncludeCompiler)
     $unit = @($units | Where-Object Name -ceq $Faculty)
     if ($unit.Count -ne 1) { throw "Unknown PSC faculty: $Faculty" }
     $unit = $unit[0]
@@ -5345,8 +5582,10 @@ function Build-PscFaculty {
         else{$imports.Contracts=Get-PscFacultyDeclarations -CompilerClassAsts $importedClasses.ToArray() -DependencyContractsOnly}
     }
     else{$imports=$null}
+    $output=[PscRuntimeSelection]::ArtifactPath($RuntimeDirectory,$Faculty)
+    [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($output)))
     $scope=$null
-    Export-LoweredAssembly -RealizedScope ([ref]$scope) -SourceAst $holder -DeclarationsOnly -ClassName $unit.Primary -ClassNames $unit.Declarations -ScopeDeclarations $definitions.ToArray() -DependencyScope $imports -StaticData $data -OutputPath (Join-Path $RuntimeDirectory ($Faculty+'.dll')) -Deterministic
+    Export-LoweredAssembly -RealizedScope ([ref]$scope) -SourceAst $holder -DeclarationsOnly -ClassName $unit.Primary -ClassNames $unit.Declarations -ScopeDeclarations $definitions.ToArray() -DependencyScope $imports -StaticData $data -OutputPath $output -Deterministic
     if($null -ne $RetainedScopes){
         if($null -eq $scope){throw 'Faculty realization returned no declaration scope.'}
         $RetainedScopes.Add($Faculty,$scope)
@@ -5375,7 +5614,7 @@ function Build-PscRuntime {
     if($ContractInputsPath){
         # Resolve the declared dependency graph before realizing any unit.
         $pending=[Collections.Generic.List[PscFacultyUnit]]::new()
-        $pending.AddRange([PscFacultyUnit[]]@(Get-PscFacultyUnits))
+        $pending.AddRange([PscFacultyUnit[]]@(Get-PscFacultyUnits -IncludeCompiler:(!$ContractPaths.Count -and !$ContractReferences.Count)))
         $ordered=[Collections.Generic.List[PscFacultyUnit]]::new()
         $ready=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         while($pending.Count){
@@ -5427,16 +5666,26 @@ function Build-PscRuntime {
 class PscRuntimeSelection {
     hidden [System.Runtime.Loader.AssemblyLoadContext] $FacultyContext
     hidden [Func[type[][],type[],int]] $NumericSelector
+    [Guid] $Identity
+    hidden [System.Runtime.CompilerServices.ConditionalWeakTable[System.Management.Automation.Language.Ast,PscDeclarationScope]] $Scopes
+    hidden [Func[System.Management.Automation.Language.TypeDefinitionAst[],int[],Tuple[int,int,string]]] $GraphAcquisition
+    hidden [Func[int,int,Collections.Generic.Dictionary[type,Tuple[int,int]],Collections.Generic.Dictionary[string,type],Tuple[int,type,Tuple[type,type[]][],string]]] $GraphProjection
+    hidden [Func[int,int,string,type[],bool,bool,Collections.Generic.Dictionary[type,Tuple[int,int]],Tuple[int,int,bool[],string[],string]]] $GraphBinding
     static [string[]] FacultyNames(){return @('HandleTable','ScriptType','PrimitiveConversion')}
+    static [string[]] AdmissionNames(){return @('HandleTable','ScriptType','PrimitiveConversion','CompilerDeclarations')}
+    static [string] ArtifactPath([string]$Directory,[string]$Name){
+        if($Name -ceq 'CompilerDeclarations'){return [IO.Path]::Combine($Directory,'compiler',$Name+'.dll')}
+        return [IO.Path]::Combine($Directory,$Name+'.dll')
+    }
     static [PscRuntimeSelection] Open([string]$SourcePath,[string]$ExpectedSource,[string]$Directory){
         $path=[IO.Path]::Combine([IO.Path]::GetFullPath($Directory),'PSC.runtime-selection.bin')
         $record=[IO.File]::ReadAllBytes($path)
         if($record.Length -gt 2048){throw 'Invalid faculty selection receipt size.'}
         $reader=[IO.BinaryReader]::new([IO.MemoryStream]::new($record,$false))
-        $names=[PscRuntimeSelection]::FacultyNames()
+        $names=[PscRuntimeSelection]::AdmissionNames()
         $images=[byte[][]]::new($names.Length)
         try{
-            if($reader.ReadString() -cne 'PSC.Runtime.Selection/1'){throw 'Invalid faculty selection receipt.'}
+            if($reader.ReadString() -cne 'PSC.Runtime.Selection/2'){throw 'Invalid faculty selection receipt.'}
             $sourceDigest=[PscRuntimeInventory]::FileDigest($SourcePath)
             if(($ExpectedSource -and $ExpectedSource -cne $sourceDigest) -or $reader.ReadString() -cne $sourceDigest){throw 'Faculty selection source identity mismatch.'}
             if($reader.ReadString() -cne [PscRuntimeInventory]::FileDigest([object].Assembly.Location) -or $reader.ReadString() -cne [PscRuntimeInventory]::FileDigest([System.Management.Automation.PSObject].Assembly.Location)){throw 'Faculty selection host identity mismatch.'}
@@ -5444,7 +5693,7 @@ class PscRuntimeSelection {
             for($index=0;$index -lt $names.Length;$index++){
                 $name=$names[$index]
                 if($reader.ReadString() -cne $name){throw 'Faculty selection dependency identity mismatch.'}
-                $image=[IO.File]::ReadAllBytes(([IO.Path]::Combine($Directory,($name+'.dll'))))
+                $image=[IO.File]::ReadAllBytes(([PscRuntimeSelection]::ArtifactPath($Directory,$name)))
                 if($reader.ReadString() -cne [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($image))){throw "Faculty selection artifact identity mismatch: $name"}
                 $images[$index]=$image
             }
@@ -5467,18 +5716,27 @@ class PscRuntimeSelection {
                     $converter=[ComponentModel.TypeConverter].Assembly.GetName()
                     $admitted.Add($converter.Name,$converter)
                 }
+                if($names[$index] -ceq 'CompilerDeclarations'){
+                    $sma=[System.Management.Automation.PSObject].Assembly.GetName();$admitted.Add($sma.Name,$sma)
+                }
                 foreach($reference in $assembly.GetReferencedAssemblies()){
                     if(!$admitted.ContainsKey($reference.Name) -or $admitted[$reference.Name].FullName -cne $reference.FullName){throw "Unexpected faculty selection dependency: $($reference.FullName)"}
                 }
                 $admitted.Add($names[$index],$assembly.GetName())
                 $loaded[$index]=$assembly
             }
-            $target=$loaded[$loaded.Length-1].GetType('ScriptTypePrimitiveConversion',$true,$false)
+            $target=$loaded[$loaded.Length-2].GetType('ScriptTypePrimitiveConversion',$true,$false)
             $method=$target.GetMethod('SelectSignatures',[Reflection.BindingFlags]'Public,Static,DeclaredOnly',$null,[type[]]@([type[][]],[type[]]),$null)
             if($null -eq $method -or $method.ReturnType -ne [int]){throw 'Faculty selection realization signature mismatch.'}
             $session=[PscRuntimeSelection]::new()
             $session.FacultyContext=$context
             $session.NumericSelector=$method.CreateDelegate([Func[type[][],type[],int]])
+            $session.Identity=[Guid]::NewGuid()
+            $session.Scopes=[System.Runtime.CompilerServices.ConditionalWeakTable[System.Management.Automation.Language.Ast,PscDeclarationScope]]::new()
+            $graph=$loaded[$loaded.Length-1].GetType('PscResidentDeclarationGraph',$true,$false)
+            $session.GraphAcquisition=$graph.GetMethod('Acquire').CreateDelegate([Func[System.Management.Automation.Language.TypeDefinitionAst[],int[],Tuple[int,int,string]]])
+            $session.GraphProjection=$graph.GetMethod('Project').CreateDelegate([Func[int,int,Collections.Generic.Dictionary[type,Tuple[int,int]],Collections.Generic.Dictionary[string,type],Tuple[int,type,Tuple[type,type[]][],string]]])
+            $session.GraphBinding=$graph.GetMethod('Bind').CreateDelegate([Func[int,int,string,type[],bool,bool,Collections.Generic.Dictionary[type,Tuple[int,int]],Tuple[int,int,bool[],string[],string]]])
             return $session
         }catch{$context.Unload();throw}
     }
@@ -5496,12 +5754,41 @@ class PscRuntimeSelection {
             return $Session.NumericSelector.Invoke($Signatures,$Sources)
         }finally{[Threading.Monitor]::Exit($Session)}
     }
+    static [int] AcquireGraph([PscRuntimeSelection]$Session,[System.Management.Automation.Language.TypeDefinitionAst[]]$Definitions,[int[]]$Imports){
+        [Threading.Monitor]::Enter($Session)
+        try{
+            [PscRuntimeSelection]::AssertOpen($Session)
+            $result=$Session.GraphAcquisition.Invoke($Definitions,$Imports)
+            if($result.Item1 -ne 1){throw [InvalidOperationException]::new($result.Item3)}
+            return $result.Item2
+        }finally{[Threading.Monitor]::Exit($Session)}
+    }
+    static [Tuple[int,type,Tuple[type,type[]][],string]] ProjectGraph([PscRuntimeSelection]$Session,[int]$Scope,[int]$Owner,[Collections.Generic.Dictionary[type,Tuple[int,int]]]$Owners,[Collections.Generic.Dictionary[string,type]]$NamedTypes){
+        [Threading.Monitor]::Enter($Session)
+        try{
+            [PscRuntimeSelection]::AssertOpen($Session)
+            $result=$Session.GraphProjection.Invoke($Scope,$Owner,$Owners,$NamedTypes)
+            if($result.Item1 -ne 1){throw [InvalidOperationException]::new($result.Item4)}
+            return $result
+        }finally{[Threading.Monitor]::Exit($Session)}
+    }
+    static [Tuple[int,int,bool[],string[],string]] BindGraph([PscRuntimeSelection]$Session,[int]$Scope,[int]$Owner,[string]$Name,[type[]]$Arguments,[bool]$Static,[bool]$Constructor,[Collections.Generic.Dictionary[type,Tuple[int,int]]]$Owners){
+        [Threading.Monitor]::Enter($Session)
+        try{
+            [PscRuntimeSelection]::AssertOpen($Session)
+            $result=$Session.GraphBinding.Invoke($Scope,$Owner,$Name,$Arguments,$Static,$Constructor,$Owners)
+            if($result.Item1 -eq 3){throw [Reflection.AmbiguousMatchException]::new($result.Item5)}
+            if($result.Item1 -ne 0 -and $result.Item1 -ne 1){throw [InvalidOperationException]::new($result.Item5)}
+            return $result
+        }finally{[Threading.Monitor]::Exit($Session)}
+    }
     static [void] Close([PscRuntimeSelection]$Session){
         if($null -eq $Session){return}
         [Threading.Monitor]::Enter($Session)
         try{
             if($null -eq $Session.FacultyContext){return}
             $context=$Session.FacultyContext
+            $Session.GraphAcquisition=$null;$Session.GraphProjection=$null;$Session.GraphBinding=$null;$Session.Scopes=$null
             $Session.NumericSelector=$null
             $Session.FacultyContext=$null
             $context.Unload()
@@ -5517,14 +5804,14 @@ function Write-PscRuntimeSelectionRecord {
     try{
         $writer=[IO.BinaryWriter]::new([IO.File]::Open($temporary,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None))
         try{
-            $writer.Write('PSC.Runtime.Selection/1')
+            $writer.Write('PSC.Runtime.Selection/2')
             $writer.Write($Source.Sha256)
             $writer.Write([PscRuntimeInventory]::FileDigest([object].Assembly.Location))
             $writer.Write([PscRuntimeInventory]::FileDigest([System.Management.Automation.PSObject].Assembly.Location))
             $writer.Write([PscRuntimeInventory]::FileDigest([ComponentModel.TypeConverter].Assembly.Location))
-            foreach($name in [PscRuntimeSelection]::FacultyNames()){
+            foreach($name in [PscRuntimeSelection]::AdmissionNames()){
                 $writer.Write($name)
-                $writer.Write([PscRuntimeInventory]::FileDigest((Join-Path $Directory ($name+'.dll'))))
+                $writer.Write([PscRuntimeInventory]::FileDigest(([PscRuntimeSelection]::ArtifactPath($Directory,$name))))
             }
         }finally{$writer.Dispose()}
         [IO.File]::Move($temporary,$path,$true)
@@ -8817,11 +9104,11 @@ function New-ClrDeclarationProjection {
         Registers the projected types for Resolve-AstType. A distinct CLR namespace keeps compatibility types out of ordinary unqualified runtime type resolution; source names remain in the declaration scope.
     #>
     [OutputType([PscDeclarationScope])]
-    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]] $Model, [System.Management.Automation.Language.TypeDefinitionAst[]] $Enums = @(),[PscDeclarationScope]$Resolving)
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]] $Model, [System.Management.Automation.Language.TypeDefinitionAst[]] $Enums = @(),[PscDeclarationScope]$Resolving,[PscRuntimeSelection]$RuntimeSelection)
 
     $declarationScope=[PscDeclarationScope]::new();$declarationScope.Resolving=$Resolving
     if(!$Model.Count -and !$Enums.Count){
-        $null=Get-PscFacultyDeclarations -CompilerClassAsts @() -MaterializedTypes $script:LoweringClassTypes -DeclarationScope $declarationScope
+        $null=Get-PscFacultyDeclarations -CompilerClassAsts @() -MaterializedTypes $script:LoweringClassTypes -DeclarationScope $declarationScope -RuntimeSelection $RuntimeSelection
         return $declarationScope
     }
     $name = [Reflection.AssemblyName]::new("PSLoweringProjection$([Guid]::NewGuid().ToString('N'))")
@@ -8846,7 +9133,7 @@ function New-ClrDeclarationProjection {
     # Extract the selected definitions from the live AST once. The existing
     # materializer consumes STS signature references rather than rediscovering
     # source-owned types from member syntax.
-    $null=Get-PscFacultyDeclarations -CompilerClassAsts @(foreach($c in $Model){$c.Ast}) -MaterializedTypes $script:LoweringClassTypes -DeclarationScope $declarationScope
+    $null=Get-PscFacultyDeclarations -CompilerClassAsts @(foreach($c in $Model){$c.Ast}) -MaterializedTypes $script:LoweringClassTypes -DeclarationScope $declarationScope -RuntimeSelection $RuntimeSelection
     $signatures=$declarationScope.Signatures
     foreach($c in $Model){
         if($declarationScope.Bases.ContainsKey($c.Ast)){$builders[$c.Name].SetParent($declarationScope.Bases[$c.Ast])}
@@ -8955,15 +9242,17 @@ function Resolve-PscDeclarationRoot {
 }
 function Get-PscOperationalScope {
     [OutputType([PscDeclarationScope])]
-    param([System.Management.Automation.Language.Ast]$Root,[switch]$ExistingOnly)
+    param([System.Management.Automation.Language.Ast]$Root,[switch]$ExistingOnly,[PscRuntimeSelection]$RuntimeSelection)
     if([object]::ReferenceEquals($Root,$PscSelectedRoot)){return $PscSelectedScope}
     if([object]::ReferenceEquals($Root,$script:PscSemanticsRoot)){return $script:PscSemanticsScope}
     if($ExistingOnly){
         $scope=$null
-        if($script:DeclarationScopeCache.TryGetValue($Root,[ref]$scope)){return $scope}
+        $cache=$script:DeclarationScopeCache
+        if($null -ne $RuntimeSelection){[PscRuntimeSelection]::AssertOpen($RuntimeSelection);$cache=$RuntimeSelection.Scopes}
+        if($cache.TryGetValue($Root,[ref]$scope)){return $scope}
         return $null
     }
-    Get-DeclarationScope -Root $Root
+    Get-DeclarationScope -Root $Root -RuntimeSelection $RuntimeSelection
 }
 
 function Use-DeclarationScope {
@@ -8972,23 +9261,23 @@ function Use-DeclarationScope {
         Makes the classes of the source an AST belongs to resolvable: builds
         their CLR declaration projection once per parsed source and registers it for Resolve-AstType.
     #>
-    param([Parameter(Mandatory)][System.Management.Automation.Language.Ast] $Ast)
+    param([Parameter(Mandatory)][System.Management.Automation.Language.Ast] $Ast,[PscRuntimeSelection]$RuntimeSelection)
     $root = Resolve-PscDeclarationRoot $Ast
     # A source's function class resolves the source's own types; the source resolves its function class.
     $source = $null
     if ($script:ScriptFunctionSources.TryGetValue($root, [ref]$source)) {
-        $sourceScope = Get-PscOperationalScope -Root $source
-        $functionScope = Get-DeclarationScope -Root $root -Resolving $sourceScope
+        $sourceScope = Get-PscOperationalScope -Root $source -RuntimeSelection $RuntimeSelection
+        $functionScope = Get-DeclarationScope -Root $root -Resolving $sourceScope -RuntimeSelection $RuntimeSelection
         $script:LoweringClassTypes = @{} + $sourceScope.Types + $functionScope.Types
         return
     }
-    $sourceScope = Get-PscOperationalScope -Root $root
+    $sourceScope = Get-PscOperationalScope -Root $root -RuntimeSelection $RuntimeSelection
     $types = $sourceScope.Types
     if($null -ne $sourceScope.Resolving){$types=$sourceScope.Resolving.Types+$types}
     $functionClass = $null
     if ($script:ScriptFunctionClasses.TryGetValue($root, [ref]$functionClass) -and $null -ne $functionClass) {
         $functionRoot = $functionClass; while ($functionRoot.Parent) { $functionRoot = $functionRoot.Parent }
-        $functionScope=Get-DeclarationScope -Root $functionRoot -Resolving $sourceScope
+        $functionScope=Get-DeclarationScope -Root $functionRoot -Resolving $sourceScope -RuntimeSelection $RuntimeSelection
         $types = $types + $functionScope.Types
     }
     $script:LoweringClassTypes = @{} + $types
@@ -8999,10 +9288,11 @@ function Use-DeclarationScope {
 # if its own AST is unchanged. The old scope remains valid for existing witnesses.
 function Get-DeclarationScope {
     [OutputType([PscDeclarationScope])]
-    param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Root,[PscDeclarationScope]$Resolving,
+    param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Root,[PscDeclarationScope]$Resolving,[PscRuntimeSelection]$RuntimeSelection,
         [System.Management.Automation.Language.TypeDefinitionAst[]] $SelectedClassAst,[System.Management.Automation.Language.TypeDefinitionAst[]] $SelectedEnumAst)
     $selected=$PSBoundParameters.ContainsKey('SelectedClassAst') -or $PSBoundParameters.ContainsKey('SelectedEnumAst')
     $cache=$script:DeclarationScopeCache
+    if($null -ne $RuntimeSelection){[PscRuntimeSelection]::AssertOpen($RuntimeSelection);$cache=$RuntimeSelection.Scopes}
     if($null -ne $Resolving){$cache=$Resolving.DependentScopes}
     $declarationScope=$null
     if(!$selected -and $cache.TryGetValue($Root,[ref]$declarationScope)){return $declarationScope}
@@ -9013,7 +9303,7 @@ function Get-DeclarationScope {
         $enums = @(if ($PSBoundParameters.ContainsKey('SelectedEnumAst')) { $SelectedEnumAst } else { $Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsEnum }, $true) })
         $script:LoweringClassTypes = @{}
         if($null -ne $Resolving){$script:LoweringClassTypes += $Resolving.Types}
-        $next=New-ClrDeclarationProjection -Model @(if ($classes.Count) { Get-ClassModel -ClassAsts $classes }) -Enums $enums -Resolving $Resolving
+        $next=New-ClrDeclarationProjection -Model @(if ($classes.Count) { Get-ClassModel -ClassAsts $classes }) -Enums $enums -Resolving $Resolving -RuntimeSelection $RuntimeSelection
         if(!$selected){$cache.Add($Root,$next)}
         return $next
     }
@@ -9327,8 +9617,8 @@ function Get-PscFunctionOutputType {
     $root = Resolve-PscDeclarationRoot $Member
     $source = $null
     if (!$script:ScriptFunctionSources.TryGetValue($root, [ref]$source)) { return $null }
-    $sourceScope = Get-PscOperationalScope -Root $source
-    $functionScope = Get-DeclarationScope -Root $root -Resolving $sourceScope
+    $sourceScope = Get-PscOperationalScope -Root $source -RuntimeSelection $RuntimeSelection
+    $functionScope = Get-DeclarationScope -Root $root -Resolving $sourceScope -RuntimeSelection $RuntimeSelection
     $outputs = $functionScope.FunctionOutputTypes
     $known = $null
     if ($outputs.TryGetValue($Member, [ref]$known)) { return $known }
@@ -9336,7 +9626,7 @@ function Get-PscFunctionOutputType {
     $outputs.Add($Member, $null)
     $outerTypes = $script:LoweringClassTypes
     try {
-        Use-DeclarationScope -Ast $Member
+        Use-DeclarationScope -Ast $Member -RuntimeSelection $RuntimeSelection
         if ($null -eq $Member.Body -or $null -eq $Member.Body.EndBlock -or $Member.Body.BeginBlock -or $Member.Body.ProcessBlock) { return $null }
         $terminals = [System.Collections.Generic.List[System.Management.Automation.Language.Ast]]::new()
         $outcomes = Measure-PscOutputPaths -Statements @($Member.Body.EndBlock.Statements) -Written 0 -Terminals $terminals
@@ -10622,6 +10912,27 @@ function Add-GenericInference([Type] $Pattern, [Type] $Actual, [hashtable] $Bind
 # This adapter recognizes source ownership by the scoped CLR projection's identity,
 # never by a type name alone. The admitted binding profile is exact STS references
 # and the closed numeric compatibility fragment already used by structural calls.
+function Get-PscResidentOwnerMap {
+    [OutputType([Collections.Generic.Dictionary[type,Tuple[int,int]]])]
+    param([PscRuntimeSelection]$RuntimeSelection,[PscDeclarationScope[]]$Scopes,[PscDeclarationScope]$BuildingScope,[hashtable]$MaterializedTypes)
+    $map=[Collections.Generic.Dictionary[type,Tuple[int,int]]]::new()
+    $seen=[Collections.Generic.HashSet[PscDeclarationScope]]::new()
+    foreach($scope in $Scopes){
+        $visible=$scope
+        while($null -ne $visible -and $seen.Add($visible)){
+            if($visible.ResidentSlot -lt 0 -or $visible.ResidentSession -ne $RuntimeSelection.Identity){throw 'Unadmitted declaration graph owner'}
+            $types=$visible.Types
+            if([object]::ReferenceEquals($visible,$BuildingScope)){$types=$MaterializedTypes}
+            for($i=0;$i -lt $visible.ResidentDefinitions.Length;$i++){
+                $definition=$visible.ResidentDefinitions[$i];$type=$types[$definition.Name]
+                if($null -eq $type){throw 'Missing source type realization'}
+                $map.Add($type,[Tuple[int,int]]::new($visible.ResidentSlot,$i))
+            }
+            $visible=$visible.Resolving
+        }
+    }
+    return $map
+}
 function Resolve-PscSourceOperation {
     [OutputType([Reflection.MethodBase])]
     param([System.Management.Automation.Language.Ast]$SourceAst,[type]$TargetType,[string]$Name,[type[]]$ArgumentTypes,[bool]$Static,[bool]$Constructor,[PscRuntimeSelection]$RuntimeSelection)
@@ -10629,7 +10940,7 @@ function Resolve-PscSourceOperation {
     $root=Resolve-PscDeclarationRoot $SourceAst
     $source=$null
     if(!$script:ScriptFunctionSources.TryGetValue($root,[ref]$source)){$source=$root}
-    $scope=Get-PscOperationalScope -Root $source -ExistingOnly
+    $scope=Get-PscOperationalScope -Root $source -ExistingOnly -RuntimeSelection $RuntimeSelection
     if($null -eq $scope){return $null}
     if(!$TargetType.Assembly.IsDynamic){
         $dependencyScope=$scope.Resolving
@@ -10655,7 +10966,8 @@ function Resolve-PscSourceOperation {
         if(!$scope.DependentScopes.TryGetValue($functionRoot,[ref]$ownerScope) -or ![object]::ReferenceEquals($ownerScope.Resolving,$scope) -or $ownerScope.Types[$TargetType.Name] -ne $TargetType){return $null}
     }
     $ownerAst=$null
-    foreach($definition in $ownerScope.Contracts.Keys){if($definition.Name -ieq $TargetType.Name){$ownerAst=$definition;break}}
+    $definitions=if($ownerScope.ResidentSlot -ge 0){$ownerScope.ResidentDefinitions}else{$ownerScope.Contracts.Keys}
+    foreach($definition in $definitions){if($definition.Name -ieq $TargetType.Name){$ownerAst=$definition;break}}
     if($null -eq $ownerAst){return $null}
     $bindingScopes=[Collections.Generic.List[PscDeclarationScope]]::new();$bindingScopes.Add($scope)
     if(![object]::ReferenceEquals($ownerScope,$scope)){$bindingScopes.Add($ownerScope)}
@@ -10667,32 +10979,43 @@ function Resolve-PscSourceOperation {
             if($scope.DependentScopes.TryGetValue($functionRoot,[ref]$functionScope) -and [object]::ReferenceEquals($functionScope.Resolving,$scope)){$bindingScopes.Add($functionScope)}
         }
     }
-    $binding=Get-PscFacultyDeclarations -DeclarationScope $ownerScope -BindingOwner $ownerAst -BindingName $(if($Constructor){$ownerAst.Name}else{$Name}) -BindingArguments $ArgumentTypes -BindingStatic $Static -BindingConstructor $Constructor -BindingScopes $bindingScopes.ToArray() -RuntimeSelection $RuntimeSelection
-    if($null -eq $binding){return $null}
-    $member=$binding.Member
     $selected=$null
-    foreach($declaration in $ownerAst.Members){
-        $signature=$ownerScope.Signatures[$declaration]
-        if([object]::ReferenceEquals($signature.Member,$member) -and [object]::ReferenceEquals($signature.Owner,$binding.Owner)){$selected=$signature;break}
+    if($ownerScope.ResidentSlot -ge 0){
+        if($null -eq $RuntimeSelection -or $ownerScope.ResidentSession -ne $RuntimeSelection.Identity){throw 'Resident declaration owner is not admitted in this session'}
+        $owners=Get-PscResidentOwnerMap -RuntimeSelection $RuntimeSelection -Scopes $bindingScopes.ToArray()
+        $ownerIndex=[Array]::IndexOf($ownerScope.ResidentDefinitions,$ownerAst)
+        $operation=[PscRuntimeSelection]::BindGraph($RuntimeSelection,$ownerScope.ResidentSlot,$ownerIndex,$(if($Constructor){$ownerAst.Name}else{$Name}),$ArgumentTypes,$Static,$Constructor,$owners)
+        if($operation.Item1 -eq 0){return $null}
+        if($operation.Item2 -lt 0 -or $operation.Item2 -ge $ownerAst.Members.Count){throw 'Invalid selected resident member slot'}
+        $selected=$ownerScope.Signatures[$ownerAst.Members[$operation.Item2]]
+        $memberName=$selected.Declaration.Name;$exact=$operation.Item3;$identities=$operation.Item4
+    }else{
+        $binding=Get-PscFacultyDeclarations -DeclarationScope $ownerScope -BindingOwner $ownerAst -BindingName $(if($Constructor){$ownerAst.Name}else{$Name}) -BindingArguments $ArgumentTypes -BindingStatic $Static -BindingConstructor $Constructor -BindingScopes $bindingScopes.ToArray() -RuntimeSelection $RuntimeSelection
+        if($null -eq $binding){return $null}
+        $member=$binding.Member
+        foreach($declaration in $ownerAst.Members){
+            $signature=$ownerScope.Signatures[$declaration]
+            if([object]::ReferenceEquals($signature.Member,$member) -and [object]::ReferenceEquals($signature.Owner,$binding.Owner)){$selected=$signature;break}
+        }
+        $memberName=$member.Name;$exact=[bool[]]::new($binding.Arguments.Length);$identities=[string[]]::new($binding.Arguments.Length)
+        for($i=0;$i -lt $exact.Length;$i++){
+            $parameter=$member.ParameterReferences[$i];$identities[$i]=$parameter.ClrIdentity
+            $exact[$i]=Get-PscFacultyDeclarations -ComparisonLeft $parameter -ComparisonRight $binding.Arguments[$i]
+        }
     }
     if($null -eq $selected){throw [MissingMethodException]::new('Selected STS operation has no declaration projection')}
-    # Synthetic function switches have a legacy bool projection. Preserve that
-    # boundary instead of claiming a semantic match for its rewritten signature.
-    if($selected.Parameters.Length -ne $binding.Arguments.Length){throw [InvalidOperationException]::new('Selected STS operation projection arity differs')}
+    if($selected.Parameters.Length -ne $exact.Length -or $exact.Length -ne $identities.Length){throw [InvalidOperationException]::new('Selected STS operation projection arity differs')}
     for($i=0;$i -lt $selected.Parameters.Length;$i++){
-        $parameter=$member.ParameterReferences[$i]
-        if($parameter.ClrIdentity -ceq [System.Management.Automation.SwitchParameter].AssemblyQualifiedName -and $selected.Parameters[$i] -eq [bool]){return $null}
-        if(Get-PscFacultyDeclarations -ComparisonLeft $parameter -ComparisonRight $binding.Arguments[$i]){
+        if($identities[$i] -ceq [System.Management.Automation.SwitchParameter].AssemblyQualifiedName -and $selected.Parameters[$i] -eq [bool]){return $null}
+        if($exact[$i]){
             if($selected.Parameters[$i] -ne $ArgumentTypes[$i]){throw [InvalidOperationException]::new('Exact STS argument projection differs')}
-        }elseif(!$parameter.ClrIdentity -or $parameter.ClrIdentity -cne $selected.Parameters[$i].AssemblyQualifiedName){
-            throw [InvalidOperationException]::new('Primitive STS parameter projection differs')
-        }
+        }elseif(!$identities[$i] -or $identities[$i] -cne $selected.Parameters[$i].AssemblyQualifiedName){throw [InvalidOperationException]::new('Primitive STS parameter projection differs')}
     }
     $flags=[Reflection.BindingFlags]'Public,DeclaredOnly,ExactBinding,IgnoreCase'
     if($Constructor){$operation=$TargetType.GetConstructor(($flags -bor [Reflection.BindingFlags]::Instance),$null,$selected.Parameters,$null)}
     else{
         $flags=$flags -bor $(if($Static){[Reflection.BindingFlags]::Static}else{[Reflection.BindingFlags]::Instance})
-        $operation=$TargetType.GetMethod($member.Name,$flags,$null,$selected.Parameters,$null)
+        $operation=$TargetType.GetMethod($memberName,$flags,$null,$selected.Parameters,$null)
     }
     if($null -eq $operation){throw [MissingMethodException]::new('Selected STS operation has no CLR projection')}
     $parameters=$operation.GetParameters()
@@ -13085,7 +13408,7 @@ function Convert-MethodAstToLambda {
         [System.Management.Automation.Language.PropertyMemberAst[]] $Initializers = @(),[PscRuntimeSelection]$RuntimeSelection
     )
 
-    Use-DeclarationScope -Ast $MethodAst
+    Use-DeclarationScope -Ast $MethodAst -RuntimeSelection $RuntimeSelection
     Test-AstAdmitted -Ast $MethodAst
 
     $classType = $script:LoweringClassTypes[$MethodAst.Parent.Name]
@@ -13134,7 +13457,7 @@ function Convert-InitializersToLambda {
         [Parameter()][System.Management.Automation.Language.PropertyMemberAst[]] $Initializers = @(),
         [switch] $Static,[PscRuntimeSelection]$RuntimeSelection
     )
-    Use-DeclarationScope -Ast $ClassAst
+    Use-DeclarationScope -Ast $ClassAst -RuntimeSelection $RuntimeSelection
     $classType = $script:LoweringClassTypes[$ClassAst.Name]
     $thisParam = if ($Static) { $null } else { [Linq.Expressions.Expression]::Parameter($classType, 'this') }
     New-LoweredBody -Name $(if ($Static) { '.cctor' } else { '.ctor' }) -ReturnType ([void]) -This $thisParam `
@@ -16069,7 +16392,7 @@ Conform streams child stdout and stderr to the invoking host as they become avai
 
 - **Managed:** SMA AST and typed expression lowering, deterministic IL emission, static graph/data realization, reachability and fixed-parameter specialization.
 - **Native:** pinned Windows NativeAOT compiler plus PSC COFF linker; direct CIL-to-IR-to-x64 ELF leaf emission and decoded-byte ABI checks. The direct backend does not yet replace ILC for general programs.
-- **Faculties:** `HandleTable`, `DiscoveryMechanisms`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. BuildRuntime without contract inputs writes a local selection receipt for HandleTable, ScriptType and PrimitiveConversion after successful construction. The compiled numeric selection path verifies source, CoreLib, SMA, the existing TypeConverter framework dependency and all three faculty assembly digests once, loads the exact bytes in a private collectible context, and invokes a typed delegate. Missing or incompatible receipts refuse that path; no implicit interpreted fallback is permitted after selection is requested. Without an explicit directory the authoring selector is unchanged. The receipt identifies a trusted local build; it is not a signature or independent admission proof. This is limited compiler self-consumption, not full startup activation or migration of descriptor identities. `PscApi.AcquireSelection(api,directory)` acquires an explicit resident selection session from the API source revision. `PscRuntimeSelection.Select(session,signatures,sources)` reuses the admitted selector without reading artifacts again; `Close(session)` withdraws it and requests context unloading. Resident structural specialization accepts the same session as `-RuntimeSelection`, and does not close a caller-owned session. CLI Compile with an explicit `-RuntimeDirectory` uses `Invoke-PscCompile` to acquire one session before lowering, supply it to both structural specialization and ordinary managed lowering (including the managed precursor of Native), and close it in a finally boundary before returning the managed result. The session remains inside the authoring operation, not the process dispatcher. Even an exact-only compilation refuses a missing or incompatible receipt when explicitly requested. Without an explicit directory CLI Compile retains interpreted selection. The retained session may also be supplied to `Export-LoweredAssembly -RuntimeSelection`: ordinary source static/instance calls and explicit constructors preserve the original STS binding witnesses and use the admitted numeric selector for non-exact closed numeric signatures. Method closure, initializer lowering and recursive function-output inference use the same session; a selected compilation owns fresh declaration scopes, including their existing inference caches. Exact source-reference equality and candidate acquisition remain authoring operations in ordinary lowering; there is no secondary descriptor graph. `PscScriptTypeAcquisition` constructs signature descriptors from original SMA AST declarations with typed static operations shared by authoring and compiled realization. The descriptor acquisition operation is independently lowerable against compiled ScriptType; its compiled consumer can retain exact source referents without exposing them to SMA, and withdraw the collectible domain. This compiler-side adapter is not yet admitted by the runtime selection receipt or used for ordinary compiled-scope binding. ScriptType.dll remains independent of SMA. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
+- **Faculties:** `HandleTable`, `DiscoveryMechanisms`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. BuildRuntime without contract inputs also builds the compiler-private `compiler/CompilerDeclarations.dll` and writes a version 2 local selection receipt for it and HandleTable, ScriptType and PrimitiveConversion. The seven public faculty files and their dependency closure are unchanged. The compiled selection path verifies source, CoreLib, SMA, the existing TypeConverter framework dependency and all four admitted assembly digests once, loads the exact bytes in a private collectible context, and invokes typed delegates. Version 1 receipts require rebuilding. Missing or incompatible receipts refuse that path; no implicit interpreted fallback is permitted after selection is requested. Without an explicit directory the authoring selector is unchanged. The receipt identifies a trusted local build; it is not a signature or independent admission proof. This is explicit compiler self-consumption, not full startup activation. `PscApi.AcquireSelection(api,directory)` acquires an explicit resident selection session from the API source revision. `PscRuntimeSelection.Select(session,signatures,sources)` reuses the admitted selector without reading artifacts again; `Close(session)` withdraws it and requests context unloading. Resident structural specialization accepts the same session as `-RuntimeSelection`, and does not close a caller-owned session. CLI Compile with an explicit `-RuntimeDirectory` uses `Invoke-PscCompile` to acquire one session before lowering, supply it to both structural specialization and ordinary managed lowering (including the managed precursor of Native), and close it in a finally boundary before returning the managed result. The session remains inside the authoring operation, not the process dispatcher. Even an exact-only compilation refuses a missing or incompatible receipt when explicitly requested. Without an explicit directory CLI Compile retains interpreted selection. The retained session may also be supplied to `Export-LoweredAssembly -RuntimeSelection`: ordinary source static/instance calls and explicit constructors use session-owned compiled STS exact and numeric binding and retain the original CLR projection witnesses. Method closure, initializer lowering and recursive function-output inference use the same session; a selected compilation owns fresh declaration scopes, including their existing inference caches. `PscScriptTypeAcquisition` constructs descriptors directly from the original SMA AST declarations in the selected execution domain. A resident scope stores only its owning session, scope and source coordinates, and CLR projection witnesses; it does not construct an interpreted descriptor graph. The compiled graph retains original imported referents and supplies typed acquisition, projection and binding results across the delegate boundary, with refusal status and diagnostic text instead of collectible exceptions. The authoring caller checks the selected member against its CLR realization. Graph scope slots remain owned until session closure; a resident scope cannot import an authoring descriptor graph. ScriptType.dll remains independent of SMA; only the compiler-side adapter consumes AST evidence. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
 - **Evidence:** differential tests, structural lint, Guard, non-loading binary queries and coverage. An observed call is not a universal binding proof; an ABI check is not a proof of arithmetic equivalence.
 
 ## Trust and security
@@ -16925,9 +17248,9 @@ function Export-LoweredAssembly {
     $model = @(Get-ClassModel -ClassAsts $classAsts)
     $sourceClasses = [System.Management.Automation.Language.TypeDefinitionAst[]]@($classAsts | Where-Object { -not [object]::ReferenceEquals($_, $functionClass) })
     $PscSelectedRoot=$parsed.Ast
-    $PscSelectedScope=Get-DeclarationScope -Root $parsed.Ast -SelectedClassAst $sourceClasses -SelectedEnumAst $enumAsts -Resolving $DependencyScope
+    $PscSelectedScope=Get-DeclarationScope -Root $parsed.Ast -SelectedClassAst $sourceClasses -SelectedEnumAst $enumAsts -Resolving $DependencyScope -RuntimeSelection $RuntimeSelection
 
-    Use-DeclarationScope -Ast $parsed.Ast
+    Use-DeclarationScope -Ast $parsed.Ast -RuntimeSelection $RuntimeSelection
     $projection = @{} + $script:LoweringClassTypes
     if($MethodNames){
         foreach($c in $model){if($c.Ast.BaseTypes.Count){throw 'MethodNames selection is not yet admitted for inherited types; full virtual dispatch closure is required.'}}
