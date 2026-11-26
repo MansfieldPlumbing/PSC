@@ -7291,7 +7291,7 @@ if (-not $Help -and $PSBoundParameters.Count) {
         'Compile' {
             if ([string]::IsNullOrEmpty($SourcePath) -and $null -eq $SourceAst) { throw 'Compile requires -SourcePath or -SourceAst.' }
             if ([string]::IsNullOrEmpty($OutputPath)) { throw 'Compile requires -OutputPath.' }
-            if ($DeclarationsOnly -and ($Program -or $StructuralThunks -or $StructuralBindings -or $LeasedStructuralContracts -or $SourceAst -or !$SourcePath)) { throw 'DeclarationsOnly requires a source file and cannot be combined with program or AST-transforming compilation.' }
+            if ($DeclarationsOnly -and ($Program -or $StructuralThunks -or $StructuralBindings -or $LeasedStructuralContracts)) { throw 'DeclarationsOnly cannot be combined with program or AST-transforming compilation.' }
         }
         'BuildFaculty' { if (!$Faculty) { throw 'BuildFaculty requires -Faculty.' } }
         'Inspect' {
@@ -7320,8 +7320,11 @@ function Test-AttributeClass([System.Management.Automation.Language.TypeDefiniti
     $root=$Class
     while($root.Parent){$root=$root.Parent}
     # Source-local classes need not have CLR realizations (structural erasure).
-    foreach($definition in $root.EndBlock.Statements){
-        if($definition -is [System.Management.Automation.Language.TypeDefinitionAst] -and $definition.Name -ieq $baseName){return $false}
+    foreach($block in @($root.BeginBlock,$root.ProcessBlock,$root.EndBlock,$root.CleanBlock,$root.DynamicParamBlock)){
+        if($null -eq $block){continue}
+        foreach($definition in $block.Statements){
+            if($definition -is [System.Management.Automation.Language.TypeDefinitionAst] -and $definition.Name -ieq $baseName){return $false}
+        }
     }
     return (Resolve-AstType $Class.BaseTypes[0].TypeName) -eq [Attribute]
 }
@@ -7738,41 +7741,41 @@ function Assert-PscInlineOverrides([System.Management.Automation.Language.TypeDe
 # A typed variable assigned an array of hashtable literals converts each hashtable to the element class and each value
 # to its member's type, as PowerShell does: [PscTableElement[]] $items = @(@{ Width = 44 }) holds a [double] 44, whether
 # the hashtables are one array literal or one statement each.
+class PscTableElement {
+    [string] $Name
+    [double] $Width
+}
+
+class PscTableAssignment {
+    static [double] Run() {
+        [PscTableElement[]] $items = @(@{ Name = 'first'; Width = 44 }, @{ Name = 'second'; Width = 2 })
+        $total = 0.0
+        foreach ($item in $items) { $total += $item.Width }
+        [PscTableElement[]] $lines = @(
+            @{ Name = 'third'; Width = 3 }
+            @{ Name = 'fourth'; Width = 5 }
+        )
+        foreach ($item in $lines) { $total += $item.Width }
+        return $total
+    }
+    static [double] Elements() {
+        $data = @{ Rect = @(1.5, 2.5, 3, 4) }
+        [double[]] $rect = $data.Rect
+        return $rect[0] + $rect[1] + $rect[2] + $rect[3]
+    }
+    static [bool] Identity() {
+        [double[]] $first = 1.0, 2.0
+        [object] $boxed = $first
+        [double[]] $second = $boxed
+        return [object]::ReferenceEquals($first, $second)
+    }
+}
+
 function Test-PscTypedArrayAssignment([string] $Directory) {
-    $fixture = {
-        class PscTableElement {
-            [string] $Name
-            [double] $Width
-        }
-        class PscTableAssignment {
-            static [double] Run() {
-                [PscTableElement[]] $items = @(@{ Name = 'first'; Width = 44 }, @{ Name = 'second'; Width = 2 })
-                $total = 0.0
-                foreach ($item in $items) { $total += $item.Width }
-                [PscTableElement[]] $lines = @(
-                    @{ Name = 'third'; Width = 3 }
-                    @{ Name = 'fourth'; Width = 5 }
-                )
-                foreach ($item in $lines) { $total += $item.Width }
-                return $total
-            }
-            static [double] Elements() {
-                $data = @{ Rect = @(1.5, 2.5, 3, 4) }
-                [double[]] $rect = $data.Rect
-                return $rect[0] + $rect[1] + $rect[2] + $rect[3]
-            }
-            static [bool] Identity() {
-                [double[]] $first = 1.0, 2.0
-                [object] $boxed = $first
-                [double[]] $second = $boxed
-                return [object]::ReferenceEquals($first, $second)
-            }
-        }
-    }.Ast
-    $root = [System.Management.Automation.Language.ScriptBlockAst]::new($fixture.Extent, $null,
-        [System.Management.Automation.Language.StatementBlockAst]::new($fixture.Extent, [System.Management.Automation.Language.StatementAst[]]@($fixture.EndBlock.Statements | ForEach-Object { $_.Copy() }), $null), $false)
+    $source = [PscSource]::new($PSCommandPath,$false)
+    if ($source.ParseErrors.Count) { throw 'Verification module source is not parseable.' }
     $output = Join-Path $Directory 'PscTableAssignment.dll'
-    $null = Export-LoweredAssembly -SourceAst $root -ClassName PscTableAssignment -ClassNames PscTableElement, PscTableAssignment -OutputPath $output
+    $null = Export-LoweredAssembly -SourceAst $source.Ast -DeclarationsOnly -ClassName PscTableAssignment -ClassNames PscTableElement,PscTableAssignment -OutputPath $output
     $assembly = [Reflection.Assembly]::Load([IO.File]::ReadAllBytes($output))
     $type = $assembly.GetType('PscTableAssignment', $true)
     $verdict = [PscTypedArrayVerdict]::new()
@@ -8519,16 +8522,16 @@ function Use-DeclarationScope {
 function Get-DeclarationScope {
     [OutputType([PscDeclarationScope])]
     param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Root,[PscDeclarationScope]$Resolving,
-        [System.Management.Automation.Language.TypeDefinitionAst[]] $SelectedClassAst)
+        [System.Management.Automation.Language.TypeDefinitionAst[]] $SelectedClassAst,[System.Management.Automation.Language.TypeDefinitionAst[]] $SelectedEnumAst)
     $declarationScope=$null
     if($script:DeclarationScopeCache.TryGetValue($Root,[ref]$declarationScope)){
-        if(!$PSBoundParameters.ContainsKey('SelectedClassAst') -and [object]::ReferenceEquals($declarationScope.Resolving,$Resolving)){return $declarationScope}
+        if(!$PSBoundParameters.ContainsKey('SelectedClassAst') -and !$PSBoundParameters.ContainsKey('SelectedEnumAst') -and [object]::ReferenceEquals($declarationScope.Resolving,$Resolving)){return $declarationScope}
     }
     $inProgress = $script:LoweringClassTypes
     try {
         $classes = @(if ($PSBoundParameters.ContainsKey('SelectedClassAst')) { $SelectedClassAst }
             else { $Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true) | Where-Object { -not (Test-AttributeClass $_) } })
-        $enums = @($Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsEnum }, $true))
+        $enums = @(if ($PSBoundParameters.ContainsKey('SelectedEnumAst')) { $SelectedEnumAst } else { $Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsEnum }, $true) })
         $script:LoweringClassTypes = @{}
         if($null -ne $Resolving){$script:LoweringClassTypes += $Resolving.Types}
         $next=New-ClrDeclarationProjection -Model @(if ($classes.Count) { Get-ClassModel -ClassAsts $classes }) -Enums $enums -Resolving $Resolving
@@ -8544,7 +8547,7 @@ function Get-DeclarationScope {
 function Get-ClrTypeProjection {
     [OutputType([hashtable])]
     param([Parameter(Mandatory)][System.Management.Automation.Language.ScriptBlockAst] $Root,[PscDeclarationScope]$Resolving,
-        [System.Management.Automation.Language.TypeDefinitionAst[]] $SelectedClassAst)
+        [System.Management.Automation.Language.TypeDefinitionAst[]] $SelectedClassAst,[System.Management.Automation.Language.TypeDefinitionAst[]] $SelectedEnumAst)
     (Get-DeclarationScope @PSBoundParameters).Types
 }
 
@@ -9732,7 +9735,8 @@ class PscDifferential {
         $directory = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($psc), 'build', 'api', [Convert]::ToHexString($identity, 0, 8))
         $null = [System.IO.Directory]::CreateDirectory($directory)
         $output = [System.IO.Path]::Combine($directory, 'Lowered.dll')
-        if ($names.Count) { $null = & $psc -Mode Compile -SourceAst $source -ClassName $names[0] -ClassNames $names.ToArray() -OutputPath $output -Deterministic }
+        if ($selection) { $null = & $psc -Mode Compile -SourceAst $source -DeclarationsOnly -ClassNames $names.ToArray() -OutputPath $output -Deterministic }
+        elseif ($names.Count) { $null = & $psc -Mode Compile -SourceAst $source -ClassName $names[0] -ClassNames $names.ToArray() -OutputPath $output -Deterministic }
         else { $null = & $psc -Mode Compile -SourceAst $source -OutputPath $output -Deterministic }
         return [System.Reflection.Assembly]::Load([System.IO.File]::ReadAllBytes($output))
     }
@@ -9741,23 +9745,7 @@ class PscDifferential {
         if($null -eq $source -or !$names.Count){throw 'LowerDeclarations requires an explicit declaration set.'}
         $pending=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         foreach($name in $names){if([string]::IsNullOrWhiteSpace($name) -or !$pending.Add($name)){throw 'Empty or duplicate declaration selection.'}}
-        $selected=[Collections.Generic.List[System.Management.Automation.Language.StatementAst]]::new()
-        $classes=[Collections.Generic.List[string]]::new();$copy=[PscAstRebuild]::new()
-        foreach($block in @($source.BeginBlock,$source.ProcessBlock,$source.EndBlock,$source.CleanBlock,$source.DynamicParamBlock)){
-            if($null -eq $block){continue}
-            foreach($statement in $block.Statements){
-                if($statement -isnot [System.Management.Automation.Language.TypeDefinitionAst] -or $statement.Name -notin $names){continue}
-                if(!$pending.Remove($statement.Name)){throw 'Ambiguous top-level type declaration.'}
-                $selected.Add([System.Management.Automation.Language.StatementAst]$copy.Rebuild($statement))
-                if($statement.IsClass){$classes.Add($statement.Name)}
-            }
-        }
-        if($pending.Count -or !$classes.Count){throw 'LowerDeclarations requires existing top-level types and at least one class.'}
-        $usings=[System.Collections.Generic.List[System.Management.Automation.Language.UsingStatementAst]]::new()
-        foreach($using in $source.UsingStatements){$usings.Add([System.Management.Automation.Language.UsingStatementAst]$copy.Rebuild($using))}
-        $block=[System.Management.Automation.Language.StatementBlockAst]::new($source.Extent,$selected.ToArray(),$null)
-        $unit=[System.Management.Automation.Language.ScriptBlockAst]::new($source.Extent,$usings.ToArray(),$null,$block,$false,$false)
-        return [PscDifferential]::Lower($psc,$unit,$classes.ToArray(),'SelectedDeclarations'+[char]0+[string]::Join([char]0,$names))
+        return [PscDifferential]::Lower($psc,$source,$names,'SelectedDeclarations')
     }
 
     # PSC's PowerShellSemantics definition, alone in a script block of its own, read from PSC's source.
@@ -15647,7 +15635,7 @@ $api | Get-Member
 & ./PSC.ps1 -Mode Capability
 ```
 
-The API retains the acquired source revision. LowerDeclarations(names) compiles an explicitly selected set of top-level classes and enums, including those in PSC's begin block; LowerDeclarations(ast,names) accepts a donor source AST. It uses structural AST reconstruction and compiles only that selected unit, without executing the enclosing script. Include required source types in the selection; program compilation is a separate operation. Eligible queries reuse its AST after byte-identity verification; declaration queries share the roadmap declaration inventory and use an ordinal-ignore-case name index. IndexedArtifacts counts indexed source artifacts; SitesExamined counts candidate declarations actually tested, and VisitorCallbacks counts visits in the query itself. Pull windows advance through retained declaration sites without replay; other source kinds still traverse the AST. Measurements are acquired only on the first Measures() call. ReadSource(path) still acquires all measurements. The API is derived from the running script, so mode names and parameter evidence do not depend on a previous session's notes. Use `Describe(mode)` for dispatcher extents and associated definitions. CLI inventory below is generated; source hash, local paths, runtime and measurement values are available from the live API rather than frozen into the README. Regenerate with `& ./PSC.ps1 -Mode Readme`.
+The API retains the acquired source revision. LowerDeclarations(names) compiles an explicitly selected set of top-level classes and enums, including those in PSC's begin block; LowerDeclarations(ast,names) accepts a donor source AST. It compiles the selected original declarations directly, retaining their parser-owned AST identities without synthesizing or executing an enclosing script. Include required source types in the selection; program compilation is a separate operation. Eligible queries reuse its AST after byte-identity verification; declaration queries share the roadmap declaration inventory and use an ordinal-ignore-case name index. IndexedArtifacts counts indexed source artifacts; SitesExamined counts candidate declarations actually tested, and VisitorCallbacks counts visits in the query itself. Pull windows advance through retained declaration sites without replay; other source kinds still traverse the AST. Measurements are acquired only on the first Measures() call. ReadSource(path) still acquires all measurements. The API is derived from the running script, so mode names and parameter evidence do not depend on a previous session's notes. Use `Describe(mode)` for dispatcher extents and associated definitions. CLI inventory below is generated; source hash, local paths, runtime and measurement values are available from the live API rather than frozen into the README. Regenerate with `& ./PSC.ps1 -Mode Readme`.
 '@
         return $guideText.Replace('@@TYPESYSTEM@@',$this.TypeSystemContract).Replace('@@FORMATS@@',($formatRows -join "`n")).Replace('@@ROADMAP@@',$this.RoadmapMarkdown())
     }
@@ -16248,7 +16236,56 @@ function Export-LoweredAssembly {
     )
 
     $script:PscCompilingProgram = [bool]$Program
-    if ($Program) {
+    if ($Program -and $DeclarationsOnly) { throw 'DeclarationsOnly cannot compile a program.' }
+    if ($DeclarationsOnly) {
+        if ($null -ne $SourceAst -and $SourcePath) { throw 'Supply SourcePath or SourceAst, not both.' }
+        if ($null -eq $SourceAst) {
+            $fullSourcePath=[PscTreeText]::FullPath($SourcePath)
+            $SourceAst=Read-PowerShellSource -Source ([IO.File]::ReadAllText($fullSourcePath)) -SourceFile $fullSourcePath
+        }
+        $selected=[Collections.Generic.List[System.Management.Automation.Language.TypeDefinitionAst]]::new()
+        $pending=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $omitted=[Collections.Generic.Dictionary[string,System.Management.Automation.Language.TypeDefinitionAst]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach($name in $ClassNames){if([string]::IsNullOrWhiteSpace($name) -or !$pending.Add($name)){throw 'Empty or duplicate declaration selection.'}}
+        foreach ($block in @($SourceAst.BeginBlock,$SourceAst.ProcessBlock,$SourceAst.EndBlock,$SourceAst.CleanBlock,$SourceAst.DynamicParamBlock)) {
+            if ($null -eq $block) { continue }
+            foreach ($declaration in $block.Statements) {
+                if ($declaration -isnot [System.Management.Automation.Language.TypeDefinitionAst]) { continue }
+                if (!$declaration.IsClass -and !$declaration.IsEnum) { continue }
+                if (($ClassNames -and $declaration.Name -notin $ClassNames) -or ($declaration.IsClass -and (Test-AttributeClass $declaration))) {
+                    $omitted[$declaration.Name]=$declaration
+                    continue
+                }
+                if ($ClassNames -and !$pending.Remove($declaration.Name)) { throw 'Ambiguous top-level type declaration.' }
+                $selected.Add($declaration)
+            }
+        }
+        if ($pending.Count) { throw 'DeclarationsOnly requires existing top-level types.' }
+        $classAsts=@($selected | Where-Object IsClass)
+        $enumAsts=@($selected | Where-Object IsEnum)
+        $target=@(if($ClassName){$classAsts | Where-Object Name -eq $ClassName}else{$classAsts | Select-Object -First 1})
+        if ($target.Count -ne 1) { throw 'DeclarationsOnly requires exactly one selected target class.' }
+        # An omitted source-owned type is not an invitation to bind to a loaded namesake.
+        # Inspect the parser's explicit type references, including the leaves of arrays and generics.
+        if ($omitted.Count) {
+            function Assert-PscSelectedTypeReference([System.Management.Automation.Language.ITypeName] $Name) {
+                if ($Name -is [System.Management.Automation.Language.ArrayTypeName]) { Assert-PscSelectedTypeReference $Name.ElementType; return }
+                if ($Name -is [System.Management.Automation.Language.GenericTypeName]) {
+                    Assert-PscSelectedTypeReference $Name.TypeName
+                    foreach($argument in $Name.GenericArguments){Assert-PscSelectedTypeReference $argument}
+                    return
+                }
+                if (!$Name.AssemblyName -and $omitted.ContainsKey($Name.FullName)) { throw "Missing selected source type '$($omitted[$Name.FullName].Name)' at $($Name.Extent.StartLineNumber):$($Name.Extent.StartColumnNumber)." }
+            }
+            foreach($definition in $selected){
+                foreach($witness in $definition.FindAll({param($node) $node -is [System.Management.Automation.Language.TypeConstraintAst] -or $node -is [System.Management.Automation.Language.TypeExpressionAst]},$true)){
+                    Assert-PscSelectedTypeReference $witness.TypeName
+                }
+            }
+        }
+        $parsed=[PscLoweringSource]@{Ast=$SourceAst;ClassAst=$target[0]}
+    }
+    elseif ($Program) {
         # The script as a program: its function class, with Main, is the target (Get-ScriptFunctionClass -Program).
         if ($null -eq $SourceAst) { throw '-Program compiles -SourceAst.' }
         $null = Get-ScriptFunctionClass -Root $SourceAst -Program
@@ -16287,13 +16324,10 @@ function Export-LoweredAssembly {
     }
     $programIcon = if ($Program) { Get-ProgramIcon -Root $parsed.Ast } else { $null }
     $targetClass = $parsed.ClassAst
-    $classAsts = @(if ($DeclarationsOnly) {
-        foreach ($declaration in $parsed.Ast.EndBlock.Statements) {
-            if ($declaration -is [System.Management.Automation.Language.TypeDefinitionAst] -and $declaration.IsClass -and -not (Test-AttributeClass $declaration)) { $declaration }
-        }
-    } else {
-        $parsed.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true) | Where-Object { -not (Test-AttributeClass $_) }
-    })
+    if (!$DeclarationsOnly) {
+        $classAsts=@($parsed.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsClass }, $true) | Where-Object { -not (Test-AttributeClass $_) })
+        $enumAsts=@($parsed.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsEnum }, $true))
+    }
     # Declaration-only compilation retains the parser-owned nodes and excludes script execution units.
     $functionClass = $null
     if ($DeclarationsOnly) {
@@ -16311,14 +16345,14 @@ function Export-LoweredAssembly {
     }
     $script:LoweringKeywords = @{}
     foreach ($definition in @(Get-LoweringKeywords $parsed.Ast)) { $script:LoweringKeywords[$definition.Name] = $definition }
-    if ($ClassNames) {
+    if ($ClassNames -and !$DeclarationsOnly) {
         $classAsts = @($classAsts | Where-Object Name -in $ClassNames)
         if ($classAsts.Count -ne @($ClassNames | Sort-Object -Unique).Count -or $targetClass.Name -notin $ClassNames) { throw 'ClassNames must identify existing classes and include ClassName.' }
     }
     Assert-PscInlineOverrides -Classes $classAsts
     $model = @(Get-ClassModel -ClassAsts $classAsts)
     $sourceClasses = [System.Management.Automation.Language.TypeDefinitionAst[]]@($classAsts | Where-Object { -not [object]::ReferenceEquals($_, $functionClass) })
-    $null = Get-ClrTypeProjection -Root $parsed.Ast -SelectedClassAst $sourceClasses
+    $null = Get-ClrTypeProjection -Root $parsed.Ast -SelectedClassAst $sourceClasses -SelectedEnumAst $enumAsts
     Use-DeclarationScope -Ast $parsed.Ast
     $projection = @{} + $script:LoweringClassTypes
     $requiredMethods = if ($MethodNames) { Get-RequiredClassMethods -Model $model -ProjectedTypes $projection -ClassName $targetClass.Name -MethodNames $MethodNames } else { $null }
@@ -16343,7 +16377,7 @@ function Export-LoweredAssembly {
     $script:IlMap = @{ Types = @{}; Members = @{}; ImplicitConstructors = @{}; Semantics = [PscSemanticsPlan]@{ Session = $session; Methods = $null; Needed = [System.Collections.Generic.SortedSet[string]]::new([StringComparer]::Ordinal) } }
     try {
         # 1. Output types, so every signature can name any of them. Enums are complete once their literals exist.
-        foreach ($enumAst in @($parsed.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TypeDefinitionAst] -and $n.IsEnum }, $true))) {
+        foreach ($enumAst in $enumAsts) {
             $enumBuilder = $session.Module.DefineEnum($enumAst.Name, [Reflection.TypeAttributes]::Public, (Get-EnumUnderlyingType $enumAst))
             foreach ($literal in (Get-EnumLiterals $enumAst)) { $null = $enumBuilder.DefineLiteral($literal.Name, $literal.Value) }
             $null = $enumBuilder.CreateType()
