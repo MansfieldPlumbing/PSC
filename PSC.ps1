@@ -6242,15 +6242,25 @@ class PscGitExecutable {
     [void] Verify(){
         if(![IO.Path]::IsPathFullyQualified($this.Path) -or ![PscTreeText]::IsHash($this.Sha256) -or [PscGitExecutable]::Digest($this.Path) -cne $this.Sha256){throw 'Git acquisition executable identity changed.'}
     }
+    static [void] AssertEnvironment(){
+        $blocked=@('GIT_DIR','GIT_WORK_TREE','GIT_COMMON_DIR','GIT_OBJECT_DIRECTORY','GIT_ALTERNATE_OBJECT_DIRECTORIES','GIT_INDEX_FILE','GIT_CONFIG','GIT_CONFIG_COUNT','GIT_CONFIG_PARAMETERS','GIT_CONFIG_SYSTEM','GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','GIT_REPLACE_REF_BASE','GIT_NO_REPLACE_OBJECTS','GIT_GRAFT_FILE','GIT_SHALLOW_FILE','GIT_PREFIX','GIT_IMPLICIT_WORK_TREE','GIT_INTERNAL_SUPER_PREFIX','GIT_NAMESPACE','GIT_CEILING_DIRECTORIES','GIT_DISCOVERY_ACROSS_FILESYSTEM','GIT_EXEC_PATH','GIT_TEMPLATE_DIR','GIT_ATTR_NOSYSTEM')
+        foreach($entry in [Environment]::GetEnvironmentVariables([EnvironmentVariableTarget]::Process).GetEnumerator()){
+            [string]$name=$entry.Key
+            if($name -in $blocked -or $name.StartsWith('GIT_CONFIG_KEY_',[StringComparison]::OrdinalIgnoreCase) -or $name.StartsWith('GIT_CONFIG_VALUE_',[StringComparison]::OrdinalIgnoreCase)){throw "Ambient Git repository override not admitted: $name"}
+        }
+    }
+    static [PscGitExecutable] Resolve([string]$Expected){
+        [PscGitExecutable]::AssertEnvironment()
+        $name=if([OperatingSystem]::IsWindows()){'git.exe'}else{'git'}
+        $application=Microsoft.PowerShell.Core\Get-Command -Name $name -CommandType Application -TotalCount 1 -ErrorAction Stop
+        if($application -isnot [System.Management.Automation.ApplicationInfo]){throw 'Git acquisition executable not found.'}
+        return [PscGitExecutable]::new($application.Path,$Expected)
+    }
 }
 function Resolve-PscGitExecutable {
     [OutputType([PscGitExecutable])]
     param([string]$Expected)
-    Assert-PscGitEnvironment
-    $name=if([OperatingSystem]::IsWindows()){'git.exe'}else{'git'}
-    $application=$ExecutionContext.InvokeCommand.GetCommand($name,[System.Management.Automation.CommandTypes]::Application)
-    if($application -isnot [System.Management.Automation.ApplicationInfo]){throw 'Git acquisition executable not found.'}
-    return [PscGitExecutable]::new($application.Path,$Expected)
+    return [PscGitExecutable]::Resolve($Expected)
 }
 class PscCommittedSource {
     [string] $Path
@@ -6298,11 +6308,7 @@ function Assert-PscRunnerIdentity {
 function Assert-PscGitEnvironment {
     [OutputType([void])]
     param()
-    $blocked=@('GIT_DIR','GIT_WORK_TREE','GIT_COMMON_DIR','GIT_OBJECT_DIRECTORY','GIT_ALTERNATE_OBJECT_DIRECTORIES','GIT_INDEX_FILE','GIT_CONFIG','GIT_CONFIG_COUNT','GIT_CONFIG_PARAMETERS','GIT_CONFIG_SYSTEM','GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','GIT_REPLACE_REF_BASE','GIT_NO_REPLACE_OBJECTS','GIT_GRAFT_FILE','GIT_SHALLOW_FILE','GIT_PREFIX','GIT_IMPLICIT_WORK_TREE','GIT_INTERNAL_SUPER_PREFIX','GIT_NAMESPACE','GIT_CEILING_DIRECTORIES','GIT_DISCOVERY_ACROSS_FILESYSTEM','GIT_EXEC_PATH','GIT_TEMPLATE_DIR','GIT_ATTR_NOSYSTEM')
-    foreach($entry in [Environment]::GetEnvironmentVariables([EnvironmentVariableTarget]::Process).GetEnumerator()){
-        [string]$name=$entry.Key
-        if($name -in $blocked -or $name.StartsWith('GIT_CONFIG_KEY_',[StringComparison]::OrdinalIgnoreCase) -or $name.StartsWith('GIT_CONFIG_VALUE_',[StringComparison]::OrdinalIgnoreCase)){throw "Ambient Git repository override not admitted: $name"}
-    }
+    [PscGitExecutable]::AssertEnvironment()
 }
 # Standalone Guard preserves its untracked-file policy but refuses replacement refs before acquisition.
 function Assert-PscStandaloneGitContext {
@@ -6323,33 +6329,39 @@ class PscGitRead {
     [byte[]] $Bytes
     [int] $ExitCode
     [string] $Diagnostic
+    static [PscGitRead] Acquire([string]$Directory,[string[]]$Arguments,[PscGitExecutable]$GitExecutable){
+        [PscGitExecutable]::AssertEnvironment()
+        if($null -eq $GitExecutable){throw 'Git acquisition requires a resolved executable.'}
+        $GitExecutable.Verify()
+        $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$GitExecutable.Path
+        $info.UseShellExecute=$false;$info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
+        $info.Environment['LC_ALL']='C'
+        foreach($argument in @('--no-replace-objects','-C',$Directory)+$Arguments){$info.ArgumentList.Add($argument)}
+        $buffer=[IO.MemoryStream]::new();$child=$null
+        try{
+            $child=[Diagnostics.Process]::Start($info)
+            $copy=$child.StandardOutput.BaseStream.CopyToAsync($buffer);$diagnosticTask=$child.StandardError.ReadToEndAsync()
+            $child.WaitForExit();[void]$copy.GetAwaiter().GetResult()
+            $GitExecutable.Verify()
+            return [PscGitRead]@{Bytes=$buffer.ToArray();ExitCode=$child.ExitCode;Diagnostic=$diagnosticTask.GetAwaiter().GetResult()}
+        }finally{if($child){$child.Dispose()};$buffer.Dispose()}
+    }
+    static [byte[]] ReadBytes([string]$Directory,[string[]]$Arguments,[PscGitExecutable]$GitExecutable){
+        if($null -eq $GitExecutable){$GitExecutable=[PscGitExecutable]::Resolve('')}
+        $read=[PscGitRead]::Acquire($Directory,$Arguments,$GitExecutable)
+        if($read.ExitCode -ne 0){throw ('Git object acquisition failed: '+$read.Diagnostic.Trim())}
+        return $read.Bytes
+    }
 }
 function Invoke-PscGitRead {
     [OutputType([PscGitRead])]
     param([string]$Directory,[string[]]$Arguments,[PscGitExecutable]$GitExecutable)
-    Assert-PscGitEnvironment
-    if($null -eq $GitExecutable){throw 'Git acquisition requires a resolved executable.'}
-    $GitExecutable.Verify()
-    $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$GitExecutable.Path
-    $info.UseShellExecute=$false;$info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
-    $info.Environment['LC_ALL']='C'
-    foreach($argument in @('--no-replace-objects','-C',$Directory)+$Arguments){$info.ArgumentList.Add($argument)}
-    $buffer=[IO.MemoryStream]::new();$child=$null
-    try{
-        $child=[Diagnostics.Process]::Start($info)
-        $copy=$child.StandardOutput.BaseStream.CopyToAsync($buffer);$diagnostic=$child.StandardError.ReadToEndAsync()
-        $child.WaitForExit();[void]$copy.GetAwaiter().GetResult()
-        $GitExecutable.Verify()
-        return [PscGitRead]@{Bytes=$buffer.ToArray();ExitCode=$child.ExitCode;Diagnostic=$diagnostic.GetAwaiter().GetResult()}
-    }finally{if($child){$child.Dispose()};$buffer.Dispose()}
+    return [PscGitRead]::Acquire($Directory,$Arguments,$GitExecutable)
 }
 function Read-PscGitBytes {
     [OutputType([byte[]])]
     param([string]$Directory,[string[]]$Arguments,[PscGitExecutable]$GitExecutable)
-    if($null -eq $GitExecutable){$GitExecutable=Resolve-PscGitExecutable}
-    $read=Invoke-PscGitRead $Directory $Arguments $GitExecutable
-    if($read.ExitCode -ne 0){throw ('Git object acquisition failed: '+$read.Diagnostic.Trim())}
-    return ,$read.Bytes
+    return ,([PscGitRead]::ReadBytes($Directory,$Arguments,$GitExecutable))
 }
 function Read-PscCommittedSource {
     [OutputType([PscCommittedSource])]
@@ -6950,7 +6962,7 @@ class SmaProject {
     [SmaChange[]] Changes() {
         $changes = [Collections.Generic.List[SmaChange]]::new()
         if((Get-FileHash -LiteralPath $this.CompilerPath).Hash -cne $this.CompilerDigest){throw 'Graph compiler changed.'}
-        $currentFiles=[string[]]@(& $this.CompilerPath -Mode Graph -ProjectPath $this.Root -GraphInventoryOnly)
+        $currentFiles=[PscSourceFormat]::Inventory($this.Root)
         $currentPaths=[Collections.Generic.HashSet[string]]::new($currentFiles,[StringComparer]::Ordinal)
         $priorPaths=[Collections.Generic.HashSet[string]]::new($this.Files,[StringComparer]::Ordinal)
         foreach ($source in $this.Sources | Where-Object { -not $_.Embedded }) {
@@ -7236,16 +7248,7 @@ function Resolve-SmaEdges($project) {
 function Get-SmaSourceFiles {
     [OutputType([string])]
     param([string]$root)
-    $paths=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    if ([IO.Directory]::Exists((Join-Path $root '.git')) -or [IO.File]::Exists((Join-Path $root '.git'))) {
-        $listing=Read-PscGitBytes $root (@('ls-files','-z','--cached','--others','--exclude-standard','--')+[PscSourceFormat]::Patterns())
-        foreach($relative in [PscTreeText]::Encoding().GetString($listing).Split([char]0,[StringSplitOptions]::RemoveEmptyEntries)){$null=$paths.Add($relative)}
-    } else {
-        # SMA hosts retained third-party sources and evidence. Its own authored project is the root script.
-        foreach($item in Get-ChildItem -LiteralPath $root -File -ErrorAction Stop){if([PscSourceFormat]::IsSource($item.FullName)){$null=$paths.Add($item.Name)}}
-    }
-    $ordered=[string[]]::new($paths.Count);$paths.CopyTo($ordered);[Array]::Sort($ordered,[StringComparer]::Ordinal)
-    $ordered
+    [PscSourceFormat]::Inventory($root)
 }
 
 function Get-SmaEncodedSourceOrigins($Ast, [string]$SourceIdentity) {
@@ -15423,6 +15426,20 @@ class PscSourceFormat {
     [string] $Intent
     PscSourceFormat([string]$extension,[string]$role,[string]$analogue,[string]$intent){
         $this.Extension=$extension;$this.Role=$role;$this.Analogue=$analogue;$this.Intent=$intent
+    }
+    static [string[]] Inventory([string]$root){
+        $root=[PscTreeText]::FullPath($root)
+        if(![IO.Directory]::Exists($root)){throw 'Graph inventory requires an existing source directory.'}
+        $paths=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        if ([IO.Directory]::Exists((Join-Path $root '.git')) -or [IO.File]::Exists((Join-Path $root '.git'))) {
+            $listing=[PscGitRead]::ReadBytes($root,(@('ls-files','-z','--cached','--others','--exclude-standard','--')+[PscSourceFormat]::Patterns()),$null)
+            foreach($relative in [PscTreeText]::Encoding().GetString($listing).Split([char]0,[StringSplitOptions]::RemoveEmptyEntries)){$null=$paths.Add($relative)}
+        } else {
+            # SMA hosts retained third-party sources and evidence. Its own authored project is the root script.
+            foreach($item in Get-ChildItem -LiteralPath $root -File -ErrorAction Stop){if([PscSourceFormat]::IsSource($item.FullName)){$null=$paths.Add($item.Name)}}
+        }
+        $ordered=[string[]]::new($paths.Count);$paths.CopyTo($ordered);[Array]::Sort($ordered,[StringComparer]::Ordinal)
+        return $ordered
     }
 }
 
