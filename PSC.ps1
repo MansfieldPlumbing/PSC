@@ -2059,6 +2059,8 @@ try {
         '    Owner([Peer]$value){}'
         '    static [Peer] Choose([Peer]$value){return $value}'
         '    static [int] Choose([int]$value){return $value}'
+        '    static [int] Number([long]$value){return 1}'
+        '    static [int] Number([double]$value){return 2}'
         '}'
         'class Child : Owner {'
         '    Child(){}'
@@ -2098,6 +2100,26 @@ try {
     if($null -ne $a.GetType('Owner') -or $null -ne $a.GetType('Peer') -or $null -ne $a.GetType('Child') -or 'System.Management.Automation' -in $a.GetReferencedAssemblies().Name){throw 'Foreign realization dependency'}
     'PASS emitted STS contract graph restores shared referents, signature binding, array rank and generic structure without realizing source types or referencing SMA'
     'PASS STS member kinds: constructors, static overloads, source inheritance, shadowing and ambiguity refusal'
+    $binding=$owner.BindDeclared('Echo',$single.ParameterReferences,$false,$false)
+    if(![object]::ReferenceEquals($binding.Owner,$owner) -or ![object]::ReferenceEquals($binding.Member,$single) -or ![object]::ReferenceEquals($binding.Arguments[0],$single.ParameterReferences[0])){throw 'Semantic binding did not retain its witnesses'}
+    if($null -ne $child.BindDeclared('Echo',$single.ParameterReferences,$false,$false)){throw 'Declared binding traversed a base'}
+    $saved=$owner.Members
+    try{
+        $owner.Members=[ScriptTypeMember[]]@($saved+@($single));$refused=$false
+        try{$null=$owner.BindDeclared('Echo',$single.ParameterReferences,$false,$false)}catch [Reflection.AmbiguousMatchException]{$refused=$true}
+        if(!$refused){throw 'Semantic ambiguity became absence'}
+    }finally{$owner.Members=$saved}
+    'PASS projection-free emitted exact binding retains owner, member and ordered argument references; ambiguity is distinct from absence'
+    & $hostPath -NoProfile -File $compilerPath -Mode BuildFaculty -Faculty PrimitiveConversion -RuntimeDirectory $work | Out-Null
+    if($LASTEXITCODE -ne 0){throw 'PrimitiveConversion build failed'}
+    $primitive=[Reflection.Assembly]::LoadFrom((Join-Path $work 'PrimitiveConversion.dll'))
+    $argument=[ScriptTypeReference]::new();$argument.Kind=[ScriptTypeReferenceKind]::Clr;$argument.ClrIdentity=[byte].AssemblyQualifiedName
+    if($null -ne [ScriptTypePrimitiveConversion]::BindDeclared($owner,'Choose',[ScriptTypeReference[]]@($argument),$true,$false)){throw 'Mixed source and primitive overloads exceeded admitted profile'}
+    $number=$owner.Find('Number',[string[]]@('long'))
+    $numericBinding=[ScriptTypePrimitiveConversion]::BindDeclared($owner,'Number',[ScriptTypeReference[]]@($argument),$true,$false)
+    if(![object]::ReferenceEquals($numericBinding.Owner,$owner) -or ![object]::ReferenceEquals($numericBinding.Member,$number) -or ![object]::ReferenceEquals($numericBinding.Arguments[0],$argument)){throw 'Projection-free primitive binding differs'}
+    if('System.Management.Automation' -in $primitive.GetReferencedAssemblies().Name){throw 'Primitive binding acquired SMA dependency'}
+    'PASS projection-free primitive binding selects original STS member and argument reference'
 } finally { [IO.Directory]::Delete($work,$true) }
 '@)
     [PscSourceResource]::new('Tests/Test-ScriptTypeCompiler.ps1', @'
@@ -2280,6 +2302,19 @@ class SourceOperationProbe {
         try{$null=Resolve-MatchingMethod -TargetType $target -MethodName Pick -ArgumentTypes $argumentTypes -IsStatic -SourceAst $operationRoot}catch [Reflection.AmbiguousMatchException]{$refused=$true}
         if(!$refused){throw 'Ambiguous STS operation fell through to CTS'}
     }finally{$contract.Members=$saved}
+    $selectedWitness=@($operationScope.Signatures.Values|Where-Object {[object]::ReferenceEquals($_.Member,$member)})[0]
+    $binding=Get-PscFacultyDeclarations -DeclarationScope $operationScope -BindingOwner $operationRoot.EndBlock.Statements[1] -BindingName Pick -BindingArguments $argumentTypes -BindingStatic $true -BindingScopes @($operationScope)
+    if(![object]::ReferenceEquals($binding.Owner,$contract) -or ![object]::ReferenceEquals($binding.Member,$member) -or $binding.Arguments[0].ClrIdentity -cne [int].AssemblyQualifiedName){throw 'Compiler binding lost semantic selection'}
+    $previousParameters=$selectedWitness.Parameters
+    try{
+        $selectedWitness.Parameters=[type[]]@([double])
+        $retained=Get-PscFacultyDeclarations -DeclarationScope $operationScope -BindingOwner $operationRoot.EndBlock.Statements[1] -BindingName Pick -BindingArguments $argumentTypes -BindingStatic $true -BindingScopes @($operationScope)
+        if(![object]::ReferenceEquals($retained.Member,$member)){throw 'Projection altered semantic selection'}
+        $refused=$false
+        try{$null=Resolve-MatchingMethod -TargetType $target -MethodName Pick -ArgumentTypes $argumentTypes -IsStatic -SourceAst $operationRoot}catch [InvalidOperationException]{$refused=$true}
+        if(!$refused){throw 'Mismatched projection redirected semantic binding'}
+    }finally{$selectedWitness.Parameters=$previousParameters}
+    'PASS compiler binding survives projection corruption; mismatched realization refused'
     $operationOutput=Join-Path $work 'SourceOperation.dll'
     & ([Environment]::ProcessPath) -NoProfile -File $compilerPath -Mode Compile -SourcePath $operationPath -ClassName SourceOperationProbe -OutputPath $operationOutput -Deterministic | Out-Null
     if($LASTEXITCODE -ne 0){throw 'Source operation compilation failed'}
@@ -2413,7 +2448,7 @@ class PscDeclarationScope {
     [Collections.Generic.Dictionary[System.Management.Automation.Language.FunctionMemberAst,type]] $FunctionOutputTypes = [Collections.Generic.Dictionary[System.Management.Automation.Language.FunctionMemberAst,type]]::new()
 }
 function Get-PscFacultyDeclarations {
-    param([string[]]$ContractPaths,[System.Management.Automation.Language.TypeDefinitionAst[]]$CompilerClassAsts,[hashtable]$MaterializedTypes,[type[][]]$SelectionSignatures,[type[]]$SelectionSources,[PscDeclarationScope]$DeclarationScope)
+    param([string[]]$ContractPaths,[System.Management.Automation.Language.TypeDefinitionAst[]]$CompilerClassAsts,[hashtable]$MaterializedTypes,[type[][]]$SelectionSignatures,[type[]]$SelectionSources,[PscDeclarationScope]$DeclarationScope,[System.Management.Automation.Language.TypeDefinitionAst]$BindingOwner,[string]$BindingName,[type[]]$BindingArguments,[bool]$BindingStatic,[bool]$BindingConstructor,[PscDeclarationScope[]]$BindingScopes)
 
 # Only descriptor types are realized in the authoring scope. Other faculties must not shadow imported CLR identities.
 # The semantic description and the executable generation are ordinary VOM objects.
@@ -2460,6 +2495,16 @@ class ScriptTypeMember {
         return 'Call_'+[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($key)))
     }
 }
+# A selected operation is semantic evidence, not an executable member. Ordered
+# argument references and the member's parameter references describe the conversion.
+class ScriptTypeBinding {
+    [ScriptTypeContract] $Owner
+    [ScriptTypeMember] $Member
+    [ScriptTypeReference[]] $Arguments
+    ScriptTypeBinding([ScriptTypeContract]$Owner,[ScriptTypeMember]$Member,[ScriptTypeReference[]]$Arguments){
+        $this.Owner=$Owner;$this.Member=$Member;$this.Arguments=$Arguments
+    }
+}
 class ScriptTypeContract {
     [string] $Name
     [string] $Source
@@ -2480,16 +2525,29 @@ class ScriptTypeContract {
     [ScriptTypeMember] FindReference([string]$Name,[ScriptTypeReference[]]$Parameters){
         return $this.FindReference($Name,$Parameters,$false,$false)
     }
-    # Constructors are local declarations; static and instance methods may have source bases.
-    [ScriptTypeMember] FindReference([string]$Name,[ScriptTypeReference[]]$Parameters,[bool]$Static,[bool]$Constructor){
+    # The local declaration boundary is also used by the compiler's binding
+    # profile. Ambiguity is distinct from absence and cannot trigger fallback.
+    hidden [ScriptTypeMember] FindDeclaredReference([string]$Name,[ScriptTypeReference[]]$Parameters,[bool]$Static,[bool]$Constructor){
         if($Static -and $Constructor){return $null}
         [ScriptTypeMember]$result=$null
         foreach($member in $this.Members){
             if(![string]::Equals($member.Name,$Name,[StringComparison]::OrdinalIgnoreCase) -or !$member.Operation -or $member.Constructor -ne $Constructor -or $member.Static -ne $Static -or $null -eq $member.ParameterReferences -or $member.ParameterReferences.Length -ne $Parameters.Length){continue}
             [bool]$same=$true
             for([int]$i=0;$i -lt $Parameters.Length;$i++){if(!$member.ParameterReferences[$i].Same($Parameters[$i])){$same=$false;break}}
-            if($same){if($null -ne $result){return $null};$result=$member}
+            if($same){if($null -ne $result){throw [Reflection.AmbiguousMatchException]::new('Ambiguous declared STS signature')};$result=$member}
         }
+        return $result
+    }
+    [ScriptTypeBinding] BindDeclared([string]$Name,[ScriptTypeReference[]]$Parameters,[bool]$Static,[bool]$Constructor){
+        [ScriptTypeMember]$result=$this.FindDeclaredReference($Name,$Parameters,$Static,$Constructor)
+        if($null -eq $result){return $null}
+        return [ScriptTypeBinding]::new($this,$result,$Parameters)
+    }
+    # Constructors are local declarations; static and instance methods may have source bases.
+    [ScriptTypeMember] FindReference([string]$Name,[ScriptTypeReference[]]$Parameters,[bool]$Static,[bool]$Constructor){
+        if($Static -and $Constructor){return $null}
+        [ScriptTypeMember]$result=$null
+        try{$result=$this.FindDeclaredReference($Name,$Parameters,$Static,$Constructor)}catch [Reflection.AmbiguousMatchException]{return $null}
         if($null -ne $result){return $result}
         if(!$Constructor -and $null -ne $this.BaseContracts -and $this.BaseContracts.Length -eq 1){return $this.BaseContracts[0].FindReference($Name,$Parameters,$Static,$Constructor)}
         return $null
@@ -2557,7 +2615,7 @@ class PscMaterializedSignature {
 # Each published call references the original source member and a lowered thunk.
 
 function Get-PscOtherFacultyDeclarations {
-    param([type[][]]$SelectionSignatures,[type[]]$SelectionSources)
+    param([type[][]]$SelectionSignatures,[type[]]$SelectionSources,[ScriptTypeContract]$BindingContract,[string]$BindingName,[ScriptTypeReference[]]$BindingReferences,[bool]$BindingStatic,[bool]$BindingConstructor)
 
 # Faculty: Vom.ps1
 # One typed object space. Handle generations describe operational identity, not learning.
@@ -3664,6 +3722,40 @@ class ScriptTypePrimitiveConversion {
         for([int]$c=0;$c -lt $Candidates.Length;$c++){$signatures[$c]=$Candidates[$c].Parameters}
         return [ScriptTypePrimitiveConversion]::SelectSignatures($signatures,$sources)
     }
+    # Resolve only the existing closed compiler compatibility domain. These are
+    # canonical CTS primitives, never a source declaration's CLR projection.
+    static [type] CompilerPrimitive([ScriptTypeReference]$Reference){
+        if($null -eq $Reference -or $Reference.Kind -ne [ScriptTypeReferenceKind]::Clr){return $null}
+        foreach($candidate in [type[]]@([sbyte],[byte],[short],[ushort],[int],[uint],[long],[ulong],[single],[double],[object],[string],[bool])){
+            if([string]::Equals($Reference.ClrIdentity,$candidate.AssemblyQualifiedName,[StringComparison]::Ordinal)){return $candidate}
+        }
+        return $null
+    }
+    static [ScriptTypeBinding] BindDeclared([ScriptTypeContract]$Owner,[string]$Name,[ScriptTypeReference[]]$Arguments,[bool]$Static,[bool]$Constructor){
+        if($Static -and $Constructor){return $null}
+        [ScriptTypeBinding]$exact=$Owner.BindDeclared($Name,$Arguments,$Static,$Constructor)
+        if($null -ne $exact){return $exact}
+        if($Arguments.Length -eq 0){return $null}
+        [type[]]$sources=[type[]]::new($Arguments.Length)
+        for([int]$i=0;$i -lt $Arguments.Length;$i++){
+            $sources[$i]=[ScriptTypePrimitiveConversion]::CompilerPrimitive($Arguments[$i])
+            if($null -eq $sources[$i] -or ![ScriptTypePrimitiveConversion]::IsNumber($sources[$i])){return $null}
+        }
+        [Collections.Generic.List[ScriptTypeMember]]$members=[Collections.Generic.List[ScriptTypeMember]]::new()
+        [Collections.Generic.List[type[]]]$signatures=[Collections.Generic.List[type[]]]::new()
+        foreach($member in $Owner.Members){
+            if(!$member.Operation -or $member.Static -ne $Static -or $member.Constructor -ne $Constructor -or ![string]::Equals($member.Name,$Name,[StringComparison]::OrdinalIgnoreCase) -or $null -eq $member.ParameterReferences -or $member.ParameterReferences.Length -ne $Arguments.Length){continue}
+            [type[]]$signature=[type[]]::new($Arguments.Length)
+            for([int]$i=0;$i -lt $Arguments.Length;$i++){
+                $signature[$i]=[ScriptTypePrimitiveConversion]::CompilerPrimitive($member.ParameterReferences[$i])
+                if($null -eq $signature[$i]){return $null}
+            }
+            $members.Add($member);$signatures.Add($signature)
+        }
+        if($members.Count -eq 0){return $null}
+        [int]$index=[ScriptTypePrimitiveConversion]::SelectSignatures($signatures.ToArray(),$sources)
+        return [ScriptTypeBinding]::new($Owner,$members[$index],$Arguments)
+    }
     # Shared fixed-arity primitive compatibility selection; neither samples nor
     # invocation delegates are needed to select from a statically known signature.
     static [int] SelectSignatures([type[][]]$Signatures,[type[]]$Sources){
@@ -4764,6 +4856,7 @@ class PscElfImageReader {
         return $r
     }
 }
+    if($null -ne $BindingContract){return [ScriptTypePrimitiveConversion]::BindDeclared($BindingContract,$BindingName,$BindingReferences,$BindingStatic,$BindingConstructor)}
     if($null -ne $SelectionSignatures){return [ScriptTypePrimitiveConversion]::SelectSignatures($SelectionSignatures,$SelectionSources)}
 }
 
@@ -4851,6 +4944,55 @@ function Get-ScriptTypeContract {
     foreach($shape in $definitions){$catalog[$shape.Name]}
 }
 
+    # Translate the caller's CLR expression type at the compatibility boundary.
+    # A projected source class is identified by its scope's actual type, never
+    # by spelling or an assembly-qualified name of the temporary projection.
+    function ConvertTo-PscBindingReference {
+        [OutputType([ScriptTypeReference])]
+        param([type]$Type,[PscDeclarationScope[]]$Scopes)
+        if($null -eq $Type -or $Type.IsPointer -or $Type.IsByRef -or $Type.ContainsGenericParameters){return $null}
+        $reference=[ScriptTypeReference]::new();$reference.Spelling=$Type.FullName;$reference.Arguments=[ScriptTypeReference[]]::new(0)
+        if($Type.IsArray){
+            if($Type.GetArrayRank() -eq 1 -and !$Type.IsSZArray){return $null}
+            $reference.Kind=[ScriptTypeReferenceKind]::Array;$reference.Rank=$Type.GetArrayRank()
+            $reference.Element=ConvertTo-PscBindingReference $Type.GetElementType() $Scopes
+            if($null -eq $reference.Element){return $null};return $reference
+        }
+        if($Type.IsConstructedGenericType){
+            $reference.Kind=[ScriptTypeReferenceKind]::Generic
+            $generic=$Type.GetGenericTypeDefinition()
+            if($generic.Assembly.IsDynamic){return $null}
+            $reference.Element=[ScriptTypeReference]::new();$reference.Element.Kind=[ScriptTypeReferenceKind]::Clr;$reference.Element.Spelling=$generic.FullName;$reference.Element.ClrIdentity=$generic.AssemblyQualifiedName
+            $arguments=$Type.GetGenericArguments();$reference.Arguments=[ScriptTypeReference[]]::new($arguments.Length)
+            for($i=0;$i -lt $arguments.Length;$i++){
+                $reference.Arguments[$i]=ConvertTo-PscBindingReference $arguments[$i] $Scopes
+                if($null -eq $reference.Arguments[$i]){return $null}
+            }
+            return $reference
+        }
+        if($Type.Assembly.IsDynamic){
+            foreach($scope in $Scopes){
+                if($null -eq $scope -or $scope.Types[$Type.Name] -ne $Type){continue}
+                foreach($definition in $scope.Contracts.Keys){
+                    if($definition.Name -ieq $Type.Name){$reference.Kind=[ScriptTypeReferenceKind]::Source;$reference.Definition=$scope.Contracts[$definition];return $reference}
+                }
+            }
+            return $null
+        }
+        $reference.Kind=[ScriptTypeReferenceKind]::Clr;$reference.ClrIdentity=$Type.AssemblyQualifiedName
+        if(!$reference.ClrIdentity){return $null};return $reference
+    }
+    if($null -ne $BindingOwner){
+        $contract=$DeclarationScope.Contracts[$BindingOwner]
+        $references=[ScriptTypeReference[]]::new($BindingArguments.Length)
+        for($i=0;$i -lt $references.Length;$i++){
+            $references[$i]=ConvertTo-PscBindingReference $BindingArguments[$i] $BindingScopes
+            if($null -eq $references[$i]){return $null}
+        }
+        $exact=$contract.BindDeclared($BindingName,$references,$BindingStatic,$BindingConstructor)
+        if($null -ne $exact){return $exact}
+        return Get-PscOtherFacultyDeclarations -BindingContract $contract -BindingName $BindingName -BindingReferences $references -BindingStatic $BindingStatic -BindingConstructor $BindingConstructor
+    }
     # This is a CLR realization adapter, not a semantic binding operation. Only
     # source-owned leaves use the selected definition map; existing imported and
     # unsupported type forms retain the compatibility resolver during migration.
@@ -4932,7 +5074,7 @@ class PscFacultyUnit {
 function Get-PscFacultyUnits {
     [PscFacultyUnit]::new('Vom','Vom',@('VomState','VomRetention','VomCell','VomInfo','VomLease','VomPairLease','Vom','VomFence'),@())
     [PscFacultyUnit]::new('InquiryPrimitives','InquiryCase',@('InquirySourceCleanReference','InquiryAxis','InquiryPredictiveScalar','InquiryOrigin','InquiryBlock','InquiryReading','InquiryCase','InquirySemanticAttachment','InquiryExecutionTier','InquiryReliance','InquiryWhenClause','InquiryJudgment'),@())
-    [PscFacultyUnit]::new('ScriptType','ScriptTypeReflection',@('ScriptTypeReferenceKind','ScriptTypeReference','ScriptTypeMember','ScriptTypeContract','ScriptTypeCall','ScriptTypeSelectionMemo','ScriptTypeBindingExtension','ScriptTypeSmaSelector','ScriptTypeRealization','ScriptTypeRole','ScriptTypeReflection','ScriptTypeCatalog'),@('Vom'))
+    [PscFacultyUnit]::new('ScriptType','ScriptTypeReflection',@('ScriptTypeReferenceKind','ScriptTypeReference','ScriptTypeMember','ScriptTypeBinding','ScriptTypeContract','ScriptTypeCall','ScriptTypeSelectionMemo','ScriptTypeBindingExtension','ScriptTypeSmaSelector','ScriptTypeRealization','ScriptTypeRole','ScriptTypeReflection','ScriptTypeCatalog'),@('Vom'))
     [PscFacultyUnit]::new('PrimitiveConversion','ScriptTypePrimitiveConversion',@('ScriptTypePrimitiveConversion'),@('Vom','ScriptType'))
     [PscFacultyUnit]::new('ObjectDispatch','ScriptTypeObjectDispatch',@('ScriptTypeObjectDispatch'),@('Vom','InquiryPrimitives','ScriptType'))
     [PscFacultyUnit]::new('NativeEncoding','PscNativeEncoding',@('PscNativeInstruction','PscNativeEncoding','HexagonForm','HexagonFields','HexagonDecoded','HexagonPatternEncoder'),@())
@@ -9955,40 +10097,36 @@ function Resolve-PscSourceOperation {
     $ownerAst=$null
     foreach($definition in $ownerScope.Contracts.Keys){if($definition.Name -ieq $TargetType.Name){$ownerAst=$definition;break}}
     if($null -eq $ownerAst){return $null}
-    $contract=$ownerScope.Contracts[$ownerAst]
-    $candidates=@(foreach($declaration in $ownerAst.Members){
-        $signature=$ownerScope.Signatures[$declaration]
-        $member=$signature.Member
-        if($member.Operation -and $member.Constructor -eq $Constructor -and $member.Static -eq $Static -and ($Constructor -or $member.Name -ieq $Name) -and $signature.Parameters.Length -eq $ArgumentTypes.Length){$signature}
-    })
-    if(!$candidates.Count){return $null}
-    $exact=@(foreach($candidate in $candidates){
-        $same=$true
-        for($i=0;$i -lt $ArgumentTypes.Length;$i++){if($candidate.Parameters[$i] -ne $ArgumentTypes[$i]){$same=$false;break}}
-        if($same){$candidate}
-    })
-    if($exact.Count -gt 1){throw [Reflection.AmbiguousMatchException]::new('Ambiguous projected source signature')}
-    if($exact.Count -eq 1){$selected=$exact[0]}
+    $bindingScopes=[Collections.Generic.List[PscDeclarationScope]]::new();$bindingScopes.Add($scope)
+    if(![object]::ReferenceEquals($ownerScope,$scope)){$bindingScopes.Add($ownerScope)}
     else{
-        $numeric=[type[]]@($script:IntegralTypes+$script:FloatingTypes)
-        if(!$ArgumentTypes.Length){return $null}
-        foreach($argument in $ArgumentTypes){if($argument -notin $numeric){return $null}}
-        $targets=[type[]]@($numeric+@([object],[string],[bool]))
-        $signatures=[type[][]]::new($candidates.Count)
-        for($i=0;$i -lt $candidates.Count;$i++){
-            $signatures[$i]=$candidates[$i].Parameters
-            foreach($parameter in $signatures[$i]){if($parameter -notin $targets){return $null}}
+        $functionClass=$null
+        if($script:ScriptFunctionClasses.TryGetValue($source,[ref]$functionClass) -and $null -ne $functionClass){
+            $functionRoot=$functionClass;while($functionRoot.Parent){$functionRoot=$functionRoot.Parent}
+            $functionScope=$null
+            if($script:DeclarationScopeCache.TryGetValue($functionRoot,[ref]$functionScope) -and [object]::ReferenceEquals($functionScope.Resolving,$scope)){$bindingScopes.Add($functionScope)}
         }
-        # Use precisely the shared compatibility selector, including its refusal
-        # of ambiguity. A refused admitted decision must not fall through to CTS.
-        $index=Get-PscFacultyDeclarations -SelectionSignatures $signatures -SelectionSources $ArgumentTypes
-        $selected=$candidates[$index]
     }
-    $member=$selected.Member
-    # Unresolved references retain their previous CLR compatibility path.
-    foreach($reference in $member.ParameterReferences){if(!$reference.Same($reference)){return $null}}
-    if(![object]::ReferenceEquals($selected.Owner,$contract) -or ![object]::ReferenceEquals($contract.FindReference($member.Name,$member.ParameterReferences,$Static,$Constructor),$member)){
-        throw [Reflection.AmbiguousMatchException]::new('Selected source operation has no unique STS reference')
+    $binding=Get-PscFacultyDeclarations -DeclarationScope $ownerScope -BindingOwner $ownerAst -BindingName $(if($Constructor){$ownerAst.Name}else{$Name}) -BindingArguments $ArgumentTypes -BindingStatic $Static -BindingConstructor $Constructor -BindingScopes $bindingScopes.ToArray()
+    if($null -eq $binding){return $null}
+    $member=$binding.Member
+    $selected=$null
+    foreach($declaration in $ownerAst.Members){
+        $signature=$ownerScope.Signatures[$declaration]
+        if([object]::ReferenceEquals($signature.Member,$member) -and [object]::ReferenceEquals($signature.Owner,$binding.Owner)){$selected=$signature;break}
+    }
+    if($null -eq $selected){throw [MissingMethodException]::new('Selected STS operation has no declaration projection')}
+    # Synthetic function switches have a legacy bool projection. Preserve that
+    # boundary instead of claiming a semantic match for its rewritten signature.
+    if($selected.Parameters.Length -ne $binding.Arguments.Length){throw [InvalidOperationException]::new('Selected STS operation projection arity differs')}
+    for($i=0;$i -lt $selected.Parameters.Length;$i++){
+        $parameter=$member.ParameterReferences[$i]
+        if($parameter.ClrIdentity -ceq [System.Management.Automation.SwitchParameter].AssemblyQualifiedName -and $selected.Parameters[$i] -eq [bool]){return $null}
+        if($parameter.Same($binding.Arguments[$i])){
+            if($selected.Parameters[$i] -ne $ArgumentTypes[$i]){throw [InvalidOperationException]::new('Exact STS argument projection differs')}
+        }elseif(!$parameter.ClrIdentity -or $parameter.ClrIdentity -cne $selected.Parameters[$i].AssemblyQualifiedName){
+            throw [InvalidOperationException]::new('Primitive STS parameter projection differs')
+        }
     }
     $flags=[Reflection.BindingFlags]'Public,DeclaredOnly,ExactBinding,IgnoreCase'
     if($Constructor){$operation=$TargetType.GetConstructor(($flags -bor [Reflection.BindingFlags]::Instance),$null,$selected.Parameters,$null)}
