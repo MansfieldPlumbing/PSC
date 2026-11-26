@@ -44,6 +44,8 @@ The extension describes intent, not executable eligibility. PSC is the realizati
 
 ## Find, inspect, edit, conform
 
+`-h` / `-Help` exposes the development entry points before the full command help. The default API provides the live mode inventory (`Modes`), `Describe()`, `Guide()`, `OpenDevelopment()`, `OpenSemanticIndex()`, `OpenDocument()`, `Find()` and `Search()`. Document queries retain the current parsed revision when it has no explicit parser dependencies; documents with using statements or script requirements are conservatively reparsed. Use `LineCount()`, `LineStart(line)` and `GetText(offset,length)` for source coordinates (one-based line, UTF-16 offset). `DeclarationAt(line,column)` acquires the smallest containing supported declaration as an editable revision-bound reference; use `Replace()`, `Undo()`, `Redo()` and `Save()` on that document. `Parses()` exposes actual document parse attempts. A changed revision is parsed before use; successful replacement retains its admitted AST when eligible. This does not yet eliminate repeated visitor traversal or provide incremental cross-document binding.
+
 The canonical source is `PSC.ps1`. The worktree is a disposable, ordered AST projection, including embedded SM sources and tests. Do not maintain a competing source tree.
 
 | Tool | Responsibility |

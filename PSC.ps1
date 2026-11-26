@@ -15410,6 +15410,8 @@ The extension describes intent, not executable eligibility. PSC is the realizati
 
 ## Find, inspect, edit, conform
 
+`-h` / `-Help` exposes the development entry points before the full command help. The default API provides the live mode inventory (`Modes`), `Describe()`, `Guide()`, `OpenDevelopment()`, `OpenSemanticIndex()`, `OpenDocument()`, `Find()` and `Search()`. Document queries retain the current parsed revision when it has no explicit parser dependencies; documents with using statements or script requirements are conservatively reparsed. Use `LineCount()`, `LineStart(line)` and `GetText(offset,length)` for source coordinates (one-based line, UTF-16 offset). `DeclarationAt(line,column)` acquires the smallest containing supported declaration as an editable revision-bound reference; use `Replace()`, `Undo()`, `Redo()` and `Save()` on that document. `Parses()` exposes actual document parse attempts. A changed revision is parsed before use; successful replacement retains its admitted AST when eligible. This does not yet eliminate repeated visitor traversal or provide incremental cross-document binding.
+
 The canonical source is `PSC.ps1`. The worktree is a disposable, ordered AST projection, including embedded SM sources and tests. Do not maintain a competing source tree.
 
 | Tool | Responsibility |
@@ -16737,6 +16739,56 @@ class PscDocumentGroup {
     [Collections.Generic.List[PscDocumentEdit]] $Edits = [Collections.Generic.List[PscDocumentEdit]]::new()
 }
 class PscDocument {
+    hidden [int] $TextRevision = -1
+    hidden [string] $RevisionText
+    hidden [string] $RevisionDigest
+    hidden [System.Management.Automation.Language.ScriptBlockAst] $RevisionAst
+    hidden [int[]] $RevisionLines
+    hidden [int] $ParseCount
+    [int] Parses(){return $this.ParseCount}
+    hidden [string] Digest(){$null=$this.Text();return $this.RevisionDigest}
+    hidden [System.Management.Automation.Language.ScriptBlockAst] CurrentAst(){
+        $text=$this.Text()
+        if($null -ne $this.RevisionAst){return $this.RevisionAst}
+        $parsed=$this.Parse($text)
+        # Match PscIndexedSource's conservative external parser-dependency policy.
+        if(!$parsed.UsingStatements.Count -and $null -eq $parsed.ScriptRequirements){$this.RevisionAst=$parsed}
+        return $parsed
+    }
+    hidden [int[]] Lines(){
+        $text=$this.Text()
+        if($null -eq $this.RevisionLines){
+            $lines=[Collections.Generic.List[int]]::new();$lines.Add(0)
+            $breaks=[char[]]@(13,10);$at=$text.IndexOfAny($breaks)
+            while($at -ge 0){
+                if($text[$at] -eq [char]13 -and $at+1 -lt $text.Length -and $text[$at+1] -eq [char]10){$at++}
+                $lines.Add($at+1);$at=$text.IndexOfAny($breaks,$at+1)
+            }
+            $this.RevisionLines=$lines.ToArray()
+        }
+        return $this.RevisionLines
+    }
+    [int] LineCount(){return $this.Lines().Length}
+    [int] LineStart([int]$line){
+        $lines=$this.Lines();if($line -lt 1 -or $line -gt $lines.Length){throw [ArgumentOutOfRangeException]::new('line')}
+        return $lines[$line-1]
+    }
+    [string] GetText([int]$offset,[int]$length){return $this.Text().Substring($offset,$length)}
+    [PscMatch] DeclarationAt([int]$line,[int]$column){
+        $start=$this.LineStart($line);$end=$this.Length
+        if($line -lt $this.LineCount()){$end=$this.LineStart($line+1)}
+        if($column -lt 1 -or $column -gt $end-$start){throw [ArgumentOutOfRangeException]::new('column')}
+        $offset=$start+$column-1;$ast=$this.CurrentAst()
+        $visitor=[PscSourceQueryVisitor]::new();$visitor.Spec=[PscQuerySpec]::new([PscQueryKind]::Declaration,'','',[int]::MaxValue)
+        $visitor.Path=$this.Path;$visitor.Digest=$this.Digest();$visitor.Limit=[int]::MaxValue
+        $ast.Visit($visitor)
+        [PscMatch]$best=$null
+        foreach($candidate in $visitor.Hits){
+            if($candidate.StartOffset -le $offset -and $offset -lt $candidate.EndOffset -and ($null -eq $best -or $candidate.EndOffset-$candidate.StartOffset -lt $best.EndOffset-$best.StartOffset)){$best=$candidate}
+        }
+        if($null -ne $best){$best.DocumentIdentity=$this.Identity;$best.SourceRevision=$this.Revision}
+        return $best
+    }
     [string] $Path
     [int] $Revision
     [int] $Length
@@ -16754,16 +16806,20 @@ class PscDocument {
         if($this.Length){$this.Pieces.Add([PscDocumentPiece]::new(0,0,$this.Length))}
     }
     [string] Text(){
+        if($this.TextRevision -eq $this.Revision){return $this.RevisionText}
         $builder=[Text.StringBuilder]::new($this.Length)
         foreach($piece in $this.Pieces){
             if($piece.Buffer -eq 0){[void]$builder.Append($this.Original,$piece.Start,$piece.Length)}
             else{[void]$builder.Append($this.Added.ToString($piece.Start,$piece.Length))}
         }
-        return $builder.ToString()
+        $this.RevisionText=$builder.ToString();$this.TextRevision=$this.Revision
+        $this.RevisionDigest=[PscTreeText]::Hash($this.RevisionText)
+        $this.RevisionAst=$null;$this.RevisionLines=$null
+        return $this.RevisionText
     }
-    [bool] Modified(){return [PscTreeText]::Hash($this.Text()) -cne $this.SavedHash}
+    [bool] Modified(){return $this.Digest() -cne $this.SavedHash}
     hidden [System.Management.Automation.Language.ScriptBlockAst] Parse([string]$text){
-        $tokens=$null; $errors=$null
+        $this.ParseCount++;$tokens=$null; $errors=$null
         $ast=[System.Management.Automation.Language.Parser]::ParseInput($text,$this.Path,[ref]$tokens,[ref]$errors)
         if($errors.Count){throw "Document parse failed at $($errors[0].Extent.StartLineNumber): $($errors[0].Message)"}
         return $ast
@@ -16773,21 +16829,21 @@ class PscDocument {
     }
     [PscMatch[]] Find([PscQueryKind]$kind,[string]$name,[string]$owner,[int]$limit){return $this.Query($kind,$name,$owner,$limit)}
     [PscMatch] Resolve([PscMatch]$match){
-        $text=$this.Text();$digest=[PscTreeText]::Hash($text)
+        $text=$this.Text();$digest=$this.Digest()
         if($null -eq $match -or $match.Domain -cne 'SourceAst' -or $match.ParseIncomplete -or $match.SourceRevision -ne -1 -or $match.DocumentIdentity -ne [Guid]::Empty -or $match.ArtifactPath -cne $this.Path -or $match.ArtifactSha256 -cne $digest){throw 'Resolve requires a current read-only source reference.'}
         if($match.Target -isnot [System.Management.Automation.Language.Ast] -or $match.StartOffset -lt 0 -or $match.EndOffset -le $match.StartOffset -or $match.EndOffset -gt $text.Length){throw 'Resolve requires a valid source extent.'}
         $extent=([System.Management.Automation.Language.Ast]$match.Target).Extent
         if($extent.StartOffset -ne $match.StartOffset -or $extent.EndOffset -ne $match.EndOffset -or $extent.Text -cne $text.Substring($match.StartOffset,$match.EndOffset-$match.StartOffset)){throw 'Resolve source extent differs.'}
         $visitor=[PscSourceQueryVisitor]::new();$visitor.Spec=[PscQuerySpec]::new($match.Kind,$match.Name,$match.Owner,1);$visitor.Path=$this.Path;$visitor.Digest=$digest;$visitor.Limit=1;$visitor.ExactStart=$match.StartOffset;$visitor.ExactEnd=$match.EndOffset
-        $this.Parse($text).Visit($visitor)
+        $this.CurrentAst().Visit($visitor)
         if($visitor.Hits.Count -ne 1 -or $visitor.Hits[0].Target.GetType() -ne $match.Target.GetType()){throw 'Resolve could not reproduce structural reference.'}
         $resolved=$visitor.Hits[0];$resolved.SourceRevision=$this.Revision;$resolved.DocumentIdentity=$this.Identity;return $resolved
     }
     [PscMatch[]] Find([PscQueryKind]$kind,[string]$name,[string]$owner,[string]$literal,[int]$limit){
         if($limit -lt 1 -or $limit -gt 256 -or $kind -in [PscQueryKind]::CilMethod,[PscQueryKind]::CilOp){throw 'Document query requires a source kind and a limit of 1..256.'}
-        $text=$this.Text(); $ast=$this.Parse($text)
+        $ast=$this.CurrentAst()
         $visitor=[PscSourceQueryVisitor]::new(); $visitor.Spec=[PscQuerySpec]::new($kind,$name,$owner,$limit)
-        $visitor.Spec.Literal=$literal; $visitor.Path=$this.Path; $visitor.Digest=[PscTreeText]::Hash($text); $visitor.Limit=$limit
+        $visitor.Spec.Literal=$literal; $visitor.Path=$this.Path; $visitor.Digest=$this.Digest(); $visitor.Limit=$limit
         $ast.Visit($visitor)
         foreach($hit in $visitor.Hits){$hit.SourceRevision=$this.Revision;$hit.DocumentIdentity=$this.Identity}
         return $visitor.Hits.ToArray()
@@ -16821,7 +16877,7 @@ class PscDocument {
     [void] Replace([PscMatch]$match,[string]$replacement){$this.Replace([PscMatch[]]@($match),[string[]]@($replacement))}
     [void] Replace([PscMatch[]]$matches,[string[]]$replacements){
         if(!$matches.Length -or $matches.Length -gt 256 -or $matches.Length -ne $replacements.Length){throw 'Replacement requires 1..256 paired references and payloads.'}
-        $text=$this.Text(); $digest=[PscTreeText]::Hash($text)
+        $text=$this.Text(); $digest=$this.Digest()
         $order=[Collections.Generic.SortedDictionary[int,int]]::new()
         for($i=0;$i -lt $matches.Length;$i++){
             $hit=$matches[$i]
@@ -16842,7 +16898,7 @@ class PscDocument {
         [void]$candidate.Append($text,$at,$text.Length-$at)
         $nextText=$candidate.ToString()
         if($nextText -ceq $text){return}
-        $null=$this.Parse($nextText)
+        $nextAst=$this.Parse($nextText)
         # Only after the complete candidate has passed admission is the journal modified.
         $group=[PscDocumentGroup]::new()
         for($k=$keys.Length-1;$k -ge 0;$k--){
@@ -16854,6 +16910,8 @@ class PscDocument {
         }
         if($this.JournalPosition -lt $this.Journal.Count){$this.Journal.RemoveRange($this.JournalPosition,$this.Journal.Count-$this.JournalPosition)}
         $this.Journal.Add($group);$this.JournalPosition=$this.Journal.Count;$this.Revision++
+        $this.TextRevision=$this.Revision;$this.RevisionText=$nextText;$this.RevisionDigest=[PscTreeText]::Hash($nextText);$this.RevisionAst=$null;$this.RevisionLines=$null
+        if(!$nextAst.UsingStatements.Count -and $null -eq $nextAst.ScriptRequirements){$this.RevisionAst=$nextAst}
     }
     [bool] Undo(){
         if(!$this.JournalPosition){return $false}
@@ -16868,9 +16926,9 @@ class PscDocument {
         $this.JournalPosition++;$this.Revision++;return $true
     }
     [void] Save(){
-        $text=$this.Text();$null=$this.Parse($text)
+        $text=$this.Text();$null=$this.CurrentAst()
         if([PscTreeText]::Hash([PscTreeText]::Read($this.Path)) -cne $this.SavedHash){throw 'Document save conflict: file changed since opening or saving.'}
-        $hash=[PscTreeText]::Hash($text);if($hash -ceq $this.SavedHash){return}
+        $hash=$this.Digest();if($hash -ceq $this.SavedHash){return}
         if([IO.File]::GetAttributes($this.Path) -band [IO.FileAttributes]::ReparsePoint){throw 'Refusing reparse-point document.'}
         $temporary=$this.Path+'.psc-'+[Guid]::NewGuid().ToString('N')
         try{
@@ -19903,6 +19961,25 @@ class CompareInstrument : PscInstrument {
 
 process {
     if ($Help) {
+        [Console]::WriteLine(@"
+PSC development workflow (typed API; no raw line editing required)
+  `$api = & ./PSC.ps1
+  `$api.Modes                           # live launch surface
+  `$api.Describe('Query')                # parameters, calls and definitions
+  `$api.Guide()                          # complete development guide
+  `$api.OpenSemanticIndex('.').Refresh() # retained source graph
+  `$api.OpenDevelopment('./psc-tree')    # canonical source projection
+  `$doc = `$api.OpenDocument('./PSC.ps1')
+  `$hit = `$doc.Find('Declaration','Get-PscApi','',1)[0]
+  `$hit.Target.Extent.Text              # complete selected declaration
+  `$doc.DeclarationAt(`$hit.Line,`$hit.Column) # acquire by location
+  `$doc.GetText(`$hit.StartOffset, `$hit.EndOffset-`$hit.StartOffset)
+  `$doc.Parses()                         # actual parse attempts
+  `$doc.Replace(`$hit, `$replacement)      # revision-checked structural edit
+  `$doc.Undo(); `$doc.Redo(); `$doc.Save()  # grouped journal and conflict checks
+  `$api.OpenDevelopment('./psc-tree').Affected() # advisory faculty closure
+Full command help and live mode inventory follow.
+"@)
         Get-Help -Name $PSCommandPath -Full
         (Get-PscApi).Modes | Select-Object Mode,Parameters,Calls
         return
