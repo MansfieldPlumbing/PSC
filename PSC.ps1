@@ -2442,6 +2442,7 @@ class PscDeclarationScope {
     [hashtable] $Types = @{}
     [System.Collections.IDictionary] $Contracts
     [System.Collections.IDictionary] $Signatures
+    [Collections.Generic.Dictionary[System.Management.Automation.Language.TypeDefinitionAst,type]] $Bases = [Collections.Generic.Dictionary[System.Management.Automation.Language.TypeDefinitionAst,type]]::new()
     [PscDeclarationScope] $Resolving
     # A null result is also retained (including the recursion sentinel). Inference
     # depends on this exact source revision and its realized CLR types.
@@ -5037,6 +5038,10 @@ function Get-ScriptTypeContract {
         for($ownerIndex=0;$ownerIndex -lt $CompilerClassAsts.Length;$ownerIndex++){
             $owner=$CompilerClassAsts[$ownerIndex];$contract=$contracts[$ownerIndex]
             $retainedContracts.Add($owner,$contract)
+            if($null -ne $DeclarationScope -and $contract.BaseReferences.Count){
+                if($contract.BaseReferences.Count -ne 1 -or $contract.BaseReferences[0].Kind -ne [ScriptTypeReferenceKind]::Source){throw "Base of '$($owner.Name)' is not an admitted source-owned class."}
+                $DeclarationScope.Bases.Add($owner,(ConvertTo-PscMaterializedSignatureType $contract.BaseReferences[0] $owner.BaseTypes[0].TypeName $types ([object])))
+            }
             if($owner.Members.Count -ne $contract.Members.Length){throw 'STS member inventory differs from source'}
             for($memberIndex=0;$memberIndex -lt $owner.Members.Count;$memberIndex++){
                 $member=$owner.Members[$memberIndex];$descriptor=$contract.Members[$memberIndex]
@@ -8342,8 +8347,8 @@ function Get-ClassModel {
             }
         }
         foreach ($f in $functions) { $null = Get-NativeMethodContract $f }
-        if ($class.BaseTypes.Count) {
-            throw "[{0}:{1}] Class {2} derives from another type; only classes deriving from System.Object are supported." -f `
+        if ($class.BaseTypes.Count -gt 1) {
+            throw "[{0}:{1}] Class {2} has multiple base references; this realization does not yet admit interface composition." -f `
                 $class.Extent.StartLineNumber, $class.Extent.StartColumnNumber, $class.Name
         }
         [pscustomobject]@{
@@ -8445,6 +8450,9 @@ function New-ClrDeclarationProjection {
     # source-owned types from member syntax.
     $null=Get-PscFacultyDeclarations -CompilerClassAsts @(foreach($c in $Model){$c.Ast}) -MaterializedTypes $script:LoweringClassTypes -DeclarationScope $declarationScope
     $signatures=$declarationScope.Signatures
+    foreach($c in $Model){
+        if($declarationScope.Bases.ContainsKey($c.Ast)){$builders[$c.Name].SetParent($declarationScope.Bases[$c.Ast])}
+    }
     function Write-ThrowBody([Reflection.Emit.ILGenerator] $IL) {
         $IL.Emit([Reflection.Emit.OpCodes]::Newobj, $notSupported)
         $IL.Emit([Reflection.Emit.OpCodes]::Throw)
@@ -8465,8 +8473,10 @@ function New-ClrDeclarationProjection {
             $cb = $tb.DefineConstructor([Reflection.MethodAttributes]'Public,HideBySig,SpecialName,RTSpecialName',
                 [Reflection.CallingConventions]::Standard, $constructorParameterTypes)
             $il = $cb.GetILGenerator()
-            $il.Emit([Reflection.Emit.OpCodes]::Ldarg_0)
-            $il.Emit([Reflection.Emit.OpCodes]::Call, $objectCtor)
+            if(!$declarationScope.Bases.ContainsKey($c.Ast)){
+                $il.Emit([Reflection.Emit.OpCodes]::Ldarg_0)
+                $il.Emit([Reflection.Emit.OpCodes]::Call, $objectCtor)
+            }
             Write-ThrowBody $il
         }
         foreach ($n in $c.NativeImports) {
@@ -8484,8 +8494,17 @@ function New-ClrDeclarationProjection {
         }
     }
 
-    foreach ($c in $Model) {
-        $script:LoweringClassTypes[$c.Name] = $builders[$c.Name].CreateType()
+    $pending=[Collections.Generic.List[Reflection.Emit.TypeBuilder]]::new()
+    foreach($c in $Model){$pending.Add($builders[$c.Name])}
+    while($pending.Count){
+        $progress=$false
+        for($i=0;$i -lt $pending.Count;){
+            $builder=$pending[$i];$base=$builder.BaseType
+            if($base -is [Reflection.Emit.TypeBuilder] -and !$base.IsCreated()){$i++;continue}
+            $script:LoweringClassTypes[$builder.Name]=$builder.CreateType()
+            $pending.RemoveAt($i);$progress=$true
+        }
+        if(!$progress){throw 'Unresolved or cyclic CLR projection base.'}
     }
     foreach($signature in $signatures.Values){
         $signature.Result=Complete-PscProjectionType $signature.Result
@@ -12782,7 +12801,7 @@ function New-LoweredBody {
     foreach ($stmt in $Statements) {
         if ($null -eq $stmt) { continue }
         # The parser opens every constructor with an implicit base() call; the
-        # emitter calls System.Object's constructor, the only base supported.
+        # managed emitter calls the selected parameterless base constructor.
         # SMA Ast.Copy() can turn a synthetic BaseCtorInvokeMemberExpressionAst
         # into an ordinary InvokeMemberExpressionAst. Recognize only the copied
         # synthetic constructor prefix, not an authored member call.
@@ -12974,10 +12993,16 @@ function Save-PersistedAssemblySession {
     }
 
     # Ensure all defined types are created
-    foreach ($tb in $Session.Types.Values) {
-        if (-not $tb.IsCreated()) {
-            $null = $tb.CreateType()
+    $pending=[Collections.Generic.List[Reflection.Emit.TypeBuilder]]::new()
+    foreach($tb in $Session.Types.Values){if(!$tb.IsCreated()){$pending.Add($tb)}}
+    while($pending.Count){
+        $progress=$false
+        for($i=0;$i -lt $pending.Count;){
+            $tb=$pending[$i];$base=$tb.BaseType
+            if($base -is [Reflection.Emit.TypeBuilder] -and !$base.IsCreated()){$i++;continue}
+            $null=$tb.CreateType();$pending.RemoveAt($i);$progress=$true
         }
+        if(!$progress){throw 'Unresolved or cyclic persisted base.'}
     }
 
     if ($EntryPoint) {
@@ -13079,6 +13104,13 @@ function Get-IlType([Type] $Type) {
 }
 
 function Get-IlMember([Reflection.MemberInfo] $Member) {
+    # Reflection through a derived compatibility type can return a different
+    # MemberInfo for the same declared member. Map only the exact declaration.
+    if($null -ne $Member.DeclaringType -and $Member.ReflectedType -ne $Member.DeclaringType -and $script:IlMap.Types.ContainsKey($Member.DeclaringType)){
+        foreach($declaration in $Member.DeclaringType.GetMember($Member.Name,[Reflection.BindingFlags]'Public,NonPublic,Instance,Static,DeclaredOnly')){
+            if($declaration.HasSameMetadataDefinitionAs($Member)){$Member=$declaration;break}
+        }
+    }
     # A member this program compiles is its own builder, including when the program is PowerShellSemantics itself.
     if ($script:IlMap.Members.ContainsKey($Member)) { return $script:IlMap.Members[$Member] }
     # A PowerShellSemantics method: the helper class enters this assembly on the first call that needs it, and every
@@ -14085,14 +14117,15 @@ function Write-IlMethodBody {
         [switch] $IsStatic,
         # The lambda's first parameter is the instance ('this', argument 0).
         [switch] $HasThis,
-        # Call System.Object's constructor first, as an instance constructor must.
-        [switch] $BaseConstructor
+        # Call the selected parameterless base constructor before the instance body.
+        [switch] $BaseConstructor,
+        [Reflection.ConstructorInfo] $BaseConstructorMember
     )
 
     $il = $MethodBuilder.GetILGenerator()
     if ($BaseConstructor) {
         $il.Emit([Reflection.Emit.OpCodes]::Ldarg_0)
-        $il.Emit([Reflection.Emit.OpCodes]::Call, [object].GetConstructor([Type[]]@()))
+        $il.Emit([Reflection.Emit.OpCodes]::Call, $(if($null -ne $BaseConstructorMember){Get-IlMember $BaseConstructorMember}else{[object].GetConstructor([Type[]]@())}))
     }
 
     $paramMap = @{}
@@ -15684,7 +15717,7 @@ $api | Get-Member
 & ./PSC.ps1 -Mode Capability
 ```
 
-The API retains the acquired source revision. LowerDeclarations(names) compiles an explicitly selected set of top-level classes and enums, including those in PSC's begin block; LowerDeclarations(ast,names) accepts a donor source AST, including the original body of a named declaration scope when the selection is contained in that body. It compiles the selected original declarations directly, retaining their parser-owned AST identities without synthesizing or executing an enclosing script. Include required source types in the selection; program compilation is a separate operation. Eligible queries reuse its AST after byte-identity verification; declaration queries share the roadmap declaration inventory and use an ordinal-ignore-case name index. IndexedArtifacts counts indexed source artifacts; SitesExamined counts candidate declarations actually tested, and VisitorCallbacks counts visits in the query itself. Pull windows advance through retained declaration sites without replay; other source kinds still traverse the AST. Measurements are acquired only on the first Measures() call. ReadSource(path) still acquires all measurements. The API is derived from the running script, so mode names and parameter evidence do not depend on a previous session's notes. Use `Describe(mode)` for dispatcher extents and associated definitions. CLI inventory below is generated; source hash, local paths, runtime and measurement values are available from the live API rather than frozen into the README. Regenerate with `& ./PSC.ps1 -Mode Readme`.
+The API retains the acquired source revision. LowerDeclarations(names) compiles an explicitly selected set of top-level classes and enums, including those in PSC's begin block; LowerDeclarations(ast,names) accepts a donor source AST, including the original body of a named declaration scope when the selection is contained in that body. It compiles the selected original declarations directly, retaining their parser-owned AST identities without synthesizing or executing an enclosing script. Include required source types in the selection; program compilation is a separate operation. Managed declaration lowering supports one selected source-owned base class, including forward references, inherited fields and virtual methods, and parameterless base construction. External base classes, interfaces, explicit base arguments and MethodNames selection with inheritance remain unsupported. Eligible queries reuse its AST after byte-identity verification; declaration queries share the roadmap declaration inventory and use an ordinal-ignore-case name index. IndexedArtifacts counts indexed source artifacts; SitesExamined counts candidate declarations actually tested, and VisitorCallbacks counts visits in the query itself. Pull windows advance through retained declaration sites without replay; other source kinds still traverse the AST. Measurements are acquired only on the first Measures() call. ReadSource(path) still acquires all measurements. The API is derived from the running script, so mode names and parameter evidence do not depend on a previous session's notes. Use `Describe(mode)` for dispatcher extents and associated definitions. CLI inventory below is generated; source hash, local paths, runtime and measurement values are available from the live API rather than frozen into the README. Regenerate with `& ./PSC.ps1 -Mode Readme`.
 '@
         return $guideText.Replace('@@TYPESYSTEM@@',$this.TypeSystemContract).Replace('@@FORMATS@@',($formatRows -join "`n")).Replace('@@ROADMAP@@',$this.RoadmapMarkdown())
     }
@@ -16404,6 +16437,9 @@ function Export-LoweredAssembly {
     $null = Get-ClrTypeProjection -Root $parsed.Ast -SelectedClassAst $sourceClasses -SelectedEnumAst $enumAsts
     Use-DeclarationScope -Ast $parsed.Ast
     $projection = @{} + $script:LoweringClassTypes
+    if($MethodNames){
+        foreach($c in $model){if($c.Ast.BaseTypes.Count){throw 'MethodNames selection is not yet admitted for inherited types; full virtual dispatch closure is required.'}}
+    }
     $requiredMethods = if ($MethodNames) { Get-RequiredClassMethods -Model $model -ProjectedTypes $projection -ClassName $targetClass.Name -MethodNames $MethodNames } else { $null }
     $dataFields = @{}
     if ($null -eq $StaticData) { $StaticData = @{} }
@@ -16438,6 +16474,11 @@ function Export-LoweredAssembly {
             $script:IlMap.Types[$projection[$c.Name]] = $tb
         }
 
+        # Realize the source-owned base relation already established by the declaration scope.
+        foreach($c in $model){
+            $base=$projection[$c.Name].BaseType
+            if($base -ne [object]){$session.Types[$c.Name].SetParent((Get-IlType $base))}
+        }
         # 2. Fields, constructors and methods, in source order.
         $plans = foreach ($c in $model) {
             $tb = $session.Types[$c.Name]
@@ -16482,7 +16523,7 @@ function Export-LoweredAssembly {
             }
             if (-not $c.Constructors.Count) {
                 $mc = $projectedType.GetConstructor($declared, $null, [Type[]]@(), $null)
-                if (@($c.Properties | Where-Object { -not $_.IsStatic -and $_.InitialValue }).Count) {
+                if ($projectedType.BaseType -ne [object] -or @($c.Properties | Where-Object { -not $_.IsStatic -and $_.InitialValue }).Count) {
                     $cb = $tb.DefineConstructor($mc.Attributes, [Reflection.CallingConventions]::Standard, [Type[]]@())
                     $script:IlMap.Members[$mc] = $cb
                     $ctorPlans += [PscMemberPlan]@{ Ast = $null; Builder = $cb }
@@ -16520,7 +16561,10 @@ function Export-LoweredAssembly {
             foreach ($ctor in $plan.Constructors) {
                 $lowered = if ($ctor.Ast) { Convert-MethodAstToLambda -MethodAst $ctor.Ast -Initializers $instanceInits }
                            else { Convert-InitializersToLambda -ClassAst $c.Ast -Initializers $instanceInits }
-                Write-IlMethodBody -Lambda $lowered.Lambda -MethodBuilder $ctor.Builder -HasThis -BaseConstructor
+                $base=$projection[$c.Name].BaseType
+                $baseCtor=$base.GetConstructor([Reflection.BindingFlags]'Public,NonPublic,Instance', $null, [type[]]@(), $null)
+                if($null -eq $baseCtor -or $baseCtor.IsPrivate){throw "Base of '$($c.Name)' has no accessible parameterless constructor."}
+                Write-IlMethodBody -Lambda $lowered.Lambda -MethodBuilder $ctor.Builder -HasThis -BaseConstructor -BaseConstructorMember $baseCtor
             }
             foreach ($method in $plan.Methods) {
                 $lowered = Convert-MethodAstToLambda -MethodAst $method.Ast
