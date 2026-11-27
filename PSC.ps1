@@ -5785,6 +5785,36 @@ class PscRuntimeSelection {
     hidden [Func[int,int,string,type[],bool,bool,Collections.Generic.Dictionary[type,Tuple[int,int]],Tuple[int,int,bool[],string[],string]]] $GraphBinding
     hidden [Func[int,bool]] $GraphLive
     hidden [Func[int,Tuple[int,string]]] $GraphRelease
+    hidden [Collections.Generic.List[int]] $CompilationGraphs
+    hidden [Collections.Generic.List[Tuple[System.Runtime.CompilerServices.ConditionalWeakTable[System.Management.Automation.Language.Ast,PscDeclarationScope],System.Management.Automation.Language.Ast]]] $CompilationCacheEntries
+    static [void] BeginCompilation([PscRuntimeSelection]$Session){
+        [Threading.Monitor]::Enter($Session)
+        try{
+            [PscRuntimeSelection]::AssertOpen($Session)
+            if($null -ne $Session.CompilationGraphs){throw 'Nested resident compilation is not admitted'}
+            $Session.CompilationGraphs=[Collections.Generic.List[int]]::new()
+            $Session.CompilationCacheEntries=[Collections.Generic.List[Tuple[System.Runtime.CompilerServices.ConditionalWeakTable[System.Management.Automation.Language.Ast,PscDeclarationScope],System.Management.Automation.Language.Ast]]]::new()
+        }catch{[Threading.Monitor]::Exit($Session);throw}
+    }
+    static [void] EndCompilation([PscRuntimeSelection]$Session,[int]$RetainedSlot){
+        if(![Threading.Monitor]::IsEntered($Session) -or $null -eq $Session.CompilationGraphs){throw 'Resident compilation is not active on this thread'}
+        try{
+            foreach($entry in $Session.CompilationCacheEntries){$null=$entry.Item1.Remove($entry.Item2)}
+            for($index=$Session.CompilationGraphs.Count-1;$index -ge 0;$index--){
+                $slot=$Session.CompilationGraphs[$index]
+                if($slot -ne $RetainedSlot -and ![PscRuntimeSelection]::ReleaseGraph($Session,$slot)){throw 'Compilation-owned graph was withdrawn outside its operation'}
+            }
+        }finally{
+            $Session.CompilationGraphs=$null;$Session.CompilationCacheEntries=$null
+            [Threading.Monitor]::Exit($Session)
+        }
+    }
+    static [void] TrackCompilationCache([PscRuntimeSelection]$Session,[System.Runtime.CompilerServices.ConditionalWeakTable[System.Management.Automation.Language.Ast,PscDeclarationScope]]$Cache,[System.Management.Automation.Language.Ast]$Root){
+        [Threading.Monitor]::Enter($Session)
+        try{
+            if($null -ne $Session.CompilationCacheEntries){$Session.CompilationCacheEntries.Add([Tuple[System.Runtime.CompilerServices.ConditionalWeakTable[System.Management.Automation.Language.Ast,PscDeclarationScope],System.Management.Automation.Language.Ast]]::new($Cache,$Root))}
+        }finally{[Threading.Monitor]::Exit($Session)}
+    }
     static [string[]] FacultyNames(){return @('HandleTable','ScriptType','PrimitiveConversion')}
     static [string[]] AdmissionNames(){return @('HandleTable','ScriptType','PrimitiveConversion','CompilerDeclarations')}
     static [string] ArtifactPath([string]$Directory,[string]$Name){
@@ -5876,6 +5906,7 @@ class PscRuntimeSelection {
             [PscRuntimeSelection]::AssertOpen($Session)
             $result=$Session.GraphAcquisition.Invoke($Definitions,$Imports)
             if($result.Item1 -ne 1){throw [InvalidOperationException]::new($result.Item3)}
+            if($null -ne $Session.CompilationGraphs){$Session.CompilationGraphs.Add($result.Item2)}
             return $result.Item2
         }finally{[Threading.Monitor]::Exit($Session)}
     }
@@ -5919,6 +5950,7 @@ class PscRuntimeSelection {
         if($null -eq $Session){return}
         [Threading.Monitor]::Enter($Session)
         try{
+            if($null -ne $Session.CompilationGraphs){throw 'Cannot close a session during resident compilation'}
             if($null -eq $Session.FacultyContext){return}
             $context=$Session.FacultyContext
             $Session.GraphAcquisition=$null;$Session.GraphProjection=$null;$Session.GraphBinding=$null;$Session.GraphLive=$null;$Session.GraphRelease=$null;$Session.Scopes=$null
@@ -9446,7 +9478,10 @@ function Get-DeclarationScope {
         $script:LoweringClassTypes = @{}
         if($null -ne $Resolving){$script:LoweringClassTypes += $Resolving.Types}
         $next=New-ClrDeclarationProjection -Model @(if ($classes.Count) { Get-ClassModel -ClassAsts $classes }) -Enums $enums -Resolving $Resolving -RuntimeSelection $RuntimeSelection
-        if(!$selected){$cache.Add($Root,$next)}
+        if(!$selected){
+            $cache.Add($Root,$next)
+            if($null -ne $RuntimeSelection){[PscRuntimeSelection]::TrackCompilationCache($RuntimeSelection,$cache,$Root)}
+        }
         return $next
     }
     finally { $script:LoweringClassTypes = $inProgress }
@@ -16624,7 +16659,7 @@ Conform streams child stdout and stderr to the invoking host as they become avai
 
 - **Managed:** SMA AST and typed expression lowering, deterministic IL emission, static graph/data realization, reachability and fixed-parameter specialization.
 - **Native:** pinned Windows NativeAOT compiler plus PSC COFF linker; direct CIL-to-IR-to-x64 ELF leaf emission and decoded-byte ABI checks. The direct backend does not yet replace ILC for general programs.
-- **Faculties:** `HandleTable`, `DiscoveryMechanisms`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. `BuildRuntime -CompilerRuntimeDirectory <bootstrap> -RuntimeDirectory <empty-output>` admits the existing no-contract compiler realization, composes the original resident dependency scopes without merging their descriptors, and rebuilds all eight artifacts in a separate directory. It refuses missing or incompatible admission receipts, nonempty output directories and external contract inputs. The coordinator acquires its declaration inventory once, uses retained persisted dependency witnesses, retires completed graph scopes outside the remaining transitive dependency closure in reverse order, and closes the admitted session. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. BuildRuntime without contract inputs also builds the compiler-private `compiler/CompilerDeclarations.dll` and writes a version 2 local selection receipt for it and HandleTable, ScriptType and PrimitiveConversion. The seven public faculty files and their dependency closure are unchanged. The compiled selection path verifies source, CoreLib, SMA, the existing TypeConverter framework dependency and all four admitted assembly digests once, loads the exact bytes in a private collectible context, and invokes typed delegates. Version 1 receipts require rebuilding. Missing or incompatible receipts refuse that path; no implicit interpreted fallback is permitted after selection is requested. Without an explicit directory the authoring selector is unchanged. The receipt identifies a trusted local build; it is not a signature or independent admission proof. This is explicit compiler self-consumption, not full startup activation. `PscApi.AcquireSelection(api,directory)` acquires an explicit resident selection session from the API source revision. `PscRuntimeSelection.Select(session,signatures,sources)` reuses the admitted selector without reading artifacts again; `Close(session)` withdraws it and requests context unloading. Resident structural specialization accepts the same session as `-RuntimeSelection`, and does not close a caller-owned session. CLI Compile with an explicit `-RuntimeDirectory` uses `Invoke-PscCompile` to acquire one session before lowering, supply it to both structural specialization and ordinary managed lowering (including the managed precursor of Native), and close it in a finally boundary before returning the managed result. The session remains inside the authoring operation, not the process dispatcher. Even an exact-only compilation refuses a missing or incompatible receipt when explicitly requested. Without an explicit directory CLI Compile retains interpreted selection. The retained session may also be supplied to `Export-LoweredAssembly -RuntimeSelection`: ordinary source static/instance calls and explicit constructors use session-owned compiled STS exact and numeric binding and retain the original CLR projection witnesses. Method closure, initializer lowering and recursive function-output inference use the same session; a selected compilation owns fresh declaration scopes, including their existing inference caches. `PscScriptTypeAcquisition` constructs descriptors directly from the original SMA AST declarations in the selected execution domain. A resident scope stores only its owning session, scope and source coordinates, and CLR projection witnesses; it does not construct an interpreted descriptor graph. The compiled graph retains original imported referents and supplies typed acquisition, projection and binding results across the delegate boundary, with refusal status and diagnostic text instead of collectible exceptions. The authoring caller checks the selected member against its CLR realization. Graph scopes may be withdrawn individually through `PscRuntimeSelection.ReleaseGraph`; live importing scopes prevent withdrawal, and retired coordinates are never reused. Previously cached scope witnesses refuse subsequent operations rather than silently reacquiring a different semantic graph. A resident scope cannot import an authoring descriptor graph. ScriptType.dll remains independent of SMA; only the compiler-side adapter consumes AST evidence. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
+- **Faculties:** `HandleTable`, `DiscoveryMechanisms`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. `BuildRuntime -CompilerRuntimeDirectory <bootstrap> -RuntimeDirectory <empty-output>` admits the existing no-contract compiler realization, composes the original resident dependency scopes without merging their descriptors, and rebuilds all eight artifacts in a separate directory. It refuses missing or incompatible admission receipts, nonempty output directories and external contract inputs. The coordinator acquires its declaration inventory once, uses retained persisted dependency witnesses, retires completed graph scopes outside the remaining transitive dependency closure in reverse order, and closes the admitted session. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. BuildRuntime without contract inputs also builds the compiler-private `compiler/CompilerDeclarations.dll` and writes a version 2 local selection receipt for it and HandleTable, ScriptType and PrimitiveConversion. The seven public faculty files and their dependency closure are unchanged. The compiled selection path verifies source, CoreLib, SMA, the existing TypeConverter framework dependency and all four admitted assembly digests once, loads the exact bytes in a private collectible context, and invokes typed delegates. Version 1 receipts require rebuilding. Missing or incompatible receipts refuse that path; no implicit interpreted fallback is permitted after selection is requested. Without an explicit directory the authoring selector is unchanged. The receipt identifies a trusted local build; it is not a signature or independent admission proof. This is explicit compiler self-consumption, not full startup activation. `PscApi.AcquireSelection(api,directory)` acquires an explicit resident selection session from the API source revision. `PscRuntimeSelection.Select(session,signatures,sources)` reuses the admitted selector without reading artifacts again; `Close(session)` withdraws it and requests context unloading. Resident structural specialization accepts the same session as `-RuntimeSelection`, and does not close a caller-owned session. CLI Compile with an explicit `-RuntimeDirectory` uses `Invoke-PscCompile` to acquire one session before lowering, supply it to both structural specialization and ordinary managed lowering (including the managed precursor of Native), and close it in a finally boundary before returning the managed result. The session remains inside the authoring operation, not the process dispatcher. Even an exact-only compilation refuses a missing or incompatible receipt when explicitly requested. Without an explicit directory CLI Compile retains interpreted selection. The retained session may also be supplied to `Export-LoweredAssembly -RuntimeSelection`: ordinary source static/instance calls and explicit constructors use session-owned compiled STS exact and numeric binding and retain the original CLR projection witnesses. Method closure, initializer lowering and recursive function-output inference use the same session; a selected compilation owns fresh declaration scopes, including their existing inference caches. Ordinary resident lowering tracks every graph it acquires, including incomplete projections; it withdraws temporary scopes in reverse acquisition order and removes their cache entries on success or failure. An explicit successful RealizedScope handoff retains only the selected graph; caller-owned dependency and declaration scopes are not withdrawn. This is graph lifetime management, not reclamation of CLR compatibility projections. `PscScriptTypeAcquisition` constructs descriptors directly from the original SMA AST declarations in the selected execution domain. A resident scope stores only its owning session, scope and source coordinates, and CLR projection witnesses; it does not construct an interpreted descriptor graph. The compiled graph retains original imported referents and supplies typed acquisition, projection and binding results across the delegate boundary, with refusal status and diagnostic text instead of collectible exceptions. The authoring caller checks the selected member against its CLR realization. Graph scopes may be withdrawn individually through `PscRuntimeSelection.ReleaseGraph`; live importing scopes prevent withdrawal, and retired coordinates are never reused. Previously cached scope witnesses refuse subsequent operations rather than silently reacquiring a different semantic graph. A resident scope cannot import an authoring descriptor graph. ScriptType.dll remains independent of SMA; only the compiler-side adapter consumes AST evidence. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
 - **Evidence:** differential tests, structural lint, Guard, non-loading binary queries and coverage. An observed call is not a universal binding proof; an ABI check is not a proof of arithmetic equivalence.
 
 ## Trust and security
@@ -17352,7 +17387,12 @@ function Export-LoweredAssembly {
         [switch] $Program
     )
 
-    if($null -ne $RuntimeSelection){[PscRuntimeSelection]::AssertOpen($RuntimeSelection)}
+    $retainedSlot=-1
+    $outerTypes=$script:LoweringClassTypes
+    $outerProgram=$script:PscCompilingProgram
+    $outerKeywords=$script:LoweringKeywords
+    if($null -ne $RuntimeSelection){[PscRuntimeSelection]::BeginCompilation($RuntimeSelection)}
+    try{
     if($null -ne $RealizedScope){$RealizedScope.Value=$null}
     $script:PscCompilingProgram = [bool]$Program
     if (($ScopeDeclarations -or $DependencyScope) -and !$DeclarationsOnly){throw 'Explicit scope is available only for declaration realization.'}
@@ -17674,7 +17714,20 @@ function Export-LoweredAssembly {
     if ($null -ne $saveResult.EntryPoint) { $compiled.EntryPoint = $saveResult.EntryPoint }
     if ($null -ne $saveResult.RuntimeConfig) { $compiled.RuntimeConfig = $saveResult.RuntimeConfig }
     $compiled.ApplicationIcon = $programIcon
-    if($null -ne $RealizedScope){$RealizedScope.Value=$PscSelectedScope}
+    if($null -ne $RealizedScope){
+        $RealizedScope.Value=$PscSelectedScope
+        if($null -ne $RuntimeSelection){
+            if(![object]::ReferenceEquals($RealizedScope.Value,$PscSelectedScope)){throw 'RealizedScope must retain the selected declaration scope'}
+            $retainedSlot=$PscSelectedScope.ResidentSlot
+        }
+    }
+    }finally{
+        if($null -ne $RuntimeSelection){
+            try{[PscRuntimeSelection]::EndCompilation($RuntimeSelection,$retainedSlot)}
+            finally{$script:LoweringClassTypes=$outerTypes;$script:PscCompilingProgram=$outerProgram;$script:LoweringKeywords=$outerKeywords}
+        }
+    }
+
     $compiled
 }
 
