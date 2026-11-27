@@ -11768,6 +11768,7 @@ function Resolve-PscSourceOperation {
                 $persisted=Get-PscFacultyDeclarations -DeclarationScope $ownerScope -BindingOwner $definition -BindingName $operationName -BindingArguments $ArgumentTypes -BindingStatic $Static -BindingConstructor $Constructor -BindingScopes @($scope) -PersistedBindingTarget $TargetType -RuntimeSelection $RuntimeSelection
                 if($null -ne $persisted){return $persisted}
                 $miss=Get-PscFacultyDeclarations -DeclarationScope $ownerScope -BindingOwner $definition -BindingName $operationName -BindingStatic $Static -BindingConstructor $Constructor -BindingScopes @($scope) -OperationMiss
+                if($miss.Item1 -eq 0 -and $Constructor -and $ArgumentTypes.Length -eq 0 -and $null -ne $CompatibilityTarget){$CompatibilityTarget.Value=$TargetType}
                 if($miss.Item1 -eq 0 -and !$Constructor -and $null -ne $CompatibilityTarget){
                     if($TargetType.BaseType -ne [object]){throw 'Terminal source base realization differs'}
                     $CompatibilityTarget.Value=[object]
@@ -11810,6 +11811,7 @@ function Resolve-PscSourceOperation {
         $operation=[PscRuntimeSelection]::BindGraph($RuntimeSelection,$ownerScope.ResidentSlot,$ownerIndex,$(if($Constructor){$ownerAst.Name}else{$Name}),$ArgumentTypes,$Static,$Constructor,$owners,$named)
         if($operation.Item1 -eq 0){
             $miss=[PscRuntimeSelection]::ClassifyOperationMiss($RuntimeSelection,$ownerScope.ResidentSlot,$ownerIndex,$(if($Constructor){$ownerAst.Name}else{$Name}),$Static,$Constructor,$owners,$named)
+            if($miss.Item1 -eq 0 -and $Constructor -and $ArgumentTypes.Length -eq 0 -and $null -ne $CompatibilityTarget){$CompatibilityTarget.Value=$TargetType}
             if($miss.Item1 -eq 0 -and !$Constructor -and $null -ne $CompatibilityTarget){
                 if($TargetType.BaseType -ne [object]){throw 'Terminal source base realization differs'}
                 $CompatibilityTarget.Value=[object]
@@ -11831,6 +11833,7 @@ function Resolve-PscSourceOperation {
         $projection=Get-PscFacultyDeclarations -DeclarationScope $ownerScope -BindingOwner $ownerAst -BindingName $(if($Constructor){$ownerAst.Name}else{$Name}) -BindingArguments $ArgumentTypes -BindingStatic $Static -BindingConstructor $Constructor -BindingScopes $bindingScopes.ToArray() -RuntimeSelection $RuntimeSelection -OperationProjection
         if($null -eq $projection){
             $miss=Get-PscFacultyDeclarations -DeclarationScope $ownerScope -BindingOwner $ownerAst -BindingName $(if($Constructor){$ownerAst.Name}else{$Name}) -BindingStatic $Static -BindingConstructor $Constructor -BindingScopes $bindingScopes.ToArray() -OperationMiss
+            if($miss.Item1 -eq 0 -and $Constructor -and $ArgumentTypes.Length -eq 0 -and $null -ne $CompatibilityTarget){$CompatibilityTarget.Value=$TargetType}
             if($miss.Item1 -eq 0 -and !$Constructor -and $null -ne $CompatibilityTarget){
                 if($TargetType.BaseType -ne [object]){throw 'Terminal source base realization differs'}
                 $CompatibilityTarget.Value=[object]
@@ -14368,7 +14371,7 @@ function Convert-MethodAstToLambda {
         if($PscFunctionSelectionActive){$programParameters=$PscSelectedRoot.ParamBlock}
         else{$null=$script:PscProgramEntries.TryGetValue($MethodAst,[ref]$programParameters)}
     }
-    New-LoweredBody -Name $MethodAst.Name -ReturnType $retType -This $thisParam -Parameters $paramExprList -ParameterMap $paramMap `
+    New-LoweredBody -Name $MethodAst.Name -ReturnType $retType -Receiver $thisParam -Parameters $paramExprList -ParameterMap $paramMap `
         -Initializers $Initializers -Statements @($(if ($MethodAst.Body -and $MethodAst.Body.EndBlock) { $MethodAst.Body.EndBlock.Statements })) `
         -IsStatic ([bool]$MethodAst.IsStatic) -IsConstructor ([bool]$MethodAst.IsConstructor) -Output:($isFunction -and -not $isProgram) `
         -ScriptClass $(if ($isFunction) { $classType } else { $null }) -Program:$isProgram `
@@ -14389,9 +14392,9 @@ function Convert-InitializersToLambda {
     Use-DeclarationScope -Ast $ClassAst -RuntimeSelection $RuntimeSelection
     $classType = $script:LoweringClassTypes[$ClassAst.Name]
     $thisParam = if ($Static) { $null } else { [Linq.Expressions.Expression]::Parameter($classType, 'this') }
-    New-LoweredBody -Name $(if ($Static) { '.cctor' } else { '.ctor' }) -ReturnType ([void]) -This $thisParam `
+    New-LoweredBody -Name $(if ($Static) { '.cctor' } else { '.ctor' }) -ReturnType ([void]) -Receiver $thisParam `
         -Parameters ([System.Collections.Generic.List[Linq.Expressions.ParameterExpression]]::new()) -ParameterMap @{} `
-        -Initializers $Initializers -Statements @() -IsStatic ([bool]$Static) -IsConstructor $true -RuntimeSelection $RuntimeSelection
+        -Initializers $Initializers -Statements @() -IsStatic ([bool]$Static) -IsConstructor $true -ConstructorOwner $(if (!$Static) { $ClassAst }) -RuntimeSelection $RuntimeSelection
 }
 
 # A direct base invocation carries the selected compatibility member and its lowered
@@ -14404,7 +14407,7 @@ class PscBaseConstructorInvocation {
 
 function New-LoweredBody {
     param(
-        [string] $Name, [Type] $ReturnType, $This,
+        [string] $Name, [Type] $ReturnType, [Linq.Expressions.ParameterExpression] $Receiver,
         [System.Collections.Generic.List[Linq.Expressions.ParameterExpression]] $Parameters, [hashtable] $ParameterMap,
         [System.Management.Automation.Language.PropertyMemberAst[]] $Initializers, [object[]] $Statements,
         [bool] $IsStatic, [bool] $IsConstructor, [System.Management.Automation.Language.TypeDefinitionAst] $ConstructorOwner,
@@ -14432,7 +14435,7 @@ function New-LoweredBody {
         Locals         = @{}
         DeclaredLocals = $declaredLocals
         Loops          = [System.Collections.Generic.Stack[object]]::new()
-        This           = $This
+        This           = $Receiver
         Output         = $outputList
         ScriptClass    = $ScriptClass
         ScriptBody     = [bool]$Program
@@ -14449,7 +14452,7 @@ function New-LoweredBody {
         $classType = $script:LoweringClassTypes[$p.Parent.Name]
         $field = $classType.GetField($p.Name, [Reflection.BindingFlags]'Public,Static,Instance')
         $value = Convert-AstExpressionAs -Node $p.InitialValue -Type $field.FieldType -Scope $scope
-        $target = if ($field.IsStatic) { $null } else { $This }
+        $target = if ($field.IsStatic) { $null } else { $Receiver }
         $body.Add([Linq.Expressions.Expression]::Assign([Linq.Expressions.Expression]::Field($target, $field), $value))
     }
     if ($Program -and $null -ne $ProgramParameters -and $ProgramParameters.Parameters.Count -gt 0) {
@@ -14499,6 +14502,7 @@ function New-LoweredBody {
         }
     }
     [PscBaseConstructorInvocation]$baseInvocation = $null
+    $baseInvocationIndex = $body.Count
     foreach ($stmt in $Statements) {
         if ($null -eq $stmt) { continue }
         # The parser opens every constructor with a base invocation prefix.
@@ -14520,7 +14524,7 @@ function New-LoweredBody {
                     throw "[$($stmt.Extent.StartLineNumber):$($stmt.Extent.StartColumnNumber)] Explicit base operands require an acquired source base."
                 }
                 $baseType = Complete-PscProjectionType $declarationScope.Bases[$ConstructorOwner]
-                if ($This.Type.BaseType -ne $baseType) { throw 'Source base realization differs' }
+                if ($Receiver.Type.BaseType -ne $baseType) { throw 'Source base realization differs' }
                 $arguments = [Collections.Generic.List[Linq.Expressions.Expression]]::new()
                 $argumentTypes = [Collections.Generic.List[type]]::new()
                 foreach ($argument in $stmt.Expression.Arguments) {
@@ -14544,6 +14548,23 @@ function New-LoweredBody {
         }
         $body.Add((Convert-AstStatement -Statement $stmt -Scope $scope))
     }
+    # Parameterless source-base construction occupies the same semantic
+    # position as explicit operands, including generated constructors.
+    if ($null -eq $baseInvocation -and $null -ne $ConstructorOwner) {
+        $declarationScope = Get-PscOperationalScope -Root (Resolve-PscDeclarationRoot $ConstructorOwner) -ExistingOnly -RuntimeSelection $RuntimeSelection
+        if ($null -ne $declarationScope -and $declarationScope.Bases.ContainsKey($ConstructorOwner)) {
+            $baseType = Complete-PscProjectionType $declarationScope.Bases[$ConstructorOwner]
+            if ($Receiver.Type.BaseType -ne $baseType) { throw 'Source base realization differs' }
+            [type]$defaultTarget = $null
+            [Reflection.ConstructorInfo]$member = Resolve-PscSourceOperation $ConstructorOwner $baseType 'new' ([type[]]@()) $false $true $RuntimeSelection ([ref]$defaultTarget)
+            # Semantic absence permits only the language-generated default.
+            if ($null -eq $member -and $defaultTarget -eq $baseType) {
+                $member = $baseType.GetConstructor([Reflection.BindingFlags]'Public,Instance,DeclaredOnly,ExactBinding',$null,[type[]]@(),$null)
+            }
+            if ($null -eq $member) { throw "No admitted STS parameterless base constructor matches '$($baseType.Name)'." }
+            $baseInvocation = [PscBaseConstructorInvocation]@{Member=$member;Arguments=[Linq.Expressions.Expression[]]@();StatementIndex=$baseInvocationIndex}
+        }
+    }
     $defaultVal = if ($Output) { [Linq.Expressions.Expression]::Call($outputList, [System.Collections.Generic.List[object]].GetMethod('ToArray')) }
         elseif ($ReturnType -eq [void]) { [Linq.Expressions.Expression]::Empty() } else { [Linq.Expressions.Expression]::Default($ReturnType) }
     $body.Add([Linq.Expressions.Expression]::Label($returnTarget, $defaultVal))
@@ -14552,7 +14573,7 @@ function New-LoweredBody {
         [Linq.Expressions.ParameterExpression[]]$declaredLocals.ToArray(),
         [Linq.Expressions.Expression[]]$body.ToArray())
     $lambdaParameters = [System.Collections.Generic.List[Linq.Expressions.ParameterExpression]]::new()
-    if ($This) { $lambdaParameters.Add($This) }
+    if ($Receiver) { $lambdaParameters.Add($Receiver) }
     foreach ($p in $Parameters) { $lambdaParameters.Add($p) }
     $lambda = [Linq.Expressions.Expression]::Lambda($bodyBlock, $Name, [Linq.Expressions.ParameterExpression[]]$lambdaParameters.ToArray())
 
@@ -14560,7 +14581,7 @@ function New-LoweredBody {
         Name           = $Name
         IsStatic       = $IsStatic
         IsConstructor  = $IsConstructor
-        HasThis        = [bool]$This
+        HasThis        = [bool]$Receiver
         ReturnType     = $ReturnType
         ParameterTypes = [Type[]]@($Parameters | ForEach-Object { $_.Type })
         ParameterNames = [string[]]@($Parameters | ForEach-Object { $_.Name })
@@ -15847,15 +15868,15 @@ function Write-IlMethodBody {
         [switch] $IsStatic,
         # The lambda's first parameter is the instance ('this', argument 0).
         [switch] $HasThis,
-        # Call the selected parameterless base constructor before the instance body.
+        # Call the terminal CTS System.Object constructor before the instance body.
         [switch] $BaseConstructor,
-        [Reflection.ConstructorInfo] $BaseConstructorMember, [PscBaseConstructorInvocation] $BaseInvocation
+        [PscBaseConstructorInvocation] $BaseInvocation
     )
 
     $il = $MethodBuilder.GetILGenerator()
     if ($BaseConstructor) {
         $il.Emit([Reflection.Emit.OpCodes]::Ldarg_0)
-        $il.Emit([Reflection.Emit.OpCodes]::Call, $(if($null -ne $BaseConstructorMember){Get-IlMember $BaseConstructorMember}else{[object].GetConstructor([Type[]]@())}))
+        $il.Emit([Reflection.Emit.OpCodes]::Call, ([object].GetConstructor([Type[]]@())))
     }
 
     $paramMap = @{}
@@ -17484,7 +17505,7 @@ $api | Get-Member
 & ./PSC.ps1 -Mode Capability
 ```
 
-The API retains the acquired source revision. LowerDeclarations(names) compiles an explicitly selected set of top-level classes and enums, including those in PSC's begin block; LowerDeclarations(ast,names) accepts a donor source AST, including the original body of a named declaration scope when the selection is contained in that body. It compiles the selected original declarations directly, retaining their parser-owned AST identities without synthesizing or executing an enclosing script. Include required source types in the selection; program compilation is a separate operation. Managed declaration lowering supports one selected source-owned base class, including forward references, inherited fields and virtual methods, and base construction. Explicit base operands select a local source-owned constructor through the admitted exact and closed numeric STS binding profile, lower operands once in source order after derived field initialization, and emit a direct call on the existing instance. Authoring and resident paths share this operation; unsupported conversion profiles are refused, not redirected to CLR overload selection. External base classes, interfaces and MethodNames selection with inheritance remain unsupported. The supplementary projected `Tests/Test-BaseConstructor.ps1 -Compiler ./PSC.ps1` compares ordinary SMA, authoring, resident and borrowed graph execution, including projection and withdrawal refusals. Eligible queries reuse its AST after byte-identity verification; declaration queries share the roadmap declaration inventory and use an ordinal-ignore-case name index. IndexedArtifacts counts indexed source artifacts; SitesExamined counts candidate declarations actually tested, and VisitorCallbacks counts visits in the query itself. Pull windows advance through retained declaration sites without replay; other source kinds still traverse the AST. Measurements are acquired only on the first Measures() call. ReadSource(path) still acquires all measurements. The API is derived from the running script, so mode names and parameter evidence do not depend on a previous session's notes. Use `Describe(mode)` for dispatcher extents and associated definitions. CLI inventory below is generated; source hash, local paths, runtime and measurement values are available from the live API rather than frozen into the README. Regenerate with `& ./PSC.ps1 -Mode Readme`.
+The API retains the acquired source revision. LowerDeclarations(names) compiles an explicitly selected set of top-level classes and enums, including those in PSC's begin block; LowerDeclarations(ast,names) accepts a donor source AST, including the original body of a named declaration scope when the selection is contained in that body. It compiles the selected original declarations directly, retaining their parser-owned AST identities without synthesizing or executing an enclosing script. Include required source types in the selection; program compilation is a separate operation. Managed declaration lowering supports one selected source-owned base class, including forward references, inherited fields and virtual methods, and base construction. Explicit base operands select a local source-owned constructor through the admitted exact and closed numeric STS binding profile, lower operands once in source order after derived field initialization, and emit a direct call on the existing instance. Explicit parameterless, implicit and generated source-base calls occupy the same position after derived field initialization. A declared parameterless constructor binds through STS; only semantic absence of all declared constructors permits realization of the language-generated default. The emitter does not perform source-base overload selection. Authoring and resident paths share this operation; unsupported conversion profiles are refused, not redirected to CLR overload selection. External base classes, interfaces and MethodNames selection with inheritance remain unsupported. The supplementary projected `Tests/Test-BaseConstructor.ps1 -Compiler ./PSC.ps1` compares ordinary SMA, authoring, resident and borrowed graph execution, including projection and withdrawal refusals. Eligible queries reuse its AST after byte-identity verification; declaration queries share the roadmap declaration inventory and use an ordinal-ignore-case name index. IndexedArtifacts counts indexed source artifacts; SitesExamined counts candidate declarations actually tested, and VisitorCallbacks counts visits in the query itself. Pull windows advance through retained declaration sites without replay; other source kinds still traverse the AST. Measurements are acquired only on the first Measures() call. ReadSource(path) still acquires all measurements. The API is derived from the running script, so mode names and parameter evidence do not depend on a previous session's notes. Use `Describe(mode)` for dispatcher extents and associated definitions. CLI inventory below is generated; source hash, local paths, runtime and measurement values are available from the live API rather than frozen into the README. Regenerate with `& ./PSC.ps1 -Mode Readme`.
 '@
         return $guideText.Replace('@@TYPESYSTEM@@',$this.TypeSystemContract).Replace('@@FORMATS@@',($formatRows -join "`n")).Replace('@@ROADMAP@@',$this.RoadmapMarkdown())
     }
@@ -18399,10 +18420,8 @@ function Export-LoweredAssembly {
                     Write-IlMethodBody -Lambda $lowered.Lambda -MethodBuilder $ctor.Builder -HasThis -BaseInvocation $lowered.BaseInvocation
                     continue
                 }
-                $base=$projection[$c.Name].BaseType
-                $baseCtor=$base.GetConstructor([Reflection.BindingFlags]'Public,NonPublic,Instance', $null, [type[]]@(), $null)
-                if($null -eq $baseCtor -or $baseCtor.IsPrivate){throw "Base of '$($c.Name)' has no accessible parameterless constructor."}
-                Write-IlMethodBody -Lambda $lowered.Lambda -MethodBuilder $ctor.Builder -HasThis -BaseConstructor -BaseConstructorMember $baseCtor
+                if($projection[$c.Name].BaseType -ne [object]){throw 'Source base invocation is missing'}
+                Write-IlMethodBody -Lambda $lowered.Lambda -MethodBuilder $ctor.Builder -HasThis -BaseConstructor
             }
             foreach ($method in $plan.Methods) {
                 $lowered = Convert-MethodAstToLambda -MethodAst $method.Ast -RuntimeSelection $RuntimeSelection
