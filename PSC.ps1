@@ -2462,6 +2462,140 @@ try{
     'PASS redundancy: exact tokens, negative constant control, bound call overlap, method selection, retained graph parity and revision invalidation'
 }finally{[IO.Directory]::Delete($root,$true)}
 '@)
+    [PscSourceResource]::new('Tests/Test-BaseConstructor.ps1', @'
+#requires -Version 7.7
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$Compiler,[string]$RuntimeDirectory)
+$ErrorActionPreference='Stop'
+class ConstructorRom {
+    [int] $Value
+    ConstructorRom([int]$value){$this.Value=$value}
+}
+class ConstructorMapper {
+    [ConstructorRom] $Rom
+    ConstructorMapper([ConstructorRom]$rom){$this.Rom=$rom}
+}
+class ConstructorMapperLeaf : ConstructorMapper {
+    ConstructorMapperLeaf([ConstructorRom]$rom) : base($rom) {}
+    static [int] Run(){
+        $rom=[ConstructorRom]::new(42);$mapper=[ConstructorMapperLeaf]::new($rom)
+        if(![object]::ReferenceEquals($rom,$mapper.Rom)){return -1}
+        return $mapper.Rom.Value
+    }
+}
+class ConstructorTrace {
+    static [string] $Value = ''
+    static [int] Mark([string]$tag,[int]$value) { [ConstructorTrace]::Value += $tag; return $value }
+}
+class ConstructorRoot {
+    [int] $Value = [ConstructorTrace]::Mark('I',1)
+    ConstructorRoot([int]$x,[int]$y) { [ConstructorTrace]::Value += 'B'; $this.Value = 10*$x+$y }
+    ConstructorRoot([long]$x,[long]$y) { [ConstructorTrace]::Value += 'L'; $this.Value = [int](100*$x+$y) }
+}
+class ConstructorMiddle : ConstructorRoot {
+    [int] $Other = [ConstructorTrace]::Mark('J',2)
+    ConstructorMiddle([int]$x) : base([ConstructorTrace]::Mark('A',$x),[ConstructorTrace]::Mark('C',$x+1)) { [ConstructorTrace]::Value += 'D' }
+    ConstructorMiddle([long]$x) : base($x,$x+1L) { [ConstructorTrace]::Value += 'M' }
+}
+class ConstructorLeaf : ConstructorMiddle {
+    [int] $Third = [ConstructorTrace]::Mark('K',5)
+    ConstructorLeaf([short]$x) : base([int]$x+$this.Third) { [ConstructorTrace]::Value += 'E' }
+    static [string] Run() {
+        [ConstructorTrace]::Value = ''
+        $first = [ConstructorLeaf]::new([short]3)
+        return [ConstructorTrace]::Value + ':' + [string]$first.Value + ':' + [string]$first.Other + ':' + [string]$first.Third
+    }
+    static [string] Overload() {
+        [ConstructorTrace]::Value = ''
+        $second = [ConstructorMiddle]::new([long]3)
+        return [ConstructorTrace]::Value + ':' + [string]$second.Value
+    }
+}
+class NumericBase {
+    [long] $Value
+    NumericBase([long]$value) { $this.Value = $value }
+}
+class NumericDerived : NumericBase {
+    NumericDerived([int]$value) : base($value) { }
+    static [long] Run() { return ([NumericDerived]::new(17)).Value }
+}
+$compilerPath=[IO.Path]::GetFullPath($Compiler)
+$work=[IO.Directory]::CreateTempSubdirectory('psc-base-constructor-').FullName
+try {
+    $expected=[object[]]@([ConstructorMapperLeaf]::Run(),[ConstructorLeaf]::Run(),[ConstructorLeaf]::Overload(),[NumericDerived]::Run())
+    if($expected[0] -ne 42 -or $expected[1] -cne 'KJACIBDE:89:2:5' -or $expected[2] -cne 'JILM:304' -or $expected[3] -ne 17){throw 'Independent SMA oracle changed'}
+    $tokens=$null;$errors=$null
+    $oracle=[System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath,[ref]$tokens,[ref]$errors)
+    if($errors.Count){throw 'Oracle parse failed'}
+    $definitions=[Collections.Generic.List[string]]::new()
+    foreach($statement in $oracle.EndBlock.Statements){
+        if($statement -is [System.Management.Automation.Language.TypeDefinitionAst]){$definitions.Add($statement.Extent.Text)}
+    }
+    $source=Join-Path $work 'Constructors.ps1';[IO.File]::WriteAllLines($source,$definitions.ToArray())
+    $root=[System.Management.Automation.Language.Parser]::ParseFile($source,[ref]$tokens,[ref]$errors)
+    if($errors.Count){throw 'Compiler fixture parse failed'}
+    $authoringDirectory=[IO.Directory]::CreateDirectory((Join-Path $work 'authoring')).FullName
+    $residentDirectory=[IO.Directory]::CreateDirectory((Join-Path $work 'resident')).FullName
+    $borrowedDirectory=[IO.Directory]::CreateDirectory((Join-Path $work 'borrowed')).FullName
+    $authoring=Join-Path $authoringDirectory 'Constructors.dll'
+    $resident=Join-Path $residentDirectory 'Constructors.dll'
+    $borrowed=Join-Path $borrowedDirectory 'Constructors.dll'
+    if(!$RuntimeDirectory){
+        $RuntimeDirectory=Join-Path $work 'runtime'
+        & ([Environment]::ProcessPath) -NoProfile -File $compilerPath -Mode BuildRuntime -RuntimeDirectory $RuntimeDirectory | Out-Null
+        if($LASTEXITCODE){throw 'Runtime build failed'}
+    }
+    $runtimePath=[IO.Path]::GetFullPath($RuntimeDirectory)
+    $api=. $compilerPath -Mode Api
+    $runtimeType=$api.GetType().Assembly.GetType('PscRuntimeSelection',$true)
+    $session=$api.GetType()::AcquireSelection($api,$runtimePath)
+    try {
+        $null=Export-LoweredAssembly -SourceAst $root -ClassName ConstructorLeaf -OutputPath $authoring -Deterministic
+        $scope=$null
+        $null=Export-LoweredAssembly -SourceAst $root -ClassName ConstructorLeaf -OutputPath $resident -RuntimeSelection $session -RealizedScope ([ref]$scope) -Deterministic
+        if($null -eq $scope){throw 'Resident scope was not retained'}
+        $reprojection=Get-DeclarationScope -Root $root -RuntimeSelection $session -RealizationOf $scope
+        if($reprojection.ResidentSlot -ne $scope.ResidentSlot -or $reprojection.Types['ConstructorMapper'] -eq $scope.Types['ConstructorMapper']){throw 'Projection identity or graph coordinate differs'}
+        $PscSelectedRoot=$root;$PscSelectedScope=$reprojection
+        $member=Resolve-PscSourceOperation $root $reprojection.Types['ConstructorMapper'] 'new' ([type[]]@($reprojection.Types['ConstructorRom'])) $false $true $session
+        if($null -eq $member -or $member.DeclaringType -ne $reprojection.Types['ConstructorMapper']){throw 'Selected constructor projection differs'}
+        $stale=Resolve-PscSourceOperation $root $reprojection.Types['ConstructorMapper'] 'new' ([type[]]@($scope.Types['ConstructorRom'])) $false $true $session
+        if($null -ne $stale){throw 'Prior projection argument was admitted'}
+        $PscSelectedRoot=$null;$PscSelectedScope=$null
+        $null=Export-LoweredAssembly -SourceAst $root -ClassName ConstructorLeaf -OutputPath $borrowed -RuntimeSelection $session -RetainedScope $reprojection -Deterministic
+        if((Get-FileHash $authoring).Hash -cne (Get-FileHash $resident).Hash -or (Get-FileHash $authoring).Hash -cne (Get-FileHash $borrowed).Hash){throw 'Authoring, resident and borrowed emitted bytes differ'}
+        if(!$runtimeType::ReleaseGraph($session,$scope.ResidentSlot)){throw 'Graph withdrawal failed'}
+        $refused=$false
+        try{$null=Export-LoweredAssembly -SourceAst $root -ClassName ConstructorLeaf -OutputPath $borrowed -RuntimeSelection $session -RetainedScope $scope -Deterministic}catch [InvalidOperationException]{$refused=$true}
+        if(!$refused){throw 'Withdrawn graph admitted'}
+        $context=[System.Runtime.Loader.AssemblyLoadContext]::new('BaseConstructorFixture',$true)
+        try{
+            $assembly=$context.LoadFromAssemblyPath($resident)
+            $actual=[object[]]@($assembly.GetType('ConstructorMapperLeaf').GetMethod('Run').Invoke($null,$null),$assembly.GetType('ConstructorLeaf').GetMethod('Run').Invoke($null,$null),$assembly.GetType('ConstructorLeaf').GetMethod('Overload').Invoke($null,$null),$assembly.GetType('NumericDerived').GetMethod('Run').Invoke($null,$null))
+            for($i=0;$i -lt $expected.Length;$i++){if($actual[$i] -cne $expected[$i]){throw "Emitted behavior differs at $i"}}
+        }finally{$context.Unload()}
+        'PASS base constructor identity, overloads, conversions, evaluation order, multilevel state, retained reprojection, withdrawal and deterministic managed emission'
+        $invalid=[string[]]@(
+            'class BadBase { BadBase([int]$x){} }; class BadLeaf : BadBase { BadLeaf([int]$x):base($x,$x){} }',
+            'class BadBase { BadBase([datetime]$x){} }; class BadLeaf : BadBase { BadLeaf([int]$x):base($x){} }',
+            'class BadBase { BadBase([long]$a,[double]$b,[double]$c){} BadBase([double]$a,[long]$b,[long]$c){} }; class BadLeaf : BadBase { BadLeaf([int]$x):base($x,$x,$x){} }'
+        )
+        for($i=0;$i -lt $invalid.Length;$i++){
+            $bad=[System.Management.Automation.Language.Parser]::ParseInput($invalid[$i],[ref]$tokens,[ref]$errors)
+            if($errors.Count){throw 'Negative fixture parse failed'}
+            foreach($selection in $null,$session){
+                $refused=$false
+                try{$null=Export-LoweredAssembly -SourceAst $bad -ClassName BadLeaf -OutputPath (Join-Path $work 'Bad.dll') -RuntimeSelection $selection -Deterministic}catch {
+                    if($i -eq 2){if($_.Exception -is [Reflection.AmbiguousMatchException] -or $_.Exception.InnerException -is [Reflection.AmbiguousMatchException]){$refused=$true}}
+                    elseif($_.Exception.Message.Contains('No admitted STS base constructor')){$refused=$true}
+                }
+                if(!$refused){throw "Expected base constructor refusal differs at $i"}
+            }
+        }
+        'PASS missing, incompatible and ambiguous base constructor invocations refused in both execution domains'
+    }finally{$runtimeType::Close($session)}
+}finally{[IO.Directory]::Delete($work,$true)}
+'@)
 }
 
 # PSC-owned source faculties. The holder provides real parser-visible declarations, not executable text.
@@ -14238,7 +14372,7 @@ function Convert-MethodAstToLambda {
         -Initializers $Initializers -Statements @($(if ($MethodAst.Body -and $MethodAst.Body.EndBlock) { $MethodAst.Body.EndBlock.Statements })) `
         -IsStatic ([bool]$MethodAst.IsStatic) -IsConstructor ([bool]$MethodAst.IsConstructor) -Output:($isFunction -and -not $isProgram) `
         -ScriptClass $(if ($isFunction) { $classType } else { $null }) -Program:$isProgram `
-        -ProgramParameters $programParameters -RuntimeSelection $RuntimeSelection
+        -ProgramParameters $programParameters -ConstructorOwner $(if ($MethodAst.IsConstructor -and !$MethodAst.IsStatic) { $MethodAst.Parent }) -RuntimeSelection $RuntimeSelection
 }
 
 function Convert-InitializersToLambda {
@@ -14260,12 +14394,20 @@ function Convert-InitializersToLambda {
         -Initializers $Initializers -Statements @() -IsStatic ([bool]$Static) -IsConstructor $true -RuntimeSelection $RuntimeSelection
 }
 
+# A direct base invocation carries the selected compatibility member and its lowered
+# operands, separate from ordinary object construction and virtual invocation.
+class PscBaseConstructorInvocation {
+    [Reflection.ConstructorInfo] $Member
+    [Linq.Expressions.Expression[]] $Arguments
+    [int] $StatementIndex
+}
+
 function New-LoweredBody {
     param(
         [string] $Name, [Type] $ReturnType, $This,
         [System.Collections.Generic.List[Linq.Expressions.ParameterExpression]] $Parameters, [hashtable] $ParameterMap,
         [System.Management.Automation.Language.PropertyMemberAst[]] $Initializers, [object[]] $Statements,
-        [bool] $IsStatic, [bool] $IsConstructor,
+        [bool] $IsStatic, [bool] $IsConstructor, [System.Management.Automation.Language.TypeDefinitionAst] $ConstructorOwner,
         # A script function: what its statements write is collected and returned as [object[]].
         [switch] $Output,
         # A script function's class, whose static fields are the script's variables.
@@ -14356,10 +14498,11 @@ function New-LoweredBody {
             $body.Add($et::Assign($et::Field($null, $field), $et::Condition($et::NotEqual($text, $et::Constant($null, [string])), $given, $default)))
         }
     }
+    [PscBaseConstructorInvocation]$baseInvocation = $null
     foreach ($stmt in $Statements) {
         if ($null -eq $stmt) { continue }
-        # The parser opens every constructor with an implicit base() call; the
-        # managed emitter calls the selected parameterless base constructor.
+        # The parser opens every constructor with a base invocation prefix.
+        # Explicit operands are bound against the acquired source base.
         # SMA Ast.Copy() can turn a synthetic BaseCtorInvokeMemberExpressionAst
         # into an ordinary InvokeMemberExpressionAst. Recognize only the copied
         # synthetic constructor prefix, not an authored member call.
@@ -14372,7 +14515,30 @@ function New-LoweredBody {
               $stmt.Expression.Member -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
               $stmt.Expression.Member.Value -eq '.ctor'))) {
             if ($stmt.Expression.Arguments -and @($stmt.Expression.Arguments).Count) {
-                throw "[{0}:{1}] A base constructor call with arguments is not supported." -f $stmt.Extent.StartLineNumber, $stmt.Extent.StartColumnNumber
+                $declarationScope = Get-PscOperationalScope -Root (Resolve-PscDeclarationRoot $ConstructorOwner) -ExistingOnly -RuntimeSelection $RuntimeSelection
+                if ($null -eq $declarationScope -or !$declarationScope.Bases.ContainsKey($ConstructorOwner)) {
+                    throw "[$($stmt.Extent.StartLineNumber):$($stmt.Extent.StartColumnNumber)] Explicit base operands require an acquired source base."
+                }
+                $baseType = Complete-PscProjectionType $declarationScope.Bases[$ConstructorOwner]
+                if ($This.Type.BaseType -ne $baseType) { throw 'Source base realization differs' }
+                $arguments = [Collections.Generic.List[Linq.Expressions.Expression]]::new()
+                $argumentTypes = [Collections.Generic.List[type]]::new()
+                foreach ($argument in $stmt.Expression.Arguments) {
+                    $expression = Convert-AstExpression -Node $argument -Scope $scope
+                    $arguments.Add($expression)
+                    $argumentTypes.Add($expression.Type)
+                }
+                $member = Resolve-PscSourceOperation -SourceAst $ConstructorOwner -TargetType $baseType -Name 'new' -ArgumentTypes $argumentTypes.ToArray() -Static $false -Constructor $true -RuntimeSelection $RuntimeSelection
+                if ($null -eq $member) {
+                    throw "[$($stmt.Extent.StartLineNumber):$($stmt.Extent.StartColumnNumber)] No admitted STS base constructor matches '$($baseType.Name)'."
+                }
+                $parameterTypes = $member.GetParameters()
+                for ($i=0; $i -lt $parameterTypes.Length; $i++) {
+                    if ($arguments[$i].Type -ne $parameterTypes[$i].ParameterType) {
+                        $arguments[$i] = ConvertTo-PowerShellType -Expression $arguments[$i] -Type $parameterTypes[$i].ParameterType
+                    }
+                }
+                $baseInvocation = [PscBaseConstructorInvocation]@{Member=$member;Arguments=$arguments.ToArray();StatementIndex=$body.Count}
             }
             continue
         }
@@ -14399,6 +14565,7 @@ function New-LoweredBody {
         ParameterTypes = [Type[]]@($Parameters | ForEach-Object { $_.Type })
         ParameterNames = [string[]]@($Parameters | ForEach-Object { $_.Name })
         Lambda         = $lambda
+        BaseInvocation = $baseInvocation
     }
 }
 
@@ -15147,7 +15314,7 @@ function Write-IlExpression {
     param(
         [Parameter(Mandatory)][Reflection.Emit.ILGenerator] $IL,
         [Parameter(Mandatory)][Linq.Expressions.Expression] $Expr,
-        [Parameter(Mandatory)][hashtable] $Context
+        [Parameter(Mandatory)][hashtable] $Context, [PscBaseConstructorInvocation] $BaseInvocation
     )
 
     $native = $null
@@ -15210,6 +15377,11 @@ function Write-IlExpression {
         # Every expression but the last is evaluated for its effect; so is the last when the block is void.
         $count = $Expr.Expressions.Count
         for ($i = 0; $i -lt $count; $i++) {
+            if ($null -ne $BaseInvocation -and $i -eq $BaseInvocation.StatementIndex) {
+                $IL.Emit([Reflection.Emit.OpCodes]::Ldarg_0)
+                foreach ($argument in $BaseInvocation.Arguments) { Write-IlExpression -IL $IL -Expr $argument -Context $Context }
+                $IL.Emit([Reflection.Emit.OpCodes]::Call, (Get-IlMember $BaseInvocation.Member))
+            }
             $child = $Expr.Expressions[$i]
             if ($i -eq $count - 1 -and $Expr.Type -ne [void]) { Write-IlExpression -IL $IL -Expr $child -Context $Context }
             else { Write-IlDiscarded -IL $IL -Expr $child -Context $Context }
@@ -15677,7 +15849,7 @@ function Write-IlMethodBody {
         [switch] $HasThis,
         # Call the selected parameterless base constructor before the instance body.
         [switch] $BaseConstructor,
-        [Reflection.ConstructorInfo] $BaseConstructorMember
+        [Reflection.ConstructorInfo] $BaseConstructorMember, [PscBaseConstructorInvocation] $BaseInvocation
     )
 
     $il = $MethodBuilder.GetILGenerator()
@@ -15713,7 +15885,7 @@ function Write-IlMethodBody {
         FieldDataCount = 0
     }
 
-    Write-IlExpression -IL $il -Expr $Lambda.Body -Context $context
+    Write-IlExpression -IL $il -Expr $Lambda.Body -Context $context -BaseInvocation $BaseInvocation
 
     # Final method return
     $il.Emit([Reflection.Emit.OpCodes]::Ret)
@@ -17312,7 +17484,7 @@ $api | Get-Member
 & ./PSC.ps1 -Mode Capability
 ```
 
-The API retains the acquired source revision. LowerDeclarations(names) compiles an explicitly selected set of top-level classes and enums, including those in PSC's begin block; LowerDeclarations(ast,names) accepts a donor source AST, including the original body of a named declaration scope when the selection is contained in that body. It compiles the selected original declarations directly, retaining their parser-owned AST identities without synthesizing or executing an enclosing script. Include required source types in the selection; program compilation is a separate operation. Managed declaration lowering supports one selected source-owned base class, including forward references, inherited fields and virtual methods, and parameterless base construction. External base classes, interfaces, explicit base arguments and MethodNames selection with inheritance remain unsupported. Eligible queries reuse its AST after byte-identity verification; declaration queries share the roadmap declaration inventory and use an ordinal-ignore-case name index. IndexedArtifacts counts indexed source artifacts; SitesExamined counts candidate declarations actually tested, and VisitorCallbacks counts visits in the query itself. Pull windows advance through retained declaration sites without replay; other source kinds still traverse the AST. Measurements are acquired only on the first Measures() call. ReadSource(path) still acquires all measurements. The API is derived from the running script, so mode names and parameter evidence do not depend on a previous session's notes. Use `Describe(mode)` for dispatcher extents and associated definitions. CLI inventory below is generated; source hash, local paths, runtime and measurement values are available from the live API rather than frozen into the README. Regenerate with `& ./PSC.ps1 -Mode Readme`.
+The API retains the acquired source revision. LowerDeclarations(names) compiles an explicitly selected set of top-level classes and enums, including those in PSC's begin block; LowerDeclarations(ast,names) accepts a donor source AST, including the original body of a named declaration scope when the selection is contained in that body. It compiles the selected original declarations directly, retaining their parser-owned AST identities without synthesizing or executing an enclosing script. Include required source types in the selection; program compilation is a separate operation. Managed declaration lowering supports one selected source-owned base class, including forward references, inherited fields and virtual methods, and base construction. Explicit base operands select a local source-owned constructor through the admitted exact and closed numeric STS binding profile, lower operands once in source order after derived field initialization, and emit a direct call on the existing instance. Authoring and resident paths share this operation; unsupported conversion profiles are refused, not redirected to CLR overload selection. External base classes, interfaces and MethodNames selection with inheritance remain unsupported. The supplementary projected `Tests/Test-BaseConstructor.ps1 -Compiler ./PSC.ps1` compares ordinary SMA, authoring, resident and borrowed graph execution, including projection and withdrawal refusals. Eligible queries reuse its AST after byte-identity verification; declaration queries share the roadmap declaration inventory and use an ordinal-ignore-case name index. IndexedArtifacts counts indexed source artifacts; SitesExamined counts candidate declarations actually tested, and VisitorCallbacks counts visits in the query itself. Pull windows advance through retained declaration sites without replay; other source kinds still traverse the AST. Measurements are acquired only on the first Measures() call. ReadSource(path) still acquires all measurements. The API is derived from the running script, so mode names and parameter evidence do not depend on a previous session's notes. Use `Describe(mode)` for dispatcher extents and associated definitions. CLI inventory below is generated; source hash, local paths, runtime and measurement values are available from the live API rather than frozen into the README. Regenerate with `& ./PSC.ps1 -Mode Readme`.
 '@
         return $guideText.Replace('@@TYPESYSTEM@@',$this.TypeSystemContract).Replace('@@FORMATS@@',($formatRows -join "`n")).Replace('@@ROADMAP@@',$this.RoadmapMarkdown())
     }
@@ -18223,6 +18395,10 @@ function Export-LoweredAssembly {
             foreach ($ctor in $plan.Constructors) {
                 $lowered = if ($ctor.Ast) { Convert-MethodAstToLambda -MethodAst $ctor.Ast -Initializers $instanceInits -RuntimeSelection $RuntimeSelection }
                            else { Convert-InitializersToLambda -ClassAst $c.Ast -Initializers $instanceInits -RuntimeSelection $RuntimeSelection }
+                if ($null -ne $lowered.BaseInvocation) {
+                    Write-IlMethodBody -Lambda $lowered.Lambda -MethodBuilder $ctor.Builder -HasThis -BaseInvocation $lowered.BaseInvocation
+                    continue
+                }
                 $base=$projection[$c.Name].BaseType
                 $baseCtor=$base.GetConstructor([Reflection.BindingFlags]'Public,NonPublic,Instance', $null, [type[]]@(), $null)
                 if($null -eq $baseCtor -or $baseCtor.IsPrivate){throw "Base of '$($c.Name)' has no accessible parameterless constructor."}
