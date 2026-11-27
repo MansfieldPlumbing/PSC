@@ -2476,6 +2476,7 @@ class PscDeclarationScope {
     [int] $ResidentSlot = -1
     [System.Management.Automation.Language.TypeDefinitionAst[]] $ResidentDefinitions
     [System.Management.Automation.Language.TypeDefinitionAst[]] $ResidentEnums
+    [Tuple[type,string[],decimal[]][]] $EnumShapes
     [System.Management.Automation.Language.Ast] $ResidentRoot
     # Retained synthetic declaration provenance, independent of active lowering caches.
     [System.Management.Automation.Language.Ast] $FunctionSource
@@ -2490,7 +2491,7 @@ class PscDeclarationScope {
     [Collections.Generic.Dictionary[System.Management.Automation.Language.FunctionMemberAst,type]] $FunctionOutputTypes = [Collections.Generic.Dictionary[System.Management.Automation.Language.FunctionMemberAst,type]]::new()
 }
 function Get-PscFacultyDeclarations {
-    param([string[]]$ContractPaths,[System.Management.Automation.Language.TypeDefinitionAst[]]$CompilerClassAsts,[hashtable]$MaterializedTypes,[type[][]]$SelectionSignatures,[type[]]$SelectionSources,[PscDeclarationScope]$DeclarationScope,[System.Management.Automation.Language.TypeDefinitionAst]$BindingOwner,[string]$BindingName,[type[]]$BindingArguments,[bool]$BindingStatic,[bool]$BindingConstructor,[PscDeclarationScope[]]$BindingScopes,[ScriptTypeReference]$ComparisonLeft,[ScriptTypeReference]$ComparisonRight,[ScriptTypeContract]$ReferenceContract,[string]$ReferenceName,[ScriptTypeReference[]]$ReferenceParameters,[bool]$ReferenceStatic,[bool]$ReferenceConstructor,[switch]$DependencyContractsOnly,[PscDeclarationScope[]]$RetainedDependencyScopes,[type]$PersistedBindingTarget,[PscRuntimeSelection]$RuntimeSelection,[switch]$ReuseResidentGraph)
+    param([string[]]$ContractPaths,[System.Management.Automation.Language.TypeDefinitionAst[]]$CompilerClassAsts,[hashtable]$MaterializedTypes,[type[][]]$SelectionSignatures,[type[]]$SelectionSources,[PscDeclarationScope]$DeclarationScope,[System.Management.Automation.Language.TypeDefinitionAst]$BindingOwner,[string]$BindingName,[type[]]$BindingArguments,[bool]$BindingStatic,[bool]$BindingConstructor,[PscDeclarationScope[]]$BindingScopes,[ScriptTypeReference]$ComparisonLeft,[ScriptTypeReference]$ComparisonRight,[ScriptTypeContract]$ReferenceContract,[string]$ReferenceName,[ScriptTypeReference[]]$ReferenceParameters,[bool]$ReferenceStatic,[bool]$ReferenceConstructor,[switch]$DependencyContractsOnly,[PscDeclarationScope[]]$RetainedDependencyScopes,[type]$PersistedBindingTarget,[PscRuntimeSelection]$RuntimeSelection,[switch]$ReuseResidentGraph,[switch]$PrepareEnumShapes)
 
 # Only descriptor types are realized in the authoring scope. Other faculties must not shadow imported CLR identities.
 # The semantic description and the executable generation are ordinary HandleTable objects.
@@ -5128,6 +5129,17 @@ class PscResidentDeclarationGraph {
         if($Reference.Kind -eq [ScriptTypeReferenceKind]::Clr){return [PscResidentDeclarationGraph]::ResolveName($Reference.ClrIdentity,$NamedTypes)}
         return [PscResidentDeclarationGraph]::ResolveName($Reference.Spelling,$NamedTypes)
     }
+    static [Tuple[int,Tuple[type,string[],decimal[]],string]] EnumShape([int]$Scope,[int]$Owner){
+        [Tuple[type,string[],decimal[]]]$shape=$null
+        try{
+            if(![PscResidentDeclarationGraph]::Live($Scope)){throw [InvalidOperationException]::new('Invalid enum scope')}
+            [ScriptTypeContract[]]$contracts=[PscResidentDeclarationGraph]::Scopes[$Scope].Item1
+            if($Owner -lt 0 -or $Owner -ge $contracts.Length){throw [InvalidOperationException]::new('Invalid enum owner')}
+            $shape=[PscScriptTypeAcquisition]::DescribeEnum($contracts[$Owner])
+            return [Tuple[int,Tuple[type,string[],decimal[]],string]]::new(1,$shape,'')
+        }catch [Exception]{return [Tuple[int,Tuple[type,string[],decimal[]],string]]::new(4,$shape,$_.Exception.Message)}
+        return [Tuple[int,Tuple[type,string[],decimal[]],string]]::new(4,$shape,'Enum description did not complete')
+    }
     static [Tuple[int,type,Tuple[type,type[]][],string]] Project([int]$Scope,[int]$Owner,[Collections.Generic.Dictionary[type,Tuple[int,int]]]$Owners,[Collections.Generic.Dictionary[string,type]]$NamedTypes){
         [Tuple[int,type,Tuple[type,type[]][],string]]$result=$null
         [type]$noType=$null
@@ -5182,6 +5194,16 @@ class PscResidentDeclarationGraph {
 # SMA supplies declaration evidence. This operation constructs STS descriptors
 # directly in its executing domain; ScriptType.dll itself has no SMA dependency.
 class PscScriptTypeAcquisition {
+    # Transport only CTS representation and ordered literal values, not private contracts.
+    static [Tuple[type,string[],decimal[]]] DescribeEnum([ScriptTypeContract]$Contract){
+        if(!$Contract.IsEnum){throw [InvalidOperationException]::new('Selected definition is not an enum')}
+        [type]$underlying=[type]::GetType($Contract.EnumUnderlying.ClrIdentity,$true)
+        [string[]]$names=[string[]]::new($Contract.Members.Length)
+        [decimal[]]$values=[decimal[]]::new($names.Length)
+        for([int]$i=0;$i -lt $names.Length;$i++){$names[$i]=$Contract.Members[$i].Name;$values[$i]=$Contract.EnumValues[$i]}
+        return [Tuple[type,string[],decimal[]]]::new($underlying,$names,$values)
+    }
+
     static [ScriptTypeReference] Reference([System.Management.Automation.Language.ITypeName]$Name,[Collections.Generic.Dictionary[string,ScriptTypeContract]]$Catalog,[type]$DefaultType){
         [ScriptTypeReference]$reference=[ScriptTypeReference]::new()
         $reference.Arguments=[ScriptTypeReference[]]::new(0)
@@ -5489,6 +5511,13 @@ function Get-ScriptTypeContract {
                 $allDefinitions=[System.Management.Automation.Language.TypeDefinitionAst[]]@($DeclarationScope.ResidentDefinitions)+[System.Management.Automation.Language.TypeDefinitionAst[]]@($DeclarationScope.ResidentEnums)
                 $DeclarationScope.ResidentSlot=[PscRuntimeSelection]::AcquireGraph($RuntimeSelection,$allDefinitions,$imports)
             }
+            if($PrepareEnumShapes){
+                $DeclarationScope.EnumShapes=[Tuple[type,string[],decimal[]][]]::new($DeclarationScope.ResidentEnums.Length)
+                for($index=0;$index -lt $DeclarationScope.EnumShapes.Length;$index++){
+                    $DeclarationScope.EnumShapes[$index]=[PscRuntimeSelection]::GetEnumShape($RuntimeSelection,$DeclarationScope.ResidentSlot,$CompilerClassAsts.Length+$index)
+                }
+                return
+            }
             $owners=Get-PscResidentOwnerMap -RuntimeSelection $RuntimeSelection -Scopes @($DeclarationScope) -BuildingScope $DeclarationScope -MaterializedTypes $MaterializedTypes
             $named=[Collections.Generic.Dictionary[string,type]]::new([StringComparer]::OrdinalIgnoreCase)
             foreach($key in $MaterializedTypes.Keys){$named.Add($key,$MaterializedTypes[$key])}
@@ -5508,6 +5537,12 @@ function Get-ScriptTypeContract {
                 }
             }
             $DeclarationScope.Signatures=$signatures
+            return
+        }
+        if($PrepareEnumShapes){
+            $enumContracts=[PscScriptTypeAcquisition]::Acquire($DeclarationScope.ResidentEnums,[ScriptTypeContract[]]::new(0))
+            $DeclarationScope.EnumShapes=[Tuple[type,string[],decimal[]][]]::new($enumContracts.Length)
+            for($index=0;$index -lt $enumContracts.Length;$index++){$DeclarationScope.EnumShapes[$index]=[PscScriptTypeAcquisition]::DescribeEnum($enumContracts[$index])}
             return
         }
         $retainedContracts=[Collections.Generic.Dictionary[System.Management.Automation.Language.TypeDefinitionAst,ScriptTypeContract]]::new()
@@ -5802,6 +5837,7 @@ class PscRuntimeSelection {
     hidden [Func[System.Management.Automation.Language.TypeDefinitionAst[],int[],Tuple[int,int,string]]] $GraphAcquisition
     hidden [Func[int,int,Collections.Generic.Dictionary[type,Tuple[int,int]],Collections.Generic.Dictionary[string,type],Tuple[int,type,Tuple[type,type[]][],string]]] $GraphProjection
     hidden [Func[int,int,string,type[],bool,bool,Collections.Generic.Dictionary[type,Tuple[int,int]],Tuple[int,int,bool[],string[],string]]] $GraphBinding
+    hidden [Func[int,int,Tuple[int,Tuple[type,string[],decimal[]],string]]] $GraphEnumShape
     hidden [Func[int,bool]] $GraphLive
     hidden [Func[int,Tuple[int,string]]] $GraphRelease
     hidden [Collections.Generic.List[int]] $CompilationGraphs
@@ -5900,6 +5936,7 @@ class PscRuntimeSelection {
             $session.GraphAcquisition=$graph.GetMethod('Acquire').CreateDelegate([Func[System.Management.Automation.Language.TypeDefinitionAst[],int[],Tuple[int,int,string]]])
             $session.GraphProjection=$graph.GetMethod('Project').CreateDelegate([Func[int,int,Collections.Generic.Dictionary[type,Tuple[int,int]],Collections.Generic.Dictionary[string,type],Tuple[int,type,Tuple[type,type[]][],string]]])
             $session.GraphBinding=$graph.GetMethod('Bind').CreateDelegate([Func[int,int,string,type[],bool,bool,Collections.Generic.Dictionary[type,Tuple[int,int]],Tuple[int,int,bool[],string[],string]]])
+            $session.GraphEnumShape=$graph.GetMethod('EnumShape').CreateDelegate([Func[int,int,Tuple[int,Tuple[type,string[],decimal[]],string]]])
             $session.GraphLive=$graph.GetMethod('Live').CreateDelegate([Func[int,bool]])
             $session.GraphRelease=$graph.GetMethod('Release').CreateDelegate([Func[int,Tuple[int,string]]])
             return $session
@@ -5926,6 +5963,15 @@ class PscRuntimeSelection {
             $result=$Session.GraphAcquisition.Invoke($Definitions,$Imports)
             if($result.Item1 -ne 1){throw [InvalidOperationException]::new($result.Item3)}
             if($null -ne $Session.CompilationGraphs){$Session.CompilationGraphs.Add($result.Item2)}
+            return $result.Item2
+        }finally{[Threading.Monitor]::Exit($Session)}
+    }
+    static [Tuple[type,string[],decimal[]]] GetEnumShape([PscRuntimeSelection]$Session,[int]$Scope,[int]$Owner){
+        [Threading.Monitor]::Enter($Session)
+        try{
+            [PscRuntimeSelection]::AssertOpen($Session)
+            $result=$Session.GraphEnumShape.Invoke($Scope,$Owner)
+            if($result.Item1 -ne 1){throw [InvalidOperationException]::new($result.Item3)}
             return $result.Item2
         }finally{[Threading.Monitor]::Exit($Session)}
     }
@@ -5972,7 +6018,7 @@ class PscRuntimeSelection {
             if($null -ne $Session.CompilationGraphs){throw 'Cannot close a session during resident compilation'}
             if($null -eq $Session.FacultyContext){return}
             $context=$Session.FacultyContext
-            $Session.GraphAcquisition=$null;$Session.GraphProjection=$null;$Session.GraphBinding=$null;$Session.GraphLive=$null;$Session.GraphRelease=$null;$Session.Scopes=$null
+            $Session.GraphAcquisition=$null;$Session.GraphProjection=$null;$Session.GraphEnumShape=$null;$Session.GraphBinding=$null;$Session.GraphLive=$null;$Session.GraphRelease=$null;$Session.Scopes=$null
             $Session.NumericSelector=$null
             $Session.FacultyContext=$null
             $context.Unload()
@@ -9308,9 +9354,12 @@ function New-ClrDeclarationProjection {
         $declarationScope.ResidentSession=$RetainedScope.ResidentSession;$declarationScope.ResidentSlot=$RetainedScope.ResidentSlot
         $declarationScope.ResidentDefinitions=$RetainedScope.ResidentDefinitions;$definitions=$declarationScope.ResidentDefinitions
     }
-    if($null -ne $RuntimeSelection){$declarationScope.ResidentEnums=$Enums}
+    $declarationScope.ResidentEnums=$Enums
+    if($Enums.Count){
+        $null=Get-PscFacultyDeclarations -CompilerClassAsts $definitions -MaterializedTypes $script:LoweringClassTypes -DeclarationScope $declarationScope -RuntimeSelection $RuntimeSelection -ReuseResidentGraph:($null -ne $RuntimeSelection -and $declarationScope.ResidentSlot -ge 0) -PrepareEnumShapes
+    }
     if(!$Model.Count -and !$Enums.Count){
-        $null=Get-PscFacultyDeclarations -CompilerClassAsts $definitions -MaterializedTypes $script:LoweringClassTypes -DeclarationScope $declarationScope -RuntimeSelection $RuntimeSelection -ReuseResidentGraph:($null -ne $RetainedScope)
+        $null=Get-PscFacultyDeclarations -CompilerClassAsts $definitions -MaterializedTypes $script:LoweringClassTypes -DeclarationScope $declarationScope -RuntimeSelection $RuntimeSelection -ReuseResidentGraph:($null -ne $RuntimeSelection -and $declarationScope.ResidentSlot -ge 0)
         return $declarationScope
     }
     $name = [Reflection.AssemblyName]::new("PSLoweringProjection$([Guid]::NewGuid().ToString('N'))")
@@ -9320,9 +9369,12 @@ function New-ClrDeclarationProjection {
     $objectCtor = [object].GetConstructor([Type[]]@())
 
     # Enums declared in the source are real enums here, before any class names them.
-    foreach ($enumAst in $Enums) {
-        $enumBuilder = $module.DefineEnum(('PSC.CompatibilityProjection.' + $enumAst.Name), [Reflection.TypeAttributes]::Public, (Get-EnumUnderlyingType $enumAst))
-        foreach ($literal in (Get-EnumLiterals $enumAst)) { $null = $enumBuilder.DefineLiteral($literal.Name, $literal.Value) }
+    for($index=0;$index -lt $Enums.Length;$index++){
+        $enumAst=$Enums[$index];$shape=$declarationScope.EnumShapes[$index]
+        $enumBuilder = $module.DefineEnum(('PSC.CompatibilityProjection.' + $enumAst.Name), [Reflection.TypeAttributes]::Public, $shape.Item1)
+        for($literalIndex=0;$literalIndex -lt $shape.Item2.Length;$literalIndex++){
+            $null=$enumBuilder.DefineLiteral($shape.Item2[$literalIndex],[Convert]::ChangeType($shape.Item3[$literalIndex],$shape.Item1))
+        }
         $script:LoweringClassTypes[$enumAst.Name] = $enumBuilder.CreateType()
     }
 
@@ -9335,7 +9387,7 @@ function New-ClrDeclarationProjection {
     # Extract the selected definitions from the live AST once. The existing
     # materializer consumes STS signature references rather than rediscovering
     # source-owned types from member syntax.
-    $null=Get-PscFacultyDeclarations -CompilerClassAsts $definitions -MaterializedTypes $script:LoweringClassTypes -DeclarationScope $declarationScope -RuntimeSelection $RuntimeSelection -ReuseResidentGraph:($null -ne $RetainedScope)
+    $null=Get-PscFacultyDeclarations -CompilerClassAsts $definitions -MaterializedTypes $script:LoweringClassTypes -DeclarationScope $declarationScope -RuntimeSelection $RuntimeSelection -ReuseResidentGraph:($null -ne $RuntimeSelection -and $declarationScope.ResidentSlot -ge 0)
     $signatures=$declarationScope.Signatures
     foreach($c in $Model){
         if($declarationScope.Bases.ContainsKey($c.Ast)){$builders[$c.Name].SetParent($declarationScope.Bases[$c.Ast])}
@@ -9403,21 +9455,10 @@ function New-ClrDeclarationProjection {
 }
 
 # An enum's underlying type: its declared base, or Int32.
-function Get-EnumUnderlyingType([System.Management.Automation.Language.TypeDefinitionAst] $EnumAst) {
-    if ($EnumAst.BaseTypes.Count) { return Resolve-AstType $EnumAst.BaseTypes[0].TypeName }
-    [int]
-}
+
 
 # An enum's members and values, numbered as PowerShell numbers them: a member without a value is the previous one plus one.
-function Get-EnumLiterals([System.Management.Automation.Language.TypeDefinitionAst] $EnumAst) {
-    $underlying = Get-EnumUnderlyingType $EnumAst
-    [long] $next = 0
-    foreach ($member in $EnumAst.Members) {
-        $value = if ($member.InitialValue) { [long]$member.InitialValue.SafeGetValue() } else { $next }
-        $next = $value + 1
-        [pscustomobject]@{ Name = $member.Name; Value = [Convert]::ChangeType($value, $underlying) }
-    }
-}
+
 
 $script:DeclarationScopeCache = [System.Runtime.CompilerServices.ConditionalWeakTable[System.Management.Automation.Language.ScriptBlockAst,PscDeclarationScope]]::new()
 
@@ -16757,7 +16798,7 @@ Conform streams child stdout and stderr to the invoking host as they become avai
 
 - **Managed:** SMA AST and typed expression lowering, deterministic IL emission, static graph/data realization, reachability and fixed-parameter specialization.
 - **Native:** pinned Windows NativeAOT compiler plus PSC COFF linker; direct CIL-to-IR-to-x64 ELF leaf emission and decoded-byte ABI checks. The direct backend does not yet replace ILC for general programs.
-- **Faculties:** `HandleTable`, `DiscoveryMechanisms`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. `BuildRuntime -CompilerRuntimeDirectory <bootstrap> -RuntimeDirectory <empty-output>` admits the existing no-contract compiler realization, composes the original resident dependency scopes without merging their descriptors, and rebuilds all eight artifacts in a separate directory. It refuses missing or incompatible admission receipts, nonempty output directories and external contract inputs. The coordinator acquires its declaration inventory once, uses retained persisted dependency witnesses, retires completed graph scopes outside the remaining transitive dependency closure in reverse order, and closes the admitted session. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. BuildRuntime without contract inputs also builds the compiler-private `compiler/CompilerDeclarations.dll` and writes a version 2 local selection receipt for it and HandleTable, ScriptType and PrimitiveConversion. The seven public faculty files and their dependency closure are unchanged. The compiled selection path verifies source, CoreLib, SMA, the existing TypeConverter framework dependency and all four admitted assembly digests once, loads the exact bytes in a private collectible context, and invokes typed delegates. Version 1 receipts require rebuilding. Missing or incompatible receipts refuse that path; no implicit interpreted fallback is permitted after selection is requested. Without an explicit directory the authoring selector is unchanged. The receipt identifies a trusted local build; it is not a signature or independent admission proof. This is explicit compiler self-consumption, not full startup activation. `PscApi.AcquireSelection(api,directory)` acquires an explicit resident selection session from the API source revision. `PscRuntimeSelection.Select(session,signatures,sources)` reuses the admitted selector without reading artifacts again; `Close(session)` withdraws it and requests context unloading. Resident structural specialization accepts the same session as `-RuntimeSelection`, and does not close a caller-owned session. CLI Compile with an explicit `-RuntimeDirectory` uses `Invoke-PscCompile` to acquire one session before lowering, supply it to both structural specialization and ordinary managed lowering (including the managed precursor of Native), and close it in a finally boundary before returning the managed result. The session remains inside the authoring operation, not the process dispatcher. Even an exact-only compilation refuses a missing or incompatible receipt when explicitly requested. Without an explicit directory CLI Compile retains interpreted selection. The retained session may also be supplied to `Export-LoweredAssembly -RuntimeSelection`: ordinary source static/instance calls and explicit constructors use session-owned compiled STS exact and numeric binding and retain the original CLR projection witnesses. Method closure, initializer lowering and recursive function-output inference use the same session; by default a selected compilation owns fresh declaration scopes, including their existing inference caches. `Export-LoweredAssembly -SourceAst <original-root> -RuntimeSelection <session> -RetainedScope <scope>` instead borrows a live resident source graph with a temporary CLR compatibility projection. The original AST, ordered class and enum selection, session and dependency scope must match exactly; acquire any rewritten record source before borrowing. The graph remains caller-owned on success or failure; `RealizedScope` ownership transfer is not admitted with `RetainedScope`. Synthetic function scopes acquire temporary graphs by default. For repeated program compilation, acquire the existing program function class with `Get-ScriptFunctionClass -Root <original-root> -Program`, then `Get-DeclarationScope -Root <function-class-parent-root> -Resolving <source-scope> -RuntimeSelection <session>`. Supply that dependent scope as `-RetainedFunctionScope` together with `-RetainedScope` and `-Program`. Both graphs remain caller-owned and acquire no replacement graphs; the dependent CLR projection resolves against the fresh source CLR projection. Explicit reprojection may substitute only a live projection of the identical direct dependency graph. Function provenance is retained with the scope, independent of active synthetic class caches. Ordinary lowering resolves function source, class and program entry from its selected declarations; borrowed compilation uses the retained referents without reading or displacing the acquisition dictionaries. External acquisition and inference retain identity-keyed conditional weak indexes. Live source or synthetic AST referents preserve their relationships, including null cache entries and parameterless program entries, but the indexes do not own abandoned source or synthetic ASTs. Retained scopes continue to own their declaration evidence and graph withdrawal remains explicit. The resolving source may be any live projection of the identical source graph. Function inference remains projection-local; withdraw the dependent graph before its source graph. Ordinary resident lowering tracks every graph it acquires, including incomplete projections; it withdraws temporary scopes in reverse acquisition order and removes their cache entries on success or failure. An explicit successful RealizedScope handoff retains only the selected graph; caller-owned dependency and declaration scopes are not withdrawn. CLR compatibility projections are collectible. `Get-DeclarationScope -Root <original-root> -RuntimeSelection <session> -RealizationOf <scope>` creates a separate compatibility projection from a live retained graph, including the original enum selection and dependencies; it neither replaces the root cache nor acquires another STS graph. Existing callers may retain prior CLR witnesses, which become eligible for reclamation when no longer referenced. Graph withdrawal remains independent of these witnesses. `PscScriptTypeAcquisition` constructs descriptors directly from the original SMA AST declarations in the selected execution domain. A resident scope stores only its owning session, scope and source coordinates, and CLR projection witnesses; it does not construct an interpreted descriptor graph. The compiled graph retains original imported semantic referents, not their AST ownership. CLR signature projection realizes retained source referents and recursive CTS references without AST evidence; unresolved names retain the compatibility name resolution path. Resident acquisition appends selected source enums after class coordinates, retaining enum identity, underlying integral CTS reference and ordered exact constant values. Enum references use the same source owner map, including imported and reprojected enums; direct source emission still uses the existing enum literal lowering path. Binding, imports and graph withdrawal remain available without AST evidence. Caller-held declaration scopes retain their original ASTs. The compiled graph supplies typed acquisition, projection and binding results across the delegate boundary, with refusal status and diagnostic text instead of collectible exceptions. The authoring caller checks the selected member against its CLR realization. Graph scopes may be withdrawn individually through `PscRuntimeSelection.ReleaseGraph`; live importing scopes prevent withdrawal, and retired coordinates are never reused. Previously cached scope witnesses refuse subsequent operations rather than silently reacquiring a different semantic graph. A resident scope cannot import an authoring descriptor graph. ScriptType.dll remains independent of SMA; only the compiler-side adapter consumes AST evidence. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
+- **Faculties:** `HandleTable`, `DiscoveryMechanisms`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. `BuildRuntime -CompilerRuntimeDirectory <bootstrap> -RuntimeDirectory <empty-output>` admits the existing no-contract compiler realization, composes the original resident dependency scopes without merging their descriptors, and rebuilds all eight artifacts in a separate directory. It refuses missing or incompatible admission receipts, nonempty output directories and external contract inputs. The coordinator acquires its declaration inventory once, uses retained persisted dependency witnesses, retires completed graph scopes outside the remaining transitive dependency closure in reverse order, and closes the admitted session. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. BuildRuntime without contract inputs also builds the compiler-private `compiler/CompilerDeclarations.dll` and writes a version 2 local selection receipt for it and HandleTable, ScriptType and PrimitiveConversion. The seven public faculty files and their dependency closure are unchanged. The compiled selection path verifies source, CoreLib, SMA, the existing TypeConverter framework dependency and all four admitted assembly digests once, loads the exact bytes in a private collectible context, and invokes typed delegates. Version 1 receipts require rebuilding. Missing or incompatible receipts refuse that path; no implicit interpreted fallback is permitted after selection is requested. Without an explicit directory the authoring selector is unchanged. The receipt identifies a trusted local build; it is not a signature or independent admission proof. This is explicit compiler self-consumption, not full startup activation. `PscApi.AcquireSelection(api,directory)` acquires an explicit resident selection session from the API source revision. `PscRuntimeSelection.Select(session,signatures,sources)` reuses the admitted selector without reading artifacts again; `Close(session)` withdraws it and requests context unloading. Resident structural specialization accepts the same session as `-RuntimeSelection`, and does not close a caller-owned session. CLI Compile with an explicit `-RuntimeDirectory` uses `Invoke-PscCompile` to acquire one session before lowering, supply it to both structural specialization and ordinary managed lowering (including the managed precursor of Native), and close it in a finally boundary before returning the managed result. The session remains inside the authoring operation, not the process dispatcher. Even an exact-only compilation refuses a missing or incompatible receipt when explicitly requested. Without an explicit directory CLI Compile retains interpreted selection. The retained session may also be supplied to `Export-LoweredAssembly -RuntimeSelection`: ordinary source static/instance calls and explicit constructors use session-owned compiled STS exact and numeric binding and retain the original CLR projection witnesses. Method closure, initializer lowering and recursive function-output inference use the same session; by default a selected compilation owns fresh declaration scopes, including their existing inference caches. `Export-LoweredAssembly -SourceAst <original-root> -RuntimeSelection <session> -RetainedScope <scope>` instead borrows a live resident source graph with a temporary CLR compatibility projection. The original AST, ordered class and enum selection, session and dependency scope must match exactly; acquire any rewritten record source before borrowing. The graph remains caller-owned on success or failure; `RealizedScope` ownership transfer is not admitted with `RetainedScope`. Synthetic function scopes acquire temporary graphs by default. For repeated program compilation, acquire the existing program function class with `Get-ScriptFunctionClass -Root <original-root> -Program`, then `Get-DeclarationScope -Root <function-class-parent-root> -Resolving <source-scope> -RuntimeSelection <session>`. Supply that dependent scope as `-RetainedFunctionScope` together with `-RetainedScope` and `-Program`. Both graphs remain caller-owned and acquire no replacement graphs; the dependent CLR projection resolves against the fresh source CLR projection. Explicit reprojection may substitute only a live projection of the identical direct dependency graph. Function provenance is retained with the scope, independent of active synthetic class caches. Ordinary lowering resolves function source, class and program entry from its selected declarations; borrowed compilation uses the retained referents without reading or displacing the acquisition dictionaries. External acquisition and inference retain identity-keyed conditional weak indexes. Live source or synthetic AST referents preserve their relationships, including null cache entries and parameterless program entries, but the indexes do not own abandoned source or synthetic ASTs. Retained scopes continue to own their declaration evidence and graph withdrawal remains explicit. The resolving source may be any live projection of the identical source graph. Function inference remains projection-local; withdraw the dependent graph before its source graph. Ordinary resident lowering tracks every graph it acquires, including incomplete projections; it withdraws temporary scopes in reverse acquisition order and removes their cache entries on success or failure. An explicit successful RealizedScope handoff retains only the selected graph; caller-owned dependency and declaration scopes are not withdrawn. CLR compatibility projections are collectible. `Get-DeclarationScope -Root <original-root> -RuntimeSelection <session> -RealizationOf <scope>` creates a separate compatibility projection from a live retained graph, including the original enum selection and dependencies; it neither replaces the root cache nor acquires another STS graph. Existing callers may retain prior CLR witnesses, which become eligible for reclamation when no longer referenced. Graph withdrawal remains independent of these witnesses. `PscScriptTypeAcquisition` constructs descriptors directly from the original SMA AST declarations in the selected execution domain. A resident scope stores only its owning session, scope and source coordinates, and CLR projection witnesses; it does not construct an interpreted descriptor graph. The compiled graph retains original imported semantic referents, not their AST ownership. CLR signature projection realizes retained source referents and recursive CTS references without AST evidence; unresolved names retain the compatibility name resolution path. Resident acquisition appends selected source enums after class coordinates, retaining enum identity, underlying integral CTS reference and ordered exact constant values. Enum references use the same source owner map, including imported and reprojected enums; CLR compatibility projection and persisted emission consume the same typed enum shape from the acquired definitions, including exact full-width constants. Resident shape retrieval uses graph coordinates without reacquiring AST initializers; the authoring adapter uses the same enum acquisition operation. Binding, imports and graph withdrawal remain available without AST evidence. Caller-held declaration scopes retain their original ASTs. The compiled graph supplies typed acquisition, projection and binding results across the delegate boundary, with refusal status and diagnostic text instead of collectible exceptions. The authoring caller checks the selected member against its CLR realization. Graph scopes may be withdrawn individually through `PscRuntimeSelection.ReleaseGraph`; live importing scopes prevent withdrawal, and retired coordinates are never reused. Previously cached scope witnesses refuse subsequent operations rather than silently reacquiring a different semantic graph. A resident scope cannot import an authoring descriptor graph. ScriptType.dll remains independent of SMA; only the compiler-side adapter consumes AST evidence. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
 - **Evidence:** differential tests, structural lint, Guard, non-loading binary queries and coverage. An observed call is not a universal binding proof; an ABI check is not a proof of arithmetic equivalence.
 
 ## Trust and security
@@ -17691,11 +17732,14 @@ function Export-LoweredAssembly {
     $script:IlMap = @{ Types = @{}; Members = @{}; ImplicitConstructors = @{}; Semantics = [PscSemanticsPlan]@{ Session = $session; Methods = $null; Needed = [System.Collections.Generic.SortedSet[string]]::new([StringComparer]::Ordinal) } }
     try {
         # 1. Output types, so every signature can name any of them. Enums are complete once their literals exist.
-        foreach ($enumAst in $enumAsts) {
-            $enumBuilder = $session.Module.DefineEnum($enumAst.Name, [Reflection.TypeAttributes]::Public, (Get-EnumUnderlyingType $enumAst))
-            foreach ($literal in (Get-EnumLiterals $enumAst)) { $null = $enumBuilder.DefineLiteral($literal.Name, $literal.Value) }
-            $null = $enumBuilder.CreateType()
-            $script:IlMap.Types[$projection[$enumAst.Name]] = $enumBuilder
+        for($index=0;$index -lt $enumAsts.Length;$index++){
+            $enumAst=$enumAsts[$index];$shape=$PscSelectedScope.EnumShapes[$index]
+            $enumBuilder=$session.Module.DefineEnum($enumAst.Name,[Reflection.TypeAttributes]::Public,$shape.Item1)
+            for($literalIndex=0;$literalIndex -lt $shape.Item2.Length;$literalIndex++){
+                $null=$enumBuilder.DefineLiteral($shape.Item2[$literalIndex],[Convert]::ChangeType($shape.Item3[$literalIndex],$shape.Item1))
+            }
+            $null=$enumBuilder.CreateType()
+            $script:IlMap.Types[$projection[$enumAst.Name]]=$enumBuilder
         }
         foreach ($c in $model) {
             $tb = $session.Module.DefineType($c.Name, [Reflection.TypeAttributes]'Public,Class')
