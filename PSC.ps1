@@ -2596,6 +2596,174 @@ try {
     }finally{$runtimeType::Close($session)}
 }finally{[IO.Directory]::Delete($work,$true)}
 '@)
+    [PscSourceResource]::new('Tests/ParamArrayCases.ps1', @'
+class ParamCases {
+    static [int] Next([int[]]$state,[int]$digit) { $state[0]=$state[0]*10+$digit; return $digit }
+    static [string] FormatMany() { return [string]::Format('{0} {1} {2:X16} {3:X16}',[int]42,[long]1000,[ulong]9999,[ulong]12345) }
+    static [string] Fixed() { return [string]::Format('{0}/{1}/{2}',1,2,3) }
+    static [string] Zero() { return [IO.Path]::Combine() }
+    static [string] One() { return [IO.Path]::Combine('a') }
+    static [string] Many() { return [IO.Path]::Combine('a','b','c','d','e') }
+    static [string] Explicit() { [string[]]$parts=@('a','b','c','d','e'); return [IO.Path]::Combine($parts) }
+    static [string] Instance() { [string]$value='abcVALUEcba'; return $value.Trim([char]97,[char]98,[char]99) }
+    static [string] Converted() { [string]$value='abcVALUEcba'; return $value.Trim(97,98,99) }
+    static [string] ExplicitChars() { [string]$value='abcVALUEcba'; [char[]]$chars=@([char]97,[char]98,[char]99); return $value.Trim($chars) }
+    static [string] StringChars() { [string]$value='abcVALUEcba'; return $value.Trim('abc') }
+    static [string] Generic() { return [System.Collections.Immutable.ImmutableArray]::Create(1,2,3,4,5).Length.ToString() }
+    static [string] GenericArray() { [int[]]$items=@(1,2,3,4,5); return [System.Collections.Immutable.ImmutableArray]::Create($items).Length.ToString() }
+    static [string] NullElement() { return [string]::Format('{0}|{1}|{2}|{3}',1,$null,3,4) }
+    static [string] Order() { [int[]]$state=@(0); [string]$s=[string]::Format('{0}{1}{2}{3}',[ParamCases]::Next($state,1),[ParamCases]::Next($state,2),[ParamCases]::Next($state,3),[ParamCases]::Next($state,4)); return $s+'|'+$state[0].ToString() }
+}
+class ParamFixtureCases {
+    static [bool] Identity() { [int[]]$a=@(1,2);return [object]::ReferenceEquals($a,[ParamArrayFixture]::Identity($a)) }
+    static [int] Empty() { return [ParamArrayFixture]::Identity().Length }
+    static [int] One() { return [ParamArrayFixture]::Identity([double]1.5)[0] }
+    static [bool] NullArray() { return $null -eq [ParamArrayFixture]::Identity($null) }
+    static [int] Compete() { return [ParamArrayFixture]::Compete(2) }
+    static [int] Tie() { return [ParamArrayFixture]::Tie(2) }
+    static [int] Prefix() { return [ParamArrayFixture]::Prefix(1,2,3) }
+    static [int] Overflow() { return [ParamArrayFixture]::Identity([long]2147483648,1).Length }
+}
+class ParamAmbiguous {
+    static [int] Run(){ return [ParamArrayFixture]::Ambiguous(1,2) }
+}
+class ParamInvalid {
+    static [int] Run(){ return [ParamArrayFixture]::Identity([datetime]::MinValue,[datetime]::MaxValue).Length }
+}
+class ParamGenericConflict {
+    static [int] Run(){ return [System.Collections.Immutable.ImmutableArray]::Create([int]1,[long]2,[int]3,[long]4,[int]5).Length }
+}
+'@)
+    [PscSourceResource]::new('Tests/Test-ParamArrayBinding.ps1', @'
+#requires -Version 7.7
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$Compiler,[string]$RuntimeDirectory)
+$ErrorActionPreference='Stop'
+# Independent CTS metadata witness. PowerShell class parameters do not emit
+# ParamArrayAttribute; use the framework's persisted metadata emitter solely
+# for these external method declarations, not for binding or call realization.
+function Add-Choice {
+    [OutputType([void])]
+    param([Reflection.Emit.TypeBuilder]$Owner,[string]$Name,[type[]]$Parameters,[bool]$ParamArray,[int]$Result)
+    $method=$Owner.DefineMethod($Name,[Reflection.MethodAttributes]'Public,Static',[int],$Parameters)
+    if($ParamArray){
+        $parameter=$method.DefineParameter($Parameters.Length,[Reflection.ParameterAttributes]::None,'values')
+        $parameter.SetCustomAttribute([Reflection.Emit.CustomAttributeBuilder]::new([ParamArrayAttribute].GetConstructor([type[]]@()),[object[]]@()))
+    }
+    $il=$method.GetILGenerator();$il.Emit([Reflection.Emit.OpCodes]::Ldc_I4,$Result);$il.Emit([Reflection.Emit.OpCodes]::Ret)
+}
+function New-ParamArrayFixture {
+    [OutputType([void])]
+    param([string]$Path)
+    $builder=[Reflection.Emit.PersistedAssemblyBuilder]::new([Reflection.AssemblyName]::new('ParamArrayFixture'),[object].Assembly)
+    $module=$builder.DefineDynamicModule('ParamArrayFixture')
+    $owner=$module.DefineType('ParamArrayFixture',[Reflection.TypeAttributes]'Public,Abstract,Sealed')
+    $method=$owner.DefineMethod('Identity',[Reflection.MethodAttributes]'Public,Static',[int[]],[type[]]@([int[]]))
+    $method.DefineParameter(1,[Reflection.ParameterAttributes]::None,'values').SetCustomAttribute([Reflection.Emit.CustomAttributeBuilder]::new([ParamArrayAttribute].GetConstructor([type[]]@()),[object[]]@()))
+    $il=$method.GetILGenerator();$il.Emit([Reflection.Emit.OpCodes]::Ldarg_0);$il.Emit([Reflection.Emit.OpCodes]::Ret)
+    Add-Choice $owner 'Compete' ([type[]]@([object])) $false 1
+    Add-Choice $owner 'Compete' ([type[]]@([int[]])) $true 2
+    Add-Choice $owner 'Tie' ([type[]]@([int])) $false 3
+    Add-Choice $owner 'Tie' ([type[]]@([int[]])) $true 4
+    Add-Choice $owner 'Prefix' ([type[]]@([int[]])) $true 5
+    Add-Choice $owner 'Prefix' ([type[]]@([int],[int[]])) $true 6
+    Add-Choice $owner 'Ambiguous' ([type[]]@([IComparable[]])) $true 7
+    Add-Choice $owner 'Ambiguous' ([type[]]@([IFormattable[]])) $true 8
+    $null=$owner.CreateType();$builder.Save($Path)
+}
+function Assert-Overflow {
+    [OutputType([void])]
+    param([type]$Owner)
+    $refused=$false
+    try{$null=$Owner.GetMethod('Overflow').Invoke($null,$null)}catch{
+        $failure=$_.Exception
+        while($null -ne $failure.InnerException){$failure=$failure.InnerException}
+        if($failure -isnot [OverflowException]){throw}
+        $refused=$true
+    }
+    if(!$refused){throw 'Invalid narrowing was admitted'}
+}
+$work=[IO.Directory]::CreateTempSubdirectory('psc-params-').FullName
+$compilerPath=[IO.Path]::GetFullPath($Compiler)
+$runtimePath=$RuntimeDirectory
+$fixturePath=Join-Path $PSScriptRoot 'ParamArrayCases.ps1'
+$selection=$null
+try{
+    $external=Join-Path $work 'ParamArrayFixture.dll'
+    New-ParamArrayFixture $external
+    [void][Reflection.Assembly]::LoadFrom($external)
+    . $fixturePath
+    [type[]]$oracleTypes=@([ParamCases],[ParamFixtureCases])
+    [string[][]]$names=[string[][]]::new(2)
+    $names[0]=[string[]]@('FormatMany','Fixed','Zero','One','Many','Explicit','Instance','Converted','ExplicitChars','StringChars','Generic','GenericArray','NullElement','Order')
+    $names[1]=[string[]]@('Identity','Empty','One','NullArray','Compete','Tie','Prefix')
+    Assert-Overflow $oracleTypes[1]
+    $negative=[type[]]@([ParamAmbiguous],[ParamInvalid],[ParamGenericConflict])
+    foreach($owner in $negative){
+        $refused=$false
+        try{$null=$owner.GetMethod('Run').Invoke($null,$null)}catch{$refused=$true}
+        if(!$refused){throw "SMA unexpectedly admitted $owner"}
+    }
+    $api=. $compilerPath -Mode Api
+    if(!$runtimePath){
+        $runtimePath=Join-Path $work 'runtime'
+        & ([Environment]::ProcessPath) -NoProfile -File $compilerPath -Mode BuildRuntime -RuntimeDirectory $runtimePath | Out-Null
+        if($LASTEXITCODE -ne 0){throw 'Faculty build failed'}
+    }
+    $selection=$api.GetType()::AcquireSelection($api,$runtimePath)
+    $selectionType=$selection.GetType()
+    $tokens=$null;$errors=$null
+    $root=[System.Management.Automation.Language.Parser]::ParseFile($fixturePath,[ref]$tokens,[ref]$errors)
+    if($errors.Count){throw $errors[0]}
+    $paths=[string[]]::new(3);$modes=[string[]]@('authoring','resident','borrowed')
+    for([int]$i=0;$i -lt $paths.Length;$i++){$paths[$i]=Join-Path ([IO.Directory]::CreateDirectory((Join-Path $work $modes[$i])).FullName) 'ParamCases.dll'}
+    $declarations=[string[]]@('ParamCases','ParamFixtureCases')
+    $null=Export-LoweredAssembly -SourceAst $root -ClassName ParamCases -ClassNames $declarations -DeclarationsOnly -OutputPath $paths[0] -Deterministic
+    $scope=$null
+    $null=Export-LoweredAssembly -SourceAst $root -ClassName ParamCases -ClassNames $declarations -DeclarationsOnly -OutputPath $paths[1] -RuntimeSelection $selection -RealizedScope ([ref]$scope) -Deterministic
+    $projection=Get-DeclarationScope -Root $root -RuntimeSelection $selection -RealizationOf $scope
+    $null=Export-LoweredAssembly -SourceAst $root -ClassName ParamCases -ClassNames $declarations -DeclarationsOnly -OutputPath $paths[2] -RuntimeSelection $selection -RetainedScope $projection -Deterministic
+    $digest=(Get-FileHash $paths[0]).Hash
+    foreach($path in $paths){if((Get-FileHash $path).Hash -cne $digest){throw 'Deterministic output differs'}}
+    if(!$selectionType::ReleaseGraph($selection,$scope.ResidentSlot)){throw 'Graph withdrawal failed'}
+    for([int]$i=0;$i -lt $paths.Length;$i++){
+        $assembly=[Reflection.Assembly]::LoadFile($paths[$i])
+        for([int]$j=0;$j -lt $oracleTypes.Length;$j++){
+            $oracle=$oracleTypes[$j];$realized=$assembly.GetType($oracle.Name,$true)
+            foreach($name in $names[$j]){
+                $expected=$oracle.GetMethod($name).Invoke($null,$null);$actual=$realized.GetMethod($name).Invoke($null,$null)
+                if($actual.GetType() -ne $expected.GetType() -or !$actual.Equals($expected)){throw "$name expected '$expected', actual '$actual'"}
+                "PASS $($modes[$i]) $($oracle.Name).$name = '$actual'"
+            }
+        }
+        Assert-Overflow ($assembly.GetType('ParamFixtureCases',$true))
+        "PASS $($modes[$i]) checked overflow"
+        if('System.Management.Automation' -in $assembly.GetReferencedAssemblies().Name){throw 'Unexpected SMA dependency'}
+    }
+    foreach($owner in $negative){
+        for([int]$i=0;$i -lt 2;$i++){
+            $negativePath=Join-Path $work ($owner.Name+'.dll')
+            $refused=$false
+            try{
+                if($i -eq 0){$null=Export-LoweredAssembly -SourceAst $root -ClassName $owner.Name -ClassNames @($owner.Name) -DeclarationsOnly -OutputPath $negativePath -Deterministic}
+                else{$null=Export-LoweredAssembly -SourceAst $root -ClassName $owner.Name -ClassNames @($owner.Name) -DeclarationsOnly -OutputPath $negativePath -RuntimeSelection $selection -Deterministic}
+            }catch{
+                $failure=$_.Exception
+                while($null -ne $failure.InnerException){$failure=$failure.InnerException}
+                if($owner.Name -eq 'ParamAmbiguous' -and $failure -isnot [Reflection.AmbiguousMatchException]){throw}
+                if($owner.Name -ne 'ParamAmbiguous' -and $failure -isnot [MissingMethodException]){throw}
+                $refused=$true
+            }
+            if(!$refused){throw "Unexpected admitted call: $($owner.Name)"}
+            "PASS $($modes[$i]) refused $($owner.Name)"
+        }
+    }
+    "PASS authoring/resident/borrowed deterministic and executable after withdrawal: $digest"
+}finally{
+    if($null -ne $selection){$selectionType::Close($selection)}
+    [IO.Directory]::Delete($work,$true)
+}
+'@)
 }
 
 # PSC-owned source faculties. The holder provides real parser-visible declarations, not executable text.
@@ -2625,7 +2793,7 @@ class PscDeclarationScope {
     [Collections.Generic.Dictionary[System.Management.Automation.Language.FunctionMemberAst,type]] $FunctionOutputTypes = [Collections.Generic.Dictionary[System.Management.Automation.Language.FunctionMemberAst,type]]::new()
 }
 function Get-PscFacultyDeclarations {
-    param([string[]]$ContractPaths,[System.Management.Automation.Language.TypeDefinitionAst[]]$CompilerClassAsts,[hashtable]$MaterializedTypes,[type[][]]$SelectionSignatures,[type[]]$SelectionSources,[PscDeclarationScope]$DeclarationScope,[System.Management.Automation.Language.TypeDefinitionAst]$BindingOwner,[string]$BindingName,[type[]]$BindingArguments,[bool]$BindingStatic,[bool]$BindingConstructor,[PscDeclarationScope[]]$BindingScopes,[ScriptTypeReference]$ComparisonLeft,[ScriptTypeReference]$ComparisonRight,[ScriptTypeContract]$ReferenceContract,[string]$ReferenceName,[ScriptTypeReference[]]$ReferenceParameters,[bool]$ReferenceStatic,[bool]$ReferenceConstructor,[switch]$DependencyContractsOnly,[PscDeclarationScope[]]$RetainedDependencyScopes,[type]$PersistedBindingTarget,[PscRuntimeSelection]$RuntimeSelection,[switch]$ReuseResidentGraph,[switch]$PrepareEnumShapes,[switch]$StorageMember,[switch]$OperationProjection,[switch]$OperationMiss)
+    param([string[]]$ContractPaths,[System.Management.Automation.Language.TypeDefinitionAst[]]$CompilerClassAsts,[hashtable]$MaterializedTypes,[type[][]]$SelectionSignatures,[type[]]$SelectionSources,[Tuple[int,int,bool,bool,type[]][]]$SelectionForms,[PscDeclarationScope]$DeclarationScope,[System.Management.Automation.Language.TypeDefinitionAst]$BindingOwner,[string]$BindingName,[type[]]$BindingArguments,[bool]$BindingStatic,[bool]$BindingConstructor,[PscDeclarationScope[]]$BindingScopes,[ScriptTypeReference]$ComparisonLeft,[ScriptTypeReference]$ComparisonRight,[ScriptTypeContract]$ReferenceContract,[string]$ReferenceName,[ScriptTypeReference[]]$ReferenceParameters,[bool]$ReferenceStatic,[bool]$ReferenceConstructor,[switch]$DependencyContractsOnly,[PscDeclarationScope[]]$RetainedDependencyScopes,[type]$PersistedBindingTarget,[PscRuntimeSelection]$RuntimeSelection,[switch]$ReuseResidentGraph,[switch]$PrepareEnumShapes,[switch]$StorageMember,[switch]$OperationProjection,[switch]$OperationMiss)
 
 # Only descriptor types are realized in the authoring scope. Other faculties must not shadow imported CLR identities.
 # The semantic description and the executable generation are ordinary HandleTable objects.
@@ -2822,7 +2990,7 @@ class PscMaterializedSignature {
 # Each published call references the original source member and a lowered thunk.
 
 function Get-PscOtherFacultyDeclarations {
-    param([type[][]]$SelectionSignatures,[type[]]$SelectionSources,[ScriptTypeContract]$BindingContract,[string]$BindingName,[ScriptTypeReference[]]$BindingReferences,[bool]$BindingStatic,[bool]$BindingConstructor,[PscRuntimeSelection]$RuntimeSelection)
+    param([type[][]]$SelectionSignatures,[type[]]$SelectionSources,[Tuple[int,int,bool,bool,type[]][]]$SelectionForms,[ScriptTypeContract]$BindingContract,[string]$BindingName,[ScriptTypeReference[]]$BindingReferences,[bool]$BindingStatic,[bool]$BindingConstructor,[PscRuntimeSelection]$RuntimeSelection)
 
 # Faculty: HandleTable.ps1
 # One typed object space. Handle generations describe operational identity, not learning.
@@ -3844,7 +4012,7 @@ class ScriptTypeCatalog {
 }
 
 # Faculty: PrimitiveConversion.ps1
-# Independently lowered fixed-arity binding capability. Primitive conversions
+# Independently lowered signature and call-form binding capability. Primitive conversions
 # compatible reference conversions and bounded vector/list conversion are supported.
 class ScriptTypePrimitiveConversion {
     static [bool] IsNumber([type]$Type){
@@ -3856,11 +4024,24 @@ class ScriptTypePrimitiveConversion {
         if($null -eq $Source){
             if($Target -eq [string]){return 31}
             if(!$Target.IsValueType){return 191}
-            if($Target -eq [bool] -or [ScriptTypePrimitiveConversion]::IsNumber($Target)){return 175}
+            if($Target -eq [bool] -or $Target -eq [char] -or $null -ne [Nullable]::GetUnderlyingType($Target) -or [ScriptTypePrimitiveConversion]::IsNumber($Target)){return 175}
             return -1
         }
         if($Source -eq $Target){return 287}
         if($Target.IsAssignableFrom($Source)){return 271}
+        if($Source -eq [string] -and $Target -eq [char[]]){return 282}
+        if($Target -eq [char]){
+            if($Source -eq [string]){return 127}
+            if([ScriptTypePrimitiveConversion]::IsNumber($Source)){return 239}
+        }
+        if($Source -eq [char]){
+            if($Target -eq [string]){return 31}
+            if([ScriptTypePrimitiveConversion]::IsNumber($Target)){return 63}
+        }
+        if($Target.IsEnum){
+            if($Source -eq [string]){return 127}
+            if([ScriptTypePrimitiveConversion]::IsNumber($Source)){return 159}
+        }
         # Arrays are reference objects, but PowerShell also admits scalar wrapping
         # and element-wise conversion. Limit conversion to zero-based vectors.
         if($Target.IsSZArray){
@@ -3925,7 +4106,13 @@ class ScriptTypePrimitiveConversion {
             [int]$rb=[ScriptTypePrimitiveConversion]::Rank($Sources[$i],$B[$i])
             [int]$weight=$Sources.Length-$i
             if($ra -gt $rb){$score+=$weight}
-            elseif($ra -lt $rb){$score-=$weight}
+                        elseif($ra -lt $rb){$score-=$weight}
+            elseif($ra -eq 15 -and $Sources[$i].IsSZArray -and $A[$i].IsSZArray -and $B[$i].IsSZArray){
+                [type]$element=$Sources[$i].GetElementType()
+                [int]$ea=[ScriptTypePrimitiveConversion]::Rank($element,$A[$i].GetElementType())
+                [int]$eb=[ScriptTypePrimitiveConversion]::Rank($element,$B[$i].GetElementType())
+                if($ea -ge 0 -and $eb -ge 0){if($ea -gt $eb){$score+=$weight}elseif($ea -lt $eb){$score-=$weight}}
+            }
         }
         if($score -ne 0){return $score}
         for([int]$i=0;$i -lt $Sources.Length;$i++){
@@ -3941,7 +4128,8 @@ class ScriptTypePrimitiveConversion {
             if($ab -lt 0 -or $ba -lt 0){
                 if([ScriptTypePrimitiveConversion]::IsReference($A[$i]) -and [ScriptTypePrimitiveConversion]::IsReference($B[$i])){
                     if($ab -eq 271 -and $ba -lt 0){$ba=0}
-                    elseif($ba -eq 271 -and $ab -lt 0){$ab=0}
+                                        elseif($ba -eq 271 -and $ab -lt 0){$ab=0}
+                    elseif($ab -lt 0 -and $ba -lt 0 -and $ra -eq 271 -and $rb -eq 271 -and $A[$i].IsInterface -and $B[$i].IsInterface){$ab=0;$ba=0}
                     else{throw [NotSupportedException]::new('Unresolved reference parameter comparison')}
                 }else{throw [NotSupportedException]::new('Unresolved parameter comparison')}
             }
@@ -4023,25 +4211,86 @@ class ScriptTypePrimitiveConversion {
     # Shared fixed-arity primitive compatibility selection; neither samples nor
     # invocation delegates are needed to select from a statically known signature.
     static [int] SelectSignatures([type[][]]$Signatures,[type[]]$Sources){
-        [int]$best=-1
-        [bool]$ambiguous=$false
+        return [ScriptTypePrimitiveConversion]::SelectSignatures($Signatures,$Sources,$null)
+    }
+    # CTS call forms carry effective parameter types, original declaration slot,
+    # formal arity, expansion, generic status and original parameter patterns. Ranking remains in ScriptType.
+    static [int] CompareSpecificity([type]$A,[type]$B){
+        if($A.IsGenericParameter){if($B.IsGenericParameter){return 0};return -1}
+        if($B.IsGenericParameter){return 1}
+        if($A.IsArray -and $B.IsArray){return [ScriptTypePrimitiveConversion]::CompareSpecificity($A.GetElementType(),$B.GetElementType())}
+        if($A.IsGenericType -and $B.IsGenericType -and $A.GetGenericTypeDefinition() -eq $B.GetGenericTypeDefinition()){
+            return [ScriptTypePrimitiveConversion]::CompareSpecificity($A.GetGenericArguments(),$B.GetGenericArguments())
+        }
+        return 0
+    }
+    static [int] CompareSpecificity([type[]]$A,[type[]]$B){
+        if($A.Length -ne $B.Length){return 0}
+        [bool]$more=$false;[bool]$less=$false
+        for([int]$i=0;$i -lt $A.Length;$i++){
+            [int]$comparison=[ScriptTypePrimitiveConversion]::CompareSpecificity($A[$i],$B[$i])
+            if($comparison -gt 0){$more=$true}elseif($comparison -lt 0){$less=$true}
+        }
+        if($more -and !$less){return 1}
+        if($less -and !$more){return -1}
+        return 0
+    }
+    static [int] CompareCallForms([type[][]]$Signatures,[type[]]$Sources,[Tuple[int,int,bool,bool,type[]][]]$Forms,[int]$Left,[int]$Right){
+        [int]$comparison=[ScriptTypePrimitiveConversion]::Compare($Signatures[$Left],$Signatures[$Right],$Sources)
+        if($null -eq $Forms -or $comparison -ne 0){return $comparison}
+        for([int]$i=0;$i -lt $Sources.Length;$i++){if($Signatures[$Left][$i] -ne $Signatures[$Right][$i]){return 0}}
+        [Tuple[int,int,bool,bool,type[]]]$a=$Forms[$Left]
+        [Tuple[int,int,bool,bool,type[]]]$b=$Forms[$Right]
+        if($a.Item3 -ne $b.Item3){if($a.Item3){return -1};return 1}
+        if($a.Item3){return $a.Item2-$b.Item2}
+        if($a.Item4 -or $b.Item4){$comparison=[ScriptTypePrimitiveConversion]::CompareSpecificity($a.Item5,$b.Item5);if($comparison -ne 0){return $comparison}}
+        return $b.Item2-$a.Item2
+    }
+    static [int] SelectSignatures([type[][]]$Signatures,[type[]]$Sources,[Tuple[int,int,bool,bool,type[]][]]$Forms){
+        [bool]$formsPresent=$null -ne $Forms
+        if($formsPresent -and $Forms.Length -ne $Signatures.Length){throw [ArgumentException]::new('Call form count differs')}
+        [bool[]]$applicable=[bool[]]::new($Signatures.Length)
         for([int]$c=0;$c -lt $Signatures.Length;$c++){
             [type[]]$signature=$Signatures[$c]
             if($signature.Length -ne $Sources.Length){throw [ArgumentException]::new('Arity mismatch')}
             [bool]$valid=$true
             for([int]$i=0;$i -lt $signature.Length;$i++){
-                if(![ScriptTypePrimitiveConversion]::IsAdmitted($signature[$i])){throw [NotSupportedException]::new('Parameter outside supported domain')}
+                if(!$formsPresent -and ![ScriptTypePrimitiveConversion]::IsAdmitted($signature[$i])){throw [NotSupportedException]::new('Parameter outside supported domain')}
                 [int]$rank=[ScriptTypePrimitiveConversion]::Rank($Sources[$i],$signature[$i])
-                if($rank -lt 0){throw [NotSupportedException]::new('Conversion rank outside supported domain')}
-                if($rank -eq 0){$valid=$false}
+                if(!$formsPresent -and $rank -lt 0){throw [NotSupportedException]::new('Conversion rank outside supported domain')}
+                if($rank -le 0){$valid=$false}
             }
-            if(!$valid){continue}
+            $applicable[$c]=$valid
+        }
+        # A declaration has one applicable form. At equal arity SMA compares
+        # array and element conversions directly, preferring normal on a tie.
+        if($formsPresent -and $Sources.Length -gt 0){
+            [int]$tail=$Sources.Length-1
+            for([int]$n=0;$n -lt $Forms.Length;$n++){
+                if(!$applicable[$n] -or $Forms[$n].Item3){continue}
+                for([int]$e=0;$e -lt $Forms.Length;$e++){
+                    if(!$applicable[$e] -or !$Forms[$e].Item3 -or $Forms[$e].Item1 -ne $Forms[$n].Item1){continue}
+                    [int]$normal=[ScriptTypePrimitiveConversion]::Rank($Sources[$tail],$Signatures[$n][$tail])
+                    [int]$expanded=[ScriptTypePrimitiveConversion]::Rank($Sources[$tail],$Signatures[$e][$tail])
+                    if($normal -ge $expanded){$applicable[$e]=$false}else{$applicable[$n]=$false}
+                }
+            }
+        }
+        [int]$best=-1
+        [bool]$ambiguous=$false
+        for([int]$c=0;$c -lt $Signatures.Length;$c++){
+            if(!$applicable[$c]){continue}
             if($best -lt 0){$best=$c;continue}
-            [int]$comparison=[ScriptTypePrimitiveConversion]::Compare($Signatures[$best],$signature,$Sources)
+            [int]$comparison=[ScriptTypePrimitiveConversion]::CompareCallForms($Signatures,$Sources,$Forms,$best,$c)
             if($comparison -lt 0){$best=$c;$ambiguous=$false}
             elseif($comparison -eq 0){$ambiguous=$true}
         }
         if($best -lt 0){throw [MissingMethodException]::new('No matching dynamic operation')}
+        if($formsPresent -and !$ambiguous){
+            for([int]$c=0;$c -lt $Signatures.Length;$c++){
+                if($c -ne $best -and $applicable[$c] -and [ScriptTypePrimitiveConversion]::CompareCallForms($Signatures,$Sources,$Forms,$best,$c) -le 0){$ambiguous=$true;break}
+            }
+        }
         if($ambiguous){throw [Reflection.AmbiguousMatchException]::new('Ambiguous dynamic operation')}
         return $best
     }
@@ -5425,7 +5674,7 @@ class PscResidentDeclarationGraph {
             return [ScriptTypePrimitiveConversion]::BindNumericDeclared($BindingContract,$BindingName,$BindingReferences,$BindingStatic,$BindingConstructor,$RuntimeSelection.NumericSelector)
         }finally{[Threading.Monitor]::Exit($RuntimeSelection)}
     }
-    if($null -ne $SelectionSignatures){return [ScriptTypePrimitiveConversion]::SelectSignatures($SelectionSignatures,$SelectionSources)}
+    if($null -ne $SelectionSignatures){return [ScriptTypePrimitiveConversion]::SelectSignatures($SelectionSignatures,$SelectionSources,$SelectionForms)}
 }
 
 # Authoring-time metadata extraction; compiled runtime receives the resulting typed graph.
@@ -5792,7 +6041,7 @@ function Get-ScriptTypeContract {
         }
         return $selectedOperation
     }
-    if($null -ne $SelectionSignatures){return Get-PscOtherFacultyDeclarations -SelectionSignatures $SelectionSignatures -SelectionSources $SelectionSources}
+    if($null -ne $SelectionSignatures){return Get-PscOtherFacultyDeclarations -SelectionSignatures $SelectionSignatures -SelectionSources $SelectionSources -SelectionForms $SelectionForms}
     if($DependencyContractsOnly){
         $retained=[Collections.Generic.Dictionary[System.Management.Automation.Language.TypeDefinitionAst,ScriptTypeContract]]::new()
         if($null -ne $RetainedDependencyScopes){
@@ -6161,6 +6410,7 @@ function Build-PscRuntime {
 class PscRuntimeSelection {
     hidden [System.Runtime.Loader.AssemblyLoadContext] $FacultyContext
     hidden [Func[type[][],type[],int]] $NumericSelector
+    hidden [Func[type[][],type[],Tuple[int,int,bool,bool,type[]][],int]] $CallFormSelector
     [Guid] $Identity
     hidden [System.Runtime.CompilerServices.ConditionalWeakTable[System.Management.Automation.Language.Ast,PscDeclarationScope]] $Scopes
     hidden [Func[System.Management.Automation.Language.TypeDefinitionAst[],int[],Tuple[int,int,string]]] $GraphAcquisition
@@ -6262,6 +6512,9 @@ class PscRuntimeSelection {
             $session=[PscRuntimeSelection]::new()
             $session.FacultyContext=$context
             $session.NumericSelector=$method.CreateDelegate([Func[type[][],type[],int]])
+            $formMethod=$target.GetMethod('SelectSignatures',[Reflection.BindingFlags]'Public,Static,DeclaredOnly',$null,[type[]]@([type[][]],[type[]],[Tuple[int,int,bool,bool,type[]][]]),$null)
+            if($null -eq $formMethod -or $formMethod.ReturnType -ne [int]){throw 'Faculty call form selection realization signature mismatch.'}
+            $session.CallFormSelector=$formMethod.CreateDelegate([Func[type[][],type[],Tuple[int,int,bool,bool,type[]][],int]])
             $session.Identity=[Guid]::NewGuid()
             $session.Scopes=[System.Runtime.CompilerServices.ConditionalWeakTable[System.Management.Automation.Language.Ast,PscDeclarationScope]]::new()
             $graph=$loaded[$loaded.Length-1].GetType('PscResidentDeclarationGraph',$true,$false)
@@ -6289,6 +6542,13 @@ class PscRuntimeSelection {
         try{
             if($null -eq $Session.NumericSelector){throw 'Faculty selection session is closed.'}
             return $Session.NumericSelector.Invoke($Signatures,$Sources)
+        }finally{[Threading.Monitor]::Exit($Session)}
+    }
+    static [int] Select([PscRuntimeSelection]$Session,[type[][]]$Signatures,[type[]]$Sources,[Tuple[int,int,bool,bool,type[]][]]$Forms){
+        [Threading.Monitor]::Enter($Session)
+        try{
+            [PscRuntimeSelection]::AssertOpen($Session)
+            return $Session.CallFormSelector.Invoke($Signatures,$Sources,$Forms)
         }finally{[Threading.Monitor]::Exit($Session)}
     }
     static [int] AcquireGraph([PscRuntimeSelection]$Session,[System.Management.Automation.Language.TypeDefinitionAst[]]$Definitions,[int[]]$Imports){
@@ -6387,7 +6647,7 @@ class PscRuntimeSelection {
             if($null -eq $Session.FacultyContext){return}
             $context=$Session.FacultyContext
             $Session.GraphAcquisition=$null;$Session.GraphProjection=$null;$Session.GraphEnumShape=$null;$Session.GraphEnumLiteral=$null;$Session.GraphStorageMember=$null;$Session.GraphOperationMiss=$null;$Session.GraphBinding=$null;$Session.GraphLive=$null;$Session.GraphRelease=$null;$Session.Scopes=$null
-            $Session.NumericSelector=$null
+            $Session.NumericSelector=$null;$Session.CallFormSelector=$null
             $Session.FacultyContext=$null
             $context.Unload()
         }finally{[Threading.Monitor]::Exit($Session)}
@@ -11900,7 +12160,7 @@ function Resolve-MatchingMethod {
         [Parameter(Mandatory)][AllowEmptyCollection()][Type[]] $ArgumentTypes,
         [switch] $IsStatic,
         [System.Management.Automation.Language.IScriptExtent] $SourceExtent,
-        [System.Management.Automation.Language.Ast] $SourceAst,[PscRuntimeSelection]$RuntimeSelection
+        [System.Management.Automation.Language.Ast] $SourceAst,[PscRuntimeSelection]$RuntimeSelection,[bool[]]$ArgumentNulls,[ref]$ExpandedIndex
     )
 
     if($null -ne $SourceAst){
@@ -11923,10 +12183,17 @@ function Resolve-MatchingMethod {
     $searched = @($TargetType)
     if ($TargetType.IsInterface) { $searched += $TargetType.GetInterfaces() }
 
+    # Discover parameter-array declarations at the CTS acquisition boundary.
+    [Reflection.MethodInfo[]]$named=@(foreach($owner in $searched){foreach($member in $owner.GetMethods($flags)){if($member.Name -ieq $MethodName){$member}}})
+    [bool]$hasForms=$false
+    foreach($member in $named){
+        [Reflection.ParameterInfo[]]$parameters=$member.GetParameters()
+        if($parameters.Length -gt 0 -and $parameters[-1].ParameterType.IsSZArray -and $parameters[-1].IsDefined([ParamArrayAttribute],$false)){$hasForms=$true;break}
+    }
     # 1. Exact match, using the PowerShell case-insensitive member name.
     # Reflection's default binder may widen argument types; do not confuse
     # that behavior with an exact signature match.
-    foreach ($type in $searched) {
+    foreach ($type in $searched) { if($hasForms -and $ArgumentNulls -contains $true){break}
         $exact = @(
             foreach ($candidate in $type.GetMethods($flags)) {
                 if ($candidate.Name -ine $MethodName -or $candidate.ContainsGenericParameters) { continue }
@@ -11952,6 +12219,69 @@ function Resolve-MatchingMethod {
             }
             throw "Ambiguous exact PowerShell member '$MethodName' on '$type'."
         }
+    }
+
+    if($hasForms){
+        [type[]]$sources=$ArgumentTypes.Clone()
+        if($null -ne $ArgumentNulls){for([int]$i=0;$i -lt $sources.Length;$i++){if($ArgumentNulls[$i]){$sources[$i]=$null}}}
+        [Collections.Generic.List[Reflection.MethodInfo]]$witnesses=[Collections.Generic.List[Reflection.MethodInfo]]::new()
+        [Collections.Generic.List[type[]]]$signatures=[Collections.Generic.List[type[]]]::new()
+        [Collections.Generic.List[Tuple[int,int,bool,bool,type[]]]]$forms=[Collections.Generic.List[Tuple[int,int,bool,bool,type[]]]]::new()
+        for([int]$group=0;$group -lt $named.Length;$group++){
+            [Reflection.MethodInfo]$member=$named[$group]
+            [Reflection.ParameterInfo[]]$parameters=$member.GetParameters()
+            [int]$count=$parameters.Length
+            [bool]$variadic=$count -gt 0 -and $parameters[$count-1].ParameterType.IsSZArray -and $parameters[$count-1].IsDefined([ParamArrayAttribute],$false)
+            if($member.ReturnType.IsByRefLike -or $member.ReturnType.IsPointer){continue}
+            # Ref-like param collections are not CLR parameter arrays.
+            [bool]$representable=$true
+            foreach($parameter in $parameters){if($parameter.ParameterType.IsByRefLike -or $parameter.ParameterType.IsPointer){$representable=$false;break}}
+            if(!$representable){continue}
+            for([int]$form=0;$form -lt 2;$form++){
+                [bool]$expanded=$form -eq 1
+                if($expanded -and !$variadic){continue}
+                if(!$expanded -and ($ArgumentTypes.Length -gt $count -or ($variadic -and $ArgumentTypes.Length -ne $count))){continue}
+                [int]$prefix=$count
+                if($expanded){$prefix=$count-1}
+                [bool]$fits=$true
+                for([int]$i=$ArgumentTypes.Length;$i -lt $prefix;$i++){if(!$parameters[$i].HasDefaultValue){$fits=$false;break}}
+                if(!$fits){continue}
+                [type[]]$patterns=[type[]]::new($ArgumentTypes.Length)
+                for([int]$i=0;$i -lt $patterns.Length;$i++){
+                    if($expanded -and $i -ge $prefix){$patterns[$i]=$parameters[$prefix].ParameterType.GetElementType()}
+                    else{$patterns[$i]=$parameters[$i].ParameterType}
+                }
+                [Reflection.MethodInfo]$closed=$member
+                if($member.IsGenericMethodDefinition){
+                    $bindings=@{}
+                    for([int]$i=0;$i -lt $patterns.Length;$i++){
+                        if($patterns[$i].ContainsGenericParameters -and $null -ne $sources[$i] -and !(Add-GenericInference $patterns[$i] $sources[$i] $bindings)){$fits=$false;break}
+                    }
+                    if(!$fits){continue}
+                    [type[]]$typeArguments=@(foreach($parameter in $member.GetGenericArguments()){$bindings[$parameter]})
+                    if($typeArguments.Length -ne $member.GetGenericArguments().Length -or $typeArguments -contains $null){continue}
+                    try{$closed=$member.MakeGenericMethod($typeArguments)}catch [ArgumentException]{continue}
+                }
+                if($closed.ContainsGenericParameters){continue}
+                [Reflection.ParameterInfo[]]$realized=$closed.GetParameters()
+                [type[]]$signature=[type[]]::new($ArgumentTypes.Length)
+                for([int]$i=0;$i -lt $signature.Length;$i++){
+                    if($expanded -and $i -ge $prefix){$signature[$i]=$realized[$prefix].ParameterType.GetElementType()}
+                    else{$signature[$i]=$realized[$i].ParameterType}
+                }
+                $witnesses.Add($closed);$signatures.Add($signature)
+                [type[]]$declared=[type[]]::new($count)
+                for([int]$i=0;$i -lt $count;$i++){$declared[$i]=$parameters[$i].ParameterType}
+                $forms.Add([Tuple[int,int,bool,bool,type[]]]::new($group,$count,$expanded,$member.IsGenericMethod,$declared))
+            }
+        }
+        if($forms.Count -eq 0){throw [MissingMethodException]::new("No admitted call form for '$MethodName' on '$TargetType'")}
+        [int]$selected=if($null -ne $RuntimeSelection){[PscRuntimeSelection]::Select($RuntimeSelection,$signatures.ToArray(),$sources,$forms.ToArray())}else{Get-PscFacultyDeclarations -SelectionSignatures $signatures.ToArray() -SelectionSources $sources -SelectionForms $forms.ToArray()}
+                if($forms[$selected].Item3){
+            if($null -eq $ExpandedIndex){throw [InvalidOperationException]::new('Expanded call requires an argument realization witness')}
+            $ExpandedIndex.Value=$forms[$selected].Item2-1
+        }
+        return $witnesses[$selected]
     }
 
     # 2. Compatible match
@@ -12132,14 +12462,41 @@ function Resolve-MatchingConstructor {
 # The default of each parameter a call leaves out, appended to its arguments: the parameter's declared default as a
 # constant of the parameter's type (an enumeration's default as that enumeration's value).
 function Add-PscDefaultArguments {
-    param([Parameter(Mandatory)][System.Reflection.MethodBase] $Method, [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[Linq.Expressions.Expression]] $Arguments)
+    param([Parameter(Mandatory)][System.Reflection.MethodBase] $Method, [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[Linq.Expressions.Expression]] $Arguments,[int]$ExpandedIndex=-1)
     $parameters = $Method.GetParameters()
-    for ($i = $Arguments.Count; $i -lt $parameters.Length; $i++) {
+    [int]$defaultLimit=$parameters.Length
+    if($ExpandedIndex -ge 0){$defaultLimit=$ExpandedIndex}
+    for ($i = $Arguments.Count; $i -lt $defaultLimit; $i++) {
         $type = $parameters[$i].ParameterType
         $value = $parameters[$i].DefaultValue
         if ($null -eq $value -or $value -is [DBNull] -or $value -is [System.Reflection.Missing]) { $Arguments.Add([Linq.Expressions.Expression]::Default($type)); continue }
         if ($type.IsEnum) { $value = [Enum]::ToObject($type, $value) }
         $Arguments.Add([Linq.Expressions.Expression]::Constant($value, $type))
+    }
+    if($ExpandedIndex -ge 0){
+        [type]$element=$parameters[$ExpandedIndex].ParameterType.GetElementType()
+        [Collections.Generic.List[Linq.Expressions.Expression]]$items=[Collections.Generic.List[Linq.Expressions.Expression]]::new()
+        for([int]$i=$ExpandedIndex;$i -lt $Arguments.Count;$i++){
+            $items.Add((ConvertTo-PowerShellType -Expression $Arguments[$i] -Type $element))
+        }
+        $Arguments.RemoveRange($ExpandedIndex,$Arguments.Count-$ExpandedIndex)
+        $Arguments.Add([Linq.Expressions.Expression]::NewArrayInit($element,$items.ToArray()))
+    }
+    for([int]$i=0;$i -lt $parameters.Length;$i++){
+        [type]$target=$parameters[$i].ParameterType
+        [Linq.Expressions.Expression]$value=$Arguments[$i]
+        if($target.IsByRef -or $value.Type -eq $target){continue}
+        if($i -eq $parameters.Length-1 -and $target.IsSZArray -and $parameters[$i].IsDefined([ParamArrayAttribute],$false)){
+            if($value -is [Linq.Expressions.ConstantExpression] -and $null -eq $value.Value){$Arguments[$i]=[Linq.Expressions.Expression]::Constant($null,$target);continue}
+            if($target.IsAssignableFrom($value.Type)){$Arguments[$i]=[Linq.Expressions.Expression]::Convert($value,$target);continue}
+            if($value.Type -eq [string] -and $target -eq [char[]]){$Arguments[$i]=[Linq.Expressions.Expression]::Call($value,[string].GetMethod('ToCharArray',[type[]]@()));continue}
+            if(!$value.Type.IsArray -and ![Collections.IList].IsAssignableFrom($value.Type)){
+                [type]$element=$target.GetElementType()
+                $Arguments[$i]=[Linq.Expressions.Expression]::NewArrayInit($element,[Linq.Expressions.Expression[]]@((ConvertTo-PowerShellType -Expression $value -Type $element)))
+                continue
+            }
+        }
+        $Arguments[$i]=ConvertTo-PowerShellType -Expression $value -Type $target
     }
 }
 
@@ -13382,6 +13739,9 @@ function Convert-AstExpression {
         }
         $argTypes = [Type[]]::new($argExprs.Count)
         for ($i = 0; $i -lt $argExprs.Count; $i++) { $argTypes[$i] = if ($byReference.Contains($i)) { $argExprs[$i].Type.MakeByRefType() } else { $argExprs[$i].Type } }
+        [bool[]]$argumentNulls=[bool[]]::new($argExprs.Count)
+        for([int]$i=0;$i -lt $argExprs.Count;$i++){$argumentNulls[$i]=$argExprs[$i] -is [Linq.Expressions.ConstantExpression] -and $null -eq $argExprs[$i].Value}
+        [int]$expandedIndex=-1
 
         if ($Node.Static) {
             $targetType = if ($Node.Expression -is [System.Management.Automation.Language.TypeExpressionAst]) {
@@ -13416,17 +13776,11 @@ function Convert-AstExpression {
             }
 
             # Static method call: [T]::Method(...)
-            $method = Resolve-MatchingMethod -TargetType $targetType -MethodName $memberName -ArgumentTypes $argTypes -IsStatic -SourceExtent $Node.Extent -SourceAst $Node -RuntimeSelection $Scope.RuntimeSelection
+            $method = Resolve-MatchingMethod -TargetType $targetType -MethodName $memberName -ArgumentTypes $argTypes -IsStatic -SourceExtent $Node.Extent -SourceAst $Node -RuntimeSelection $Scope.RuntimeSelection -ArgumentNulls $argumentNulls -ExpandedIndex ([ref]$expandedIndex)
             if ($method.IsDefined([Runtime.InteropServices.UnmanagedCallersOnlyAttribute],$false)) {
                 throw ('[{0}:{1}] UnmanagedCallersOnly method cannot be called from managed code.' -f $Node.Extent.StartLineNumber,$Node.Extent.StartColumnNumber)
             }
-            Add-PscDefaultArguments -Method $method -Arguments $argExprs
-            $params = $method.GetParameters()
-            for ($i = 0; $i -lt $params.Length; $i++) {
-                if (-not $params[$i].ParameterType.IsByRef -and $argExprs[$i].Type -ne $params[$i].ParameterType) {
-                    $argExprs[$i] = (ConvertTo-PowerShellType -Expression $argExprs[$i] -Type ($params[$i].ParameterType))
-                }
-            }
+            Add-PscDefaultArguments -Method $method -Arguments $argExprs -ExpandedIndex $expandedIndex
             return [Linq.Expressions.Expression]::Call($method, [Linq.Expressions.Expression[]]$argExprs.ToArray())
         }
         else {
@@ -13446,17 +13800,11 @@ function Convert-AstExpression {
             if ($targetExpr.Type -eq [System.Management.Automation.PSObject] -and -not (Test-PSObjectView $Node.Expression)) {
                 $targetExpr = [Linq.Expressions.Expression]::Property($targetExpr, 'BaseObject')
             }
-            $method = Resolve-MatchingMethod -TargetType $targetExpr.Type -MethodName $memberName -ArgumentTypes $argTypes -SourceAst $Node -RuntimeSelection $Scope.RuntimeSelection
+            $method = Resolve-MatchingMethod -TargetType $targetExpr.Type -MethodName $memberName -ArgumentTypes $argTypes -SourceAst $Node -RuntimeSelection $Scope.RuntimeSelection -ArgumentNulls $argumentNulls -ExpandedIndex ([ref]$expandedIndex)
             if ($method.IsDefined([Runtime.InteropServices.UnmanagedCallersOnlyAttribute],$false)) {
                 throw ('[{0}:{1}] UnmanagedCallersOnly method cannot be called from managed code.' -f $Node.Extent.StartLineNumber,$Node.Extent.StartColumnNumber)
             }
-            Add-PscDefaultArguments -Method $method -Arguments $argExprs
-            $params = $method.GetParameters()
-            for ($i = 0; $i -lt $params.Length; $i++) {
-                if (-not $params[$i].ParameterType.IsByRef -and $argExprs[$i].Type -ne $params[$i].ParameterType) {
-                    $argExprs[$i] = (ConvertTo-PowerShellType -Expression $argExprs[$i] -Type ($params[$i].ParameterType))
-                }
-            }
+            Add-PscDefaultArguments -Method $method -Arguments $argExprs -ExpandedIndex $expandedIndex
             return [Linq.Expressions.Expression]::Call($targetExpr, $method, [Linq.Expressions.Expression[]]$argExprs.ToArray())
         }
     }
@@ -17547,7 +17895,7 @@ Conform streams child stdout and stderr to the invoking host as they become avai
 
 - **Managed:** SMA AST and typed expression lowering, deterministic IL emission, static graph/data realization, reachability and fixed-parameter specialization. Untyped method and function locals may infer independent typed storage in disjoint statement blocks only when each region unconditionally overwrites the local before any reference and every reference belongs to such a region. The analysis retains original AST referents; explicit casts or constraints, qualified or captured references, parameters, foreach binders and cross-region live values retain the existing lowering behavior. This is bounded storage inference, not general flow-join, sequential reassignment or dynamic local support.
 - **Native:** pinned Windows NativeAOT compiler plus PSC COFF linker; direct CIL-to-IR-to-x64 ELF leaf emission and decoded-byte ABI checks. The direct backend does not yet replace ILC for general programs.
-- **Faculties:** `HandleTable`, `DiscoveryMechanisms`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. `BuildRuntime -CompilerRuntimeDirectory <bootstrap> -RuntimeDirectory <empty-output>` admits the existing no-contract compiler realization, composes the original resident dependency scopes without merging their descriptors, and rebuilds all eight artifacts in a separate directory. It refuses missing or incompatible admission receipts, nonempty output directories and external contract inputs. The coordinator acquires its declaration inventory once, uses retained persisted dependency witnesses, retires completed graph scopes outside the remaining transitive dependency closure in reverse order, and closes the admitted session. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. BuildRuntime without contract inputs also builds the compiler-private `compiler/CompilerDeclarations.dll` and writes a version 2 local selection receipt for it and HandleTable, ScriptType and PrimitiveConversion. The seven public faculty files and their dependency closure are unchanged. The compiled selection path verifies source, CoreLib, SMA, the existing TypeConverter framework dependency and all four admitted assembly digests once, loads the exact bytes in a private collectible context, and invokes typed delegates. Version 1 receipts require rebuilding. Missing or incompatible receipts refuse that path; no implicit interpreted fallback is permitted after selection is requested. Without an explicit directory the authoring selector is unchanged. The receipt identifies a trusted local build; it is not a signature or independent admission proof. This is explicit compiler self-consumption, not full startup activation. `PscApi.AcquireSelection(api,directory)` acquires an explicit resident selection session from the API source revision. `PscRuntimeSelection.Select(session,signatures,sources)` reuses the admitted selector without reading artifacts again; `Close(session)` withdraws it and requests context unloading. Resident structural specialization accepts the same session as `-RuntimeSelection`, and does not close a caller-owned session. CLI Compile with an explicit `-RuntimeDirectory` uses `Invoke-PscCompile` to acquire one session before lowering, supply it to both structural specialization and ordinary managed lowering (including the managed precursor of Native), and close it in a finally boundary before returning the managed result. The session remains inside the authoring operation, not the process dispatcher. Even an exact-only compilation refuses a missing or incompatible receipt when explicitly requested. Without an explicit directory CLI Compile retains interpreted selection. The retained session may also be supplied to `Export-LoweredAssembly -RuntimeSelection`: ordinary source static/instance calls and explicit constructors use session-owned compiled STS exact and numeric binding and retain the original CLR projection witnesses. Method closure, initializer lowering and recursive function-output inference use the same session; by default a selected compilation owns fresh declaration scopes, including their existing inference caches. `Export-LoweredAssembly -SourceAst <original-root> -RuntimeSelection <session> -RetainedScope <scope>` instead borrows a live resident source graph with a temporary CLR compatibility projection. The original AST, ordered class and enum selection, session and dependency scope must match exactly; acquire any rewritten record source before borrowing. The graph remains caller-owned on success or failure; `RealizedScope` ownership transfer is not admitted with `RetainedScope`. Synthetic function scopes acquire temporary graphs by default. For repeated program compilation, acquire the existing program function class with `Get-ScriptFunctionClass -Root <original-root> -Program`, then `Get-DeclarationScope -Root <function-class-parent-root> -Resolving <source-scope> -RuntimeSelection <session>`. Supply that dependent scope as `-RetainedFunctionScope` together with `-RetainedScope` and `-Program`. Both graphs remain caller-owned and acquire no replacement graphs; the dependent CLR projection resolves against the fresh source CLR projection. Explicit reprojection may substitute only a live projection of the identical direct dependency graph. Function provenance is retained with the scope, independent of active synthetic class caches. Ordinary lowering resolves function source, class and program entry from its selected declarations; borrowed compilation uses the retained referents without reading or displacing the acquisition dictionaries. External acquisition and inference retain identity-keyed conditional weak indexes. Live source or synthetic AST referents preserve their relationships, including null cache entries and parameterless program entries, but the indexes do not own abandoned source or synthetic ASTs. Retained scopes continue to own their declaration evidence and graph withdrawal remains explicit. The resolving source may be any live projection of the identical source graph. Function inference remains projection-local; withdraw the dependent graph before its source graph. Ordinary resident lowering tracks every graph it acquires, including incomplete projections; it withdraws temporary scopes in reverse acquisition order and removes their cache entries on success or failure. An explicit successful RealizedScope handoff retains only the selected graph; caller-owned dependency and declaration scopes are not withdrawn. CLR compatibility projections are collectible. `Get-DeclarationScope -Root <original-root> -RuntimeSelection <session> -RealizationOf <scope>` creates a separate compatibility projection from a live retained graph, including the original enum selection and dependencies; it neither replaces the root cache nor acquires another STS graph. Existing callers may retain prior CLR witnesses, which become eligible for reclamation when no longer referenced. Graph withdrawal remains independent of these witnesses. `PscScriptTypeAcquisition` constructs descriptors directly from the original SMA AST declarations in the selected execution domain. A resident scope stores only its owning session, scope and source coordinates, and CLR projection witnesses; it does not construct an interpreted descriptor graph. The compiled graph retains original imported semantic referents, not their AST ownership. CLR signature projection realizes retained source referents and recursive CTS references without AST evidence; unresolved names retain the compatibility name resolution path. Resident acquisition appends selected source enums after class coordinates, retaining enum identity, underlying integral CTS reference and ordered exact constant values. Enum references use the same source owner map, including imported and reprojected enums; CLR compatibility projection and persisted emission consume the same typed enum shape from the acquired definitions, including exact full-width constants. Resident shape retrieval uses graph coordinates without reacquiring AST initializers; the authoring adapter uses the same enum acquisition operation. Source enum literal expressions bind through the acquired enum member names and exact values in the visible declaration scope; the CLR enum value is a typed expression witness, not the source of the constant. Resident literal binding uses the compiled STS member selector and transports only the selected coordinate, integral CTS type and exact constant; full enum shapes are used for construction, not resident expression binding. Source storage expressions select declared members through STS, validate the exact CLR field against the selected result reference, and follow the semantic base on inherited static or instance lookup. Resident storage binding realizes only the selected result or base, independent of transported signature and base projections; authoring retains compatibility name resolution where the class-only inventory requires it. Resident operation binding also realizes the selected name, parameters and result from the retained graph instead of transported signatures, while retaining coordinate-only inspection and the existing script-function switch compatibility path. Authoring operation binding independently validates the selected result projection against its retained semantic reference; unresolved forms use the existing authoring realization adapter. On a static or instance operation binding miss, distinguish a local operation outside the admitted conversion profile from absence, and select inherited source operations through the retained semantic base reference after checking its CLR realization. Constructors remain local; unsupported profiles retain existing compatibility behavior. Mixed fixed-arity CTS method and constructor overloads whose arguments and reachable parameter signatures are all admitted integral or floating types use one shared adapter to the existing ScriptType primitive selector, including its resident compiled realization when requested. Exact constructor acquisition uses ExactBinding, not CLR default-binder widening. The selected CTS operation is lowered with the existing argument conversions. Exact CTS method signatures exposed on both a derived class and its base are selected only when a unique declaring class strictly descends from every competing owner; same-owner or unrelated ties remain refused. Other compatibility profiles are unchanged. An inherited static operation outside the admitted conversion profile uses its traversed semantic owner as the CTS compatibility receiver. A terminal source method miss permits CTS lookup on the verified System.Object base only, not on the source projection. Explicitly imported CTS enums without a source enum definition retain CLR binding. Binding, imports and graph withdrawal remain available without AST evidence. Caller-held declaration scopes retain their original ASTs. The compiled graph supplies typed acquisition, projection and binding results across the delegate boundary, with refusal status and diagnostic text instead of collectible exceptions. The authoring caller checks the selected member against its CLR realization. Graph scopes may be withdrawn individually through `PscRuntimeSelection.ReleaseGraph`; live importing scopes prevent withdrawal, and retired coordinates are never reused. Previously cached scope witnesses refuse subsequent operations rather than silently reacquiring a different semantic graph. A resident scope cannot import an authoring descriptor graph. ScriptType.dll remains independent of SMA; only the compiler-side adapter consumes AST evidence. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
+- **Faculties:** `HandleTable`, `DiscoveryMechanisms`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. `BuildRuntime -CompilerRuntimeDirectory <bootstrap> -RuntimeDirectory <empty-output>` admits the existing no-contract compiler realization, composes the original resident dependency scopes without merging their descriptors, and rebuilds all eight artifacts in a separate directory. It refuses missing or incompatible admission receipts, nonempty output directories and external contract inputs. The coordinator acquires its declaration inventory once, uses retained persisted dependency witnesses, retires completed graph scopes outside the remaining transitive dependency closure in reverse order, and closes the admitted session. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. BuildRuntime without contract inputs also builds the compiler-private `compiler/CompilerDeclarations.dll` and writes a version 2 local selection receipt for it and HandleTable, ScriptType and PrimitiveConversion. The seven public faculty files and their dependency closure are unchanged. The compiled selection path verifies source, CoreLib, SMA, the existing TypeConverter framework dependency and all four admitted assembly digests once, loads the exact bytes in a private collectible context, and invokes typed delegates. Version 1 receipts require rebuilding. Missing or incompatible receipts refuse that path; no implicit interpreted fallback is permitted after selection is requested. Without an explicit directory the authoring selector is unchanged. The receipt identifies a trusted local build; it is not a signature or independent admission proof. This is explicit compiler self-consumption, not full startup activation. `PscApi.AcquireSelection(api,directory)` acquires an explicit resident selection session from the API source revision. `PscRuntimeSelection.Select(session,signatures,sources)` reuses the admitted selector without reading artifacts again; `Close(session)` withdraws it and requests context unloading. Resident structural specialization accepts the same session as `-RuntimeSelection`, and does not close a caller-owned session. CLI Compile with an explicit `-RuntimeDirectory` uses `Invoke-PscCompile` to acquire one session before lowering, supply it to both structural specialization and ordinary managed lowering (including the managed precursor of Native), and close it in a finally boundary before returning the managed result. The session remains inside the authoring operation, not the process dispatcher. Even an exact-only compilation refuses a missing or incompatible receipt when explicitly requested. Without an explicit directory CLI Compile retains interpreted selection. The retained session may also be supplied to `Export-LoweredAssembly -RuntimeSelection`: ordinary source static/instance calls and explicit constructors use session-owned compiled STS exact and numeric binding and retain the original CLR projection witnesses. Method closure, initializer lowering and recursive function-output inference use the same session; by default a selected compilation owns fresh declaration scopes, including their existing inference caches. `Export-LoweredAssembly -SourceAst <original-root> -RuntimeSelection <session> -RetainedScope <scope>` instead borrows a live resident source graph with a temporary CLR compatibility projection. The original AST, ordered class and enum selection, session and dependency scope must match exactly; acquire any rewritten record source before borrowing. The graph remains caller-owned on success or failure; `RealizedScope` ownership transfer is not admitted with `RetainedScope`. Synthetic function scopes acquire temporary graphs by default. For repeated program compilation, acquire the existing program function class with `Get-ScriptFunctionClass -Root <original-root> -Program`, then `Get-DeclarationScope -Root <function-class-parent-root> -Resolving <source-scope> -RuntimeSelection <session>`. Supply that dependent scope as `-RetainedFunctionScope` together with `-RetainedScope` and `-Program`. Both graphs remain caller-owned and acquire no replacement graphs; the dependent CLR projection resolves against the fresh source CLR projection. Explicit reprojection may substitute only a live projection of the identical direct dependency graph. Function provenance is retained with the scope, independent of active synthetic class caches. Ordinary lowering resolves function source, class and program entry from its selected declarations; borrowed compilation uses the retained referents without reading or displacing the acquisition dictionaries. External acquisition and inference retain identity-keyed conditional weak indexes. Live source or synthetic AST referents preserve their relationships, including null cache entries and parameterless program entries, but the indexes do not own abandoned source or synthetic ASTs. Retained scopes continue to own their declaration evidence and graph withdrawal remains explicit. The resolving source may be any live projection of the identical source graph. Function inference remains projection-local; withdraw the dependent graph before its source graph. Ordinary resident lowering tracks every graph it acquires, including incomplete projections; it withdraws temporary scopes in reverse acquisition order and removes their cache entries on success or failure. An explicit successful RealizedScope handoff retains only the selected graph; caller-owned dependency and declaration scopes are not withdrawn. CLR compatibility projections are collectible. `Get-DeclarationScope -Root <original-root> -RuntimeSelection <session> -RealizationOf <scope>` creates a separate compatibility projection from a live retained graph, including the original enum selection and dependencies; it neither replaces the root cache nor acquires another STS graph. Existing callers may retain prior CLR witnesses, which become eligible for reclamation when no longer referenced. Graph withdrawal remains independent of these witnesses. `PscScriptTypeAcquisition` constructs descriptors directly from the original SMA AST declarations in the selected execution domain. A resident scope stores only its owning session, scope and source coordinates, and CLR projection witnesses; it does not construct an interpreted descriptor graph. The compiled graph retains original imported semantic referents, not their AST ownership. CLR signature projection realizes retained source referents and recursive CTS references without AST evidence; unresolved names retain the compatibility name resolution path. Resident acquisition appends selected source enums after class coordinates, retaining enum identity, underlying integral CTS reference and ordered exact constant values. Enum references use the same source owner map, including imported and reprojected enums; CLR compatibility projection and persisted emission consume the same typed enum shape from the acquired definitions, including exact full-width constants. Resident shape retrieval uses graph coordinates without reacquiring AST initializers; the authoring adapter uses the same enum acquisition operation. Source enum literal expressions bind through the acquired enum member names and exact values in the visible declaration scope; the CLR enum value is a typed expression witness, not the source of the constant. Resident literal binding uses the compiled STS member selector and transports only the selected coordinate, integral CTS type and exact constant; full enum shapes are used for construction, not resident expression binding. Source storage expressions select declared members through STS, validate the exact CLR field against the selected result reference, and follow the semantic base on inherited static or instance lookup. Resident storage binding realizes only the selected result or base, independent of transported signature and base projections; authoring retains compatibility name resolution where the class-only inventory requires it. Resident operation binding also realizes the selected name, parameters and result from the retained graph instead of transported signatures, while retaining coordinate-only inspection and the existing script-function switch compatibility path. Authoring operation binding independently validates the selected result projection against its retained semantic reference; unresolved forms use the existing authoring realization adapter. On a static or instance operation binding miss, distinguish a local operation outside the admitted conversion profile from absence, and select inherited source operations through the retained semantic base reference after checking its CLR realization. Constructors remain local; unsupported profiles retain existing compatibility behavior. Mixed fixed-arity CTS method and constructor overloads whose arguments and reachable parameter signatures are all admitted integral or floating types use one shared adapter to the existing ScriptType primitive selector, including its resident compiled realization when requested. Exact constructor acquisition uses ExactBinding, not CLR default-binder widening. The selected CTS operation is lowered with the existing argument conversions. CLR method groups containing ParamArrayAttribute vector parameters acquire ordinary and expanded forms from the declared metadata. The same ScriptType selector ranks effective parameter types, normal-versus-expanded forms and generic declaration specificity in authoring and resident execution. Existing structural generic inference closes eligible forms. The selected call retains its actual CTS member and an expansion coordinate; ordinary argument lowering converts each operand once and constructs the declared trailing vector only when required. Explicit compatible vectors retain identity. The supported conversion profile remains bounded; ref-like parameter collections, constructor parameter arrays and fully dynamic CTS binding are not covered by this increment. The supplementary projected `Tests/Test-ParamArrayBinding.ps1` compares SMA, authoring, resident and borrowed execution, plus ambiguity and conversion refusals. Exact CTS method signatures exposed on both a derived class and its base are selected only when a unique declaring class strictly descends from every competing owner; same-owner or unrelated ties remain refused. Other compatibility profiles are unchanged. An inherited static operation outside the admitted conversion profile uses its traversed semantic owner as the CTS compatibility receiver. A terminal source method miss permits CTS lookup on the verified System.Object base only, not on the source projection. Explicitly imported CTS enums without a source enum definition retain CLR binding. Binding, imports and graph withdrawal remain available without AST evidence. Caller-held declaration scopes retain their original ASTs. The compiled graph supplies typed acquisition, projection and binding results across the delegate boundary, with refusal status and diagnostic text instead of collectible exceptions. The authoring caller checks the selected member against its CLR realization. Graph scopes may be withdrawn individually through `PscRuntimeSelection.ReleaseGraph`; live importing scopes prevent withdrawal, and retired coordinates are never reused. Previously cached scope witnesses refuse subsequent operations rather than silently reacquiring a different semantic graph. A resident scope cannot import an authoring descriptor graph. ScriptType.dll remains independent of SMA; only the compiler-side adapter consumes AST evidence. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
 - **Evidence:** differential tests, structural lint, Guard, non-loading binary queries and coverage. An observed call is not a universal binding proof; an ABI check is not a proof of arithmetic equivalence.
 
 ## Trust and security
