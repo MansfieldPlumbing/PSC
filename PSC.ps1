@@ -2764,6 +2764,102 @@ try{
     [IO.Directory]::Delete($work,$true)
 }
 '@)
+    [PscSourceResource]::new('Tests/MembershipCases.ps1', @'
+class MembershipCases {
+    static [bool] Lexer([string]$text,[int]$i){return $text[$i-1] -cin @('e','E','p','P')}
+    static [bool] Insensitive([char]$value){return $value -in @('e','p')}
+    static [bool] Negative([char]$value){return $value -cnotin @('e','p')}
+    static [bool] NegativeInsensitive([char]$value){return $value -notin @('e','p')}
+    static [bool] Dynamic([char]$value,[string[]]$items){return $value -cin $items}
+    static [bool] DynamicInsensitive([char]$value,[string[]]$items){return $value -in $items}
+    static [bool] CharArray([char]$value,[char[]]$items){return $value -cin $items}
+    static [bool] CharInsensitive([char]$value,[char[]]$items){return $value -in $items}
+    static [bool] CharLiteral([char]$value){return $value -cin @([char]101,[char]112)}
+    static [bool] Empty([char]$value){return $value -cin @()}
+    static [bool] StringControl([string]$value,[string[]]$items){return $value -in $items}
+    static [string] $Trace = ''
+    static [char] Take(){[MembershipCases]::Trace += '1';return [char]101}
+    static [string] Read([string]$label,[string]$value){[MembershipCases]::Trace += $label;return $value}
+    static [string] Order(){[MembershipCases]::Trace = '';[bool]$hit=[MembershipCases]::Take() -cin @([MembershipCases]::Read('2','e'),[MembershipCases]::Read('3','p'));return [MembershipCases]::Trace + ':' + $hit}
+    static [string] StringOrder(){[MembershipCases]::Trace = '';[bool]$hit=[MembershipCases]::Read('1','e') -in @([MembershipCases]::Read('2','e'),[MembershipCases]::Read('3','p'));return [MembershipCases]::Trace + ':' + $hit}
+    static [string] NegativeOrder(){[MembershipCases]::Trace = '';[bool]$hit=[MembershipCases]::Take() -cnotin @([MembershipCases]::Read('2','e'),[MembershipCases]::Read('3','p'));return [MembershipCases]::Trace + ':' + $hit}
+    static [string] ShortCircuit(){[MembershipCases]::Trace = '';[bool]$hit=$false -and ([MembershipCases]::Take() -cin @([MembershipCases]::Read('2','e')));return [MembershipCases]::Trace + ':' + $hit}
+}
+class MembershipMixed {static [bool] Run([char]$value){return $value -cin @('e',[char]101)}}
+class MembershipDynamic {static [bool] Run([char]$value,[object[]]$values){return $value -cin $values}}
+'@)
+    [PscSourceResource]::new('Tests/Test-MembershipBinding.ps1', @'
+#requires -Version 7.7
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$Compiler,[string]$RuntimeDirectory)
+$ErrorActionPreference='Stop'
+$source=Join-Path $PSScriptRoot 'MembershipCases.ps1'
+. $source
+$compilerPath=[IO.Path]::GetFullPath($Compiler)
+$runtimePath=$RuntimeDirectory
+$work=[IO.Directory]::CreateTempSubdirectory('psc-membership-').FullName
+$selection=$null
+try{
+    $api=. $compilerPath -Mode Api
+    if(!$runtimePath){$runtimePath=Join-Path $work 'runtime';& ([Environment]::ProcessPath) -NoProfile -File $compilerPath -Mode BuildRuntime -RuntimeDirectory $runtimePath | Out-Null;if($LASTEXITCODE -ne 0){throw 'Faculty build failed'}}
+    $selection=$api.GetType()::AcquireSelection($api,$runtimePath)
+    $selectionType=$selection.GetType()
+    $tokens=$null;$errors=$null
+    $root=[System.Management.Automation.Language.Parser]::ParseFile($source,[ref]$tokens,[ref]$errors)
+    if($errors.Count){throw $errors[0]}
+    $paths=[string[]]::new(3);$modes=[string[]]@('authoring','resident','borrowed')
+    for([int]$i=0;$i -lt $paths.Length;$i++){$paths[$i]=Join-Path ([IO.Directory]::CreateDirectory((Join-Path $work $modes[$i])).FullName) 'MembershipCases.dll'}
+    $null=Export-LoweredAssembly -SourceAst $root -ClassName MembershipCases -ClassNames @('MembershipCases') -DeclarationsOnly -OutputPath $paths[0] -Deterministic
+    $scope=$null
+    $null=Export-LoweredAssembly -SourceAst $root -ClassName MembershipCases -ClassNames @('MembershipCases') -DeclarationsOnly -OutputPath $paths[1] -RuntimeSelection $selection -RealizedScope ([ref]$scope) -Deterministic
+    $projection=Get-DeclarationScope -Root $root -RuntimeSelection $selection -RealizationOf $scope
+    $null=Export-LoweredAssembly -SourceAst $root -ClassName MembershipCases -ClassNames @('MembershipCases') -DeclarationsOnly -OutputPath $paths[2] -RuntimeSelection $selection -RetainedScope $projection -Deterministic
+    $digest=(Get-FileHash $paths[0]).Hash
+    foreach($path in $paths){if((Get-FileHash $path).Hash -cne $digest){throw 'Deterministic output differs'}}
+    if(!$selectionType::ReleaseGraph($selection,$scope.ResidentSlot)){throw 'Graph withdrawal failed'}
+    $cases=[Collections.Generic.List[Tuple[string,object[]]]]::new()
+    foreach($value in [char[]]@('e','E','p','P','q',0,0xE9,0x017F,0x212A)){
+        $cases.Add([Tuple[string,object[]]]::new('Lexer',[object[]]@(([string]$value+'1'),1)))
+        foreach($name in [string[]]@('Insensitive','Negative','NegativeInsensitive','CharLiteral','Empty')){$cases.Add([Tuple[string,object[]]]::new($name,[object[]]@($value)))}
+        $strings=[string[][]]::new(7)
+        $strings[0]=[string[]]@('e','P');$strings[1]=[string[]]@('E');$strings[2]=[string[]]@('S','K');$strings[3]=[string[]]@('e'+[char]0x301);$strings[4]=[string[]]@('');$strings[5]=[string[]]::new(1);$strings[6]=[string[]]@()
+        foreach($name in [string[]]@('Dynamic','DynamicInsensitive')){
+            foreach($items in $strings){$cases.Add([Tuple[string,object[]]]::new($name,[object[]]@($value,$items)))}
+            $cases.Add([Tuple[string,object[]]]::new($name,[object[]]@($value,$null)))
+        }
+        $chars=[char[][]]::new(4);$chars[0]=[char[]]@('E','P');$chars[1]=[char[]]@('S','K');$chars[2]=[char[]]@(0);$chars[3]=[char[]]@()
+        foreach($name in [string[]]@('CharArray','CharInsensitive')){
+            foreach($items in $chars){$cases.Add([Tuple[string,object[]]]::new($name,[object[]]@($value,$items)))}
+            $cases.Add([Tuple[string,object[]]]::new($name,[object[]]@($value,$null)))
+        }
+    }
+    $cases.Add([Tuple[string,object[]]]::new('StringControl',[object[]]@('E',[string[]]@('e'))))
+    $cases.Add([Tuple[string,object[]]]::new('Order',[object[]]@()))
+    $cases.Add([Tuple[string,object[]]]::new('StringOrder',[object[]]@()))
+    $cases.Add([Tuple[string,object[]]]::new('NegativeOrder',[object[]]@()))
+    $cases.Add([Tuple[string,object[]]]::new('ShortCircuit',[object[]]@()))
+    for([int]$i=0;$i -lt $paths.Length;$i++){
+        $owner=[Reflection.Assembly]::LoadFile($paths[$i]).GetType('MembershipCases',$true)
+        foreach($case in $cases){
+            $expected=[MembershipCases].GetMethod($case.Item1).Invoke($null,$case.Item2)
+            $actual=$owner.GetMethod($case.Item1).Invoke($null,$case.Item2)
+            if(!$actual.Equals($expected)){throw "$($modes[$i]) $($case.Item1) arguments $($case.Item2 -join ','): expected '$expected' actual '$actual'"}
+        }
+        "PASS $($modes[$i]) $($cases.Count) comparisons, Unicode distinctions, null/empty vectors and eager operand evaluation"
+    }
+    foreach($name in [string[]]@('MembershipMixed','MembershipDynamic')){
+        foreach($pathKind in [string[]]@('authoring','resident')){
+            $refused=$false
+            try{
+                if($pathKind -eq 'resident'){$null=Export-LoweredAssembly -SourceAst $root -ClassName $name -ClassNames @($name) -DeclarationsOnly -OutputPath (Join-Path $work "$name.dll") -RuntimeSelection $selection -Deterministic}
+                else{$null=Export-LoweredAssembly -SourceAst $root -ClassName $name -ClassNames @($name) -DeclarationsOnly -OutputPath (Join-Path $work "$name.dll") -Deterministic}
+            }catch{if(!$_.Exception.Message.Contains('Character membership requires')){throw};$refused=$true}
+            if(!$refused){throw "$name unexpectedly admitted"};"PASS $pathKind refused $name"
+        }
+    }
+    "PASS byte-identical emissions and post-withdrawal execution $digest"
+}finally{if($null -ne $selection){$selection.GetType()::Close($selection)};Remove-Item -LiteralPath $work -Recurse -Force}
+'@)
 }
 
 # PSC-owned source faculties. The holder provides real parser-visible declarations, not executable text.
@@ -13394,28 +13490,73 @@ function Convert-AstExpression {
             return $et::Block([bool], [Linq.Expressions.Expression[]]@($et::Assign($value, $left), $result))
         }
         if ($Node.Operator -in [System.Management.Automation.Language.TokenKind]::Iin, [System.Management.Automation.Language.TokenKind]::Inotin, [System.Management.Automation.Language.TokenKind]::Cin, [System.Management.Automation.Language.TokenKind]::Cnotin) {
-            $right = Convert-AstExpressionAs -Node $Node.Right -Type ([string[]]) -Scope $Scope
-            if ($left.Type -ne [string]) {
-                throw "[$($Node.Extent.StartLineNumber):$($Node.Extent.StartColumnNumber)] Membership requires a string value and string[] collection."
-            }
             $et = [Linq.Expressions.Expression]
+            $elementType = [string]
+            $arrayType = [string[]]
+            if ($left.Type -eq [char]) {
+                # Membership compares each collection element to the searched value, not the reverse.
+                # A String element uses invariant linguistic comparison; a Char element uses code-unit
+                # equality (invariant uppercase for insensitive comparison). Retain that distinction.
+                if ($Node.Right -is [System.Management.Automation.Language.ArrayExpressionAst] -and $null -eq $Node.Right.SubExpression.Traps -and $Node.Right.SubExpression.Statements.Count -eq 0) {
+                    $right = $et::NewArrayInit([string], [Linq.Expressions.Expression[]]@())
+                } else {
+                    $right = Convert-AstExpression -Node $Node.Right -Scope $Scope
+                }
+                if ($right.Type -eq [object[]] -and $right -is [Linq.Expressions.NewArrayExpression] -and $right.NodeType -eq [Linq.Expressions.ExpressionType]::NewArrayInit) {
+                    # The ordinary literal lowerer boxes operands into an object vector. A homogeneous
+                    # literal has a closed comparison profile; recover those already-lowered operands.
+                    $items = [Collections.Generic.List[Linq.Expressions.Expression]]::new()
+                    [type] $literalElement = $null
+                    foreach ($item in $right.Expressions) {
+                        if ($item -isnot [Linq.Expressions.UnaryExpression] -or $item.NodeType -ne [Linq.Expressions.ExpressionType]::Convert -or $item.Operand.Type -notin [string], [char]) { throw 'Character membership requires a homogeneous string or character literal, or a typed vector.' }
+                        if ($null -eq $literalElement) { $literalElement = $item.Operand.Type }
+                        elseif ($literalElement -ne $item.Operand.Type) { throw 'Character membership requires a homogeneous string or character literal, or a typed vector.' }
+                        $items.Add($item.Operand)
+                    }
+                    if ($null -eq $literalElement) { $literalElement = [string] }
+                    $right = $et::NewArrayInit($literalElement, $items.ToArray())
+                }
+                if ($right.Type -ne [string[]] -and $right.Type -ne [char[]]) { throw 'Character membership requires a homogeneous string or character literal, or a typed vector.' }
+                $arrayType = $right.Type
+                $elementType = $arrayType.GetElementType()
+                if ($elementType -eq [string]) { $left = ConvertTo-PowerShellType -Expression $left -Type ([string]) }
+            } elseif ($left.Type -eq [string]) {
+                $right = Convert-AstExpressionAs -Node $Node.Right -Type ([string[]]) -Scope $Scope
+            } else {
+                throw "[$($Node.Extent.StartLineNumber):$($Node.Extent.StartColumnNumber)] Membership requires a string or character value with an admitted collection."
+            }
             $id = $Scope.DeclaredLocals.Count
-            $value = $et::Variable([string], "membershipValue$id")
-            $array = $et::Variable([string[]], "membershipArray$id")
+            $value = $et::Variable($elementType, "membershipValue$id")
+            $array = $et::Variable($arrayType, "membershipArray$id")
             $index = $et::Variable([int], "membershipIndex$id")
             $found = $et::Variable([bool], "membershipFound$id")
             foreach ($local in @($value, $array, $index, $found)) { $Scope.DeclaredLocals.Add($local) }
             $done = $et::Label("membershipDone$id")
-            $compare = New-PowerShellStringComparison -Left ($et::ArrayIndex($array, $index)) -Right $value -CaseSensitive ([string]$Node.Operator).StartsWith('C', [StringComparison]::Ordinal)
+            $caseSensitive = $Node.Operator -in [System.Management.Automation.Language.TokenKind]::Cin, [System.Management.Automation.Language.TokenKind]::Cnotin
+            $element = $et::ArrayIndex($array, $index)
+            if ($elementType -eq [char]) {
+                $compared = $value
+                if (!$caseSensitive) {
+                    $upper = [Func[char,char]][char]::ToUpperInvariant
+                    $element = $et::Call($upper.Method, $element)
+                    $compared = $et::Call($upper.Method, $value)
+                }
+                $equal = $et::Equal($element, $compared)
+            } else {
+                $compare = New-PowerShellStringComparison -Left $element -Right $value -CaseSensitive $caseSensitive
+                $equal = $et::Equal($compare, $et::Constant(0))
+            }
             $loop = $et::Loop($et::IfThenElse($et::LessThan($index, $et::ArrayLength($array)),
-                $et::Block($et::IfThen($et::Equal($compare, $et::Constant(0)),
+                $et::Block($et::IfThen($equal,
                     $et::Block($et::Assign($found, $et::Constant($true)), $et::Break($done))),
                     $et::Assign($index, $et::Add($index, $et::Constant(1))), $et::Empty()),
                 $et::Break($done)), $done)
             $result = if ($Node.Operator -in [System.Management.Automation.Language.TokenKind]::Inotin, [System.Management.Automation.Language.TokenKind]::Cnotin) { $et::Not($found) } else { $found }
-            return $et::Block($et::Assign($value, $left), $et::Assign($array, $right),
+            # SMA implements -in by exchanging the comparison operands: the collection is
+            # evaluated first, then the searched value, before testing any element.
+            return $et::Block($et::Assign($array, $right), $et::Assign($value, $left),
                 $et::Assign($index, $et::Constant(0)), $et::Assign($found, $et::Constant($false)),
-                $et::IfThen($et::NotEqual($array, $et::Constant($null, [string[]])), $loop), $result)
+                $et::IfThen($et::NotEqual($array, $et::Constant($null, $arrayType)), $loop), $result)
         }
         $right = Convert-AstExpression -Node $Node.Right -Scope $Scope
 
@@ -17893,7 +18034,7 @@ Conform streams child stdout and stderr to the invoking host as they become avai
 
 ## Compiler and runtime
 
-- **Managed:** SMA AST and typed expression lowering, deterministic IL emission, static graph/data realization, reachability and fixed-parameter specialization. Untyped method and function locals may infer independent typed storage in disjoint statement blocks only when each region unconditionally overwrites the local before any reference and every reference belongs to such a region. The analysis retains original AST referents; explicit casts or constraints, qualified or captured references, parameters, foreach binders and cross-region live values retain the existing lowering behavior. This is bounded storage inference, not general flow-join, sequential reassignment or dynamic local support.
+- **Managed:** SMA AST and typed expression lowering, deterministic IL emission, static graph/data realization, reachability and fixed-parameter specialization. Untyped method and function locals may infer independent typed storage in disjoint statement blocks only when each region unconditionally overwrites the local before any reference and every reference belongs to such a region. The analysis retains original AST referents; explicit casts or constraints, qualified or captured references, parameters, foreach binders and cross-region live values retain the existing lowering behavior. This is bounded storage inference, not general flow-join, sequential reassignment or dynamic local support. Character membership (`-in`, `-cin` and negated forms) admits typed character and string vectors and homogeneous literal vectors. It preserves the collection element comparison domain: invariant linguistic string comparison or UTF-16 character equality with invariant uppercase for insensitive comparison. The collection is evaluated first, then the searched operand, each once before the search, matching SMA membership evaluation. Heterogeneous and dynamically typed collections remain outside this character membership profile. The supplementary projected `Tests/Test-MembershipBinding.ps1` compares interpreted and three managed compilation paths.
 - **Native:** pinned Windows NativeAOT compiler plus PSC COFF linker; direct CIL-to-IR-to-x64 ELF leaf emission and decoded-byte ABI checks. The direct backend does not yet replace ILC for general programs.
 - **Faculties:** `HandleTable`, `DiscoveryMechanisms`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. `BuildRuntime -CompilerRuntimeDirectory <bootstrap> -RuntimeDirectory <empty-output>` admits the existing no-contract compiler realization, composes the original resident dependency scopes without merging their descriptors, and rebuilds all eight artifacts in a separate directory. It refuses missing or incompatible admission receipts, nonempty output directories and external contract inputs. The coordinator acquires its declaration inventory once, uses retained persisted dependency witnesses, retires completed graph scopes outside the remaining transitive dependency closure in reverse order, and closes the admitted session. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. BuildRuntime without contract inputs also builds the compiler-private `compiler/CompilerDeclarations.dll` and writes a version 2 local selection receipt for it and HandleTable, ScriptType and PrimitiveConversion. The seven public faculty files and their dependency closure are unchanged. The compiled selection path verifies source, CoreLib, SMA, the existing TypeConverter framework dependency and all four admitted assembly digests once, loads the exact bytes in a private collectible context, and invokes typed delegates. Version 1 receipts require rebuilding. Missing or incompatible receipts refuse that path; no implicit interpreted fallback is permitted after selection is requested. Without an explicit directory the authoring selector is unchanged. The receipt identifies a trusted local build; it is not a signature or independent admission proof. This is explicit compiler self-consumption, not full startup activation. `PscApi.AcquireSelection(api,directory)` acquires an explicit resident selection session from the API source revision. `PscRuntimeSelection.Select(session,signatures,sources)` reuses the admitted selector without reading artifacts again; `Close(session)` withdraws it and requests context unloading. Resident structural specialization accepts the same session as `-RuntimeSelection`, and does not close a caller-owned session. CLI Compile with an explicit `-RuntimeDirectory` uses `Invoke-PscCompile` to acquire one session before lowering, supply it to both structural specialization and ordinary managed lowering (including the managed precursor of Native), and close it in a finally boundary before returning the managed result. The session remains inside the authoring operation, not the process dispatcher. Even an exact-only compilation refuses a missing or incompatible receipt when explicitly requested. Without an explicit directory CLI Compile retains interpreted selection. The retained session may also be supplied to `Export-LoweredAssembly -RuntimeSelection`: ordinary source static/instance calls and explicit constructors use session-owned compiled STS exact and numeric binding and retain the original CLR projection witnesses. Method closure, initializer lowering and recursive function-output inference use the same session; by default a selected compilation owns fresh declaration scopes, including their existing inference caches. `Export-LoweredAssembly -SourceAst <original-root> -RuntimeSelection <session> -RetainedScope <scope>` instead borrows a live resident source graph with a temporary CLR compatibility projection. The original AST, ordered class and enum selection, session and dependency scope must match exactly; acquire any rewritten record source before borrowing. The graph remains caller-owned on success or failure; `RealizedScope` ownership transfer is not admitted with `RetainedScope`. Synthetic function scopes acquire temporary graphs by default. For repeated program compilation, acquire the existing program function class with `Get-ScriptFunctionClass -Root <original-root> -Program`, then `Get-DeclarationScope -Root <function-class-parent-root> -Resolving <source-scope> -RuntimeSelection <session>`. Supply that dependent scope as `-RetainedFunctionScope` together with `-RetainedScope` and `-Program`. Both graphs remain caller-owned and acquire no replacement graphs; the dependent CLR projection resolves against the fresh source CLR projection. Explicit reprojection may substitute only a live projection of the identical direct dependency graph. Function provenance is retained with the scope, independent of active synthetic class caches. Ordinary lowering resolves function source, class and program entry from its selected declarations; borrowed compilation uses the retained referents without reading or displacing the acquisition dictionaries. External acquisition and inference retain identity-keyed conditional weak indexes. Live source or synthetic AST referents preserve their relationships, including null cache entries and parameterless program entries, but the indexes do not own abandoned source or synthetic ASTs. Retained scopes continue to own their declaration evidence and graph withdrawal remains explicit. The resolving source may be any live projection of the identical source graph. Function inference remains projection-local; withdraw the dependent graph before its source graph. Ordinary resident lowering tracks every graph it acquires, including incomplete projections; it withdraws temporary scopes in reverse acquisition order and removes their cache entries on success or failure. An explicit successful RealizedScope handoff retains only the selected graph; caller-owned dependency and declaration scopes are not withdrawn. CLR compatibility projections are collectible. `Get-DeclarationScope -Root <original-root> -RuntimeSelection <session> -RealizationOf <scope>` creates a separate compatibility projection from a live retained graph, including the original enum selection and dependencies; it neither replaces the root cache nor acquires another STS graph. Existing callers may retain prior CLR witnesses, which become eligible for reclamation when no longer referenced. Graph withdrawal remains independent of these witnesses. `PscScriptTypeAcquisition` constructs descriptors directly from the original SMA AST declarations in the selected execution domain. A resident scope stores only its owning session, scope and source coordinates, and CLR projection witnesses; it does not construct an interpreted descriptor graph. The compiled graph retains original imported semantic referents, not their AST ownership. CLR signature projection realizes retained source referents and recursive CTS references without AST evidence; unresolved names retain the compatibility name resolution path. Resident acquisition appends selected source enums after class coordinates, retaining enum identity, underlying integral CTS reference and ordered exact constant values. Enum references use the same source owner map, including imported and reprojected enums; CLR compatibility projection and persisted emission consume the same typed enum shape from the acquired definitions, including exact full-width constants. Resident shape retrieval uses graph coordinates without reacquiring AST initializers; the authoring adapter uses the same enum acquisition operation. Source enum literal expressions bind through the acquired enum member names and exact values in the visible declaration scope; the CLR enum value is a typed expression witness, not the source of the constant. Resident literal binding uses the compiled STS member selector and transports only the selected coordinate, integral CTS type and exact constant; full enum shapes are used for construction, not resident expression binding. Source storage expressions select declared members through STS, validate the exact CLR field against the selected result reference, and follow the semantic base on inherited static or instance lookup. Resident storage binding realizes only the selected result or base, independent of transported signature and base projections; authoring retains compatibility name resolution where the class-only inventory requires it. Resident operation binding also realizes the selected name, parameters and result from the retained graph instead of transported signatures, while retaining coordinate-only inspection and the existing script-function switch compatibility path. Authoring operation binding independently validates the selected result projection against its retained semantic reference; unresolved forms use the existing authoring realization adapter. On a static or instance operation binding miss, distinguish a local operation outside the admitted conversion profile from absence, and select inherited source operations through the retained semantic base reference after checking its CLR realization. Constructors remain local; unsupported profiles retain existing compatibility behavior. Mixed fixed-arity CTS method and constructor overloads whose arguments and reachable parameter signatures are all admitted integral or floating types use one shared adapter to the existing ScriptType primitive selector, including its resident compiled realization when requested. Exact constructor acquisition uses ExactBinding, not CLR default-binder widening. The selected CTS operation is lowered with the existing argument conversions. CLR method groups containing ParamArrayAttribute vector parameters acquire ordinary and expanded forms from the declared metadata. The same ScriptType selector ranks effective parameter types, normal-versus-expanded forms and generic declaration specificity in authoring and resident execution. Existing structural generic inference closes eligible forms. The selected call retains its actual CTS member and an expansion coordinate; ordinary argument lowering converts each operand once and constructs the declared trailing vector only when required. Explicit compatible vectors retain identity. The supported conversion profile remains bounded; ref-like parameter collections, constructor parameter arrays and fully dynamic CTS binding are not covered by this increment. The supplementary projected `Tests/Test-ParamArrayBinding.ps1` compares SMA, authoring, resident and borrowed execution, plus ambiguity and conversion refusals. Exact CTS method signatures exposed on both a derived class and its base are selected only when a unique declaring class strictly descends from every competing owner; same-owner or unrelated ties remain refused. Other compatibility profiles are unchanged. An inherited static operation outside the admitted conversion profile uses its traversed semantic owner as the CTS compatibility receiver. A terminal source method miss permits CTS lookup on the verified System.Object base only, not on the source projection. Explicitly imported CTS enums without a source enum definition retain CLR binding. Binding, imports and graph withdrawal remain available without AST evidence. Caller-held declaration scopes retain their original ASTs. The compiled graph supplies typed acquisition, projection and binding results across the delegate boundary, with refusal status and diagnostic text instead of collectible exceptions. The authoring caller checks the selected member against its CLR realization. Graph scopes may be withdrawn individually through `PscRuntimeSelection.ReleaseGraph`; live importing scopes prevent withdrawal, and retired coordinates are never reused. Previously cached scope witnesses refuse subsequent operations rather than silently reacquiring a different semantic graph. A resident scope cannot import an authoring descriptor graph. ScriptType.dll remains independent of SMA; only the compiler-side adapter consumes AST evidence. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
 - **Evidence:** differential tests, structural lint, Guard, non-loading binary queries and coverage. An observed call is not a universal binding proof; an ABI check is not a proof of arithmetic equivalence.
