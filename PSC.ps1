@@ -8322,8 +8322,8 @@ function Get-ProgramIcon {
 
 function Set-ProgramEntryAttributes {
     param([System.Management.Automation.Language.FunctionMemberAst] $Method, [Reflection.Emit.MethodBuilder] $Builder)
-    if (-not $script:PscProgramEntries.ContainsKey($Method)) { return }
-    $parameters = $script:PscProgramEntries[$Method]
+    if (-not (Test-PscProgramEntry -Member $Method)) { return }
+    $parameters = if($PscFunctionSelectionActive){$PscSelectedRoot.ParamBlock}else{$script:PscProgramEntries[$Method]}
     if ($null -eq $parameters) { return }
     $marked = $false
     foreach ($attribute in $parameters.Attributes) {
@@ -9412,6 +9412,8 @@ $script:PscSelectedScope=$null
 $script:PscSemanticsRoot=$null
 $script:PscSemanticsScope=$null
 
+$script:PscFunctionSelectionActive=$false
+
 function Resolve-PscDeclarationRoot {
     [OutputType([System.Management.Automation.Language.Ast])]
     param([Parameter(Mandatory)][System.Management.Automation.Language.Ast]$Ast)
@@ -9453,8 +9455,8 @@ function Use-DeclarationScope {
     param([Parameter(Mandatory)][System.Management.Automation.Language.Ast] $Ast,[PscRuntimeSelection]$RuntimeSelection)
     $root = Resolve-PscDeclarationRoot $Ast
     # A source's function class resolves the source's own types; the source resolves its function class.
-    $source = $null
-    if ($script:ScriptFunctionSources.TryGetValue($root, [ref]$source)) {
+    $source = Get-PscFunctionSource -Root $root
+    if ($null -ne $source) {
         $sourceScope = Get-PscOperationalScope -Root $source -RuntimeSelection $RuntimeSelection
         $functionScope = Get-DeclarationScope -Root $root -Resolving $sourceScope -RuntimeSelection $RuntimeSelection
         $script:LoweringClassTypes = @{} + $sourceScope.Types + $functionScope.Types
@@ -9463,8 +9465,8 @@ function Use-DeclarationScope {
     $sourceScope = Get-PscOperationalScope -Root $root -RuntimeSelection $RuntimeSelection
     $types = $sourceScope.Types
     if($null -ne $sourceScope.Resolving){$types=$sourceScope.Resolving.Types+$types}
-    $functionClass = $null
-    if ($script:ScriptFunctionClasses.TryGetValue($root, [ref]$functionClass) -and $null -ne $functionClass) {
+    $functionClass = Get-PscFunctionDeclaration -Root $root
+    if ($null -ne $functionClass) {
         $functionRoot = $functionClass; while ($functionRoot.Parent) { $functionRoot = $functionRoot.Parent }
         $functionScope=Get-DeclarationScope -Root $functionRoot -Resolving $sourceScope -RuntimeSelection $RuntimeSelection
         $types = $types + $functionScope.Types
@@ -9510,10 +9512,10 @@ function Get-DeclarationScope {
             $next.ResidentRoot=$Root
             if($null -ne $RealizationOf){$next.FunctionSource=$RealizationOf.FunctionSource;$next.ProgramEntry=$RealizationOf.ProgramEntry}
             elseif($null -ne $Resolving -and $classes.Count -eq 1 -and !$enums.Count){
-                $source=$null
-                if($script:ScriptFunctionSources.TryGetValue($Root,[ref]$source) -and [object]::ReferenceEquals($source,$Resolving.ResidentRoot)){
+                $source=Get-PscFunctionSource -Root $Root
+                if($null -ne $source -and [object]::ReferenceEquals($source,$Resolving.ResidentRoot)){
                     $next.FunctionSource=$source
-                    foreach($member in $classes[0].Members){if($member -is [System.Management.Automation.Language.FunctionMemberAst] -and $script:PscProgramEntries.ContainsKey($member)){$next.ProgramEntry=$member;break}}
+                    foreach($member in $classes[0].Members){if($member -is [System.Management.Automation.Language.FunctionMemberAst] -and (Test-PscProgramEntry -Member $member)){$next.ProgramEntry=$member;break}}
                 }
             }
         }
@@ -9834,8 +9836,8 @@ function Get-PscFunctionOutputType {
     param([Parameter(Mandatory)][System.Management.Automation.Language.FunctionMemberAst] $Member,[PscRuntimeSelection]$RuntimeSelection)
     if($null -ne $RuntimeSelection){[PscRuntimeSelection]::AssertOpen($RuntimeSelection)}
     $root = Resolve-PscDeclarationRoot $Member
-    $source = $null
-    if (!$script:ScriptFunctionSources.TryGetValue($root, [ref]$source)) { return $null }
+    $source = Get-PscFunctionSource -Root $root
+    if ($null -eq $source) { return $null }
     $sourceScope = Get-PscOperationalScope -Root $source -RuntimeSelection $RuntimeSelection
     $functionScope = Get-DeclarationScope -Root $root -Resolving $sourceScope -RuntimeSelection $RuntimeSelection
     $outputs = $functionScope.FunctionOutputTypes
@@ -10210,9 +10212,40 @@ function Get-ScriptField {
 }
 
 # Whether a member is one of a source's functions, lowered with pipeline output.
+function Get-PscFunctionSource {
+    [OutputType([System.Management.Automation.Language.Ast])]
+    param([System.Management.Automation.Language.Ast]$Root)
+    if($PscFunctionSelectionActive){
+        if($null -ne $PscSelectedFunctionRoot -and [object]::ReferenceEquals($Root,$PscSelectedFunctionRoot)){return $PscSelectedRoot}
+        return $null
+    }
+    $source=$null
+    if($script:ScriptFunctionSources.TryGetValue($Root,[ref]$source)){return $source}
+    return $null
+}
+
+function Get-PscFunctionDeclaration {
+    [OutputType([System.Management.Automation.Language.TypeDefinitionAst])]
+    param([System.Management.Automation.Language.Ast]$Root)
+    if($PscFunctionSelectionActive){
+        if([object]::ReferenceEquals($Root,$PscSelectedRoot)){return $PscSelectedFunctionClass}
+        return $null
+    }
+    $class=$null
+    if($script:ScriptFunctionClasses.TryGetValue($Root,[ref]$class)){return $class}
+    return $null
+}
+
+function Test-PscProgramEntry {
+    [OutputType([bool])]
+    param([System.Management.Automation.Language.FunctionMemberAst]$Member)
+    if($PscFunctionSelectionActive){return [object]::ReferenceEquals($Member,$PscSelectedProgramEntry)}
+    return $script:PscProgramEntries.ContainsKey($Member)
+}
+
 function Test-ScriptFunctionMember([System.Management.Automation.Language.Ast] $Member) {
     $root = Resolve-PscDeclarationRoot $Member
-    $script:ScriptFunctionSources.ContainsKey($root)
+    $null -ne (Get-PscFunctionSource -Root $root)
 }
 
 # Resolve a command to the function declaration in its own source, including
@@ -10224,10 +10257,10 @@ function Find-ScriptFunction {
     $name = $Command.GetCommandName()
     if ([string]::IsNullOrEmpty($name)) { return $null }
     $root = Resolve-PscDeclarationRoot $Command
-    $source = $null
-    if ($script:ScriptFunctionSources.TryGetValue($root, [ref]$source)) { $root = $source }
-    $class = $null
-    if (!$script:ScriptFunctionClasses.TryGetValue($root, [ref]$class) -or $null -eq $class -or !$script:LoweringClassTypes.ContainsKey($class.Name)) { return $null }
+    $source = Get-PscFunctionSource -Root $root
+    if ($null -ne $source) { $root = $source }
+    $class = Get-PscFunctionDeclaration -Root $root
+    if ($null -eq $class -or !$script:LoweringClassTypes.ContainsKey($class.Name)) { return $null }
     foreach ($member in $class.Members) {
         if ($member -is [System.Management.Automation.Language.FunctionMemberAst] -and $member.Name -eq $name) { return $member }
     }
@@ -11251,8 +11284,8 @@ function Resolve-PscSourceOperation {
     param([System.Management.Automation.Language.Ast]$SourceAst,[type]$TargetType,[string]$Name,[type[]]$ArgumentTypes,[bool]$Static,[bool]$Constructor,[PscRuntimeSelection]$RuntimeSelection)
     if($null -eq $SourceAst){return $null}
     $root=Resolve-PscDeclarationRoot $SourceAst
-    $source=$null
-    if(!$script:ScriptFunctionSources.TryGetValue($root,[ref]$source)){$source=$root}
+    $source=Get-PscFunctionSource -Root $root
+    if($null -eq $source){$source=$root}
     $scope=Get-PscOperationalScope -Root $source -ExistingOnly -RuntimeSelection $RuntimeSelection
     if($null -eq $scope){return $null}
     $ownerScope=$scope
@@ -11269,8 +11302,8 @@ function Resolve-PscSourceOperation {
             return $null
         }
     }elseif($scope.Types[$TargetType.Name] -ne $TargetType){
-        $functionClass=$null
-        if(!$script:ScriptFunctionClasses.TryGetValue($source,[ref]$functionClass) -or $null -eq $functionClass){return $null}
+        $functionClass=Get-PscFunctionDeclaration -Root $source
+        if($null -eq $functionClass){return $null}
         $functionRoot=$functionClass;while($functionRoot.Parent){$functionRoot=$functionRoot.Parent}
         if(!$scope.DependentScopes.TryGetValue($functionRoot,[ref]$ownerScope) -or ![object]::ReferenceEquals($ownerScope.Resolving,$scope) -or $ownerScope.Types[$TargetType.Name] -ne $TargetType){return $null}
     }
@@ -11281,8 +11314,8 @@ function Resolve-PscSourceOperation {
     $bindingScopes=[Collections.Generic.List[PscDeclarationScope]]::new();$bindingScopes.Add($scope)
     if(![object]::ReferenceEquals($ownerScope,$scope)){$bindingScopes.Add($ownerScope)}
     else{
-        $functionClass=$null
-        if($script:ScriptFunctionClasses.TryGetValue($source,[ref]$functionClass) -and $null -ne $functionClass){
+        $functionClass=Get-PscFunctionDeclaration -Root $source
+        if($null -ne $functionClass){
             $functionRoot=$functionClass;while($functionRoot.Parent){$functionRoot=$functionRoot.Parent}
             $functionScope=$null
             if($scope.DependentScopes.TryGetValue($functionRoot,[ref]$functionScope) -and [object]::ReferenceEquals($functionScope.Resolving,$scope)){$bindingScopes.Add($functionScope)}
@@ -13747,12 +13780,12 @@ function Convert-MethodAstToLambda {
 
     $thisParam = if ($MethodAst.IsStatic) { $null } else { [Linq.Expressions.Expression]::Parameter($classType, 'this') }
     # A program's Main is the script's top level: it writes no output and binds the script's parameters first.
-    $isProgram = $script:PscProgramEntries.ContainsKey($MethodAst)
+    $isProgram = Test-PscProgramEntry -Member $MethodAst
     New-LoweredBody -Name $MethodAst.Name -ReturnType $retType -This $thisParam -Parameters $paramExprList -ParameterMap $paramMap `
         -Initializers $Initializers -Statements @($(if ($MethodAst.Body -and $MethodAst.Body.EndBlock) { $MethodAst.Body.EndBlock.Statements })) `
         -IsStatic ([bool]$MethodAst.IsStatic) -IsConstructor ([bool]$MethodAst.IsConstructor) -Output:($isFunction -and -not $isProgram) `
         -ScriptClass $(if ($isFunction) { $classType } else { $null }) -Program:$isProgram `
-        -ProgramParameters $(if ($isProgram) { $script:PscProgramEntries[$MethodAst] } else { $null }) -RuntimeSelection $RuntimeSelection
+        -ProgramParameters $(if ($isProgram) { if($PscFunctionSelectionActive){$PscSelectedRoot.ParamBlock}else{$script:PscProgramEntries[$MethodAst]} } else { $null }) -RuntimeSelection $RuntimeSelection
 }
 
 function Convert-InitializersToLambda {
@@ -16701,7 +16734,7 @@ Conform streams child stdout and stderr to the invoking host as they become avai
 
 - **Managed:** SMA AST and typed expression lowering, deterministic IL emission, static graph/data realization, reachability and fixed-parameter specialization.
 - **Native:** pinned Windows NativeAOT compiler plus PSC COFF linker; direct CIL-to-IR-to-x64 ELF leaf emission and decoded-byte ABI checks. The direct backend does not yet replace ILC for general programs.
-- **Faculties:** `HandleTable`, `DiscoveryMechanisms`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. `BuildRuntime -CompilerRuntimeDirectory <bootstrap> -RuntimeDirectory <empty-output>` admits the existing no-contract compiler realization, composes the original resident dependency scopes without merging their descriptors, and rebuilds all eight artifacts in a separate directory. It refuses missing or incompatible admission receipts, nonempty output directories and external contract inputs. The coordinator acquires its declaration inventory once, uses retained persisted dependency witnesses, retires completed graph scopes outside the remaining transitive dependency closure in reverse order, and closes the admitted session. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. BuildRuntime without contract inputs also builds the compiler-private `compiler/CompilerDeclarations.dll` and writes a version 2 local selection receipt for it and HandleTable, ScriptType and PrimitiveConversion. The seven public faculty files and their dependency closure are unchanged. The compiled selection path verifies source, CoreLib, SMA, the existing TypeConverter framework dependency and all four admitted assembly digests once, loads the exact bytes in a private collectible context, and invokes typed delegates. Version 1 receipts require rebuilding. Missing or incompatible receipts refuse that path; no implicit interpreted fallback is permitted after selection is requested. Without an explicit directory the authoring selector is unchanged. The receipt identifies a trusted local build; it is not a signature or independent admission proof. This is explicit compiler self-consumption, not full startup activation. `PscApi.AcquireSelection(api,directory)` acquires an explicit resident selection session from the API source revision. `PscRuntimeSelection.Select(session,signatures,sources)` reuses the admitted selector without reading artifacts again; `Close(session)` withdraws it and requests context unloading. Resident structural specialization accepts the same session as `-RuntimeSelection`, and does not close a caller-owned session. CLI Compile with an explicit `-RuntimeDirectory` uses `Invoke-PscCompile` to acquire one session before lowering, supply it to both structural specialization and ordinary managed lowering (including the managed precursor of Native), and close it in a finally boundary before returning the managed result. The session remains inside the authoring operation, not the process dispatcher. Even an exact-only compilation refuses a missing or incompatible receipt when explicitly requested. Without an explicit directory CLI Compile retains interpreted selection. The retained session may also be supplied to `Export-LoweredAssembly -RuntimeSelection`: ordinary source static/instance calls and explicit constructors use session-owned compiled STS exact and numeric binding and retain the original CLR projection witnesses. Method closure, initializer lowering and recursive function-output inference use the same session; by default a selected compilation owns fresh declaration scopes, including their existing inference caches. `Export-LoweredAssembly -SourceAst <original-root> -RuntimeSelection <session> -RetainedScope <scope>` instead borrows a live resident source graph with a temporary CLR compatibility projection. The original AST, ordered class and enum selection, session and dependency scope must match exactly; acquire any rewritten record source before borrowing. The graph remains caller-owned on success or failure; `RealizedScope` ownership transfer is not admitted with `RetainedScope`. Synthetic function scopes acquire temporary graphs by default. For repeated program compilation, acquire the existing program function class with `Get-ScriptFunctionClass -Root <original-root> -Program`, then `Get-DeclarationScope -Root <function-class-parent-root> -Resolving <source-scope> -RuntimeSelection <session>`. Supply that dependent scope as `-RetainedFunctionScope` together with `-RetainedScope` and `-Program`. Both graphs remain caller-owned and acquire no replacement graphs; the dependent CLR projection resolves against the fresh source CLR projection. Explicit reprojection may substitute only a live projection of the identical direct dependency graph. Function provenance is retained with the scope, independent of active synthetic class caches; borrowed lowering temporarily binds the retained declarations and restores previous bindings on exit. The resolving source may be any live projection of the identical source graph. Function inference remains projection-local; withdraw the dependent graph before its source graph. Ordinary resident lowering tracks every graph it acquires, including incomplete projections; it withdraws temporary scopes in reverse acquisition order and removes their cache entries on success or failure. An explicit successful RealizedScope handoff retains only the selected graph; caller-owned dependency and declaration scopes are not withdrawn. CLR compatibility projections are collectible. `Get-DeclarationScope -Root <original-root> -RuntimeSelection <session> -RealizationOf <scope>` creates a separate compatibility projection from a live retained graph, including the original enum selection and dependencies; it neither replaces the root cache nor acquires another STS graph. Existing callers may retain prior CLR witnesses, which become eligible for reclamation when no longer referenced. Graph withdrawal remains independent of these witnesses. `PscScriptTypeAcquisition` constructs descriptors directly from the original SMA AST declarations in the selected execution domain. A resident scope stores only its owning session, scope and source coordinates, and CLR projection witnesses; it does not construct an interpreted descriptor graph. The compiled graph retains original imported referents and supplies typed acquisition, projection and binding results across the delegate boundary, with refusal status and diagnostic text instead of collectible exceptions. The authoring caller checks the selected member against its CLR realization. Graph scopes may be withdrawn individually through `PscRuntimeSelection.ReleaseGraph`; live importing scopes prevent withdrawal, and retired coordinates are never reused. Previously cached scope witnesses refuse subsequent operations rather than silently reacquiring a different semantic graph. A resident scope cannot import an authoring descriptor graph. ScriptType.dll remains independent of SMA; only the compiler-side adapter consumes AST evidence. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
+- **Faculties:** `HandleTable`, `DiscoveryMechanisms`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. `BuildRuntime -CompilerRuntimeDirectory <bootstrap> -RuntimeDirectory <empty-output>` admits the existing no-contract compiler realization, composes the original resident dependency scopes without merging their descriptors, and rebuilds all eight artifacts in a separate directory. It refuses missing or incompatible admission receipts, nonempty output directories and external contract inputs. The coordinator acquires its declaration inventory once, uses retained persisted dependency witnesses, retires completed graph scopes outside the remaining transitive dependency closure in reverse order, and closes the admitted session. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. BuildRuntime without contract inputs also builds the compiler-private `compiler/CompilerDeclarations.dll` and writes a version 2 local selection receipt for it and HandleTable, ScriptType and PrimitiveConversion. The seven public faculty files and their dependency closure are unchanged. The compiled selection path verifies source, CoreLib, SMA, the existing TypeConverter framework dependency and all four admitted assembly digests once, loads the exact bytes in a private collectible context, and invokes typed delegates. Version 1 receipts require rebuilding. Missing or incompatible receipts refuse that path; no implicit interpreted fallback is permitted after selection is requested. Without an explicit directory the authoring selector is unchanged. The receipt identifies a trusted local build; it is not a signature or independent admission proof. This is explicit compiler self-consumption, not full startup activation. `PscApi.AcquireSelection(api,directory)` acquires an explicit resident selection session from the API source revision. `PscRuntimeSelection.Select(session,signatures,sources)` reuses the admitted selector without reading artifacts again; `Close(session)` withdraws it and requests context unloading. Resident structural specialization accepts the same session as `-RuntimeSelection`, and does not close a caller-owned session. CLI Compile with an explicit `-RuntimeDirectory` uses `Invoke-PscCompile` to acquire one session before lowering, supply it to both structural specialization and ordinary managed lowering (including the managed precursor of Native), and close it in a finally boundary before returning the managed result. The session remains inside the authoring operation, not the process dispatcher. Even an exact-only compilation refuses a missing or incompatible receipt when explicitly requested. Without an explicit directory CLI Compile retains interpreted selection. The retained session may also be supplied to `Export-LoweredAssembly -RuntimeSelection`: ordinary source static/instance calls and explicit constructors use session-owned compiled STS exact and numeric binding and retain the original CLR projection witnesses. Method closure, initializer lowering and recursive function-output inference use the same session; by default a selected compilation owns fresh declaration scopes, including their existing inference caches. `Export-LoweredAssembly -SourceAst <original-root> -RuntimeSelection <session> -RetainedScope <scope>` instead borrows a live resident source graph with a temporary CLR compatibility projection. The original AST, ordered class and enum selection, session and dependency scope must match exactly; acquire any rewritten record source before borrowing. The graph remains caller-owned on success or failure; `RealizedScope` ownership transfer is not admitted with `RetainedScope`. Synthetic function scopes acquire temporary graphs by default. For repeated program compilation, acquire the existing program function class with `Get-ScriptFunctionClass -Root <original-root> -Program`, then `Get-DeclarationScope -Root <function-class-parent-root> -Resolving <source-scope> -RuntimeSelection <session>`. Supply that dependent scope as `-RetainedFunctionScope` together with `-RetainedScope` and `-Program`. Both graphs remain caller-owned and acquire no replacement graphs; the dependent CLR projection resolves against the fresh source CLR projection. Explicit reprojection may substitute only a live projection of the identical direct dependency graph. Function provenance is retained with the scope, independent of active synthetic class caches. Ordinary lowering resolves function source, class and program entry from its selected declarations; borrowed compilation uses the retained referents without reading or displacing the acquisition dictionaries. External acquisition and inference retain their existing cache behavior. The resolving source may be any live projection of the identical source graph. Function inference remains projection-local; withdraw the dependent graph before its source graph. Ordinary resident lowering tracks every graph it acquires, including incomplete projections; it withdraws temporary scopes in reverse acquisition order and removes their cache entries on success or failure. An explicit successful RealizedScope handoff retains only the selected graph; caller-owned dependency and declaration scopes are not withdrawn. CLR compatibility projections are collectible. `Get-DeclarationScope -Root <original-root> -RuntimeSelection <session> -RealizationOf <scope>` creates a separate compatibility projection from a live retained graph, including the original enum selection and dependencies; it neither replaces the root cache nor acquires another STS graph. Existing callers may retain prior CLR witnesses, which become eligible for reclamation when no longer referenced. Graph withdrawal remains independent of these witnesses. `PscScriptTypeAcquisition` constructs descriptors directly from the original SMA AST declarations in the selected execution domain. A resident scope stores only its owning session, scope and source coordinates, and CLR projection witnesses; it does not construct an interpreted descriptor graph. The compiled graph retains original imported referents and supplies typed acquisition, projection and binding results across the delegate boundary, with refusal status and diagnostic text instead of collectible exceptions. The authoring caller checks the selected member against its CLR realization. Graph scopes may be withdrawn individually through `PscRuntimeSelection.ReleaseGraph`; live importing scopes prevent withdrawal, and retired coordinates are never reused. Previously cached scope witnesses refuse subsequent operations rather than silently reacquiring a different semantic graph. A resident scope cannot import an authoring descriptor graph. ScriptType.dll remains independent of SMA; only the compiler-side adapter consumes AST evidence. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
 - **Evidence:** differential tests, structural lint, Guard, non-loading binary queries and coverage. An observed call is not a universal binding proof; an ABI check is not a proof of arithmetic equivalence.
 
 ## Trust and security
@@ -17434,8 +17467,8 @@ function Export-LoweredAssembly {
     )
 
     $retainedSlot=-1
-    $functionBinding=$false
-    $priorClass=$null;$priorSource=$null;$priorEntry=$null
+    $PscSelectedRoot=$null;$PscSelectedScope=$null;$PscFunctionSelectionActive=$false
+    $PscSelectedFunctionClass=$null;$PscSelectedFunctionRoot=$null;$PscSelectedProgramEntry=$null
     $outerTypes=$script:LoweringClassTypes
     $outerProgram=$script:PscCompilingProgram
     $outerKeywords=$script:LoweringKeywords
@@ -17458,14 +17491,6 @@ function Export-LoweredAssembly {
         $retainedClass=$RetainedFunctionScope.ResidentDefinitions[0]
         $retainedEntry=$RetainedFunctionScope.ProgramEntry
         if($null -eq $retainedEntry -or ![object]::ReferenceEquals($retainedEntry.Parent,$retainedClass)){throw 'Retained function scope is not a program realization'}
-        $retainedRoot=$RetainedFunctionScope.ResidentRoot
-        $hadClass=$script:ScriptFunctionClasses.TryGetValue($SourceAst,[ref]$priorClass)
-        $hadSource=$script:ScriptFunctionSources.TryGetValue($retainedRoot,[ref]$priorSource)
-        $hadEntry=$script:PscProgramEntries.TryGetValue($retainedEntry,[ref]$priorEntry)
-        $functionBinding=$true
-        $script:ScriptFunctionClasses[$SourceAst]=$retainedClass
-        $script:ScriptFunctionSources[$retainedRoot]=$SourceAst
-        $script:PscProgramEntries[$retainedEntry]=$SourceAst.ParamBlock
     }
     $script:PscCompilingProgram = [bool]$Program
     if (($ScopeDeclarations -or $DependencyScope) -and !$DeclarationsOnly){throw 'Explicit scope is available only for declaration realization.'}
@@ -17528,7 +17553,6 @@ function Export-LoweredAssembly {
     elseif ($Program) {
         # The script as a program: its function class, with Main, is the target (Get-ScriptFunctionClass -Program).
         if ($null -eq $SourceAst) { throw '-Program compiles -SourceAst.' }
-        $null = Get-ScriptFunctionClass -Root $SourceAst -Program
         $parsed = [PscLoweringSource]@{ Ast = $SourceAst; ClassAst = $null }
     }
     elseif ($null -ne $SourceAst) {
@@ -17574,7 +17598,7 @@ function Export-LoweredAssembly {
     if ($DeclarationsOnly) {
         if ($targetClass -notin $classAsts) { throw 'DeclarationsOnly requires a top-level target class.' }
         $script:ScriptFunctionClasses[$parsed.Ast] = $null
-    } else { $functionClass = Get-ScriptFunctionClass -Root $parsed.Ast -Program:$Program }
+    } elseif($null -ne $RetainedFunctionScope){$functionClass=$retainedClass} else { $functionClass = Get-ScriptFunctionClass -Root $parsed.Ast -Program:$Program }
     if ($Program) { $targetClass = $functionClass }
     if ($null -ne $functionClass) {
         if (-not $ClassNames -or $functionClass.Name -in $ClassNames) { $classAsts += $functionClass }
@@ -17590,10 +17614,17 @@ function Export-LoweredAssembly {
         $classAsts = @($classAsts | Where-Object Name -in $ClassNames)
         if ($classAsts.Count -ne @($ClassNames | Sort-Object -Unique).Count -or $targetClass.Name -notin $ClassNames) { throw 'ClassNames must identify existing classes and include ClassName.' }
     }
+    $PscSelectedRoot=$parsed.Ast
+    if($null -ne $functionClass -and $functionClass -in $classAsts){
+        $PscSelectedFunctionClass=$functionClass
+        $PscSelectedFunctionRoot=Resolve-PscDeclarationRoot $functionClass
+        if($null -ne $RetainedFunctionScope){$PscSelectedProgramEntry=$retainedEntry}
+        else{foreach($member in $functionClass.Members){if($script:PscProgramEntries.ContainsKey($member)){$PscSelectedProgramEntry=$member;break}}}
+    }
+    $PscFunctionSelectionActive=$true
     Assert-PscInlineOverrides -Classes $classAsts
     $model = @(Get-ClassModel -ClassAsts $classAsts)
     $sourceClasses = [System.Management.Automation.Language.TypeDefinitionAst[]]@($classAsts | Where-Object { -not [object]::ReferenceEquals($_, $functionClass) })
-    $PscSelectedRoot=$parsed.Ast
     $PscSelectedScope=if($null -ne $RetainedScope){
         if($sourceClasses.Length -ne $RetainedScope.ResidentDefinitions.Length -or $enumAsts.Length -ne $RetainedScope.ResidentEnums.Length){throw 'Retained compilation declaration selection differs'}
         for($index=0;$index -lt $sourceClasses.Length;$index++){if(![object]::ReferenceEquals($sourceClasses[$index],$RetainedScope.ResidentDefinitions[$index])){throw 'Retained compilation class selection differs'}}
@@ -17810,11 +17841,7 @@ function Export-LoweredAssembly {
         }
     }
     }finally{
-        if($functionBinding){
-            if($hadClass){$script:ScriptFunctionClasses[$SourceAst]=$priorClass}else{$null=$script:ScriptFunctionClasses.Remove($SourceAst)}
-            if($hadSource){$script:ScriptFunctionSources[$retainedRoot]=$priorSource}else{$null=$script:ScriptFunctionSources.Remove($retainedRoot)}
-            if($hadEntry){$script:PscProgramEntries[$retainedEntry]=$priorEntry}else{$null=$script:PscProgramEntries.Remove($retainedEntry)}
-        }
+
         if($null -ne $RuntimeSelection){
             try{[PscRuntimeSelection]::EndCompilation($RuntimeSelection,$retainedSlot)}
             finally{$script:LoweringClassTypes=$outerTypes;$script:PscCompilingProgram=$outerProgram;$script:LoweringKeywords=$outerKeywords}
