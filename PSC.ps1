@@ -3119,6 +3119,179 @@ try {
     if($runtimePath){"PASS deterministic emission and graph withdrawal $digest"}
 }finally{if($null -ne $selection){$selection.GetType()::Close($selection)};Remove-Item -LiteralPath $work -Recurse -Force}
 '@)
+    [PscSourceResource]::new('Tests/OutputCases.ps1', @'
+class OutputCaseMarker { [int] $Value }
+
+function Get-Pair([bool]$Flag) {
+    if ($Flag) { return [int[]]@(2,3) }
+    return [int[]]@(0,1)
+}
+function Get-LoopPair([int]$Count) {
+    for ($i=0; $i -lt $Count; $i++) {
+        if ($i -eq 0) { continue }
+        if ($i -eq 2) { return [int[]]@($i,9) }
+        if ($i -eq 3) { break }
+    }
+    return [int[]]@(0,1)
+}
+function Get-BreakPair([int]$Count) {
+    for ($i=0; $i -lt $Count; $i++) {
+        if ($i -eq 1) { break }
+        if ($i -eq 2) { return [int[]]@(5,6) }
+    }
+    return [int[]]@(8,9)
+}
+function Get-NestedPair([int]$Count) {
+    for ($i=0; $i -lt $Count; $i++) {
+        for ($j=0; $j -lt 3; $j++) {
+            if ($j -eq 0) { continue }
+            if ($i -eq 1) { return [int[]]@($i,$j) }
+            if ($j -eq 2) { break }
+        }
+    }
+    return [int[]]@(-1,-2)
+}
+function Get-DoPair([int]$Count) {
+    $i=0
+    do {
+        $i++
+        if ($i -eq 2) { return [int[]]@(7,8) }
+        if ($i -eq 1) { continue }
+    } while ($i -lt $Count)
+    return [int[]]@(9,10)
+}
+function Get-WhilePair([int]$Count) {
+    $i=0
+    while($i -lt $Count) {
+        $i++
+        if($i -eq 2){return [int[]]@(6,7)}
+    }
+    return [int[]]@(4,5)
+}
+function Get-SwitchPair([int]$Kind) {
+    switch($Kind) {
+        1 { [int[]]@(10,11); break }
+        2 { [int[]]@(12,13); continue }
+        default { [int[]]@(20,21) }
+    }
+}
+function Get-VariableWidth([bool]$Flag) {
+    if($Flag){ return 2,3,4 }
+    return 0,1
+}
+function Get-ForwardPair([bool]$Flag) { Get-Pair $Flag }
+function Get-ForwardReturn([bool]$Flag) { return Get-Pair $Flag }
+function Get-First([bool]$Flag) { $range=Get-Pair $Flag; return [int]$range[0] }
+function Get-CaptureType([bool]$Flag) { $range=Get-Pair $Flag; return $range.GetType().FullName }
+function Get-LoopFirst([int]$Count) { $range=Get-LoopPair $Count; return [int]$range[0] }
+function Get-BreakFirst([int]$Count) { $range=Get-BreakPair $Count; return [int]$range[0] }
+function Get-NestedFirst([int]$Count) { $range=Get-NestedPair $Count; return [int]$range[0] }
+function Get-DoFirst([int]$Count) { $range=Get-DoPair $Count; return [int]$range[0] }
+function Get-WhileFirst([int]$Count) { $range=Get-WhilePair $Count; return [int]$range[0] }
+function Get-SwitchFirst([int]$Kind) { $range=Get-SwitchPair $Kind; return [int]$range[0] }
+function Get-WidthLast([bool]$Flag) { $range=Get-VariableWidth $Flag; return [int]$range[-1] }
+function Get-ForwardFirst([bool]$Flag) { $range=Get-ForwardPair $Flag; return [int]$range[0] }
+function Get-ForwardReturnFirst([bool]$Flag) { $range=Get-ForwardReturn $Flag; return [int]$range[0] }
+function Get-Scalar([int]$Count) {
+    for($i=0;$i -lt $Count;$i++){ if($i -eq 2){return 7} }
+    return 3
+}
+function Get-ScalarSum([int]$Count) { $value=Get-Scalar $Count; return $value+1 }
+'@)
+    [PscSourceResource]::new('Tests/Test-OutputCapture.ps1', @'
+#requires -Version 7.7
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$Compiler,[string]$RuntimeDirectory)
+$ErrorActionPreference='Stop'
+$source=Join-Path $PSScriptRoot 'OutputCases.ps1'
+. $source
+$work=[IO.Directory]::CreateTempSubdirectory('psc-output-').FullName
+$selection=$null
+$runtimePath=$RuntimeDirectory
+try {
+    $api=. ([IO.Path]::GetFullPath($Compiler)) -Mode Api
+    if($runtimePath){$selection=$api.GetType()::AcquireSelection($api,$runtimePath)}
+    $tokens=$null;$errors=$null
+    $root=[System.Management.Automation.Language.Parser]::ParseFile($source,[ref]$tokens,[ref]$errors)
+    if($errors.Count){throw $errors[0]}
+    [string[]]$kinds=@('authoring');if($runtimePath){$kinds=@('authoring','resident','borrowed')}
+    [string[]]$paths=[string[]]::new($kinds.Length)
+    for([int]$i=0;$i -lt $paths.Length;$i++){$paths[$i]=Join-Path ([IO.Directory]::CreateDirectory((Join-Path $work $kinds[$i])).FullName) 'OutputCases.dll'}
+    $null=Export-LoweredAssembly -SourceAst $root -Program -OutputPath $paths[0] -Deterministic
+    if($runtimePath){
+        $scope=$null
+        $null=Export-LoweredAssembly -SourceAst $root -Program -OutputPath $paths[1] -RuntimeSelection $selection -RealizedScope ([ref]$scope) -Deterministic
+        $functionClass=Get-ScriptFunctionClass -Root $root -Program
+        $functionRoot=$functionClass;while($functionRoot.Parent){$functionRoot=$functionRoot.Parent}
+        $functionScope=Get-DeclarationScope -Root $functionRoot -Resolving $scope -RuntimeSelection $selection
+        $null=Export-LoweredAssembly -SourceAst $root -Program -OutputPath $paths[2] -RuntimeSelection $selection -RetainedScope $scope -RetainedFunctionScope $functionScope -Deterministic
+        if(!$selection.GetType()::ReleaseGraph($selection,$functionScope.ResidentSlot)){throw 'Function graph withdrawal failed'}
+        if(!$selection.GetType()::ReleaseGraph($selection,$scope.ResidentSlot)){throw 'Source graph withdrawal failed'}
+    }
+    $digest=(Get-FileHash $paths[0]).Hash
+    foreach($path in $paths){if((Get-FileHash $path).Hash -cne $digest){throw 'Deterministic output differs'}}
+    foreach($path in $paths){
+        $type=[Reflection.Assembly]::LoadFile($path).GetType('OutputCases',$true)
+        [int]$count=0
+        foreach($name in [string[]]@('Get-Pair','Get-VariableWidth','Get-ForwardPair','Get-ForwardReturn','Get-First','Get-CaptureType','Get-WidthLast','Get-ForwardFirst','Get-ForwardReturnFirst')){
+            foreach($arg in [bool[]]@($false,$true)){
+                [object[]]$expected=@(& $name $arg)
+                [object[]]$actual=$type.GetMethod($name).Invoke($null,[object[]]@($arg))
+                if($expected.Length -ne $actual.Length){throw "$name output count differs"}
+                for([int]$i=0;$i -lt $expected.Length;$i++){
+                    if($expected[$i].GetType() -ne $actual[$i].GetType() -or $expected[$i] -cne $actual[$i]){throw "$name output $i differs"}
+                }
+                $count++
+            }
+        }
+        foreach($name in [string[]]@('Get-LoopPair','Get-BreakPair','Get-NestedPair','Get-DoPair','Get-WhilePair','Get-SwitchPair','Get-LoopFirst','Get-BreakFirst','Get-NestedFirst','Get-DoFirst','Get-WhileFirst','Get-SwitchFirst','Get-Scalar','Get-ScalarSum')){
+            foreach($arg in [int[]]@(-1,0,1,2,3,4,5)){
+                [object[]]$expected=@(& $name $arg)
+                [object[]]$actual=$type.GetMethod($name).Invoke($null,[object[]]@($arg))
+                if($expected.Length -ne $actual.Length){throw "$name output count differs"}
+                for([int]$i=0;$i -lt $expected.Length;$i++){
+                    if($expected[$i].GetType() -ne $actual[$i].GetType() -or $expected[$i] -cne $actual[$i]){throw "$name output $i differs"}
+                }
+                $count++
+            }
+        }
+        if($type.GetMethod('Get-First').Invoke($null,[object[]]@($true))[0] -eq 3){throw 'Deliberate perturbation was accepted'}
+        "PASS $path $count SMA comparisons; exact element types and values; SHA256 $digest"
+    }
+    # Each source contains an actual caller requiring indexed storage; no arbitrary
+    # array, zero-output, mixed scalar/vector or repeated terminal path is proven.
+    [string[]]$negative=@(
+        'function Get-Range([int]$n){ if($n -eq 1){return [int[]]@(1)};return [int[]]@(2,3) }',
+        'function Get-Range([int]$n){ if($n -eq 1){return [int[]]@()};return [int[]]@(2,3) }',
+        'function Get-Range([int]$n){ if($n -eq 1){return};return [int[]]@(2,3) }',
+        'function Get-Range([int]$n){ $range=[int[]]::new($n);return $range }',
+        'function Get-Range([int]$n){ if($n -eq 1){return 1};return [int[]]@(2,3) }',
+        'function Get-Range([int]$n){ for($i=0;$i -lt $n;$i++){ [int[]]@(1,2);continue;return [int[]]@(3,4) };return [int[]]@(5,6) }',
+        'function Get-Range([int]$n){ for($i=0;$i -lt $n;$i++){ [int[]]@(1,2);break;return [int[]]@(3,4) };return [int[]]@(5,6) }',
+        'function Get-Range([int]$n){ for($i=0;$i -lt $n;$i++){ if($i -eq 1){return} };return [int[]]@(5,6) }'
+    )
+    for([int]$i=0;$i -lt $negative.Length;$i++){
+        $case=$negative[$i]+"`n"+'function Read-Range([int]$n){$range=Get-Range $n;return [int]$range[0]}'
+        $negativePath=Join-Path $work ('Negative'+$i+'.ps1')
+        [IO.File]::WriteAllText($negativePath,$case)
+        $negativeRoot=[System.Management.Automation.Language.Parser]::ParseFile($negativePath,[ref]$tokens,[ref]$errors)
+        if($errors.Count){throw $errors[0]}
+        foreach($kind in $kinds){
+            if($kind -eq 'borrowed'){continue}
+            [bool]$refused=$false
+            try{
+                if($kind -eq 'resident'){$null=Export-LoweredAssembly -SourceAst $negativeRoot -Program -OutputPath (Join-Path $work ('Negative'+$i+'.dll')) -RuntimeSelection $selection -Deterministic}
+                else{$null=Export-LoweredAssembly -SourceAst $negativeRoot -Program -OutputPath (Join-Path $work ('Negative'+$i+'.dll')) -Deterministic}
+            }catch{$refused=$_.Exception.Message.Contains("Indexing into non-array type 'System.Object'");if(!$refused){throw}}
+            if(!$refused){throw "Unproven capture $i admitted ($kind)"}
+            "PASS $kind negative capture $i refused"
+        }
+    }
+} finally {
+    if($null -ne $selection){$selection.GetType()::Close($selection)}
+    [IO.Directory]::Delete($work,$true)
+}
+'@)
 }
 
 # PSC-owned source faculties. The holder provides real parser-visible declarations, not executable text.
@@ -10723,29 +10896,42 @@ function New-OutputWrite {
 # the name), -Switch or -Switch:value, then the remaining arguments in parameter order, switches excepted. A parameter
 # left unbound takes its default, written in the callee as a constant, or its type's default. Returns the call, which
 # yields the function's [object[]] output; $null when the command is not one of the source's functions.
+# Count terminal writes (zero or one), not the elements of an enumerable write.
+# Each transfer has distinct control-flow meaning; a loop consumes only its own transfers.
+enum PscOutputPath {
+    FallthroughEmpty; FallthroughValue; ReturnEmpty; ReturnValue
+    BreakEmpty; BreakValue; ContinueEmpty; ContinueValue; Throw
+}
+
 function Measure-PscOutputStatement {
     <#
     .SYNOPSIS
-        The outcomes of one statement for the count of values a script function
-        has written: 'F<n>' falls through having written n, 'T<n>' returns having
-        written n, 'X' throws. $null when the statement's writes are not counted
-        here. -Terminals collects each statement or return value that writes one
-        value.
+        The possible transfers of one statement and whether a terminal write
+        has occurred. $null means the proof cannot count the writes. Terminals
+        retains the original AST witness of each admitted write.
     #>
+    [OutputType([PscOutputPath[]])]
     param(
         [Parameter(Mandatory)][System.Management.Automation.Language.StatementAst] $Statement,
-        [Parameter(Mandatory)][int] $Written,
+        [Parameter(Mandatory)][bool] $Written,
         [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[System.Management.Automation.Language.Ast]] $Terminals
     )
+    [PscOutputPath]$fallthrough = if ($Written) { [PscOutputPath]::FallthroughValue } else { [PscOutputPath]::FallthroughEmpty }
+    [PscOutputPath]$returned = if ($Written) { [PscOutputPath]::ReturnValue } else { [PscOutputPath]::ReturnEmpty }
     # An assignment writes nothing; it captures what its right side writes.
-    if ($Statement -is [System.Management.Automation.Language.AssignmentStatementAst]) { return @("F$Written") }
-    if ($Statement -is [System.Management.Automation.Language.BreakStatementAst] -or $Statement -is [System.Management.Automation.Language.ContinueStatementAst]) { return @("F$Written") }
-    if ($Statement -is [System.Management.Automation.Language.ThrowStatementAst]) { return @('X') }
+    if ($Statement -is [System.Management.Automation.Language.AssignmentStatementAst]) { return $fallthrough }
+    if ($Statement -is [System.Management.Automation.Language.BreakStatementAst] -or $Statement -is [System.Management.Automation.Language.ContinueStatementAst]) {
+        if ($Statement.Label) { return $null }
+        if ($Statement -is [System.Management.Automation.Language.BreakStatementAst]) { if ($Written) { return [PscOutputPath]::BreakValue }; return [PscOutputPath]::BreakEmpty }
+        if ($Written) { return [PscOutputPath]::ContinueValue }; return [PscOutputPath]::ContinueEmpty
+    }
+    if ($Statement -is [System.Management.Automation.Language.ThrowStatementAst]) { return [PscOutputPath]::Throw }
     if ($Statement -is [System.Management.Automation.Language.ReturnStatementAst]) {
-        if ($null -eq $Statement.Pipeline) { return @("T$Written") }
-        if ($Written -ge 1) { return $null }
+        if ($null -eq $Statement.Pipeline) { return $returned }
+        if ($Written) { return $null }
+        if ($Statement.Pipeline -isnot [System.Management.Automation.Language.PipelineAst] -or $Statement.Pipeline.PipelineElements.Count -ne 1 -or $Statement.Pipeline.PipelineElements[0].Redirections.Count -ne 0) { return $null }
         $Terminals.Add($Statement.Pipeline)
-        return @('T1')
+        return [PscOutputPath]::ReturnValue
     }
     if ($Statement -is [System.Management.Automation.Language.PipelineAst]) {
         if ($Statement.PipelineElements.Count -ne 1) { return $null }
@@ -10753,16 +10939,16 @@ function Measure-PscOutputStatement {
         # $i++ and $i-- as statements write nothing.
         if ($element -is [System.Management.Automation.Language.CommandExpressionAst] -and $element.Redirections.Count -eq 0 -and
             $element.Expression -is [System.Management.Automation.Language.UnaryExpressionAst] -and
-            $element.Expression.TokenKind -in [System.Management.Automation.Language.TokenKind]::PostfixPlusPlus, [System.Management.Automation.Language.TokenKind]::PlusPlus, [System.Management.Automation.Language.TokenKind]::PostfixMinusMinus, [System.Management.Automation.Language.TokenKind]::MinusMinus) { return @("F$Written") }
+            $element.Expression.TokenKind -in [System.Management.Automation.Language.TokenKind]::PostfixPlusPlus, [System.Management.Automation.Language.TokenKind]::PlusPlus, [System.Management.Automation.Language.TokenKind]::PostfixMinusMinus, [System.Management.Automation.Language.TokenKind]::MinusMinus) { return $fallthrough }
         $counted = ($element -is [System.Management.Automation.Language.CommandExpressionAst] -and $element.Redirections.Count -eq 0) -or
             ($element -is [System.Management.Automation.Language.CommandAst] -and $element.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Unknown -and
              $element.Redirections.Count -eq 0 -and $null -ne $element.GetCommandName() -and $null -ne (Find-ScriptFunction $element))
-        if (-not $counted -or $Written -ge 1) { return $null }
+        if (-not $counted -or $Written) { return $null }
         $Terminals.Add($Statement)
-        return @('F1')
+        return [PscOutputPath]::FallthroughValue
     }
     if ($Statement -is [System.Management.Automation.Language.IfStatementAst]) {
-        $outcomes = [System.Collections.Generic.HashSet[string]]::new()
+        $outcomes = [System.Collections.Generic.HashSet[PscOutputPath]]::new()
         foreach ($clause in $Statement.Clauses) {
             $branch = Measure-PscOutputPaths -Statements @($clause.Item2.Statements) -Written $Written -Terminals $Terminals
             if ($null -eq $branch) { return $null }
@@ -10773,8 +10959,8 @@ function Measure-PscOutputStatement {
             if ($null -eq $branch) { return $null }
             foreach ($outcome in $branch) { $null = $outcomes.Add($outcome) }
         }
-        else { $null = $outcomes.Add("F$Written") }
-        return [string[]]@($outcomes)
+        else { $null = $outcomes.Add($fallthrough) }
+        return [PscOutputPath[]]@($outcomes)
     }
     # A switch over one scalar value with distinct constant labels runs at most one clause, or its default when none
     # matches: its outcomes are those of its clauses (and of falling through when it has no default). Counted only
@@ -10803,27 +10989,45 @@ function Measure-PscOutputStatement {
         if (-not (Test-PscWrittenWhole $subjectType)) { return $null }
         $comparer = if ($Statement.Flags -band $flags::CaseSensitive) { [StringComparer]::Ordinal } else { [StringComparer]::OrdinalIgnoreCase }
         $labels = [System.Collections.Generic.HashSet[string]]::new($comparer)
-        $outcomes = [System.Collections.Generic.HashSet[string]]::new()
+        $outcomes = [System.Collections.Generic.HashSet[PscOutputPath]]::new()
         foreach ($clause in $Statement.Clauses) {
             if ($clause.Item1 -isnot [System.Management.Automation.Language.ConstantExpressionAst] -or -not $labels.Add([string]$clause.Item1.Value)) { return $null }
             $branch = Measure-PscOutputPaths -Statements @($clause.Item2.Statements) -Written $Written -Terminals $Terminals
             if ($null -eq $branch) { return $null }
-            foreach ($outcome in $branch) { $null = $outcomes.Add($outcome) }
+            foreach ($outcome in $branch) { if ($outcome -in [PscOutputPath]::BreakEmpty,[PscOutputPath]::ContinueEmpty) { [void]$outcomes.Add([PscOutputPath]::FallthroughEmpty) } elseif ($outcome -in [PscOutputPath]::BreakValue,[PscOutputPath]::ContinueValue) { [void]$outcomes.Add([PscOutputPath]::FallthroughValue) } else { [void]$outcomes.Add($outcome) } }
         }
         if ($null -ne $Statement.Default) {
             $branch = Measure-PscOutputPaths -Statements @($Statement.Default.Statements) -Written $Written -Terminals $Terminals
             if ($null -eq $branch) { return $null }
-            foreach ($outcome in $branch) { $null = $outcomes.Add($outcome) }
+            foreach ($outcome in $branch) { if ($outcome -in [PscOutputPath]::BreakEmpty,[PscOutputPath]::ContinueEmpty) { [void]$outcomes.Add([PscOutputPath]::FallthroughEmpty) } elseif ($outcome -in [PscOutputPath]::BreakValue,[PscOutputPath]::ContinueValue) { [void]$outcomes.Add([PscOutputPath]::FallthroughValue) } else { [void]$outcomes.Add($outcome) } }
         }
-        else { $null = $outcomes.Add("F$Written") }
-        return [string[]]@($outcomes)
+        else { $null = $outcomes.Add($fallthrough) }
+        return [PscOutputPath[]]@($outcomes)
     }
-    # A loop counts only when its body writes nothing on every pass.
+    # A repeatable path must write nothing. A terminating return may write once:
+    # it cannot be repeated. Conservatively include loop exit even for post-test loops.
     if ($Statement -is [System.Management.Automation.Language.LoopStatementAst]) {
+        if ($Statement -is [System.Management.Automation.Language.ForStatementAst]) {
+            foreach ($part in $Statement.Initializer,$Statement.Iterator) {
+                if ($null -eq $part) { continue }
+                [PscOutputPath[]]$side = Measure-PscOutputStatement -Statement $part -Written $false -Terminals $Terminals
+                if ($null -eq $side -or $side.Count -ne 1 -or $side[0] -ne [PscOutputPath]::FallthroughEmpty) { return $null }
+            }
+        }
         $inner = [System.Collections.Generic.List[System.Management.Automation.Language.Ast]]::new()
-        $body = Measure-PscOutputPaths -Statements @($Statement.Body.Statements) -Written 0 -Terminals $inner
-        if ($null -eq $body -or @($body | Where-Object { $_ -notin 'F0', 'X' }).Count) { return $null }
-        return @("F$Written")
+        $body = Measure-PscOutputPaths -Statements @($Statement.Body.Statements) -Written $false -Terminals $inner
+        if ($null -eq $body) { return $null }
+        $outcomes = [System.Collections.Generic.HashSet[PscOutputPath]]::new()
+        [void]$outcomes.Add($fallthrough)
+        foreach ($path in $body) {
+            if ($path -in [PscOutputPath]::FallthroughEmpty,[PscOutputPath]::BreakEmpty,[PscOutputPath]::ContinueEmpty) { continue }
+            if ($path -eq [PscOutputPath]::Throw) { [void]$outcomes.Add([PscOutputPath]::Throw); continue }
+            if ($path -eq [PscOutputPath]::ReturnEmpty) { [void]$outcomes.Add($returned); continue }
+            if ($path -ne [PscOutputPath]::ReturnValue -or $Written) { return $null }
+            [void]$outcomes.Add([PscOutputPath]::ReturnValue)
+        }
+        foreach ($terminal in $inner) { $Terminals.Add($terminal) }
+        return [PscOutputPath[]]@($outcomes)
     }
     $null
 }
@@ -10831,29 +11035,32 @@ function Measure-PscOutputStatement {
 function Measure-PscOutputPaths {
     <#
     .SYNOPSIS
-        The outcomes of a statement sequence for the count of values written
+        The outcomes of a statement sequence for the count of terminal writes
         (see Measure-PscOutputStatement); $null when any statement is not counted
-        or a path would write more than one value.
+        or a path would perform more than one terminal write.
     #>
+    [OutputType([PscOutputPath[]])]
     param(
-        [Parameter(Mandatory)][AllowEmptyCollection()][object[]] $Statements,
-        [Parameter(Mandatory)][int] $Written,
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Management.Automation.Language.StatementAst[]] $Statements,
+        [Parameter(Mandatory)][bool] $Written,
         [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[System.Management.Automation.Language.Ast]] $Terminals
     )
-    $open = [System.Collections.Generic.HashSet[string]]::new([string[]]@("F$Written"))
-    $ended = [System.Collections.Generic.HashSet[string]]::new()
+    $open = [System.Collections.Generic.HashSet[PscOutputPath]]::new()
+    [PscOutputPath]$initial = if ($Written) { [PscOutputPath]::FallthroughValue } else { [PscOutputPath]::FallthroughEmpty }
+    [void]$open.Add($initial)
+    $ended = [System.Collections.Generic.HashSet[PscOutputPath]]::new()
     foreach ($statement in $Statements) {
         if ($open.Count -eq 0) { break }
-        $next = [System.Collections.Generic.HashSet[string]]::new()
+        $next = [System.Collections.Generic.HashSet[PscOutputPath]]::new()
         foreach ($outcome in $open) {
-            $result = Measure-PscOutputStatement -Statement $statement -Written ([int]$outcome.Substring(1)) -Terminals $Terminals
+            $result = Measure-PscOutputStatement -Statement $statement -Written ($outcome -eq [PscOutputPath]::FallthroughValue) -Terminals $Terminals
             if ($null -eq $result) { return $null }
-            foreach ($r in $result) { if ($r.StartsWith('F')) { $null = $next.Add($r) } else { $null = $ended.Add($r) } }
+            foreach ($r in $result) { if ($r -in [PscOutputPath]::FallthroughEmpty,[PscOutputPath]::FallthroughValue) { $null = $next.Add($r) } else { $null = $ended.Add($r) } }
         }
         $open = $next
     }
     foreach ($outcome in $open) { $null = $ended.Add($outcome) }
-    [string[]]@($ended)
+    [PscOutputPath[]]@($ended)
 }
 
 $script:PscOutputWatch = $null
@@ -10861,18 +11068,20 @@ $script:PscOutputWatch = $null
 function Get-PscFunctionOutputType {
     <#
     .SYNOPSIS
-        The type of the one value a script function writes, when it provably
-        writes exactly one on every path that returns; otherwise $null.
+        The type of a script function capture, when every successful path provably
+        writes one terminal expression with the same capture type; otherwise $null.
     .DESCRIPTION
-        PowerShell collapses one written value to that value, so a call to such a
-        function, used as a value, is its output cast to this type. The paths are
-        counted on the AST (Measure-PscOutputPaths): assignments, loops that write
-        nothing and ++/-- write nothing; each return value, expression statement or
-        call to a counted script function writes one. The type is read by lowering
-        the function once and recording each terminal's static type; all must be
-        one type that is written whole, and not void. Retained by the declaration
-        scope of the function's execution unit, not by AST identity alone.
+        PowerShell captures zero outputs as null, one as itself, and multiple
+        as object[]. The AST proof (Measure-PscOutputPaths) admits one terminal
+        write per successful path, including early returns from loops whose
+        continuing paths do not write. Lower once and inspect each terminal
+        expression; all must prove the same captured type, either a whole scalar
+        or multiple elements of a freshly initialized vector. A direct function
+        call uses its independently proven capture. No array element conversion
+        or signature change is introduced. The inference is retained by the
+        declaration scope of the execution unit, not by AST identity alone.
     #>
+    [OutputType([type])]
     param([Parameter(Mandatory)][System.Management.Automation.Language.FunctionMemberAst] $Member,[PscRuntimeSelection]$RuntimeSelection)
     if($null -ne $RuntimeSelection){[PscRuntimeSelection]::AssertOpen($RuntimeSelection)}
     $root = Resolve-PscDeclarationRoot $Member
@@ -10890,14 +11099,23 @@ function Get-PscFunctionOutputType {
         Use-DeclarationScope -Ast $Member -RuntimeSelection $RuntimeSelection
         if ($null -eq $Member.Body -or $null -eq $Member.Body.EndBlock -or $Member.Body.BeginBlock -or $Member.Body.ProcessBlock) { return $null }
         $terminals = [System.Collections.Generic.List[System.Management.Automation.Language.Ast]]::new()
-        $outcomes = Measure-PscOutputPaths -Statements @($Member.Body.EndBlock.Statements) -Written 0 -Terminals $terminals
-        if ($null -eq $outcomes -or @($outcomes | Where-Object { $_ -in 'F0', 'T0' }).Count -or -not @($outcomes | Where-Object { $_ -in 'F1', 'T1' }).Count) { return $null }
+        $outcomes = Measure-PscOutputPaths -Statements @($Member.Body.EndBlock.Statements) -Written $false -Terminals $terminals
+        if ($null -eq $outcomes) { return $null }
+        [bool]$hasValue = $false
+        foreach ($outcome in $outcomes) {
+            if ($outcome -eq [PscOutputPath]::Throw) { continue }
+            if ($outcome -notin [PscOutputPath]::FallthroughValue,[PscOutputPath]::ReturnValue) { return $null }
+            $hasValue = $true
+        }
+        if (!$hasValue) { return $null }
         $types = [System.Collections.Generic.List[Type]]::new()
         $watched = [System.Collections.Generic.List[System.Management.Automation.Language.Ast]]::new()
         foreach ($terminal in $terminals) {
             $element = if ($terminal -is [System.Management.Automation.Language.PipelineAst]) { $terminal.PipelineElements[0] } else { $null }
             if ($element -is [System.Management.Automation.Language.CommandAst]) {
-                $callee = Get-PscFunctionOutputType -Member (Find-ScriptFunction $element) -RuntimeSelection $RuntimeSelection
+                $declaration = Find-ScriptFunction $element
+                if ($null -eq $declaration) { return $null }
+                $callee = Get-PscFunctionOutputType -Member $declaration -RuntimeSelection $RuntimeSelection
                 if ($null -eq $callee) { return $null }
                 $types.Add($callee)
             }
@@ -10906,13 +11124,18 @@ function Get-PscFunctionOutputType {
         if ($watched.Count) {
             $outer = $script:PscOutputWatch
             $watchTypes = $script:LoweringClassTypes
-            $script:PscOutputWatch = [System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast, Type]]::new()
+            $script:PscOutputWatch = [System.Collections.Generic.Dictionary[System.Management.Automation.Language.Ast, Linq.Expressions.Expression]]::new()
             try {
                 try { $null = Convert-MethodAstToLambda -MethodAst $Member -RuntimeSelection $RuntimeSelection } catch { return $null }
                 foreach ($terminal in $watched) {
-                    $type = $null
-                    if (-not $script:PscOutputWatch.TryGetValue($terminal, [ref]$type)) { return $null }
-                    $types.Add($type)
+                    [Linq.Expressions.Expression]$value = $null
+                    if (-not $script:PscOutputWatch.TryGetValue($terminal, [ref]$value)) { return $null }
+                    # Write enumerates a freshly constructed vector exactly once. A capture
+                    # of two or more output objects is the actual object[] returned by Collapse,
+                    # not the type of the original vector and not a new conversion of its elements.
+                    if ($value -is [Linq.Expressions.NewArrayExpression] -and $value.NodeType -eq [Linq.Expressions.ExpressionType]::NewArrayInit -and $value.Expressions.Count -ge 2) { $types.Add([object[]]) }
+                    elseif ($value.Type -ne [void] -and (Test-PscWrittenWhole $value.Type)) { $types.Add($value.Type) }
+                    else { return $null }
                 }
             }
             finally { $script:PscOutputWatch = $outer; $script:LoweringClassTypes = $watchTypes }
@@ -10920,7 +11143,7 @@ function Get-PscFunctionOutputType {
         $distinct = [System.Collections.Generic.HashSet[Type]]::new($types)
         if ($distinct.Count -ne 1) { return $null }
         $single = $types[0]
-        if ($single -eq [void] -or -not (Test-PscWrittenWhole $single)) { return $null }
+        if ($single -eq [void]) { return $null }
         $outputs[$Member] = $single
         return $single
     }
@@ -13537,7 +13760,7 @@ function Convert-AstExpression {
             if ($null -ne $call) {
                 $collapse = Get-PscSemanticsMethod -Name Collapse -ParameterTypes ([object[]])
                 $collapsed = [Linq.Expressions.Expression]::Call($collapse, $call)
-                # A function that writes exactly one value of one type: that value, as that type.
+                # Preserve the statically proven capture type, including a multiple-output object vector.
                 $single = Get-PscFunctionOutputType -Member (Find-ScriptFunction $Node.PipelineElements[0]) -RuntimeSelection $Scope.RuntimeSelection
                 if ($null -ne $single) { return [Linq.Expressions.Expression]::Convert($collapsed, $single) }
                 return $collapsed
@@ -14811,8 +15034,8 @@ function Convert-AstStatement {
         $all = [Linq.Expressions.Expression]::Call($Scope.Output, [System.Collections.Generic.List[object]].GetMethod('ToArray'))
         if ($null -eq $Statement.Pipeline) { return [Linq.Expressions.Expression]::Return($Scope.ReturnTarget, $all) }
         $returned = Convert-AstExpression -Node $Statement.Pipeline -Scope $Scope
-        # Get-PscFunctionOutputType reads the static type of what each return writes.
-        if ($null -ne $script:PscOutputWatch) { $script:PscOutputWatch[$Statement.Pipeline] = $returned.Type }
+        # Get-PscFunctionOutputType reads the lowered expression of what each return writes.
+        if ($null -ne $script:PscOutputWatch) { $script:PscOutputWatch[$Statement.Pipeline] = $returned }
         return [Linq.Expressions.Expression]::Block(
             (New-OutputWrite -Value $returned -Scope $Scope),
             [Linq.Expressions.Expression]::Return($Scope.ReturnTarget, $all))
@@ -15099,8 +15322,8 @@ function Convert-AstStatement {
             $element.Expression -is [System.Management.Automation.Language.UnaryExpressionAst] -and
             $element.Expression.TokenKind -in [System.Management.Automation.Language.TokenKind]::PostfixPlusPlus, [System.Management.Automation.Language.TokenKind]::PlusPlus,
                 [System.Management.Automation.Language.TokenKind]::PostfixMinusMinus, [System.Management.Automation.Language.TokenKind]::MinusMinus) { return $value }
-        # Get-PscFunctionOutputType reads the static type of what each expression statement writes.
-        if ($null -ne $script:PscOutputWatch) { $script:PscOutputWatch[$Statement] = $value.Type }
+        # Get-PscFunctionOutputType reads the lowered expression of what each expression statement writes.
+        if ($null -ne $script:PscOutputWatch) { $script:PscOutputWatch[$Statement] = $value }
         if ($null -ne $Scope['Output']) { return New-OutputWrite -Value $value -Scope $Scope }
         return $value
     }
@@ -18400,7 +18623,7 @@ Conform streams child stdout and stderr to the invoking host as they become avai
 
 ## Compiler and runtime
 
-- **Managed:** SMA AST and typed expression lowering, deterministic IL emission, static graph/data realization, reachability and fixed-parameter specialization. Untyped method and function locals may infer independent typed storage in disjoint statement blocks only when each region unconditionally overwrites the local before any reference and every reference belongs to such a region. The analysis retains original AST referents; explicit casts or constraints, qualified or captured references, parameters, foreach binders and cross-region live values retain the existing lowering behavior. This is bounded storage inference, not general flow-join, sequential reassignment or dynamic local support. Positive `-is` tests of object-typed local or parameter storage against closed vector-array types refine reads within the true region when the original binding cannot be reassigned or escape by reference there. This does not change storage, infer across joins, or extend interface binding. String-left `*` and `*=` lower as repetition with declared integral, Single, Double, Decimal, Char or Boolean counts, converted to Int32 using SMA scalar conversion rules. Operand evaluation remains left-to-right and once, null-left propagates, a negative count throws, and UTF-16 capacity is checked before allocation. Text, dynamic or nullable counts are not admitted by this increment. The projected `Tests/Test-Repetition.ps1` compares SMA and all three managed compilation paths, including failure categories and explicit overflow and perturbation controls. The supplementary projected `Tests/Test-RefinementBinding.ps1` compares interpreted, authoring, resident and borrowed execution and rejects unproven reads. Predicate loops support `while`, `do ... while` and `do ... until` in the existing typed statement and output lowering. Post-test loops enter the body first and direct unlabeled continue to the tail predicate, while break and return bypass it. The supplementary projected `Tests/Test-PostTestBinding.ps1` compares SMA, authoring, resident and borrowed execution. Labeled transfers remain unsupported. Character membership (`-in`, `-cin` and negated forms) admits typed character and string vectors and homogeneous literal vectors. It preserves the collection element comparison domain: invariant linguistic string comparison or UTF-16 character equality with invariant uppercase for insensitive comparison. The collection is evaluated first, then the searched operand, each once before the search, matching SMA membership evaluation. Heterogeneous and dynamically typed collections remain outside this character membership profile. The supplementary projected `Tests/Test-MembershipBinding.ps1` compares interpreted and three managed compilation paths.
+- **Managed:** SMA AST and typed expression lowering, deterministic IL emission, static graph/data realization, reachability and fixed-parameter specialization. Untyped method and function locals may infer independent typed storage in disjoint statement blocks only when each region unconditionally overwrites the local before any reference and every reference belongs to such a region. The analysis retains original AST referents; explicit casts or constraints, qualified or captured references, parameters, foreach binders and cross-region live values retain the existing lowering behavior. This is bounded storage inference, not general flow-join, sequential reassignment or dynamic local support. Positive `-is` tests of object-typed local or parameter storage against closed vector-array types refine reads within the true region when the original binding cannot be reassigned or escape by reference there. This does not change storage, infer across joins, or extend interface binding. Function-output inference distinguishes fallthrough, return, break, continue and throw using typed path outcomes. An admitted path has one terminal write; a freshly initialized vector of at least two elements proves an `object[]` capture, not the original vector element type. Same-capture branches and direct function forwarding preserve that type; early returns in loops are counted when repeatable and break paths write nothing. Variable-size vectors, zero/one versus multiple output joins, and unproven repeated writes retain the existing unknown result. `Tests/Test-OutputCapture.ps1` compares SMA with authoring, resident and retained program-graph compilation and exercises refusal controls. String-left `*` and `*=` lower as repetition with declared integral, Single, Double, Decimal, Char or Boolean counts, converted to Int32 using SMA scalar conversion rules. Operand evaluation remains left-to-right and once, null-left propagates, a negative count throws, and UTF-16 capacity is checked before allocation. Text, dynamic or nullable counts are not admitted by this increment. The projected `Tests/Test-Repetition.ps1` compares SMA and all three managed compilation paths, including failure categories and explicit overflow and perturbation controls. The supplementary projected `Tests/Test-RefinementBinding.ps1` compares interpreted, authoring, resident and borrowed execution and rejects unproven reads. Predicate loops support `while`, `do ... while` and `do ... until` in the existing typed statement and output lowering. Post-test loops enter the body first and direct unlabeled continue to the tail predicate, while break and return bypass it. The supplementary projected `Tests/Test-PostTestBinding.ps1` compares SMA, authoring, resident and borrowed execution. Labeled transfers remain unsupported. Character membership (`-in`, `-cin` and negated forms) admits typed character and string vectors and homogeneous literal vectors. It preserves the collection element comparison domain: invariant linguistic string comparison or UTF-16 character equality with invariant uppercase for insensitive comparison. The collection is evaluated first, then the searched operand, each once before the search, matching SMA membership evaluation. Heterogeneous and dynamically typed collections remain outside this character membership profile. The supplementary projected `Tests/Test-MembershipBinding.ps1` compares interpreted and three managed compilation paths.
 - **Native:** pinned Windows NativeAOT compiler plus PSC COFF linker; direct CIL-to-IR-to-x64 ELF leaf emission and decoded-byte ABI checks. The direct backend does not yet replace ILC for general programs.
 - **Faculties:** `HandleTable`, `DiscoveryMechanisms`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. `BuildRuntime -CompilerRuntimeDirectory <bootstrap> -RuntimeDirectory <empty-output>` admits the existing no-contract compiler realization, composes the original resident dependency scopes without merging their descriptors, and rebuilds all eight artifacts in a separate directory. It refuses missing or incompatible admission receipts, nonempty output directories and external contract inputs. The coordinator acquires its declaration inventory once, uses retained persisted dependency witnesses, retires completed graph scopes outside the remaining transitive dependency closure in reverse order, and closes the admitted session. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. BuildRuntime without contract inputs also builds the compiler-private `compiler/CompilerDeclarations.dll` and writes a version 2 local selection receipt for it and HandleTable, ScriptType and PrimitiveConversion. The seven public faculty files and their dependency closure are unchanged. The compiled selection path verifies source, CoreLib, SMA, the existing TypeConverter framework dependency and all four admitted assembly digests once, loads the exact bytes in a private collectible context, and invokes typed delegates. Version 1 receipts require rebuilding. Missing or incompatible receipts refuse that path; no implicit interpreted fallback is permitted after selection is requested. Without an explicit directory the authoring selector is unchanged. The receipt identifies a trusted local build; it is not a signature or independent admission proof. This is explicit compiler self-consumption, not full startup activation. `PscApi.AcquireSelection(api,directory)` acquires an explicit resident selection session from the API source revision. `PscRuntimeSelection.Select(session,signatures,sources)` reuses the admitted selector without reading artifacts again; `Close(session)` withdraws it and requests context unloading. Resident structural specialization accepts the same session as `-RuntimeSelection`, and does not close a caller-owned session. CLI Compile with an explicit `-RuntimeDirectory` uses `Invoke-PscCompile` to acquire one session before lowering, supply it to both structural specialization and ordinary managed lowering (including the managed precursor of Native), and close it in a finally boundary before returning the managed result. The session remains inside the authoring operation, not the process dispatcher. Even an exact-only compilation refuses a missing or incompatible receipt when explicitly requested. Without an explicit directory CLI Compile retains interpreted selection. The retained session may also be supplied to `Export-LoweredAssembly -RuntimeSelection`: ordinary source static/instance calls and explicit constructors use session-owned compiled STS exact and numeric binding and retain the original CLR projection witnesses. Method closure, initializer lowering and recursive function-output inference use the same session; by default a selected compilation owns fresh declaration scopes, including their existing inference caches. `Export-LoweredAssembly -SourceAst <original-root> -RuntimeSelection <session> -RetainedScope <scope>` instead borrows a live resident source graph with a temporary CLR compatibility projection. The original AST, ordered class and enum selection, session and dependency scope must match exactly; acquire any rewritten record source before borrowing. The graph remains caller-owned on success or failure; `RealizedScope` ownership transfer is not admitted with `RetainedScope`. Synthetic function scopes acquire temporary graphs by default. For repeated program compilation, acquire the existing program function class with `Get-ScriptFunctionClass -Root <original-root> -Program`, then `Get-DeclarationScope -Root <function-class-parent-root> -Resolving <source-scope> -RuntimeSelection <session>`. Supply that dependent scope as `-RetainedFunctionScope` together with `-RetainedScope` and `-Program`. Both graphs remain caller-owned and acquire no replacement graphs; the dependent CLR projection resolves against the fresh source CLR projection. Explicit reprojection may substitute only a live projection of the identical direct dependency graph. Function provenance is retained with the scope, independent of active synthetic class caches. Ordinary lowering resolves function source, class and program entry from its selected declarations; borrowed compilation uses the retained referents without reading or displacing the acquisition dictionaries. External acquisition and inference retain identity-keyed conditional weak indexes. Live source or synthetic AST referents preserve their relationships, including null cache entries and parameterless program entries, but the indexes do not own abandoned source or synthetic ASTs. Retained scopes continue to own their declaration evidence and graph withdrawal remains explicit. The resolving source may be any live projection of the identical source graph. Function inference remains projection-local; withdraw the dependent graph before its source graph. Ordinary resident lowering tracks every graph it acquires, including incomplete projections; it withdraws temporary scopes in reverse acquisition order and removes their cache entries on success or failure. An explicit successful RealizedScope handoff retains only the selected graph; caller-owned dependency and declaration scopes are not withdrawn. CLR compatibility projections are collectible. `Get-DeclarationScope -Root <original-root> -RuntimeSelection <session> -RealizationOf <scope>` creates a separate compatibility projection from a live retained graph, including the original enum selection and dependencies; it neither replaces the root cache nor acquires another STS graph. Existing callers may retain prior CLR witnesses, which become eligible for reclamation when no longer referenced. Graph withdrawal remains independent of these witnesses. `PscScriptTypeAcquisition` constructs descriptors directly from the original SMA AST declarations in the selected execution domain. A resident scope stores only its owning session, scope and source coordinates, and CLR projection witnesses; it does not construct an interpreted descriptor graph. The compiled graph retains original imported semantic referents, not their AST ownership. CLR signature projection realizes retained source referents and recursive CTS references without AST evidence; unresolved names retain the compatibility name resolution path. Resident acquisition appends selected source enums after class coordinates, retaining enum identity, underlying integral CTS reference and ordered exact constant values. Enum references use the same source owner map, including imported and reprojected enums; CLR compatibility projection and persisted emission consume the same typed enum shape from the acquired definitions, including exact full-width constants. Resident shape retrieval uses graph coordinates without reacquiring AST initializers; the authoring adapter uses the same enum acquisition operation. Source enum literal expressions bind through the acquired enum member names and exact values in the visible declaration scope; the CLR enum value is a typed expression witness, not the source of the constant. Resident literal binding uses the compiled STS member selector and transports only the selected coordinate, integral CTS type and exact constant; full enum shapes are used for construction, not resident expression binding. Source storage expressions select declared members through STS, validate the exact CLR field against the selected result reference, and follow the semantic base on inherited static or instance lookup. Resident storage binding realizes only the selected result or base, independent of transported signature and base projections; authoring retains compatibility name resolution where the class-only inventory requires it. Resident operation binding also realizes the selected name, parameters and result from the retained graph instead of transported signatures, while retaining coordinate-only inspection and the existing script-function switch compatibility path. Authoring operation binding independently validates the selected result projection against its retained semantic reference; unresolved forms use the existing authoring realization adapter. On a static or instance operation binding miss, distinguish a local operation outside the admitted conversion profile from absence, and select inherited source operations through the retained semantic base reference after checking its CLR realization. Constructors remain local; unsupported profiles retain existing compatibility behavior. Mixed fixed-arity CTS method and constructor overloads whose arguments and reachable parameter signatures are all admitted integral or floating types use one shared adapter to the existing ScriptType primitive selector, including its resident compiled realization when requested. Exact constructor acquisition uses ExactBinding, not CLR default-binder widening. The selected CTS operation is lowered with the existing argument conversions. CLR method groups containing ParamArrayAttribute vector parameters acquire ordinary and expanded forms from the declared metadata. The same ScriptType selector ranks effective parameter types, normal-versus-expanded forms and generic declaration specificity in authoring and resident execution. Existing structural generic inference closes eligible forms. The selected call retains its actual CTS member and an expansion coordinate; ordinary argument lowering converts each operand once and constructs the declared trailing vector only when required. Explicit compatible vectors retain identity. The supported conversion profile remains bounded; ref-like parameter collections, constructor parameter arrays and fully dynamic CTS binding are not covered by this increment. The supplementary projected `Tests/Test-ParamArrayBinding.ps1` compares SMA, authoring, resident and borrowed execution, plus ambiguity and conversion refusals. Exact CTS method signatures exposed on both a derived class and its base are selected only when a unique declaring class strictly descends from every competing owner; same-owner or unrelated ties remain refused. Other compatibility profiles are unchanged. An inherited static operation outside the admitted conversion profile uses its traversed semantic owner as the CTS compatibility receiver. A terminal source method miss permits CTS lookup on the verified System.Object base only, not on the source projection. Explicitly imported CTS enums without a source enum definition retain CLR binding. Binding, imports and graph withdrawal remain available without AST evidence. Caller-held declaration scopes retain their original ASTs. The compiled graph supplies typed acquisition, projection and binding results across the delegate boundary, with refusal status and diagnostic text instead of collectible exceptions. The authoring caller checks the selected member against its CLR realization. Graph scopes may be withdrawn individually through `PscRuntimeSelection.ReleaseGraph`; live importing scopes prevent withdrawal, and retired coordinates are never reused. Previously cached scope witnesses refuse subsequent operations rather than silently reacquiring a different semantic graph. A resident scope cannot import an authoring descriptor graph. ScriptType.dll remains independent of SMA; only the compiler-side adapter consumes AST evidence. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
 - **Evidence:** differential tests, structural lint, Guard, non-loading binary queries and coverage. An observed call is not a universal binding proof; an ABI check is not a proof of arithmetic equivalence.
