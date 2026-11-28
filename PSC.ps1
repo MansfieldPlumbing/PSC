@@ -3582,6 +3582,85 @@ try {
     [IO.Directory]::Delete($work,$true)
 }
 '@)
+    [PscSourceResource]::new('Tests/SpecializationCases.ps1', @'
+param([switch]$Verify)
+class SpecializationEarly {
+    static [SpecializationLate] Create(){return [SpecializationLate]::new(7)}
+}
+if($Verify){
+    $instance=[SpecializationEarly]::Create()
+    [Console]::WriteLine($instance.Value)
+    [Console]::WriteLine([int][SpecializationKind]::Selected)
+    return
+}
+class SpecializationBase {
+    [int]$Value
+    SpecializationBase([int]$value){$this.Value=$value}
+}
+class SpecializationLate : SpecializationBase {
+    SpecializationLate([int]$value) : base($value+3) {}
+}
+enum SpecializationKind { Selected = 11 }
+[Console]::WriteLine(99)
+'@)
+    [PscSourceResource]::new('Tests/Test-Specialization.ps1', @'
+#requires -Version 7.7
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$Compiler,[string]$RuntimeDirectory)
+$ErrorActionPreference='Stop'
+$source=Join-Path $PSScriptRoot 'SpecializationCases.ps1'
+$work=[IO.Directory]::CreateTempSubdirectory('psc-specialization-').FullName
+$selection=$null
+$runtimePath=$RuntimeDirectory
+try {
+    $api=. ([IO.Path]::GetFullPath($Compiler)) -Mode Api
+    if($runtimePath){$selection=$api.GetType()::AcquireSelection($api,$runtimePath)}
+    foreach($verify in [bool[]]@($false,$true)){
+        $tokens=$null;$errors=$null
+        $root=[System.Management.Automation.Language.Parser]::ParseFile($source,[ref]$tokens,[ref]$errors)
+        if($errors.Count){throw $errors[0]}
+        $fixed=[PscReachability]::Prune([PscFixedParameters]::new(@{Verify=$verify}).Fix($root))
+        $declarations=@($fixed.EndBlock.Statements | Where-Object {$_ -is [System.Management.Automation.Language.TypeDefinitionAst]})
+        if($declarations.Length -ne 4){throw 'Specialization lost a source-owned declaration'}
+        $entry=[string]$verify
+        [string[]]$kinds=@('authoring');if($runtimePath){$kinds=@('authoring','resident','borrowed')}
+        [string[]]$paths=[string[]]::new($kinds.Length)
+        for([int]$i=0;$i -lt $paths.Length;$i++){$paths[$i]=Join-Path ([IO.Directory]::CreateDirectory((Join-Path $work ($entry+'-'+$kinds[$i]))).FullName) 'SpecializationCases.dll'}
+        $null=Export-LoweredAssembly -SourceAst $fixed -Program -EntryPoint Main -OutputPath $paths[0] -Deterministic
+        if($runtimePath){
+            $scope=$null
+            $null=Export-LoweredAssembly -SourceAst $fixed -Program -EntryPoint Main -OutputPath $paths[1] -RuntimeSelection $selection -RealizedScope ([ref]$scope) -Deterministic
+            $functionClass=Get-ScriptFunctionClass -Root $fixed -Program
+            $functionRoot=$functionClass;while($functionRoot.Parent){$functionRoot=$functionRoot.Parent}
+            $functionScope=Get-DeclarationScope -Root $functionRoot -Resolving $scope -RuntimeSelection $selection
+            $null=Export-LoweredAssembly -SourceAst $fixed -Program -EntryPoint Main -OutputPath $paths[2] -RuntimeSelection $selection -RetainedScope $scope -RetainedFunctionScope $functionScope -Deterministic
+            if(!$selection.GetType()::ReleaseGraph($selection,$functionScope.ResidentSlot)){throw 'Function graph withdrawal failed'}
+            if(!$selection.GetType()::ReleaseGraph($selection,$scope.ResidentSlot)){throw 'Source graph withdrawal failed'}
+        }
+        $expectedWriter=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+        $old=[Console]::Out
+        try {[Console]::SetOut($expectedWriter); & $source -Verify:$verify} finally {[Console]::SetOut($old)}
+        $expected=$expectedWriter.ToString();$expectedWriter.Dispose()
+        $known=if($verify){'10'+[Environment]::NewLine+'11'+[Environment]::NewLine}else{'99'+[Environment]::NewLine}
+        if($expected -cne $known){throw 'Independent SMA oracle differs from expected control flow'}
+        $digest=(Get-FileHash $paths[0]).Hash
+        foreach($path in $paths){
+            if((Get-FileHash $path).Hash -cne $digest){throw 'Specialized assemblies differ'}
+            $assembly=[Reflection.Assembly]::LoadFile($path)
+            foreach($name in 'SpecializationEarly','SpecializationBase','SpecializationLate','SpecializationKind'){if($null -eq $assembly.GetType($name,$false)){throw "Missing emitted type $name"}}
+            $writer=[IO.StringWriter]::new([Globalization.CultureInfo]::InvariantCulture)
+            $actualArgs=[object[]]::new(1);$actualArgs[0]=[string[]]@()
+            try {[Console]::SetOut($writer);$null=$assembly.EntryPoint.Invoke($null,$actualArgs)} finally {[Console]::SetOut($old)}
+            $actual=$writer.ToString();$writer.Dispose()
+            if($actual -cne $expected){throw "Specialized execution differs: $path"}
+            "PASS $path Verify=$verify SHA256 $digest"
+        }
+    }
+} finally {
+    if($null -ne $selection){$selection.GetType()::Close($selection)}
+    [IO.Directory]::Delete($work,$true)
+}
+'@)
 }
 
 # PSC-owned source faculties. The holder provides real parser-visible declarations, not executable text.
@@ -18262,12 +18341,18 @@ class PscFixedParameters : PscAstRebuild {
         return $false
     }
 
-    # The statements up to and including the first that always leaves, copied for a new parent; $null when none does.
-    hidden [System.Management.Automation.Language.StatementAst[]] Reachable([System.Collections.ObjectModel.ReadOnlyCollection[System.Management.Automation.Language.StatementAst]] $statements) {
+    # Execution reachability does not govern script-owned type declarations:
+    # forward references remain valid even after an unconditional return.
+    hidden [System.Management.Automation.Language.StatementAst[]] Reachable([System.Collections.ObjectModel.ReadOnlyCollection[System.Management.Automation.Language.StatementAst]] $statements,[bool]$retainTypes) {
         for ($i = 0; $i -lt $statements.Count; $i++) {
             if ($this.AlwaysLeaves($statements[$i]) -and $i -lt $statements.Count - 1) {
                 $kept = [System.Collections.Generic.List[System.Management.Automation.Language.StatementAst]]::new()
-                for ($j = 0; $j -le $i; $j++) { $kept.Add([System.Management.Automation.Language.StatementAst]$statements[$j].Copy()) }
+                $copy = [PscAstRebuild]::new()
+                for ($j = 0; $j -lt $statements.Count; $j++) {
+                    if ($j -le $i -or ($retainTypes -and $statements[$j] -is [System.Management.Automation.Language.TypeDefinitionAst])) {
+                        $kept.Add([System.Management.Automation.Language.StatementAst]$copy.Rebuild($statements[$j]))
+                    }
+                }
                 return $kept.ToArray()
             }
         }
@@ -18318,14 +18403,14 @@ class PscFixedParameters : PscAstRebuild {
             return [System.Management.Automation.Language.IfStatementAst]::new($rebuilt.Extent, $clauses, $else)
         }
         if ($rebuilt -is [System.Management.Automation.Language.StatementBlockAst]) {
-            $kept = $this.Reachable($rebuilt.Statements)
+            $kept = $this.Reachable($rebuilt.Statements, $false)
             if ($null -ne $kept) {
                 $traps = if ($null -ne $rebuilt.Traps) { [System.Management.Automation.Language.TrapStatementAst[]]@(foreach ($trap in $rebuilt.Traps) { $trap.Copy() }) } else { $null }
                 return [System.Management.Automation.Language.StatementBlockAst]::new($rebuilt.Extent, $kept, $traps)
             }
         }
         if ($rebuilt -is [System.Management.Automation.Language.NamedBlockAst]) {
-            $kept = $this.Reachable($rebuilt.Statements)
+            $kept = $this.Reachable($rebuilt.Statements, [object]::ReferenceEquals($original.Parent,$this.Script))
             if ($null -ne $kept) {
                 $traps = if ($null -ne $rebuilt.Traps) { [System.Management.Automation.Language.TrapStatementAst[]]@(foreach ($trap in $rebuilt.Traps) { $trap.Copy() }) } else { $null }
                 return [System.Management.Automation.Language.NamedBlockAst]::new($rebuilt.Extent, $rebuilt.BlockKind,
@@ -19303,7 +19388,7 @@ $api | Get-Member
 & ./PSC.ps1 -Mode Capability
 ```
 
-The API retains the acquired source revision. LowerDeclarations(names) compiles an explicitly selected set of top-level classes and enums, including those in PSC's begin block; LowerDeclarations(ast,names) accepts a donor source AST, including the original body of a named declaration scope when the selection is contained in that body. It compiles the selected original declarations directly, retaining their parser-owned AST identities without synthesizing or executing an enclosing script. Include required source types in the selection; program compilation is a separate operation. Managed declaration lowering supports one selected source-owned base class, including forward references, inherited fields and virtual methods, and base construction. Explicit base operands select a local source-owned constructor through the admitted exact and closed numeric STS binding profile, lower operands once in source order after derived field initialization, and emit a direct call on the existing instance. Explicit parameterless, implicit and generated source-base calls occupy the same position after derived field initialization. A declared parameterless constructor binds through STS; only semantic absence of all declared constructors permits realization of the language-generated default. The emitter does not perform source-base overload selection. Authoring and resident paths share this operation; unsupported conversion profiles are refused, not redirected to CLR overload selection. External base classes, interfaces and MethodNames selection with inheritance remain unsupported. The supplementary projected `Tests/Test-BaseConstructor.ps1 -Compiler ./PSC.ps1` compares ordinary SMA, authoring, resident and borrowed graph execution, including projection and withdrawal refusals. Eligible queries reuse its AST after byte-identity verification; declaration queries share the roadmap declaration inventory and use an ordinal-ignore-case name index. IndexedArtifacts counts indexed source artifacts; SitesExamined counts candidate declarations actually tested, and VisitorCallbacks counts visits in the query itself. Pull windows advance through retained declaration sites without replay; other source kinds still traverse the AST. Measurements are acquired only on the first Measures() call. ReadSource(path) still acquires all measurements. The API is derived from the running script, so mode names and parameter evidence do not depend on a previous session's notes. Use `Describe(mode)` for dispatcher extents and associated definitions. CLI inventory below is generated; source hash, local paths, runtime and measurement values are available from the live API rather than frozen into the README. Regenerate with `& ./PSC.ps1 -Mode Readme`.
+The API retains the acquired source revision. LowerDeclarations(names) compiles an explicitly selected set of top-level classes and enums, including those in PSC's begin block; LowerDeclarations(ast,names) accepts a donor source AST, including the original body of a named declaration scope when the selection is contained in that body. It compiles the selected original declarations directly, retaining their parser-owned AST identities without synthesizing or executing an enclosing script. Include required source types in the selection; program compilation is a separate operation. Fixed-parameter specialization prunes unreachable execution but preserves script-owned class and enum declarations after a terminating statement in the script named block. Their forward references and base-constructor operands survive structural rebuilding. `Tests/Test-Specialization.ps1` compares both specialized paths with independent SMA execution, including retained declaration identities in emitted images. Managed declaration lowering supports one selected source-owned base class, including forward references, inherited fields and virtual methods, and base construction. Explicit base operands select a local source-owned constructor through the admitted exact and closed numeric STS binding profile, lower operands once in source order after derived field initialization, and emit a direct call on the existing instance. Explicit parameterless, implicit and generated source-base calls occupy the same position after derived field initialization. A declared parameterless constructor binds through STS; only semantic absence of all declared constructors permits realization of the language-generated default. The emitter does not perform source-base overload selection. Authoring and resident paths share this operation; unsupported conversion profiles are refused, not redirected to CLR overload selection. External base classes, interfaces and MethodNames selection with inheritance remain unsupported. The supplementary projected `Tests/Test-BaseConstructor.ps1 -Compiler ./PSC.ps1` compares ordinary SMA, authoring, resident and borrowed graph execution, including projection and withdrawal refusals. Eligible queries reuse its AST after byte-identity verification; declaration queries share the roadmap declaration inventory and use an ordinal-ignore-case name index. IndexedArtifacts counts indexed source artifacts; SitesExamined counts candidate declarations actually tested, and VisitorCallbacks counts visits in the query itself. Pull windows advance through retained declaration sites without replay; other source kinds still traverse the AST. Measurements are acquired only on the first Measures() call. ReadSource(path) still acquires all measurements. The API is derived from the running script, so mode names and parameter evidence do not depend on a previous session's notes. Use `Describe(mode)` for dispatcher extents and associated definitions. CLI inventory below is generated; source hash, local paths, runtime and measurement values are available from the live API rather than frozen into the README. Regenerate with `& ./PSC.ps1 -Mode Readme`.
 '@
         return $guideText.Replace('@@TYPESYSTEM@@',$this.TypeSystemContract).Replace('@@FORMATS@@',($formatRows -join "`n")).Replace('@@ROADMAP@@',$this.RoadmapMarkdown())
     }
