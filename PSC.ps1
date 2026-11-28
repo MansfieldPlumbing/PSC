@@ -3391,6 +3391,197 @@ try {
     [IO.Directory]::Delete($work,$true)
 }
 '@)
+    [PscSourceResource]::new('Tests/LocalCases.ps1', @'
+class LocalView {
+    [int]$LastLine
+    static [LocalView] Resolve([int]$Line) {
+        if($Line -lt 0){return $null}
+        $view=[LocalView]::new()
+        $view.LastLine=$Line+2
+        return $view
+    }
+}
+function Get-View([int]$Line){
+    if($Line -eq 0){return $null}
+    return [LocalView]::Resolve($Line)
+}
+function Test-Local([int]$Count){
+    $view=$null
+    $hits=0
+    for($line=0;$line -lt $Count;$line++){
+        if(!$view -or $line -gt $view.LastLine){$view=Get-View $line}
+        if($view -and $line -le $view.LastLine){$hits++}
+        if($line -eq 3){$view=$null}
+    }
+    return $hits
+}
+function Get-ViewForward([int]$Line){return Get-View $Line}
+function Test-Branch([int]$Line){
+    $view=$null
+    $wasNull=$null -eq $view
+    if($Line -lt 2){$view=Get-View $Line}else{$view=Get-ViewForward $Line}
+    if(!$view){return [int]$wasNull}
+    $view.LastLine=$view.LastLine+1
+    $result=$view.LastLine
+    $view=$null
+    if($view){return -1}
+    return $result
+}
+function Test-SameBlock([int]$Line){
+    $view=$null
+    $first=!$view
+    $view=Get-View $Line
+    if(!$view){return [int]$first}
+    return $view.LastLine+1
+}
+function Test-TwoSlots([int]$Count){
+    $left=$null;$right=$null
+    $sum=0
+    for($line=0;$line -lt $Count;$line++){
+        if(!$left -or $line -gt $left.LastLine){$left=Get-View $line}
+        if(!$right -or $line -gt $right.LastLine){$right=Get-ViewForward ($line+1)}
+        if($left -and $right){$sum+=$left.LastLine+$right.LastLine}
+    }
+    return $sum
+}
+class LocalProjection {
+    [int]$Width
+    static [LocalProjection] Map([int]$width){$value=[LocalProjection]::new();$value.Width=$width;return $value}
+}
+class LocalRow {
+    [int]$Line
+    static [LocalRow] Parse([int]$line){if($line -lt 1){return $null};$row=[LocalRow]::new();$row.Line=$line;return $row}
+    static [LocalRow] Parse([string]$line){return [LocalRow]::Parse([int]$line)}
+    [LocalProjection] Project([int]$width){return [LocalProjection]::Map($this.Line+$width)}
+}
+function Test-Factory([int]$Count){
+    $total=0
+    for($line=0;$line -lt $Count;$line++){
+        $projection=$null
+        $row=$null
+        $row=[LocalRow]::Parse($line)
+        if($row){$projection=$row.Project($line)}else{$projection=[LocalProjection]::Map($line)}
+        if($projection -and $line -lt $projection.Width){$total+=$projection.Width}
+        $row=$null
+    }
+    return $total
+}
+function Test-FactorySameBlock([int]$Line){
+    $row=$null
+    $row=[LocalRow]::Parse([string]$Line)
+    if(!$row){return -1}
+    return $row.Line
+}
+'@)
+    [PscSourceResource]::new('Tests/Test-NullLocal.ps1', @'
+#requires -Version 7.7
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$Compiler,[string]$RuntimeDirectory)
+$ErrorActionPreference='Stop'
+$source=Join-Path $PSScriptRoot 'LocalCases.ps1'
+. $source
+$work=[IO.Directory]::CreateTempSubdirectory('psc-null-local-').FullName
+$selection=$null
+$runtimePath=$RuntimeDirectory
+try {
+    $api=. ([IO.Path]::GetFullPath($Compiler)) -Mode Api
+    if($runtimePath){$selection=$api.GetType()::AcquireSelection($api,$runtimePath)}
+    $tokens=$null;$errors=$null
+    $root=[System.Management.Automation.Language.Parser]::ParseFile($source,[ref]$tokens,[ref]$errors)
+    if($errors.Count){throw $errors[0]}
+    [string[]]$kinds=@('authoring');if($runtimePath){$kinds=@('authoring','resident','borrowed')}
+    [string[]]$paths=[string[]]::new($kinds.Length)
+    for([int]$i=0;$i -lt $paths.Length;$i++){$paths[$i]=Join-Path ([IO.Directory]::CreateDirectory((Join-Path $work $kinds[$i])).FullName) 'LocalCases.dll'}
+    $null=Export-LoweredAssembly -SourceAst $root -Program -OutputPath $paths[0] -Deterministic
+    if($runtimePath){
+        $scope=$null
+        $null=Export-LoweredAssembly -SourceAst $root -Program -OutputPath $paths[1] -RuntimeSelection $selection -RealizedScope ([ref]$scope) -Deterministic
+        $functionClass=Get-ScriptFunctionClass -Root $root -Program
+        $functionRoot=$functionClass;while($functionRoot.Parent){$functionRoot=$functionRoot.Parent}
+        $functionScope=Get-DeclarationScope -Root $functionRoot -Resolving $scope -RuntimeSelection $selection
+        $null=Export-LoweredAssembly -SourceAst $root -Program -OutputPath $paths[2] -RuntimeSelection $selection -RetainedScope $scope -RetainedFunctionScope $functionScope -Deterministic
+        if(!$selection.GetType()::ReleaseGraph($selection,$functionScope.ResidentSlot)){throw 'Function graph withdrawal failed'}
+        if(!$selection.GetType()::ReleaseGraph($selection,$scope.ResidentSlot)){throw 'Source graph withdrawal failed'}
+    }
+    $digest=(Get-FileHash $paths[0]).Hash
+    foreach($path in $paths){if((Get-FileHash $path).Hash -cne $digest){throw 'Deterministic output differs'}}
+    foreach($path in $paths){
+        $type=[Reflection.Assembly]::LoadFile($path).GetType('LocalCases',$true)
+        [int]$count=0
+        foreach($name in [string[]]@('Test-Local','Test-Branch','Test-SameBlock','Test-TwoSlots','Test-Factory','Test-FactorySameBlock')){
+            foreach($arg in [int[]]@(-1,0,1,2,3,4,5,6,7,8,9,10,20)){
+                [object[]]$expected=@(& $name $arg)
+                [object[]]$actual=$type.GetMethod($name).Invoke($null,[object[]]@($arg))
+                if($expected.Length -ne $actual.Length){throw "$name output count differs"}
+                for([int]$i=0;$i -lt $expected.Length;$i++){
+                    if($expected[$i].GetType() -ne $actual[$i].GetType() -or $expected[$i] -cne $actual[$i]){throw "$name output $i differs"}
+                }
+                $count++
+            }
+        }
+        if($type.GetMethod('Test-Local').Invoke($null,[object[]]@(3))[0] -eq 3){throw 'Perturbation was accepted'}
+        "PASS $path $count independent SMA comparisons SHA256 $digest"
+    }
+    [string]$prefix='class LocalView { [int]$LastLine }; class OtherView { [int]$LastLine }; function Get-View([int]$n){if($n -eq 0){return $null};return [LocalView]::new()};function Get-Other([int]$n){return [OtherView]::new()};function Get-Number([int]$n){return $n};class MixedFactory { static [LocalView] Make([int]$n){return [LocalView]::new()}
+ static [OtherView] Make([string]$n){return [OtherView]::new()} }'
+    [string[]]$negative=@(
+        '$view=$null;if($n){$view=Get-View $n}else{$view=Get-Other $n}',
+        '$view=$null;if($n){$view=Get-View $n}else{$view=Get-Number $n}',
+        '$view=$null;$view=Get-View $n;$view=1',
+        '[object]$view=$null;$view=Get-View $n',
+        '$view=$null;$view=Get-View $n;$view=$other',
+        '$view=$null;$view=Get-View $n;$v=$view;$view=$v',
+        '$view=$null;$view=[MixedFactory]::Make($n)',
+        '$view=$null;$view=Get-View $n;$view=Get-Other $n',
+        '$view=$null;$view=Get-View $n;if($n){$view=$other}'
+    )
+    for([int]$i=0;$i -lt $negative.Length;$i++){
+        $case=$prefix+"`n"+'function Test-Negative([int]$n,[object]$other){'+$negative[$i]+';if(!$view){return $false};return 1 -lt $view.LastLine}'
+        $negativeRoot=[System.Management.Automation.Language.Parser]::ParseInput($case,[ref]$tokens,[ref]$errors)
+        if($errors.Count){throw $errors[0]}
+        foreach($kind in $kinds){
+            if($kind -eq 'borrowed'){continue}
+            [bool]$refused=$false
+            try{
+                if($kind -eq 'resident'){$null=Export-LoweredAssembly -SourceAst $negativeRoot -Program -OutputPath (Join-Path $work ('Negative'+$i+'.dll')) -RuntimeSelection $selection -Deterministic}
+                else{$null=Export-LoweredAssembly -SourceAst $negativeRoot -Program -OutputPath (Join-Path $work ('Negative'+$i+'.dll')) -Deterministic}
+            }catch{$refused=$_.Exception.Message.Contains("requires identical operand types, got 'System.Int32' and 'System.Object'");if(!$refused){throw}}
+            if(!$refused){throw "Unproven storage $i admitted ($kind)"}
+            "PASS $kind negative storage $i refused"
+        }
+    }
+    # Acquire real source-owned signatures for the positive and exclusion controls.
+    # Unknown call names cannot make these tests pass by accident.
+    [string]$proofPrefix="class LocalProof { [int]`$LastLine`n static [LocalProof] Make(){return [LocalProof]::new()}`n }`nfunction Probe {"
+    [string[]]$excluded=@(
+        '$v=$null; $v=[LocalProof]::Make(); $v.LastLine',
+        '$v=$null; $v=[LocalProof]::Make(); $r=[ref]$v; $v.LastLine',
+        '$v.LastLine; $v=$null; $v=[LocalProof]::Make(); $v.LastLine',
+        '$v=$null; $v=[LocalProof]::Make(); foreach($v in @(1,2)){}; $v.LastLine',
+        'if($true){$v=$null;$v=[LocalProof]::Make()}; $v.LastLine'
+    )
+    for([int]$i=0;$i -lt $excluded.Length;$i++){
+        $root=[System.Management.Automation.Language.Parser]::ParseInput(($proofPrefix+$excluded[$i]+'}'),[ref]$tokens,[ref]$errors)
+        if($errors.Count){throw $errors[0]}
+        $functionClass=Get-ScriptFunctionClass -Root $root -Program
+        $member=$functionClass.Members[0]
+        if($member.Name -ne 'Probe'){throw 'Probe declaration absent'}
+        foreach($kind in $kinds){
+            if($kind -eq 'borrowed'){continue}
+            $session=if($kind -eq 'resident'){$selection}else{$null}
+            Use-DeclarationScope -Ast $member -RuntimeSelection $session
+            $writes=[Collections.Generic.Dictionary[System.Management.Automation.Language.AssignmentStatementAst,type]]::new()
+            $null=Get-PscLocalRegions -Statements @($member.Body.EndBlock.Statements) -Parameters @{} -NullableWrites $writes -RuntimeSelection $session
+            if($i -eq 0){if($writes.Count -ne 2){throw 'Positive storage proof failed'}}
+            elseif($writes.Count){throw 'Unstable local acquired a nullable slot'}
+            "PASS $kind structural control $i"
+        }
+    }
+} finally {
+    if($null -ne $selection){$selection.GetType()::Close($selection)}
+    [IO.Directory]::Delete($work,$true)
+}
+'@)
 }
 
 # PSC-owned source faculties. The holder provides real parser-visible declarations, not executable text.
@@ -14915,9 +15106,58 @@ class PscLocalRegion {
     }
 }
 
+function Get-PscLocalWriteType {
+    [OutputType([type])]
+    param([System.Management.Automation.Language.Ast]$Right,[Collections.Generic.Dictionary[string,type]]$Known,[PscRuntimeSelection]$RuntimeSelection)
+    if($Right -is [System.Management.Automation.Language.PipelineAst] -and $Right.PipelineElements.Count -eq 1){
+        $call=$Right.PipelineElements[0]
+        if($call -isnot [System.Management.Automation.Language.CommandAst] -or $call.Redirections.Count -or $call.InvocationOperator -ne [System.Management.Automation.Language.TokenKind]::Unknown){return $null}
+        $member=Find-ScriptFunction $call
+        if($null -eq $member){return $null}
+        return Get-PscFunctionOutputType -Member $member -RuntimeSelection $RuntimeSelection
+    }
+    if($Right -isnot [System.Management.Automation.Language.CommandExpressionAst] -or $Right.Redirections.Count -or $Right.Expression -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst]){return $null}
+    $call=$Right.Expression
+    if($call.Member -isnot [System.Management.Automation.Language.StringConstantExpressionAst]){return $null}
+    $root=Resolve-PscDeclarationRoot $call
+    $source=Get-PscFunctionSource -Root $root
+    if($null -eq $source){$source=$root}
+    $scope=Get-PscOperationalScope -Root $source -ExistingOnly -RuntimeSelection $RuntimeSelection
+    if($null -eq $scope){return $null}
+    [type]$target=$null
+    if($call.Static){
+        if($call.Expression -isnot [System.Management.Automation.Language.TypeExpressionAst]){return $null}
+        $target=$scope.Types[$call.Expression.TypeName.FullName]
+    }else{
+        if($call.Expression -isnot [System.Management.Automation.Language.VariableExpressionAst] -or !$call.Expression.VariablePath.IsUnqualified){return $null}
+        if(!$Known.TryGetValue((Get-VariableName $call.Expression.VariablePath),[ref]$target)){return $null}
+    }
+    # Source-owned, non-inherited declarations only. The signature inventory
+    # was materialized from STS, in both authoring and resident sessions.
+    if($null -eq $target -or $scope.Types[$target.Name] -ne $target){return $null}
+    $definitions=if($scope.ResidentSlot -ge 0){$scope.ResidentDefinitions}else{$scope.Contracts.Keys}
+    foreach($owner in $definitions){
+        if($scope.Types[$owner.Name] -ne $target){continue}
+        if($scope.Bases.ContainsKey($owner)){return $null}
+        if($call.Static -and $call.Member.Value -ieq 'new'){return $target}
+        [type]$result=$null
+        foreach($member in $owner.Members){
+            if($member -isnot [System.Management.Automation.Language.FunctionMemberAst] -or $member.IsConstructor -or $member.IsStatic -ne $call.Static -or $member.Name -ine $call.Member.Value){continue}
+            $signature=$scope.Signatures[$member]
+            if($null -eq $signature -or $null -eq $signature.Result -or ($null -ne $result -and $result -ne $signature.Result)){return $null}
+            $result=$signature.Result
+        }
+        # This is a result invariant, not overload selection. The normal
+        # lowerer still selects the operation with actual argument types.
+        return $result
+    }
+    return $null
+}
 function Get-PscLocalRegions {
     [OutputType([Collections.Generic.Dictionary[System.Management.Automation.Language.VariableExpressionAst,System.Management.Automation.Language.AssignmentStatementAst]])]
-    param([System.Management.Automation.Language.Ast[]]$Statements,[hashtable]$Parameters)
+    param([System.Management.Automation.Language.Ast[]]$Statements,[hashtable]$Parameters,
+        [Collections.Generic.Dictionary[System.Management.Automation.Language.AssignmentStatementAst,type]]$NullableWrites,
+        [PscRuntimeSelection]$RuntimeSelection)
     $regions=[Collections.Generic.Dictionary[System.Management.Automation.Language.VariableExpressionAst,System.Management.Automation.Language.AssignmentStatementAst]]::new()
     $uses=[Collections.Generic.Dictionary[string,Collections.Generic.List[System.Management.Automation.Language.VariableExpressionAst]]]::new([StringComparer]::OrdinalIgnoreCase)
     $excluded=[Collections.Generic.HashSet[string]]::new([string[]]@(Get-SmaVariableName),[StringComparer]::OrdinalIgnoreCase)
@@ -14947,6 +15187,7 @@ function Get-PscLocalRegions {
             }
         }
     }
+    $pending=[Collections.Generic.Dictionary[string,System.Management.Automation.Language.AssignmentStatementAst[]]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach($name in $uses.Keys){
         if($excluded.Contains($name)){continue}
         $references=$uses[$name]
@@ -14959,6 +15200,54 @@ function Get-PscLocalRegions {
             if($null -ne $block.Traps -and $block.Traps.Count){continue}
             if(!$entries.ContainsKey($block)){$entries.Add($block,$assignment)}
             elseif($block.Statements.IndexOf($assignment) -lt $block.Statements.IndexOf($entries[$block])){$entries[$block]=$assignment}
+        }
+        # A null initializer can share a single reference slot with later
+        # writes only when the initializer dominates every use and every
+        # write is null or has the same independently proven capture type.
+        # Keep the existing disjoint-region analysis for all other locals.
+        if($null -ne $NullableWrites){
+            [bool]$joinedLocal=$false
+            foreach($entry in $entries.Values){
+                $initial=$entry.Right
+                if($initial -isnot [System.Management.Automation.Language.CommandExpressionAst] -or $initial.Redirections.Count -or
+                    $initial.Expression -isnot [System.Management.Automation.Language.VariableExpressionAst] -or $initial.Expression.VariablePath.UserPath -ne 'null'){continue}
+                $block=$entry.Parent
+                $position=$block.Statements.IndexOf($entry)
+                if($position -lt 0){continue}
+                $writes=[Collections.Generic.List[System.Management.Automation.Language.AssignmentStatementAst]]::new()
+                [bool]$valid=$true
+                foreach($variable in $references){
+                    $direct=[PscLocalRegion]::StatementIn($variable,$block)
+                    if($null -eq $direct){$valid=$false;break}
+                    $index=$block.Statements.IndexOf($direct)
+                    if($index -lt $position -or ($index -eq $position -and ![object]::ReferenceEquals($variable,$entry.Left))){$valid=$false;break}
+                    $parent=$variable.Parent
+                    if($parent -is [System.Management.Automation.Language.UnaryExpressionAst] -and $parent.TokenKind -in [System.Management.Automation.Language.TokenKind]::PlusPlus,[System.Management.Automation.Language.TokenKind]::MinusMinus,[System.Management.Automation.Language.TokenKind]::PostfixPlusPlus,[System.Management.Automation.Language.TokenKind]::PostfixMinusMinus){$valid=$false;break}
+                    if($parent -isnot [System.Management.Automation.Language.AssignmentStatementAst] -or ![object]::ReferenceEquals($parent.Left,$variable)){
+                        # Destructuring can rebind a local without a direct
+                        # assignment parent. Member/element stores do not.
+                        if($parent -is [System.Management.Automation.Language.ArrayLiteralAst]){
+                            for($part=$parent;$null -ne $part;$part=$part.Parent){
+                                if($part.Parent -is [System.Management.Automation.Language.AssignmentStatementAst] -and [object]::ReferenceEquals($part.Parent.Left,$part)){$valid=$false;break}
+                            }
+                        }
+                        if(!$valid){break}
+                        continue
+                    }
+                    if($parent.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals){$valid=$false;break}
+                    $writes.Add($parent)
+                    $right=$parent.Right
+                    if($right -is [System.Management.Automation.Language.CommandExpressionAst] -and !$right.Redirections.Count -and
+                        $right.Expression -is [System.Management.Automation.Language.VariableExpressionAst] -and $right.Expression.VariablePath.UserPath -eq 'null'){continue}
+                    if($right -isnot [System.Management.Automation.Language.PipelineAst] -and
+                        ($right -isnot [System.Management.Automation.Language.CommandExpressionAst] -or $right.Expression -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst])){$valid=$false;break}
+                }
+                if(!$valid -or $writes.Count -lt 2){continue}
+                $pending.Add($name,$writes.ToArray())
+                $joinedLocal=$true
+                break
+            }
+            if($joinedLocal){continue}
         }
         if($entries.Count -lt 2){continue}
         # A region may not be entered by reading the old value, including in
@@ -14992,6 +15281,33 @@ function Get-PscLocalRegions {
         }
         if($selected.Count -ne $references.Count -or $distinct.Count -lt 2){continue}
         foreach($variable in $selected.Keys){$regions.Add($variable,$selected[$variable])}
+    }
+    # Only prove a local when every non-null write has a common reference
+    # result. An instance receiver can depend on another proven local in
+    # the same body. Each successful pass removes a pending variable; an
+    # unresolved cycle or mixed result is left to the existing lowering.
+    if($pending.Count){
+        $known=[Collections.Generic.Dictionary[string,type]]::new([StringComparer]::OrdinalIgnoreCase)
+        do{
+            [bool]$progress=$false
+            foreach($name in @($pending.Keys)){
+                [type]$joined=$null
+                [bool]$valid=$true
+                foreach($write in $pending[$name]){
+                    $right=$write.Right
+                    if($right -is [System.Management.Automation.Language.CommandExpressionAst] -and !$right.Redirections.Count -and
+                        $right.Expression -is [System.Management.Automation.Language.VariableExpressionAst] -and $right.Expression.VariablePath.UserPath -eq 'null'){continue}
+                    $inferred=Get-PscLocalWriteType -Right $right -Known $known -RuntimeSelection $RuntimeSelection
+                    if($null -eq $inferred -or $inferred.IsValueType -or $inferred.IsArray -or $inferred -in [void],[object],[string] -or ($null -ne $joined -and $joined -ne $inferred)){$valid=$false;break}
+                    $joined=$inferred
+                }
+                if(!$valid -or $null -eq $joined){continue}
+                foreach($write in $pending[$name]){$NullableWrites.Add($write,$joined)}
+                $known.Add($name,$joined)
+                [void]$pending.Remove($name)
+                $progress=$true
+            }
+        }while($progress -and $pending.Count)
     }
     return ,$regions
 }
@@ -15189,6 +15505,24 @@ function Convert-AstStatement {
                 if ($value.Type -ne $scriptField.FieldType) { $value = ConvertTo-PowerShellType -Expression $value -Type $scriptField.FieldType }
                 return [Linq.Expressions.Expression]::Assign([Linq.Expressions.Expression]::Field($null, $scriptField), $value)
             }
+        }
+
+        # A proven null-initialized local retains one slot throughout the
+        # enclosing body. Do not coerce later writes to satisfy the proof:
+        # require their uncontextualized lowered type or literal null.
+        if($Scope.ContainsKey('NullableWrites') -and $Scope.NullableWrites.ContainsKey($Statement)){
+            [type]$joined=$Scope.NullableWrites[$Statement]
+            $value=Convert-AstExpression -Node $Statement.Right -Scope $Scope
+            if($value -is [Linq.Expressions.ConstantExpression] -and $null -eq $value.Value -and !$value.Type.IsValueType){$value=[Linq.Expressions.Expression]::Constant($null,$joined)}
+            if($value.Type -ne $joined){throw 'Null-initialized local write differs from its capture proof.'}
+            if(!$Scope.Locals.ContainsKey($varName)){
+                $slot=[Linq.Expressions.Expression]::Variable($joined,$varName)
+                $Scope.Locals[$varName]=$slot
+                $Scope.DeclaredLocals.Add($slot)
+            }
+            $slot=$Scope.Locals[$varName]
+            if($slot.Type -ne $joined){throw 'Null-initialized local storage differs from its capture proof.'}
+            return [Linq.Expressions.Expression]::Assign($slot,$value)
         }
 
         # In an independently overwritten region, infer its entry from its
@@ -15902,7 +16236,8 @@ function New-LoweredBody {
     }
 
     if(!$Program -and $Statements.Length){
-        $scope.LocalRegions=Get-PscLocalRegions -Statements $Statements -Parameters $ParameterMap
+        $scope.NullableWrites=[Collections.Generic.Dictionary[System.Management.Automation.Language.AssignmentStatementAst,type]]::new()
+        $scope.LocalRegions=Get-PscLocalRegions -Statements $Statements -Parameters $ParameterMap -NullableWrites $scope.NullableWrites -RuntimeSelection $RuntimeSelection
         $scope.LocalRegionSlots=[Collections.Generic.Dictionary[System.Management.Automation.Language.AssignmentStatementAst,Linq.Expressions.ParameterExpression]]::new()
     }
     $body = [System.Collections.Generic.List[Linq.Expressions.Expression]]::new()
@@ -18841,7 +19176,7 @@ Conform streams child stdout and stderr to the invoking host as they become avai
 
 ## Compiler and runtime
 
-- **Managed:** SMA AST and typed expression lowering, deterministic IL emission, static graph/data realization, reachability and fixed-parameter specialization. Untyped method and function locals may infer independent typed storage in disjoint statement blocks only when each region unconditionally overwrites the local before any reference and every reference belongs to such a region. The analysis retains original AST referents; explicit casts or constraints, qualified or captured references, parameters, foreach binders and cross-region live values retain the existing lowering behavior. This is bounded storage inference, not general flow-join, sequential reassignment or dynamic local support. Positive `-is` tests of object-typed local or parameter storage against closed vector-array types refine reads within the true region when the original binding cannot be reassigned or escape by reference there. This does not change storage, infer across joins, or extend interface binding. Function-output inference distinguishes fallthrough, return, break, continue and throw using typed path outcomes. An admitted path has one terminal write; a freshly initialized vector of at least two elements proves an `object[]` capture, not the original vector element type. Same-capture branches and direct function forwarding preserve that type; early returns in loops are counted when repeatable and break paths write nothing. Variable-size vectors, zero/one versus multiple output joins, and unproven repeated writes retain the existing unknown result. Explicit null terminal writes can join a proven scalar reference type without changing capture storage or the output ABI. Unsealed references require an exact non-enumerable construction or the selected static source method to prove that each return is null or a fresh instance, including a stable local initialized once before use. A method result type alone does not prove that an enumerable subtype cannot escape. Unknown origin, rebinding and reference escape remain unproven. Method expression statements whose admitted lowering returns Void do not write to the function output; a first-pass ambiguous path count is reconsidered using the same lowered expression evidence. Value-producing method calls still count as writes. `Tests/Test-OutputCapture.ps1` compares SMA with authoring, resident and retained program-graph compilation and exercises refusal controls. String-left `*` and `*=` lower as repetition with declared integral, Single, Double, Decimal, Char or Boolean counts, converted to Int32 using SMA scalar conversion rules. Operand evaluation remains left-to-right and once, null-left propagates, a negative count throws, and UTF-16 capacity is checked before allocation. Text, dynamic or nullable counts are not admitted by this increment. The projected `Tests/Test-Repetition.ps1` compares SMA and all three managed compilation paths, including failure categories and explicit overflow and perturbation controls. The supplementary projected `Tests/Test-RefinementBinding.ps1` compares interpreted, authoring, resident and borrowed execution and rejects unproven reads. Predicate loops support `while`, `do ... while` and `do ... until` in the existing typed statement and output lowering. Post-test loops enter the body first and direct unlabeled continue to the tail predicate, while break and return bypass it. The supplementary projected `Tests/Test-PostTestBinding.ps1` compares SMA, authoring, resident and borrowed execution. Labeled transfers remain unsupported. Character membership (`-in`, `-cin` and negated forms) admits typed character and string vectors and homogeneous literal vectors. It preserves the collection element comparison domain: invariant linguistic string comparison or UTF-16 character equality with invariant uppercase for insensitive comparison. The collection is evaluated first, then the searched operand, each once before the search, matching SMA membership evaluation. Heterogeneous and dynamically typed collections remain outside this character membership profile. The supplementary projected `Tests/Test-MembershipBinding.ps1` compares interpreted and three managed compilation paths.
+- **Managed:** SMA AST and typed expression lowering, deterministic IL emission, static graph/data realization, reachability and fixed-parameter specialization. Untyped method and function locals may infer independent typed storage in disjoint statement blocks only when each region unconditionally overwrites the local before any reference and every reference belongs to such a region. The analysis retains original AST referents; explicit casts or constraints, qualified or captured references, parameters, foreach binders and cross-region live values retain the existing lowering behavior. A null-initialized local can use a single inferred reference slot when an unconditional null entry dominates every reference in its containing statement block and all later direct writes are null or have the same proven reference result. Function captures consume retained output proofs; source-owned method calls consume their acquired STS signature result invariant without selecting an overload. Constructors of admitted source types contribute that type. One proven local can supply another local's receiver; unresolved cycles, mixed or unknown results, inherited method targets, rebinding through unsupported lvalues and explicit constraints or escapes remain outside this proof. Each lowered write must exactly agree with the proof; null is stored without conversion. `Tests/Test-NullLocal.ps1` compares SMA with authoring, resident and borrowed compilation and refusal controls. This is bounded storage inference, not general flow-join, sequential reassignment or dynamic local support. Positive `-is` tests of object-typed local or parameter storage against closed vector-array types refine reads within the true region when the original binding cannot be reassigned or escape by reference there. This does not change storage, infer across joins, or extend interface binding. Function-output inference distinguishes fallthrough, return, break, continue and throw using typed path outcomes. An admitted path has one terminal write; a freshly initialized vector of at least two elements proves an `object[]` capture, not the original vector element type. Same-capture branches and direct function forwarding preserve that type; early returns in loops are counted when repeatable and break paths write nothing. Variable-size vectors, zero/one versus multiple output joins, and unproven repeated writes retain the existing unknown result. Explicit null terminal writes can join a proven scalar reference type without changing capture storage or the output ABI. Unsealed references require an exact non-enumerable construction or the selected static source method to prove that each return is null or a fresh instance, including a stable local initialized once before use. A method result type alone does not prove that an enumerable subtype cannot escape. Unknown origin, rebinding and reference escape remain unproven. Method expression statements whose admitted lowering returns Void do not write to the function output; a first-pass ambiguous path count is reconsidered using the same lowered expression evidence. Value-producing method calls still count as writes. `Tests/Test-OutputCapture.ps1` compares SMA with authoring, resident and retained program-graph compilation and exercises refusal controls. String-left `*` and `*=` lower as repetition with declared integral, Single, Double, Decimal, Char or Boolean counts, converted to Int32 using SMA scalar conversion rules. Operand evaluation remains left-to-right and once, null-left propagates, a negative count throws, and UTF-16 capacity is checked before allocation. Text, dynamic or nullable counts are not admitted by this increment. The projected `Tests/Test-Repetition.ps1` compares SMA and all three managed compilation paths, including failure categories and explicit overflow and perturbation controls. The supplementary projected `Tests/Test-RefinementBinding.ps1` compares interpreted, authoring, resident and borrowed execution and rejects unproven reads. Predicate loops support `while`, `do ... while` and `do ... until` in the existing typed statement and output lowering. Post-test loops enter the body first and direct unlabeled continue to the tail predicate, while break and return bypass it. The supplementary projected `Tests/Test-PostTestBinding.ps1` compares SMA, authoring, resident and borrowed execution. Labeled transfers remain unsupported. Character membership (`-in`, `-cin` and negated forms) admits typed character and string vectors and homogeneous literal vectors. It preserves the collection element comparison domain: invariant linguistic string comparison or UTF-16 character equality with invariant uppercase for insensitive comparison. The collection is evaluated first, then the searched operand, each once before the search, matching SMA membership evaluation. Heterogeneous and dynamically typed collections remain outside this character membership profile. The supplementary projected `Tests/Test-MembershipBinding.ps1` compares interpreted and three managed compilation paths.
 - **Native:** pinned Windows NativeAOT compiler plus PSC COFF linker; direct CIL-to-IR-to-x64 ELF leaf emission and decoded-byte ABI checks. The direct backend does not yet replace ILC for general programs.
 - **Faculties:** `HandleTable`, `DiscoveryMechanisms`, `ScriptType`, `PrimitiveConversion`, `ObjectDispatch`, `NativeEncoding`, `ElfEncoding`. Build with `-Mode BuildRuntime`. All seven faculties lower selected original declarations from the retained module inventory, including nested declaration scopes. Explicit dependency realizations map to their source definitions for signature binding. For admitted exact and closed numeric bindings, persisted dependency methods and explicit constructors select their original STS member first, then match the exact CLR realization by parameter and result references. Ambiguity and realization mismatch are refused; unsupported binding profiles still use the existing CLR compatibility path. BuildRuntime resolves the declared dependency order and builds all faculties in one isolated coordinator with one retained source acquisition, keeping faculty assembly identities out of the caller. Within that coordinator, dependency signature binding consumes the original contracts retained from preceding faculty builds; independent BuildFaculty calls acquire contracts for their own source scope. `BuildRuntime -CompilerRuntimeDirectory <bootstrap> -RuntimeDirectory <empty-output>` admits the existing no-contract compiler realization, composes the original resident dependency scopes without merging their descriptors, and rebuilds all eight artifacts in a separate directory. It refuses missing or incompatible admission receipts, nonempty output directories and external contract inputs. The coordinator acquires its declaration inventory once, uses retained persisted dependency witnesses, retires completed graph scopes outside the remaining transitive dependency closure in reverse order, and closes the admitted session. Selected lowering scopes do not replace the complete source scope. The lowerer returns its exact completed selection to the coordinator, and dependent function scopes are retained by their resolving source context. CLR compatibility projections have their own namespace; emitted types keep their original names and the compiler retains source names in its declaration scope. BuildRuntime without contract inputs also builds the compiler-private `compiler/CompilerDeclarations.dll` and writes a version 2 local selection receipt for it and HandleTable, ScriptType and PrimitiveConversion. The seven public faculty files and their dependency closure are unchanged. The compiled selection path verifies source, CoreLib, SMA, the existing TypeConverter framework dependency and all four admitted assembly digests once, loads the exact bytes in a private collectible context, and invokes typed delegates. Version 1 receipts require rebuilding. Missing or incompatible receipts refuse that path; no implicit interpreted fallback is permitted after selection is requested. Without an explicit directory the authoring selector is unchanged. The receipt identifies a trusted local build; it is not a signature or independent admission proof. This is explicit compiler self-consumption, not full startup activation. `PscApi.AcquireSelection(api,directory)` acquires an explicit resident selection session from the API source revision. `PscRuntimeSelection.Select(session,signatures,sources)` reuses the admitted selector without reading artifacts again; `Close(session)` withdraws it and requests context unloading. Resident structural specialization accepts the same session as `-RuntimeSelection`, and does not close a caller-owned session. CLI Compile with an explicit `-RuntimeDirectory` uses `Invoke-PscCompile` to acquire one session before lowering, supply it to both structural specialization and ordinary managed lowering (including the managed precursor of Native), and close it in a finally boundary before returning the managed result. The session remains inside the authoring operation, not the process dispatcher. Even an exact-only compilation refuses a missing or incompatible receipt when explicitly requested. Without an explicit directory CLI Compile retains interpreted selection. The retained session may also be supplied to `Export-LoweredAssembly -RuntimeSelection`: ordinary source static/instance calls and explicit constructors use session-owned compiled STS exact and numeric binding and retain the original CLR projection witnesses. Method closure, initializer lowering and recursive function-output inference use the same session; by default a selected compilation owns fresh declaration scopes, including their existing inference caches. `Export-LoweredAssembly -SourceAst <original-root> -RuntimeSelection <session> -RetainedScope <scope>` instead borrows a live resident source graph with a temporary CLR compatibility projection. The original AST, ordered class and enum selection, session and dependency scope must match exactly; acquire any rewritten record source before borrowing. The graph remains caller-owned on success or failure; `RealizedScope` ownership transfer is not admitted with `RetainedScope`. Synthetic function scopes acquire temporary graphs by default. For repeated program compilation, acquire the existing program function class with `Get-ScriptFunctionClass -Root <original-root> -Program`, then `Get-DeclarationScope -Root <function-class-parent-root> -Resolving <source-scope> -RuntimeSelection <session>`. Supply that dependent scope as `-RetainedFunctionScope` together with `-RetainedScope` and `-Program`. Both graphs remain caller-owned and acquire no replacement graphs; the dependent CLR projection resolves against the fresh source CLR projection. Explicit reprojection may substitute only a live projection of the identical direct dependency graph. Function provenance is retained with the scope, independent of active synthetic class caches. Ordinary lowering resolves function source, class and program entry from its selected declarations; borrowed compilation uses the retained referents without reading or displacing the acquisition dictionaries. External acquisition and inference retain identity-keyed conditional weak indexes. Live source or synthetic AST referents preserve their relationships, including null cache entries and parameterless program entries, but the indexes do not own abandoned source or synthetic ASTs. Retained scopes continue to own their declaration evidence and graph withdrawal remains explicit. The resolving source may be any live projection of the identical source graph. Function inference remains projection-local; withdraw the dependent graph before its source graph. Ordinary resident lowering tracks every graph it acquires, including incomplete projections; it withdraws temporary scopes in reverse acquisition order and removes their cache entries on success or failure. An explicit successful RealizedScope handoff retains only the selected graph; caller-owned dependency and declaration scopes are not withdrawn. CLR compatibility projections are collectible. `Get-DeclarationScope -Root <original-root> -RuntimeSelection <session> -RealizationOf <scope>` creates a separate compatibility projection from a live retained graph, including the original enum selection and dependencies; it neither replaces the root cache nor acquires another STS graph. Existing callers may retain prior CLR witnesses, which become eligible for reclamation when no longer referenced. Graph withdrawal remains independent of these witnesses. `PscScriptTypeAcquisition` constructs descriptors directly from the original SMA AST declarations in the selected execution domain. A resident scope stores only its owning session, scope and source coordinates, and CLR projection witnesses; it does not construct an interpreted descriptor graph. The compiled graph retains original imported semantic referents, not their AST ownership. CLR signature projection realizes retained source referents and recursive CTS references without AST evidence; unresolved names retain the compatibility name resolution path. Resident acquisition appends selected source enums after class coordinates, retaining enum identity, underlying integral CTS reference and ordered exact constant values. Enum references use the same source owner map, including imported and reprojected enums; CLR compatibility projection and persisted emission consume the same typed enum shape from the acquired definitions, including exact full-width constants. Resident shape retrieval uses graph coordinates without reacquiring AST initializers; the authoring adapter uses the same enum acquisition operation. Source enum literal expressions bind through the acquired enum member names and exact values in the visible declaration scope; the CLR enum value is a typed expression witness, not the source of the constant. Resident literal binding uses the compiled STS member selector and transports only the selected coordinate, integral CTS type and exact constant; full enum shapes are used for construction, not resident expression binding. Source storage expressions select declared members through STS, validate the exact CLR field against the selected result reference, and follow the semantic base on inherited static or instance lookup. Resident storage binding realizes only the selected result or base, independent of transported signature and base projections; authoring retains compatibility name resolution where the class-only inventory requires it. Resident operation binding also realizes the selected name, parameters and result from the retained graph instead of transported signatures, while retaining coordinate-only inspection and the existing script-function switch compatibility path. Authoring operation binding independently validates the selected result projection against its retained semantic reference; unresolved forms use the existing authoring realization adapter. On a static or instance operation binding miss, distinguish a local operation outside the admitted conversion profile from absence, and select inherited source operations through the retained semantic base reference after checking its CLR realization. Constructors remain local; unsupported profiles retain existing compatibility behavior. Mixed fixed-arity CTS method and constructor overloads whose arguments and reachable parameter signatures are all admitted integral or floating types use one shared adapter to the existing ScriptType primitive selector, including its resident compiled realization when requested. Exact constructor acquisition uses ExactBinding, not CLR default-binder widening. The selected CTS operation is lowered with the existing argument conversions. CLR method groups containing ParamArrayAttribute vector parameters acquire ordinary and expanded forms from the declared metadata. The same ScriptType selector ranks effective parameter types, normal-versus-expanded forms and generic declaration specificity in authoring and resident execution. Existing structural generic inference closes eligible forms. The selected call retains its actual CTS member and an expansion coordinate; ordinary argument lowering converts each operand once and constructs the declared trailing vector only when required. Explicit compatible vectors retain identity. The supported conversion profile remains bounded; ref-like parameter collections, constructor parameter arrays and fully dynamic CTS binding are not covered by this increment. The supplementary projected `Tests/Test-ParamArrayBinding.ps1` compares SMA, authoring, resident and borrowed execution, plus ambiguity and conversion refusals. Exact CTS method signatures exposed on both a derived class and its base are selected only when a unique declaring class strictly descends from every competing owner; same-owner or unrelated ties remain refused. Other compatibility profiles are unchanged. An inherited static operation outside the admitted conversion profile uses its traversed semantic owner as the CTS compatibility receiver. A terminal source method miss permits CTS lookup on the verified System.Object base only, not on the source projection. Explicitly imported CTS enums without a source enum definition retain CLR binding. Binding, imports and graph withdrawal remain available without AST evidence. Caller-held declaration scopes retain their original ASTs. The compiled graph supplies typed acquisition, projection and binding results across the delegate boundary, with refusal status and diagnostic text instead of collectible exceptions. The authoring caller checks the selected member against its CLR realization. Graph scopes may be withdrawn individually through `PscRuntimeSelection.ReleaseGraph`; live importing scopes prevent withdrawal, and retired coordinates are never reused. Previously cached scope witnesses refuse subsequent operations rather than silently reacquiring a different semantic graph. A resident scope cannot import an authoring descriptor graph. ScriptType.dll remains independent of SMA; only the compiler-side adapter consumes AST evidence. Structural contracts can be erased at build time or retained as typed descriptors with revocable role bindings.
 - **Evidence:** differential tests, structural lint, Guard, non-loading binary queries and coverage. An observed call is not a universal binding proof; an ABI check is not a proof of arithmetic equivalence.
